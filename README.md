@@ -33,6 +33,10 @@ out. For concrete input→output, see [examples.md](examples.md).
 | [deployment.md](deployment.md)                       | Docker Compose vs Kubernetes, full K8s deployment plan                                                            |
 | [plan.md](plan.md)                                   | Phased implementation roadmap and milestones                                                                      |
 
+Background: [social_media_llm_architecture_prompt.md](social_media_llm_architecture_prompt.md)
+is the original system-design request. It has been reconciled with
+[what.txt](what.txt), which is now the authoritative source and supersedes it.
+
 ## TL;DR of the recommendation
 
 - **Unit of analysis = post + its comment thread.** A scraped item is a parent

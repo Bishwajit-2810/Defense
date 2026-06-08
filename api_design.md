@@ -181,12 +181,12 @@ Poll job/analysis status and fetch results. `{id}` is a `job_id` or `analysis_id
       "post_summary": "গ্রিন গার্ডেন ও ট্রান্সপোর্টে খাবারের দাম বাইরের তুলনায় অনেক বেশি; পোস্টদাতা কেনা বন্ধ ও বয়কটের ডাক দিয়েছেন।",
       "post_summary_lang": "bn",
       "overall_sentiment": "negative",
-      "sentiment_score": -0.61,
+      "sentiment_score": -0.64,
       "emotion": "anger",
       "intents": ["complaint", "call_to_action"],
       "topics": ["food pricing", "campus transport", "boycott"],
       "entities": [
-        { "type": "organization", "value": "Green Garden", "confidence": 0.93 }
+        { "type": "organization", "value": "Green Garden", "confidence": 0.94 }
       ],
       "brand_mentions": [
         { "name": "Green Garden", "sentiment": "negative", "mentions": 9 }

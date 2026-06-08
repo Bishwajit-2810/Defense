@@ -1,10 +1,22 @@
 # Social Media Analysis Platform - System Design Request
 
+> **Note:** This is the original request. The authoritative, refined requirements
+> now live in [what.txt](what.txt), and the design docs are written against that.
+> This file has been reconciled with what.txt on the points that matter most:
+> **no external/paid LLM API** (two local open-source LLMs only), **Banglish**
+> (romanized Bangla) as a first-class language, and the **post + comment thread**
+> as the unit of analysis.
+
 ## Project Overview
 
-I want to design and implement a production-grade AI platform capable of processing and analyzing large volumes of Facebook and Instagram content.
+I want to design and implement a production-grade AI **microservice** ("smart
+layer") capable of processing and analyzing large volumes of scraped Facebook and
+Instagram content — **each post together with its comment thread**.
 
-The system should process **1,000+ posts per batch** and eventually scale to **10,000+ posts per batch** while remaining fast, cost-effective, and horizontally scalable.
+The system should process **1,000+ posts per batch** and eventually scale to
+**10,000+ and then 100,000+ posts per batch** while remaining fast,
+cost-effective, and horizontally scalable. A scraper feeds posts in; the smart
+layer returns structured JSON out for downstream projects to consume.
 
 ---
 
@@ -12,10 +24,11 @@ The system should process **1,000+ posts per batch** and eventually scale to **1
 
 Build a multilingual AI-powered platform that:
 
-- Ingests Facebook and Instagram posts.
-- Supports Bangla and English text.
+- Ingests scraped Facebook and Instagram posts **with their comment threads**.
+- Supports **Bangla, English, and Banglish** (romanized/code-mixed Bangla).
 - Performs advanced AI/NLP analysis.
-- Generates structured JSON output.
+- Generates structured JSON output (summary in the post's original language).
+- Runs the smart layer on **two local open-source LLMs — no external/paid API**.
 - Supports batch and streaming workloads.
 - Can be deployed on-premise or in the cloud.
 - Uses load balancing and distributed processing.
@@ -26,10 +39,10 @@ Build a multilingual AI-powered platform that:
 
 ## Input Sources
 
-- Facebook Posts
+- Facebook Posts **+ their comment threads**
 - Instagram Captions
 - Instagram Comments
-- Mixed Bangla-English Content
+- Mixed Bangla-English-**Banglish** Content
 - Large Batch Uploads
 
 ### Target Scale
@@ -122,7 +135,7 @@ The system should support:
 
 ## Cost Optimization
 
-- Minimize LLM API costs
+- **No external/paid LLM API** — two local open-source LLMs only (zero per-token cost)
 - Prefer open-source models
 - GPU optimization
 - Smart routing of requests
@@ -182,7 +195,7 @@ Please provide a complete architecture including:
 
 Recommend:
 
-- LLMs for Bangla + English
+- **Two local open-source LLMs** for Bangla + English + Banglish (no external API)
 - Embedding Models
 - Classification Models
 - Fine-Tuning Strategy
@@ -432,7 +445,7 @@ Include:
 - Compute
 - Storage
 - Networking
-- LLM Costs
+- LLM serving cost (local GPU compute — **no per-token API charges**)
 
 ---
 
@@ -481,9 +494,10 @@ Instead design a hybrid architecture where:
                     │ Feature Extraction │
                     └─────────┬──────────┘
                               │
-                    ┌─────────▼──────────┐
-                    │ LLM (Selective)    │
-                    └─────────┬──────────┘
+                    ┌──────────▼─────────────┐
+                    │ Local LLM-A / LLM-B    │
+                    │ (Selective · no API)   │
+                    └──────────┬─────────────┘
                               │
                     ┌─────────▼──────────┐
                     │ JSON Generator     │
