@@ -106,14 +106,14 @@ The system should support:
   "language": "bn",
   "sentiment": "positive",
   "emotion": "joy",
-  "topics": ["education", "technology"],
+  "topics": ["fashion", "clothing"],
   "entities": [
     {
       "type": "organization",
-      "value": "OpenAI"
+      "value": "Fabrilife"
     }
   ],
-  "keywords": ["AI", "research"],
+  "keywords": ["jersey", "price"],
   "toxicity_score": 0.02,
   "summary": "Short summary",
   "confidence": 0.94,
@@ -478,7 +478,8 @@ Instead design a hybrid architecture where:
                     └─────────┬──────────┘
                               │
                     ┌─────────▼──────────┐
-                    │ RabbitMQ / Kafka   │
+                    │ Redis Streams (MVP)│
+                    │  / Kafka (prod)    │
                     └─────────┬──────────┘
                               │
          ┌────────────────────┼────────────────────┐
@@ -503,9 +504,10 @@ Instead design a hybrid architecture where:
                     │ JSON Generator     │
                     └─────────┬──────────┘
                               │
-                    ┌─────────▼──────────┐
-                    │ MongoDB / Qdrant   │
-                    └─────────┬──────────┘
+                    ┌──────────▼──────────────┐
+                    │ PostgreSQL · ClickHouse │
+                    │ Qdrant · Redis · object │
+                    └──────────┬──────────────┘
                               │
                     ┌─────────▼──────────┐
                     │ Analytics API      │

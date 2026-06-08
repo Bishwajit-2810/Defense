@@ -177,6 +177,7 @@ Poll job/analysis status and fetch results. `{id}` is a `job_id` or `analysis_id
       "author": "TalentedOstrich6332",
       "language": "bn",
       "language_mix": ["bn", "banglish", "en"],
+      "language_confidence": 0.97,
       "post_type": "complaint",
       "post_summary": "গ্রিন গার্ডেন ও ট্রান্সপোর্টে খাবারের দাম বাইরের তুলনায় অনেক বেশি; পোস্টদাতা কেনা বন্ধ ও বয়কটের ডাক দিয়েছেন।",
       "post_summary_lang": "bn",
@@ -202,7 +203,7 @@ Poll job/analysis status and fetch results. `{id}` is a `job_id` or `analysis_id
       },
       "post_summary_source": "llm",
       "confidence": 0.92,
-      "processing": { "unit": "post+thread", "stage1_ms": 58, "llm_used": true, "llm_model": "LLM-B" },
+      "processing": { "unit": "post+thread", "stage1_ms": 58, "llm_used": true, "llm_model": "LLM-A" },
       "created_at": "2026-06-01T10:00:00Z"
     }
   ],

@@ -90,15 +90,16 @@ a thread of mostly Banglish comments agreeing and calling for a boycott.
   },
   "post_summary_source": "llm",
   "confidence": 0.92,
-  "processing": { "unit": "post+thread", "stage1_ms": 61, "llm_used": true, "llm_model": "LLM-B" },
+  "processing": { "unit": "post+thread", "stage1_ms": 61, "llm_used": true, "llm_model": "LLM-A" },
   "created_at": "2026-06-01T09:00:00Z"
 }
 ```
 
 **What did the work:** Stage-1 NLP detected language/Banglish, per-comment
 sentiment, entities (Green Garden), and toxicity cheaply. The router sent the
-thread to **LLM-B** only for the Bangla `post_summary` and the comment `themes`
-(generative fields) — everything else is small-model output.
+thread to **LLM-A** (the fast per-post model) only for the Bangla `post_summary`
+and the comment `themes` (generative fields) — everything else is small-model
+output.
 
 ---
 

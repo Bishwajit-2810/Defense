@@ -19,10 +19,17 @@ This folder answers the system-design request described by the owner in
 posts (with comment threads) in, and this smart layer returns structured JSON
 out. For concrete input→output, see [examples.md](examples.md).
 
+> **Single-file master plan:** [masterplan.md](masterplan.md) consolidates every
+> document below into one self-contained read (overview, architecture,
+> alternatives, models, infrastructure, cost, API, examples, deployment, roadmap),
+> kept in sync with the per-topic docs. Use the focused docs for one subject;
+> use the master plan for the whole picture.
+
 ## Document index
 
 | Document                                             | What it covers                                                                                                    |
 | ---------------------------------------------------- | ----------------------------------------------------------------------------------------------------------------- |
+| [masterplan.md](masterplan.md)                       | **Single-file master plan** — every document below consolidated into one self-contained read                      |
 | [architecture.md](architecture.md)                   | Recommended high- and low-level architecture, the hybrid NLP→LLM pipeline, data flow, service breakdown, security |
 | [possible_architecture.md](possible_architecture.md) | Alternatives considered and tradeoffs (queues, databases, deployment, service mesh)                               |
 | [models.md](models.md)                               | AI/NLP model selection per task, Bangla/Banglish support, RAG evaluation, fine-tuning strategy                    |

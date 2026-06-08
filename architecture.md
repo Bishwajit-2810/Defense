@@ -271,7 +271,7 @@ normalized to the dominant language for the summary.
     "unit": "post+thread",
     "stage1_ms": 58,
     "llm_used": true,
-    "llm_model": "LLM-B",
+    "llm_model": "LLM-A",
     "model_versions": {}
   },
   "created_at": "2026-06-01T10:00:00Z"
@@ -291,6 +291,10 @@ Notes:
 - All fields except `post_summary`, `comment_analysis.themes`, and
   `representative_comments` come from cheap Stage-1 NLP; the LLM fills only the
   generative fields when the router asks for them.
+- The flat schema the owner sketched (`post_id, platform, language, sentiment,
+  emotion, topics, entities, keywords, toxicity_score, summary, confidence,
+  created_at`) is preserved as a subset of this richer object (`sentiment` →
+  `overall_sentiment`, `summary` → `post_summary`).
 
 ---
 
@@ -320,7 +324,7 @@ Rationale for each data-layer pick and the alternatives rejected is in
 ## 8. Reliability & fault tolerance
 
 - **Retries with backoff** at every worker; transient failures (OOM, GPU hiccup,
-  API 5xx) retried up to N times.
+  local vLLM 5xx) retried up to N times.
 - **Dead-letter queue (DLQ).** Messages that exhaust retries go to a DLQ topic
   with the error context for inspection/replay.
 - **Idempotency.** Content hash + job id make reprocessing safe; assembler
