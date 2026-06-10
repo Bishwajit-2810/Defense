@@ -11,15 +11,18 @@
 > local-only — superseded by the pluggable backend in
 > [models.md](models.md) §2 and [architecture.md](architecture.md) §0.)
 >
-> **Superseded on input/integration:** the real input is **pulled** from an
-> existing platform's **Post API / Comment API** into the service's **own
-> database** (not pushed by a scraper), spans **Facebook, Telegram, X, Instagram,
-> …** (platform derived from the URL host, not Facebook/Instagram only), and the
-> upstream's coarse `sentiment`/`viralPotential` are kept as a **baseline** while we
-> **recompute** our own. The authoritative input contract is
+> **Superseded on input/integration:** the real input is **pulled** as a single
+> **post-with-details** payload (post with its **comments embedded**, plus
+> `engagement`, `reactionBreakdown`, `sampleShares`) into the service's **own
+> database** (not pushed by a scraper); platform is derived from the URL host. The
+> upstream's coarse **post** `sentiment`/`viralPotential` are kept as a **baseline**
+> while we **recompute** our own; **comment sentiment and OCR are our job** (the
+> upstream ships neither). The authoritative input contract is
 > [data_contract.md](data_contract.md) (real sample:
-> [social_posts.json](social_posts.json)). The `Expected JSON Output` sketch below
-> is the original ask; the delivered schema is in [architecture.md](architecture.md) §6.
+> [posts_with_details.json](posts_with_details.json)). The `Expected JSON Output`
+> sketch below is the original ask; the delivered schema is in
+> [architecture.md](architecture.md) §6. The UI is **plain HTML/CSS/JS**, not Flutter
+> (as the diagram/skills below imply).
 
 ## Project Overview
 

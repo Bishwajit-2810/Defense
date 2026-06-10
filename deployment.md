@@ -32,9 +32,11 @@ Single host with one GPU. One `docker-compose.yml` brings up:
 services:
   gateway        (NGINX)            → TLS, routing, rate limit
   api            (FastAPI)          → auth + ingestion + reporting (combined for MVP)
-  worker-nlp     (Python)           → Stage-1 text suite + vision (image sentiment, GPU)
+  worker-nlp     (Python)           → Stage-1 text suite + vision (image sentiment, OCR, GPU)
   worker-llm     (Python)           → Stage-2 worker (text LLM + VLM); LLM_BACKEND=local|groq
   vllm           (vLLM, optional)   → local backend only: LLM-A (+LLM-B) + VLM (Qwen2.5-VL) on GPU
+  agent-orch     (FastAPI)          → AI agents (insight/analyst, deep-dive, alerting) → LLM-B + MCP   [Phase 2]
+  mcp-servers    (FastAPI + MCP)    → analytics-mcp · retrieval-mcp · ingest-mcp (internal tools)        [Phase 2]
   redis          (cache/queue)      → Redis Streams = bus + cache + dedup
   postgres       (ops + jobs)
   clickhouse     (analytics)
@@ -52,7 +54,7 @@ services:
     `GROQ_API_KEY` + role→model IDs; the worker calls Groq over HTTPS and needs
     **no GPU**. Flip the env var to switch at any time (no image rebuild).
 - Goal: prove the hybrid pipeline end-to-end on 1k post+comment-thread batches —
-  posts pulled from the upstream Post/Comment APIs into our own DB, structured
+  the post-with-details payload (comments embedded) pulled into our own DB, structured
   JSON out (see [examples.md](examples.md), [data_contract.md](data_contract.md)).
 
 ---
@@ -109,8 +111,11 @@ services:
 ### Workload mapping
 
 - **Stateless services** (auth, ingestion, reporting, user-mgmt, assembler,
-  router) → `Deployment` + `Service`, HPA on CPU/RPS, `PodDisruptionBudget`,
-  liveness/readiness probes.
+  router, **agent-orchestrator**, **MCP servers**) → `Deployment` + `Service`, HPA
+  on CPU/RPS, `PodDisruptionBudget`, liveness/readiness probes. The agent
+  orchestrator + MCP servers (analytics/retrieval/ingest) are **CPU-only** — they
+  query stores and call the Stage-2 LLM backend; no GPU. MCP servers are
+  `ClusterIP`-only (internal), reachable by the orchestrator, not the gateway.
 - **Workers** (nlp, llm) → `Deployment` on **GPU node pools** (nodeSelector +
   tolerations + `nvidia.com/gpu` resource requests), scaled by **KEDA** on Kafka
   consumer lag.
@@ -121,8 +126,8 @@ services:
   - `groq`: no vLLM deployments — the Stage-2 worker (a stateless `Deployment`,
     HPA/KEDA on queue depth, **no GPU**) calls Groq over HTTPS. Allow egress to
     Groq in `NetworkPolicy`/egress rules and mount `GROQ_API_KEY` from a Secret.
-  Both are valid simultaneously for **hybrid/failover**; the worker picks per
-  request/policy. Switching backends is a config rollout, not a rebuild.
+    Both are valid simultaneously for **hybrid/failover**; the worker picks per
+    request/policy. Switching backends is a config rollout, not a rebuild.
 - **Stateful infra** (Kafka, PostgreSQL, ClickHouse, Qdrant) → operators or
   `StatefulSet` + `PersistentVolumeClaim`; or managed equivalents to cut ops.
 - **Object storage** → MinIO operator or cloud S3.

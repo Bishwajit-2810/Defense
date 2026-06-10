@@ -5,10 +5,10 @@ why the recommended choice in [architecture.md](architecture.md) won. Use it to
 revisit a decision if constraints change.
 
 Context for every choice below: the service is a **self-hosted microservice** that
-**pulls** scraped **posts + comment threads** (Bangla/English/Banglish, across
-Facebook/Telegram/X/Instagram) — **multimodal: caption text _and_ images (with
-OCR), so it runs both text and vision models** ([data_contract.md](data_contract.md)
-§4) — from an upstream platform's Post/Comment APIs into
+**pulls** the upstream **post-with-details** payload (posts **with comments
+embedded**, Bangla/English/Banglish, Facebook in the sample) — **multimodal: caption
+text _and_ images (we run our own OCR), so it runs both text and vision models**
+([data_contract.md](data_contract.md) §4) — into
 **its own database** and emits structured JSON, under hard constraints — fast,
 cheap, Bangla-accurate (input contract: [data_contract.md](data_contract.md)). The
 data stores and NLP fleet are self-hosted (no data egress there). The **Stage-2 LLM is
@@ -150,8 +150,8 @@ All of these are used; they are complementary, not alternatives:
   distinct).
 - **Query cache** — short-TTL cache of expensive ClickHouse aggregations powering
   the dashboard.
-- **CDN** — fronts the Flutter web assets and any public/static report exports;
-  not for dynamic per-tenant data.
+- **CDN** — fronts the static **HTML/CSS/JS** dashboard assets and any
+  public/static report exports; not for dynamic per-tenant data.
 
 ---
 
@@ -236,3 +236,34 @@ Full reasoning in [models.md](models.md) §5. Per-post classification needs no
 retrieval. RAG becomes valuable for analyst Q&A over the corpus, grounded report
 generation, and "what are people saying about X" queries — backed by Qdrant +
 the embeddings you already compute.
+
+---
+
+## 11. Agentic layer & MCP: where, and where not
+
+**Single-shot LLM vs. agent.** The per-post / per-comment pipeline uses the LLM/VLM
+as a **single-shot** tool (summarize, classify) — deterministic, cheap, no planning.
+**Agents** (plan → call tools → observe → repeat) are reserved for **corpus-level**
+work that genuinely needs it: analyst Q&A, grounded report generation, and targeted
+deep-dives. We deliberately **do not** make per-post analysis agentic — that would
+multiply LLM calls per item and break the cost model. So agents live **only** at the
+reporting/insight tier ([architecture.md](architecture.md) §11).
+
+**Why MCP (Model Context Protocol) for tools.** Options for giving an agent access
+to our data:
+
+- **Bespoke per-agent glue** — fastest to write once, but every agent re-implements
+  DB access, auth, and schemas; brittle as agents multiply.
+- **MCP servers (RECOMMENDED)** — expose `analytics`/`retrieval`/`ingest` as typed
+  MCP tools once; any agent (and future LLM clients/operator tools) reuse them with
+  consistent auth/tenant scoping. Standard protocol, language-agnostic, and the
+  backend models (Qwen on vLLM, Llama on Groq) already support the tool/function
+  calling MCP builds on. Small added surface (a few stateless FastAPI services).
+- **Dump everything into the prompt** — rejected: doesn't scale, leaks data, no
+  fresh aggregates.
+
+**Tradeoff accepted:** a little extra infrastructure (the MCP servers + agent
+orchestrator) in exchange for grounded, auditable, reusable tooling — and the agent
+layer is **gated, cached, and budget-capped** so it stays low-volume/high-value.
+Backend-agnostic and policy-bound: privacy-locked tenants keep agent calls on
+`local`. Not needed for the MVP; lands with the reporting/insight phase.

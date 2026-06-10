@@ -10,17 +10,19 @@ posts efficiently. Read alongside [architecture.md](architecture.md).
 
 - Repo + monorepo layout (services, workers, infra, models, dashboard).
 - Lock the **input contract** ([data_contract.md](data_contract.md)): the upstream
-  **Post API** schema (real sample in [social_posts.json](social_posts.json)), the
-  **Comment API** schema (working contract until the real payload arrives), the
-  pull + own-DB integration (no write-back), platform-from-URL, and the
-  recompute-with-baseline sentiment policy. Lock the **canonical output JSON
-  schema** ([architecture.md](architecture.md) §6, worked in
-  [examples.md](examples.md)) and a shared JSON Schema validator. These contracts
-  (what we pull from upstream, what downstream consumes) are the heart of the
-  microservice; lock them early.
-- Build the **upstream API client + ingestion**: pull posts (and comments when
-  available) keyed by CUID `id`, derive `platform`, keep upstream
-  `sentiment`/`viralPotential` as `baseline_*`, upsert into **our own database**.
+  **post-with-details** schema (real sample in
+  [posts_with_details.json](posts_with_details.json)) — post with embedded
+  `comments[]`, `engagement`, `reactionBreakdown`, and `sampleShares` — the pull +
+  own-DB integration (no write-back), platform-from-URL, and the recompute-with-baseline
+  sentiment policy. Lock the **canonical output JSON schema**
+  ([architecture.md](architecture.md) §6, worked in [examples.md](examples.md)) and
+  a shared JSON Schema validator. These contracts (what we pull, what downstream
+  consumes) are the heart of the microservice; lock them early.
+- Build the **upstream API client + ingestion**: pull the post-with-details payload
+  keyed by CUID `id` (comments embedded), derive `platform`, keep upstream
+  `sentiment`/`viralPotential` as `baseline_*`, **run OCR on `photoUrls`** (no OCR
+  is shipped), record comment **coverage** (`storedCommentRows`/`commentCount`),
+  upsert into **our own database**.
 - Stand up local Docker Compose skeleton: Postgres, Redis, Qdrant, ClickHouse,
   MinIO, a stub API, Prometheus/Grafana.
 - Pick and pin model versions ([models.md](models.md)), **including the vision
@@ -32,6 +34,8 @@ posts efficiently. Read alongside [architecture.md](architecture.md).
   Groq role→model IDs and store `GROQ_API_KEY` as a secret.
 - Build a small **labeled eval set** per task and per language (bn / en /
   Banglish) — needed to tune confidence thresholds and judge fine-tuning later.
+  The scoring rubric, gold sets, ship gates, and drift monitoring are in
+  [evaluation.md](evaluation.md).
 
 **Exit criterion:** a single post flows API → Redis Stream → stub worker →
 Postgres → `GET /analysis/{id}`, with valid JSON.
@@ -42,31 +46,34 @@ Postgres → `GET /analysis/{id}`, with valid JSON.
 
 Goal: prove the hybrid pipeline and output quality end-to-end, cheaply.
 
-> **First target (priority order)** — the multimodal post pipeline, shippable on
-> the data we have today (post API; comments follow):
+> **First target (priority order)** — the multimodal post-and-thread pipeline,
+> shippable on the data we have today (comments are **embedded** in the payload):
 > **(1) post text sentiment** (caption) → **(2) image sentiment** (visual model on
-> the photo, when present) → **(3) fuse** into post `overall_sentiment` →
-> **(4) post summary grounded on caption + image/OCR** → **(5) comments** when the
-> Comment API lands. See [data_contract.md](data_contract.md) §4.
+> the photo, when present; we also OCR it) → **(3) fuse** into post
+> `overall_sentiment` (cross-check `reactionBreakdown`) → **(4) post summary
+> grounded on caption + image/OCR** → **(5) per-comment sentiment** over the
+> embedded thread. See [data_contract.md](data_contract.md) §4.
 
-- **Ingestion service:** **pull from the upstream Post API** (the live data path —
-  comments follow when the Comment API lands), derive `platform` from URL host,
-  keep upstream `sentiment`/`viralPotential` as `baseline_*`, normalize the caption
-  plus `photoOcrTexts` (Unicode, Bangla/English/Banglish script tagging), assemble any
-  available comment thread (keep `parent_id`), content-hash **dedup** (Redis),
-  upsert into **our own DB** keyed by CUID `id`, job creation, enqueue to Redis
-  Streams. The `/v1/posts/upload` push path is wired for replay/external sources.
+- **Ingestion service:** **pull the post-with-details payload** (comments embedded),
+  derive `platform` from URL host, keep upstream `sentiment`/`viralPotential` as
+  `baseline_*`, **run OCR on `photoUrls`** (no OCR is shipped), normalize the
+  caption + OCR (Unicode, Bangla/English/Banglish script tagging), take the embedded
+  comment thread (record **coverage** `storedCommentRows`/`commentCount`),
+  content-hash **dedup** (Redis), upsert into **our own DB** keyed by CUID `id`, job
+  creation, enqueue to Redis Streams. The `/v1/posts/upload` push path is wired for
+  replay/external sources.
 - **Stage-1 NLP + vision worker:** runs **post first, then each comment**.
   - _Text:_ language/Banglish detection (fastText) → shared XLM-R encoder with
     sentiment/emotion/topic/intent heads (**recomputed** `text_sentiment`, upstream
     score kept as baseline) → toxicity/hate → NER (GLiNER/spaCy) → embedding
     (bge-m3) → keywords.
   - _Vision (image posts):_ a cheap **visual** model (SigLIP/CLIP zero-shot or a
-    fine-tuned ViT) scores `image_sentiment`; a small VLM (Qwen2.5-VL) produces an
-    image description; reuse upstream `photoOcrTexts`.
-  - _Fuse_ `text_sentiment` + `image_sentiment` → post `overall_sentiment`. Run the
-    text models over each comment → thread `sentiment_breakdown`. Micro-batched;
-    confidence per field.
+    fine-tuned ViT) scores `image_sentiment`; we **run OCR** (PaddleOCR/Tesseract);
+    a small VLM (Qwen2.5-VL) produces an image description.
+  - _Fuse_ `text_sentiment` + `image_sentiment` → post `overall_sentiment`
+    (cross-checked against `reactionBreakdown`). Run the text models over **each
+    embedded comment** (the upstream ships none) → thread `sentiment_breakdown` with
+    **coverage**. Micro-batched; confidence per field.
 - **Router/Triage:** confidence gates + task flags; decide LLM/VLM routing.
 - **Stage-2 LLM/VLM worker:** a backend-agnostic worker for selective summarization
   /insight — running either backend, `local` (vLLM serving **LLM-A** quantized 7B
@@ -80,7 +87,9 @@ Goal: prove the hybrid pipeline and output quality end-to-end, cheaply.
   ClickHouse, Qdrant, MinIO.
 - **APIs:** `/posts/upload`, `/analysis/run`, `/analysis/{id}`, `/reports`
   (basic), auth (API key + JWT).
-- **Flutter dashboard (v1):** upload, job status, results table, basic charts.
+- **Web dashboard (v1) — plain HTML/CSS/JS** (vanilla, no framework): job status,
+  results table, per-post sentiment + comment breakdown + reaction chart, served as
+  static files calling the read APIs.
 - **Monitoring:** Prometheus + Grafana + Loki; track LLM-routing rate + cache hits.
 
 **Exit criteria:** process 1,000-post batches reliably; measured LLM slice in
@@ -111,6 +120,13 @@ Goal: scale, reliability, and the move to Kubernetes.
   clusters, not posts (key cost lever at 10k).
 - **Reporting:** trend analysis, brand-mention tracking, political analysis on
   ClickHouse; grounded report generation via RAG (Qdrant + LLM).
+- **Agentic insight layer ([architecture.md](architecture.md) §11):** stand up the
+  **MCP servers** (`analytics-mcp`, `retrieval-mcp`, `ingest-mcp` — FastAPI + MCP
+  SDK) and the **agent orchestrator**; ship the **Insight/Analyst agent**
+  (`POST /v1/agents/query` + agent-generated reports) on **LLM-B** over those tools,
+  then the **coverage deep-dive** and **alerting** agents. Gate, cache, and
+  budget-cap every agent run; honor the `local`⇄`groq` tenant policy. (Corpus-tier
+  only — never per post.)
 - **Observability:** OpenTelemetry traces → Jaeger; dashboards for throughput,
   cost-per-batch, LLM slice, cache hit rates, queue lag, DLQ size.
 - **First fine-tune:** LoRA/QLoRA on router-flagged + labeled data; ship only if
@@ -178,18 +194,19 @@ Production; graceful degradation under failure proven (chaos test).
 
 ## Risk register (top items)
 
-| Risk                                    | Mitigation                                                                                                    |
-| --------------------------------------- | ------------------------------------------------------------------------------------------------------------- |
-| Comment API not yet available           | Ship the **post-first** path now (post sentiment runs standalone); build comments against the working contract ([data_contract.md](data_contract.md) §2) and finalize when the real payload arrives |
-| Image/VLM cost or latency (every image post) | Cheap visual model (SigLIP/CLIP) for `image_sentiment` on all images; VLM only **selectively** for the grounded summary (router-gated); cache by image hash; batch on GPU |
-| Visual sentiment accuracy on local content | Calibrate against `baseline_sentiment`; eval set including news-graphics/memes; fall back to OCR-text sentiment when image confidence is low |
-| Upstream schema / platform drift        | Platform derived from URL host (open-ended); ingest keyed by CUID `id`; tolerate new fields, validate the ones we use |
-| Bangla / Banglish accuracy below bar    | Multilingual encoder + Bangla fine-tune + Banglish-heavy eval set                                             |
-| LLM slice creeps up → cost spikes       | Confidence-gate tuning, caching, clustering, alert on LLM-share metric                                        |
-| GPU cost overrun                        | Spot for batch, reserved base, quantization, right-sizing                                                     |
-| Queue/worker overload                   | KEDA on lag, bounded queues, backpressure, DLQ                                                                |
-| Data privacy / PII                      | Encryption at rest/in transit, retention/deletion APIs, access audit                                          |
-| Prompt injection via post text          | Treat post text as untrusted; never let it alter system instructions                                          |
-| Model regression on upgrade             | Eval-set gate before ship; Kafka replay to compare                                                            |
-| Groq backend leaks PII (data egress)    | Default `local`; pin sensitive tenants to `local`; reject policy-violating overrides; audit `llm_backend`     |
-| Groq outage / rate-limit / price change | Failover to `local` (or degrade to Stage-1-only); retry on 429; alert on Groq error/cost; cap per-call tokens |
+| Risk                                                          | Mitigation                                                                                                                                                                |
+| ------------------------------------------------------------- | ------------------------------------------------------------------------------------------------------------------------------------------------------------------------- |
+| Comment sample ≪ total (`storedCommentRows` ≪ `commentCount`) | Analyze the stored sample; **report coverage** (`analyzed/commentCount`) — never imply full coverage; request deeper comment pulls where it matters                       |
+| Comment sentiment is entirely ours (upstream ships `null`)    | Same multilingual sentiment models as the post; Banglish-heavy eval set for comments; weight by `likes` for themes                                                        |
+| Image/VLM cost or latency (every image post)                  | Cheap visual model (SigLIP/CLIP) for `image_sentiment` on all images; VLM only **selectively** for the grounded summary (router-gated); cache by image hash; batch on GPU |
+| Visual sentiment accuracy on local content                    | Calibrate against `baseline_sentiment`; eval set including news-graphics/memes; fall back to OCR-text sentiment when image confidence is low                              |
+| Upstream schema / platform drift                              | Platform derived from URL host (open-ended); ingest keyed by CUID `id`; tolerate new fields, validate the ones we use                                                     |
+| Bangla / Banglish accuracy below bar                          | Multilingual encoder + Bangla fine-tune + Banglish-heavy eval set                                                                                                         |
+| LLM slice creeps up → cost spikes                             | Confidence-gate tuning, caching, clustering, alert on LLM-share metric                                                                                                    |
+| GPU cost overrun                                              | Spot for batch, reserved base, quantization, right-sizing                                                                                                                 |
+| Queue/worker overload                                         | KEDA on lag, bounded queues, backpressure, DLQ                                                                                                                            |
+| Data privacy / PII                                            | Encryption at rest/in transit, retention/deletion APIs, access audit                                                                                                      |
+| Prompt injection via post text                                | Treat post text as untrusted; never let it alter system instructions                                                                                                      |
+| Model regression on upgrade                                   | Eval-set gate before ship; Kafka replay to compare                                                                                                                        |
+| Groq backend leaks PII (data egress)                          | Default `local`; pin sensitive tenants to `local`; reject policy-violating overrides; audit `llm_backend`                                                                 |
+| Groq outage / rate-limit / price change                       | Failover to `local` (or degrade to Stage-1-only); retry on 429; alert on Groq error/cost; cap per-call tokens                                                             |

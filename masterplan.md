@@ -37,31 +37,36 @@ roadmap — into one source of truth.
 ## 1. What this service is
 
 An **existing social-media monitoring platform** scrapes 1,000+ real-time
-Bangla/English/Banglish posts (Facebook, Telegram, X, Instagram, …), **each with
-its comment thread**, and exposes them over a **Post API** and a **Comment API**.
+Bangla/English/Banglish posts (Facebook in the current sample; others by URL host)
+**with their comments embedded**, and exposes them as a single **post-with-details**
+payload (post + `comments[]` + `engagement` + `reactionBreakdown` + `sampleShares`).
 This service is a **smart, self-contained microservice** — a "thinking layer" —
 that sits on top of that platform and:
 
-- **pulls** posts and their comments from the upstream APIs (joined by the post's
-  unique CUID `id`) into its **own separate database** — read-only consumer, no
-  write-back (full input contract: [data_contract.md](data_contract.md), real
-  sample [social_posts.json](social_posts.json)),
+- **pulls** the post-with-details payload into its **own separate database** —
+  read-only consumer, no write-back (full input contract:
+  [data_contract.md](data_contract.md), real sample
+  [posts_with_details.json](posts_with_details.json)). The **comment thread is
+  embedded**, so no separate fetch/join is needed.
 - decides _per item_ how much intelligence each one needs (cheap NLP models vs. an
   LLM — this routing is the "smart" part), and
 - returns one **structured JSON** object per thread (summary in the post's own
   language, sentiment, topics, intents, entities, brand mentions, comment
   analysis — see §8) that downstream projects consume directly.
 
-Platform is **derived from each post's URL host** (Facebook/Telegram/X/Instagram/…),
-so the service is platform-agnostic. The upstream already stores a coarse
-`sentiment` and `viralPotential`; we keep those as a **baseline** and **recompute**
-our own richer sentiment (see [data_contract.md](data_contract.md) §4).
+Platform is **derived from each post's URL host**, so the service is
+platform-agnostic. The upstream stores a coarse post `sentiment` and
+`viralPotential` (kept as a **baseline**); **comment sentiment is empty and OCR is
+no longer shipped — both are our job**, and the free `reactionBreakdown`
+(LIKE/LOVE/HAHA/WOW/SAD/ANGRY/CARE) is a crowd emotion prior
+(see [data_contract.md](data_contract.md) §4).
 
 **Posts are multimodal, and that is the first target** (in order): (1) **text
 sentiment** on the caption, (2) **image sentiment** from a _visual_ model on the
-photo when present (separate from its OCR), (3) **fuse** into the post's overall
-sentiment, (4) a **post summary grounded on caption + image/OCR** (so a photo-only,
-`null`-caption post is still summarized from its picture), then (5) **comments**.
+photo when present (we also OCR it), (3) **fuse** into the post's overall sentiment
+(cross-checked against `reactionBreakdown`), (4) a **post summary grounded on
+caption + image/OCR** (so a photo-only, `null`-caption post is still summarized),
+then (5) **per-comment sentiment** over the embedded comments.
 
 Hard product constraints from the owner: **fast**, **cost-effective**,
 **efficient**, and **accurate on Bangla and Banglish** (with fine-tuning hooks for
@@ -76,10 +81,10 @@ config- and request-level, so the operator can flip between them at any time
 without redeploying.
 
 **The unit of analysis is a _post together with its comment thread_, not an
-isolated post.** A post (upstream Post API) is joined to N comments/replies pulled
-from the Comment API by the post's unique `id` ([data_contract.md](data_contract.md));
-the thread is **assembled** from two API responses rather than received pre-nested.
-The smart layer analyzes the whole thread and emits one JSON object per thread.
+isolated post.** The post arrives **with its `comments[]` embedded** (a stored
+sample of `engagement.commentCount`; [data_contract.md](data_contract.md)) — no
+separate fetch/join. The smart layer analyzes the whole thread and emits one JSON
+object per thread, reporting comment **coverage** since only a sample is shipped.
 
 ---
 
@@ -135,7 +140,7 @@ The smart layer analyzes the whole thread and emits one JSON object per thread.
 
 ```text
                           ┌─────────────────────────────┐
-   Clients                │  Flutter Dashboard / API     │
+   Clients                │  Web Dashboard (HTML/CSS/JS) │
  (dashboard, uploaders)   │  consumers / 3rd-party apps  │
                           └───────────────┬─────────────┘
                                           │ HTTPS
@@ -148,16 +153,16 @@ The smart layer analyzes the whole thread and emits one JSON object per thread.
               │                           │                           │
      ┌────────▼────────┐        ┌─────────▼─────────┐       ┌─────────▼────────┐
      │  Auth Service   │        │ Ingestion Service │       │ Reporting / Query│
-     │ (JWT, API keys) │        │ (validate, dedup, │       │ Service          │
-     └─────────────────┘        │  enqueue)         │       │ (read APIs)      │
+     │ (JWT, FastAPI)  │        │ (FastAPI, dedup,  │       │ + Agent Orchestr.│  FastAPI
+     └─────────────────┘        │  enqueue)         │       │ (read + agents)  │
                                 └─────────┬─────────┘       └────────┬─────────┘
-                                          │ produce                  │ read
-                                ┌─────────▼─────────┐                │
-                                │   Message Bus     │                │
-                                │ Kafka / Redis Str │                │
-                                │  (partitioned)    │                │
-                                └─────────┬─────────┘                │
-                                          │ consume                  │
+                                          │ produce                  │ read / agent tools
+                                ┌─────────▼─────────┐       ┌─────────▼─────────────────┐
+                                │   Message Bus     │       │ Agentic layer: AI agents  │
+                                │ Kafka / Redis Str │       │ (LLM-B/VLM) + MCP servers │
+                                │  (partitioned)    │       │ analytics·retrieval·ingest│
+                                └─────────┬─────────┘       └─────────┬─────────────────┘
+                                          │ consume                  │ read
         ┌─────────────────────────────────┼──────────────────────────────────┐
         │  STAGE 1 — Fast NLP workers (CPU + small GPU), horizontally scaled   │
         │  lang detect · sentiment · emotion · topic · toxicity · NER · embed  │
@@ -195,16 +200,17 @@ strategy — see §7.
 
 ## 5. Data flow (end to end)
 
-1. **Ingest (pull).** The Ingestion Service **pulls from the upstream Post API**
-   (poll `status: NOT_ANALYZED` / a campaign / time window) and, per post, **pulls
-   its comments from the Comment API** joined by the post's unique `id`
+1. **Ingest (pull).** The Ingestion Service **pulls the post-with-details payload**
+   (a campaign / time window / id) — post **with its `comments[]` embedded**, plus
+   `engagement`, `reactionBreakdown`, `sampleShares`
    ([data_contract.md](data_contract.md)). It copies records into **our own
    database** (no write-back), derives `platform` from the URL host, keeps upstream
-   `sentiment`/`viralPotential` as `baseline_*`, normalizes the caption + OCR text
-   (`photoOcrTexts`; Unicode NFC, emoji, Bangla/English/Banglish script tagging),
-   assembles the comment thread (ordered, `parent_id` preserved), and computes a
-   content hash over the post + comments. A pushed batch (`POST /v1/posts/upload`)
-   is also accepted for external/replay sources.
+   `sentiment`/`viralPotential` as `baseline_*`, **runs OCR on `photoUrls`** (no OCR
+   is shipped), normalizes the caption + OCR (Unicode NFC, emoji,
+   Bangla/English/Banglish script tagging), takes the embedded comment thread (tracks
+   `storedCommentRows` of `commentCount` — coverage), and computes a content hash
+   over the post + comments. A pushed batch (`POST /v1/posts/upload`) is also
+   accepted for external/replay sources.
 2. **Dedup gate.** Hash is checked against Redis (recent) and Qdrant/Postgres
    (historical). Exact duplicates short-circuit to the cached result; near
    duplicates (cosine > threshold on embedding) can reuse prior analysis. This
@@ -219,12 +225,13 @@ strategy — see §7.
    path** runs a cheap **visual** model on each image → `image_sentiment` + a short
    image description (skipped for text-only posts); the two are **fused** into
    post-level `overall_sentiment`/`sentiment_score` (text-weighted when a caption
-   exists; image + OCR-weighted for `null`-caption photo posts). Upstream
-   `sentiment`/`viralPotential` are retained as `baseline_*`. The **same text
-   models** then run over **each comment**, aggregated into the thread's
-   `sentiment_breakdown`. (Before the Comment API is wired, the post pass runs
-   standalone and `comment_analysis.analyzed = 0`.) Each output carries a
-   **confidence** score. Results are written to a partial-result store.
+   exists; image + OCR-weighted for `null`-caption photo posts), **cross-checked
+   against `reactionBreakdown`**. Upstream `sentiment`/`viralPotential` are retained
+   as `baseline_*`. The **same text models** then run over **each embedded comment**
+   (the upstream ships no comment sentiment), aggregated into the thread's
+   `sentiment_breakdown` + themes (weighted by `likes`), reporting **coverage**
+   (`analyzed` of `commentCount`). Each output carries a **confidence** score.
+   Results are written to a partial-result store.
 5. **Router/Triage (the "smart thinking layer").** For each thread the router
    decides:
    - All required fields produced with confidence ≥ threshold, and no LLM-only task
@@ -261,17 +268,19 @@ strategy — see §7.
 
 ## 6. Service breakdown
 
-| Service                     | Responsibility                                                     | Stack                                                  | Scaling unit        |
-| --------------------------- | ------------------------------------------------------------------ | ------------------------------------------------------ | ------------------- |
-| **API Gateway**             | TLS termination, routing, rate limiting, request size limits, CORS | NGINX / K8s Ingress (+ optional Kong)                  | replicas behind LB  |
-| **Auth Service**            | API keys, JWT issue/verify, RBAC, per-tenant quotas                | FastAPI + PostgreSQL + Redis                           | stateless replicas  |
-| **Ingestion Service**       | Validate, normalize, dedup, create job, enqueue                    | FastAPI (async)                                        | stateless replicas  |
-| **Stage-1 NLP + Vision Workers** | Text small-model suite **and the visual model on image posts** (`image_sentiment` + description), micro-batched, emit features + confidence | Python + Triton/ONNX/CTranslate2; SigLIP/CLIP + light VLM | GPU/CPU worker pool |
-| **Router/Triage**           | Apply confidence gates + task flags; decide LLM/VLM routing        | lightweight Python service or in-worker rule module    | stateless           |
-| **Stage-2 LLM/VLM Workers** | Selective summarization (text **and image-grounded via a VLM**) / insight / report / hard cases | Thin worker → local vLLM (LLM-A+LLM-B + VLM) **or** Groq API (text + vision) | GPU pool, stateless |
-| **Result Assembler**        | Merge, JSON-schema validate, compute aggregate confidence          | Python consumer                                        | stateless replicas  |
-| **Reporting/Query Service** | Read APIs, report generation, exports                              | FastAPI + ClickHouse + PostgreSQL                      | stateless replicas  |
-| **User Management**         | Tenants, users, roles, billing/usage metering                      | FastAPI + PostgreSQL                                   | stateless replicas  |
+| Service                          | Responsibility                                                                                                                                                                        | Stack                                                                        | Scaling unit        |
+| -------------------------------- | ------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- | ---------------------------------------------------------------------------- | ------------------- |
+| **API Gateway**                  | TLS termination, routing, rate limiting, request size limits, CORS                                                                                                                    | NGINX / K8s Ingress (+ optional Kong)                                        | replicas behind LB  |
+| **Auth Service**                 | API keys, JWT issue/verify, RBAC, per-tenant quotas                                                                                                                                   | FastAPI + PostgreSQL + Redis                                                 | stateless replicas  |
+| **Ingestion Service**            | Validate, normalize, dedup, create job, enqueue                                                                                                                                       | FastAPI (async)                                                              | stateless replicas  |
+| **Stage-1 NLP + Vision Workers** | Text small-model suite **and the visual model + OCR on image posts** (`image_sentiment`, our OCR, description), and **per-comment sentiment** over the embedded thread, micro-batched | Python + Triton/ONNX/CTranslate2; SigLIP/CLIP + PaddleOCR + light VLM        | GPU/CPU worker pool |
+| **Router/Triage**                | Apply confidence gates + task flags; decide LLM/VLM routing                                                                                                                           | lightweight Python service or in-worker rule module                          | stateless           |
+| **Stage-2 LLM/VLM Workers**      | Selective summarization (text **and image-grounded via a VLM**) / insight / report / hard cases                                                                                       | Thin worker → local vLLM (LLM-A+LLM-B + VLM) **or** Groq API (text + vision) | GPU pool, stateless |
+| **Result Assembler**             | Merge, JSON-schema validate, compute aggregate confidence                                                                                                                             | Python consumer                                                              | stateless replicas  |
+| **Reporting/Query Service**      | Read APIs, report generation, exports                                                                                                                                                 | FastAPI + ClickHouse + PostgreSQL                                            | stateless replicas  |
+| **Agent Orchestrator**           | Selective **AI agents** (insight/analyst, coverage deep-dive, alerting) — corpus/report tier only, never per-post (§14.6)                                                             | FastAPI + agent loop → LLM-B/VLM backend + MCP tools                         | stateless replicas  |
+| **MCP Servers**                  | Standardized tools for the agents: `analytics-mcp` (ClickHouse/Postgres), `retrieval-mcp` (Qdrant), `ingest-mcp` (upstream pull / more comments)                                      | FastAPI + MCP SDK (internal)                                                 | stateless replicas  |
+| **User Management**              | Tenants, users, roles, billing/usage metering                                                                                                                                         | FastAPI + PostgreSQL                                                         | stateless replicas  |
 
 Workers are split into **separate pools per stage** so the expensive LLM GPUs
 scale independently from the cheap NLP fleet. The Stage-2 worker itself is a thin
@@ -328,75 +337,99 @@ per-post calls.
 ## 8. Canonical output JSON
 
 The assembler emits and validates this schema. `overall_sentiment`/`sentiment_score`
-are a **fusion of `text_sentiment` (caption) and `image_sentiment` (the photo)**
-([data_contract.md](data_contract.md) §4); `image_sentiment`/`image_analysis` are
-`null` for text-only posts and `text_sentiment` is `null` for `null`-caption posts.
-`post_summary` is **grounded on caption + OCR + image** (`post_summary_grounding`
-records which) and written **in the post's own language** (detected, never forced;
-Banglish normalized to the dominant language). Field provenance: the
-`post_id`/`campaign_id`/`platform_post_id`/`media_type`/`baseline_*` fields come
-from the upstream Post API ([data_contract.md](data_contract.md) §5), `platform` is
-derived from the URL host, and everything else is computed by this service.
+are a **fusion of `text_sentiment` (caption) and `image_sentiment` (the photo)**,
+cross-checked against `reaction_breakdown` ([data_contract.md](data_contract.md) §4);
+`image_sentiment`/`image_analysis` are `null` for text-only posts and
+`text_sentiment` is `null` for `null`-caption posts. `post_summary` is **grounded on
+caption + OCR + image** and written **in the post's own language**.
+`comment_analysis.coverage` reports `analyzed / commentCount`. Provenance:
+`post_id`/`campaign_id`/`platform_post_id`/`media_type`/`baseline_*`/
+`reaction_breakdown`/`shares` come from the upstream payload; `platform` is derived;
+everything else — including **all comment sentiment** and **OCR** — is computed by us.
+(Real example below: the Bangla photo+text Shapla post.)
 
 ```json
 {
-  "post_id": "cmq7phcmplnt00xmpl0a1b2cx",
-  "campaign_id": "cmpgrn1cmplnt0xmpl0camp01",
+  "post_id": "cmosjpp9305n0u9tskgmd1c4k",
+  "campaign_id": "cmoldmxzr02d8fu22vhvrg23c",
   "platform": "facebook",
-  "platform_post_id": "1402233557981288",
-  "url": "https://www.facebook.com/...",
-  "author": null,
+  "platform_post_id": "4460219584209360",
+  "url": "https://www.facebook.com/4460219584209360",
   "media_type": "PHOTO_TEXT",
   "language": "bn",
-  "language_mix": ["bn", "banglish", "en"],
-  "language_confidence": 0.97,
-  "post_type": "complaint",
-  "post_summary": "গ্রিন গার্ডেন ও ট্রান্সপোর্টে খাবারের দাম বাইরের তুলনায় অনেক বেশি — একটি সিঙ্গারা ২০ টাকা; পোস্টদাতা কেনা বন্ধ করার ও বয়কটের ডাক দিয়েছেন। ছবিতে দামের তালিকা দেখা যাচ্ছে।",
+  "language_mix": ["bn"],
+  "language_confidence": 0.98,
+  "post_type": "commemoration",
+  "post_summary": "শাপলা চত্বরের ঘটনার স্মরণে একটি আবেগঘন বাংলা পোস্ট; ছবিতে সেই রাতের দৃশ্য। পোস্ট ও মন্তব্যে শোক এবং আওয়ামী লীগের প্রতি ক্ষোভ প্রবল।",
   "post_summary_lang": "bn",
-  "post_summary_grounding": ["caption", "ocr", "image"],
+  "post_summary_grounding": ["caption", "image"],
   "overall_sentiment": "negative",
-  "sentiment_score": -0.64,
-  "text_sentiment": { "label": "negative", "score": -0.7 },
-  "image_sentiment": { "label": "neutral", "score": -0.1, "per_image": [-0.1] },
-  "baseline_sentiment": -0.3,
-  "baseline_viral_potential": 0.25,
-  "emotion": "anger",
-  "intents": ["complaint", "call_to_action"],
-  "topics": ["food pricing", "campus transport", "boycott"],
+  "sentiment_score": -0.82,
+  "text_sentiment": { "label": "negative", "score": -0.85 },
+  "image_sentiment": {
+    "label": "negative",
+    "score": -0.7,
+    "per_image": [-0.7]
+  },
+  "baseline_sentiment": -0.85,
+  "baseline_viral_potential": 0.78,
+  "emotion": "sadness",
+  "intents": ["commemorate", "express_grievance"],
+  "topics": ["shapla chattar", "2013", "politics", "grief"],
   "entities": [
-    { "type": "organization", "value": "Green Garden", "confidence": 0.94 },
-    { "type": "product", "value": "singara", "confidence": 0.82 }
+    { "type": "event", "value": "Shapla Chattar", "confidence": 0.9 },
+    { "type": "organization", "value": "Awami League", "confidence": 0.86 }
   ],
-  "brand_mentions": [
-    { "name": "Green Garden", "sentiment": "negative", "mentions": 9 }
-  ],
-  "keywords": ["দাম", "সিঙ্গারা", "boycott", "transport"],
-  "toxicity_score": 0.07,
-  "hate_speech_score": 0.01,
-  "engagement": { "reactions": 48, "comment_count": 12 },
+  "brand_mentions": [],
+  "keywords": ["শাপলা", "শোক", "আওয়ামী লীগ"],
+  "toxicity_score": 0.18,
+  "hate_speech_score": 0.12,
+  "engagement": {
+    "reactions": 84979,
+    "comment_count": 1562,
+    "share_count": 3189,
+    "stored_comments": 112
+  },
+  "reaction_breakdown": {
+    "SAD": 65289,
+    "LIKE": 18235,
+    "LOVE": 682,
+    "HAHA": 566,
+    "CARE": 125,
+    "WOW": 56,
+    "ANGRY": 26
+  },
+  "shares": { "sample_count": 0, "sample": [] },
   "image_analysis": {
     "image_count": 1,
-    "ocr_text": "মেনু: সিঙ্গারা ২০৳ ...",
-    "description": "a printed café price list / menu board",
+    "ocr_text": "",
+    "description": "a dark night-time scene of a crowd / security forces",
     "images": [
-      { "ref": "photoUrls[0]", "sentiment": { "label": "neutral", "score": -0.1 }, "ocr_text": "মেনু: সিঙ্গারা ২০৳ ...", "description": "a printed café price list / menu board" }
+      {
+        "ref": "photoUrls[0]",
+        "sentiment": { "label": "negative", "score": -0.7 },
+        "ocr_text": "",
+        "description": "a dark night-time scene of a crowd / security forces"
+      }
     ],
-    "vision_model": "SigLIP (sentiment) + Qwen2.5-VL-7B (description)"
+    "vision_model": "SigLIP (sentiment) + Qwen2.5-VL-7B (description+OCR)"
   },
   "comment_analysis": {
-    "analyzed": 12,
-    "sentiment_breakdown": { "positive": 1, "negative": 9, "neutral": 2 },
+    "analyzed": 112,
+    "coverage": "112/1562 stored",
+    "sentiment_breakdown": { "positive": 6, "negative": 89, "neutral": 17 },
     "themes": [
-      "prices far above market",
-      "same quality cheaper outside",
-      "calls to boycott"
+      "grief and remembrance",
+      "anger at Awami League",
+      "calls for justice"
     ],
     "representative_comments": [
       {
-        "author": "Anonymous participant 558",
+        "author": "Abdur Rahman Wisdom's",
         "lang": "bn",
         "sentiment": "negative",
-        "text": "নুনুর গার্ডেনে এক প্লেট ভাতের দাম ২০ টাকা, বাইরে ৫ টাকা"
+        "likes": 574,
+        "text": "এই ছবিগুলো প্রমাণ করে যে পুলিশ আমাদের বন্ধু ছিল না কখনো।"
       }
     ]
   },
@@ -413,9 +446,8 @@ derived from the URL host, and everything else is computed by this service.
     "vision_model": "Qwen2.5-VL-7B-Instruct",
     "model_versions": {}
   },
-  "upstream_status": "NOT_ANALYZED",
-  "created_at": "2026-06-10T05:47:00",
-  "scraped_at": "2026-06-10T06:26:40.838"
+  "created_at": "2026-05-04T18:19:14",
+  "scraped_at": "2026-05-05T17:39:44.464"
 }
 ```
 
@@ -424,14 +456,19 @@ Notes:
 - **`sentiment_analysis` the owner asked for** is **multimodal**: `text_sentiment`
   (caption), `image_sentiment` (the photo, via a visual model), and the **fused**
   post-level `overall_sentiment` + `sentiment_score` — all **recomputed** — plus
-  `comment_analysis.sentiment_breakdown` across the thread. `image_*` are `null` for
-  text-only posts; `text_sentiment` is `null` for `null`-caption posts. The upstream
-  coarse score is kept as `baseline_sentiment` (and `baseline_viral_potential`),
-  never overwritten ([data_contract.md](data_contract.md) §4).
-- **`image_analysis`** holds per-image visual `sentiment`, `ocr_text` (from upstream
-  `photoOcrTexts`), and a `description` that grounds the summary.
-- **`media_type`** (upstream `postType`: TEXT/PHOTO/PHOTO_TEXT/UNKNOWN) is distinct
-  from the semantic `post_type`.
+  **our** per-comment `comment_analysis.sentiment_breakdown` across the embedded
+  thread (the upstream ships none). `image_*` are `null` for text-only posts;
+  `text_sentiment` is `null` for `null`-caption posts. The upstream coarse **post**
+  score is kept as `baseline_sentiment` (and `baseline_viral_potential`), never
+  overwritten ([data_contract.md](data_contract.md) §4).
+- **`reaction_breakdown`** is a free crowd **emotion signal** (SAD/ANGRY vs
+  HAHA/LOVE) used to cross-check sentiment; **`shares`** carries `sampleShares`;
+  `engagement.stored_comments` + `comment_analysis.coverage` make comment
+  **sampling** explicit.
+- **`image_analysis`** holds per-image visual `sentiment`, `ocr_text` (**our** OCR —
+  the payload no longer ships it), and a `description` that grounds the summary.
+- **`media_type`** (upstream `postType`: TEXT/PHOTO/PHOTO_TEXT) is distinct from the
+  semantic `post_type`.
 - `post_summary` is **grounded on caption + OCR + image** (`post_summary_grounding`);
   `post_summary_source` is `vlm` when a vision-language model produced it, else `llm`.
 - `post_type`, `intents`, `brand_mentions`, and `comment_analysis.themes` are the
@@ -452,21 +489,22 @@ created_at`) is preserved as a subset of the above richer object.
 
 ## 9. Technology stack
 
-| Layer          | Choice                                                       | Why                                                                      |
-| -------------- | ------------------------------------------------------------ | ------------------------------------------------------------------------ |
-| API services   | **Python + FastAPI** (async)                                 | Matches team skills; great for I/O-bound APIs and ML glue                |
-| Workers        | **Python**, Celery or Ray for orchestration                  | Native ML ecosystem; Ray scales to multi-node cleanly                    |
-| Model serving  | **Triton/ONNX/CTranslate2** (NLP); **SigLIP/CLIP + VLM** (vision); Stage-2 **vLLM**⇄**Groq** | High GPU util for NLP; cheap visual sentiment + a VLM for image-grounded summaries; Stage-2 backend switchable local↔Groq |
-| Message bus    | **Kafka** (prod), **Redis Streams** (MVP)                    | Durable, partitioned, replayable at scale; simple to start               |
-| Operational DB | **PostgreSQL**                                               | ACID jobs/state, JSONB flexibility, mature                               |
-| Analytics DB   | **ClickHouse**                                               | Columnar, billions of rows, sub-second aggregations for trends           |
-| Vector DB      | **Qdrant**                                                   | Fast, open-source, easy ops, good filtering; for dedup/search/clustering |
-| Cache          | **Redis**                                                    | LLM/embedding/query cache, dedup set, rate limits                        |
-| Object storage | **S3 / MinIO**                                               | Raw payloads, reports, model artifacts                                   |
-| Orchestration  | **Kubernetes** (prod), **Docker Compose** (MVP)              | Autoscaling + HA vs simplicity                                           |
-| Autoscaling    | **KEDA** (scale on queue depth) + HPA                        | Workers track backlog, not just CPU                                      |
-| Observability  | **Prometheus + Grafana + Loki + OpenTelemetry + Jaeger**     | Metrics, logs, traces                                                    |
-| Frontend       | **Flutter**                                                  | Matches team skills; one codebase for web/mobile dashboard               |
+| Layer          | Choice                                                                                         | Why                                                                                                                                                     |
+| -------------- | ---------------------------------------------------------------------------------------------- | ------------------------------------------------------------------------------------------------------------------------------------------------------- |
+| API services   | **Python + FastAPI** (async)                                                                   | Matches team skills; great for I/O-bound APIs and ML glue                                                                                               |
+| Workers        | **Python**, Celery or Ray for orchestration                                                    | Native ML ecosystem; Ray scales to multi-node cleanly                                                                                                   |
+| Model serving  | **Triton/ONNX/CTranslate2** (NLP); **SigLIP/CLIP + VLM** (vision); Stage-2 **vLLM**⇄**Groq**   | High GPU util for NLP; cheap visual sentiment + a VLM for image-grounded summaries; Stage-2 backend switchable local↔Groq                               |
+| Agents + tools | **Agent orchestrator** (FastAPI) on the LLM-B/VLM backend; **MCP servers** (FastAPI + MCP SDK) | Tool-using agents for corpus-level insight; MCP standardizes tools over our stores + upstream (§14.6); backend models (Qwen/Llama) support tool calling |
+| Message bus    | **Kafka** (prod), **Redis Streams** (MVP)                                                      | Durable, partitioned, replayable at scale; simple to start                                                                                              |
+| Operational DB | **PostgreSQL**                                                                                 | ACID jobs/state, JSONB flexibility, mature                                                                                                              |
+| Analytics DB   | **ClickHouse**                                                                                 | Columnar, billions of rows, sub-second aggregations for trends                                                                                          |
+| Vector DB      | **Qdrant**                                                                                     | Fast, open-source, easy ops, good filtering; for dedup/search/clustering                                                                                |
+| Cache          | **Redis**                                                                                      | LLM/embedding/query cache, dedup set, rate limits                                                                                                       |
+| Object storage | **S3 / MinIO**                                                                                 | Raw payloads, reports, model artifacts                                                                                                                  |
+| Orchestration  | **Kubernetes** (prod), **Docker Compose** (MVP)                                                | Autoscaling + HA vs simplicity                                                                                                                          |
+| Autoscaling    | **KEDA** (scale on queue depth) + HPA                                                          | Workers track backlog, not just CPU                                                                                                                     |
+| Observability  | **Prometheus + Grafana + Loki + OpenTelemetry + Jaeger**                                       | Metrics, logs, traces                                                                                                                                   |
+| Frontend       | **Plain HTML + CSS + JavaScript** (vanilla, no framework)                                      | Simple static dashboard served from a CDN/static host; calls the read APIs directly; no build step or framework runtime                                 |
 
 ---
 
@@ -484,7 +522,7 @@ created_at`) is preserved as a subset of the above richer object.
   or unhealthy, the router can (a) queue, (b) degrade LLM-B work to LLM-A (lower
   quality), (c) **fail over to the other backend** — local↔Groq — when both are
   configured, or (d) return Stage-1-only results flagged `summary_source:
-  "skipped"`. Failover is policy-driven: a privacy-locked tenant can be pinned to
+"skipped"`. Failover is policy-driven: a privacy-locked tenant can be pinned to
   `local` and will never spill to Groq even under load (it degrades to
   Stage-1-only instead). Never block the whole batch.
 - **Health/readiness probes** on every service; circuit breakers around each LLM
@@ -641,8 +679,8 @@ over BYO simplicity.
 All complementary, not alternatives: **Redis** (LLM/embedding/query cache, dedup
 set, rate-limit counters), **embedding cache** (keyed by `content_hash`), **LLM
 response cache** (keyed by `(backend, model, task, content_hash)`), **query cache**
-(short-TTL ClickHouse aggregations), **CDN** (Flutter web assets + static report
-exports; not dynamic per-tenant data). See §15.4.
+(short-TTL ClickHouse aggregations), **CDN** (static HTML/CSS/JS dashboard assets +
+static report exports; not dynamic per-tenant data). See §15.4.
 
 ### 13.7 Load balancing & traffic management
 
@@ -718,22 +756,22 @@ judged on **bn + en + code-mixed Banglish**.
 
 ### 14.1 Model recommendations per task
 
-| Task                                | Recommended model(s)                                                      | Bangla | English | Notes                                                                  |
-| ----------------------------------- | ------------------------------------------------------------------------- | ------ | ------- | ---------------------------------------------------------------------- |
-| **Language + Banglish detection**   | `fastText lid.176` + CLD3 + transliteration heuristic                     | ✅     | ✅      | <1 ms/item; flags `banglish` (romanized bn) → multilingual path        |
-| **Text sentiment** (caption + per comment) | `XLM-RoBERTa`/`mBERT` fine-tuned; BanglaBERT for bn                | ✅     | ✅      | **Recompute** → `text_sentiment` + `sentiment_breakdown`; upstream `sentiment` kept as `baseline_sentiment` |
-| **Image sentiment** (visual)        | `SigLIP 2` / `CLIP` zero-shot, or fine-tuned ViT                          | n/a    | n/a     | Cheap Stage-1 model on **every image post** → `image_sentiment`; visual, fused with text sentiment |
-| **Image description / caption**     | small **VLM** (`Qwen2.5-VL-3B/7B`) or `BLIP-2`                            | ✅     | ✅      | Short image description → grounds `post_summary` (esp. `null`-caption posts) |
-| **OCR (image text)**                | reuse upstream `photoOcrTexts`; fallback `PaddleOCR`/`Tesseract`          | ✅     | ✅      | Already upstream for 25/50; folded into the text path                  |
-| **Emotion**                         | XLM-R fine-tuned (joy/anger/sadness/fear/…); GoEmotions heads for en      | ✅     | ✅      | Shares encoder with sentiment to save GPU                              |
-| **Topic classification**            | XLM-R / embedding + classifier head; or zero-shot via small NLI model     | ✅     | ✅      | Use embeddings + lightweight classifier; reduces per-label models      |
-| **Intent**                          | XLM-R fine-tuned (inform/promote/complain/request/…)                      | ✅     | ✅      | Per comment too (price/availability/location inquiries)                |
-| **Toxicity / hate / offensive**     | `XLM-R`/`mBERT` fine-tuned; Detoxify (en) + Bangla hate datasets          | ✅     | ✅      | Bangla hate-speech corpora exist (e.g. Bengali Hate Speech); fine-tune |
-| **NER (person/org/location/brand)** | `GLiNER` (multilingual, zero/few-shot), `spaCy` (en), BanglaBERT-NER (bn) | ✅     | ✅      | GLiNER gives flexible entity types without per-type models             |
-| **Embeddings**                      | `BAAI/bge-m3` (multilingual, incl. Bangla) or `intfloat/multilingual-e5`  | ✅     | ✅      | Powers dedup, comment clustering, semantic search, RAG                 |
-| **Summarization** (multimodal)      | text: **LLM-A**/**LLM-B**; image posts: a **VLM** (`Qwen2.5-VL` ⇄ Groq vision) §14.2 | ✅     | ✅      | Selective; **grounded on caption + OCR + image**; original language    |
-| **Insight / report generation**     | **LLM-B** role + RAG, on the active backend (see §14.5)                   | ✅     | ✅      | Cluster summaries → corpus-level insight                               |
-| **Keyword extraction**              | KeyBERT (on embeddings) / YAKE                                            | ✅     | ✅      | Cheap, no extra GPU model                                              |
+| Task                                       | Recommended model(s)                                                                 | Bangla | English | Notes                                                                                                                                                                   |
+| ------------------------------------------ | ------------------------------------------------------------------------------------ | ------ | ------- | ----------------------------------------------------------------------------------------------------------------------------------------------------------------------- |
+| **Language + Banglish detection**          | `fastText lid.176` + CLD3 + transliteration heuristic                                | ✅     | ✅      | <1 ms/item; flags `banglish` (romanized bn) → multilingual path                                                                                                         |
+| **Text sentiment** (caption + per comment) | `XLM-RoBERTa`/`mBERT` fine-tuned; BanglaBERT for bn                                  | ✅     | ✅      | **Recompute** → `text_sentiment` + `sentiment_breakdown`. Post `sentiment` kept as `baseline_sentiment`; **comment sentiment is entirely ours** (upstream ships `null`) |
+| **Image sentiment** (visual)               | `SigLIP 2` / `CLIP` zero-shot, or fine-tuned ViT                                     | n/a    | n/a     | Cheap Stage-1 model on **every image post** → `image_sentiment`; visual, fused with text sentiment                                                                      |
+| **Image description / caption**            | small **VLM** (`Qwen2.5-VL-3B/7B`) or `BLIP-2`                                       | ✅     | ✅      | Short image description → grounds `post_summary` (esp. `null`-caption posts)                                                                                            |
+| **OCR (image text)**                       | **ours** — `PaddleOCR` / `Tesseract` (bn+en), or the VLM                             | ✅     | ✅      | Payload no longer ships OCR, so we **run it ourselves** on `photoUrls`; folded into the text path                                                                       |
+| **Emotion**                                | XLM-R fine-tuned (joy/anger/sadness/fear/…); GoEmotions heads for en                 | ✅     | ✅      | Shares encoder with sentiment; **cross-checked against `reactionBreakdown`**                                                                                            |
+| **Topic classification**                   | XLM-R / embedding + classifier head; or zero-shot via small NLI model                | ✅     | ✅      | Use embeddings + lightweight classifier; reduces per-label models                                                                                                       |
+| **Intent**                                 | XLM-R fine-tuned (inform/promote/complain/request/…)                                 | ✅     | ✅      | Per comment too (price/availability/location inquiries)                                                                                                                 |
+| **Toxicity / hate / offensive**            | `XLM-R`/`mBERT` fine-tuned; Detoxify (en) + Bangla hate datasets                     | ✅     | ✅      | Bangla hate-speech corpora exist (e.g. Bengali Hate Speech); fine-tune                                                                                                  |
+| **NER (person/org/location/brand)**        | `GLiNER` (multilingual, zero/few-shot), `spaCy` (en), BanglaBERT-NER (bn)            | ✅     | ✅      | GLiNER gives flexible entity types without per-type models                                                                                                              |
+| **Embeddings**                             | `BAAI/bge-m3` (multilingual, incl. Bangla) or `intfloat/multilingual-e5`             | ✅     | ✅      | Powers dedup, comment clustering, semantic search, RAG                                                                                                                  |
+| **Summarization** (multimodal)             | text: **LLM-A**/**LLM-B**; image posts: a **VLM** (`Qwen2.5-VL` ⇄ Groq vision) §14.2 | ✅     | ✅      | Selective; **grounded on caption + OCR + image**; original language                                                                                                     |
+| **Insight / report generation**            | **LLM-B** role + RAG, on the active backend (see §14.5)                              | ✅     | ✅      | Cluster summaries → corpus-level insight                                                                                                                                |
+| **Keyword extraction**                     | KeyBERT (on embeddings) / YAKE                                                       | ✅     | ✅      | Cheap, no extra GPU model                                                                                                                                               |
 
 **Bangla-specific resources:** BanglaBERT (csebuetnlp), XLM-RoBERTa / mBERT (handle
 code-mixed Banglish reasonably), bge-m3 / multilingual-e5 embeddings. **Banglish is
@@ -773,7 +811,7 @@ over local→Groq under load.
 | ---------------------------------- | ------------------------------------------------------------------------------ | ---------------------------------------------------- | ---------------------------------------------------------------------------------- |
 | **LLM-A — fast / high-throughput** | `Qwen2.5-7B-Instruct` (or `Llama-3.1-8B-Instruct`), AWQ/GPTQ quantized         | a fast Groq model (e.g. `llama-3.1-8b-instant`)      | Per-post selective refinement, hardest classification, short single-post summaries |
 | **LLM-B — large / high-quality**   | `Qwen2.5-32B-Instruct` (or `Qwen2.5-14B-Instruct` at smaller scale), quantized | a larger Groq model (e.g. `llama-3.3-70b-versatile`) | Cluster summarization, corpus insight, grounded report generation (RAG)            |
-| **VLM — vision-language**          | `Qwen2.5-VL-7B-Instruct` (or `-3B` at MVP), on vLLM                            | a Groq vision/multimodal model id | **Image-grounded `post_summary`** (caption + OCR + image); image description |
+| **VLM — vision-language**          | `Qwen2.5-VL-7B-Instruct` (or `-3B` at MVP), on vLLM                            | a Groq vision/multimodal model id                    | **Image-grounded `post_summary`** (caption + OCR + image); image description       |
 
 Groq model IDs change as their catalog evolves — treat the examples above as
 placeholders and pin the current IDs in config. The prompts and JSON output schema
@@ -818,8 +856,8 @@ a switch never routes their data to Groq.
     throughput.
   - `groq`: the **Groq Cloud endpoint**, with role→model-ID mapping in config; no
     GPU, no model loading, just outbound HTTPS.
-  The worker picks the **role** (A or B) by task; the **backend** is selected by
-  config/flag and switchable at runtime.
+    The worker picks the **role** (A or B) by task; the **backend** is selected by
+    config/flag and switchable at runtime.
 - **Versioning:** every result records `processing.llm_backend` + `llm_model` +
   `model_versions` so re-runs (and a backend switch) are auditable and reproducible
   (replay from Kafka).
@@ -860,6 +898,35 @@ embeddings + the **LLM-B role** for generation on whichever Stage-2 backend is
 active — `local` for fully in-cluster RAG, or `groq` for faster report generation
 when the retrieved context may leave the cluster. Retrieval and embeddings stay
 local in both cases; only the final generation call follows the chosen backend.
+
+### 14.6 Agentic insight layer — MCP servers + AI agents
+
+The per-post / per-comment pipeline stays **deterministic NLP + single-shot
+LLM/VLM** (that's the cost model). **Above** it sits a small, **selective agent
+layer** for corpus-level work that needs planning + multiple tool calls — analyst
+Q&A, grounded reports, targeted deep-dives. **Agents never run per post.**
+
+- **MCP servers** (Model Context Protocol — standardized tools, small FastAPI
+  services): **`analytics-mcp`** (ClickHouse trends/aggregations + Postgres lookups),
+  **`retrieval-mcp`** (Qdrant semantic search + post/thread fetch), **`ingest-mcp`**
+  (trigger an upstream post-with-details pull / fetch more comments to raise coverage).
+  One consistent tool interface, same auth/tenant scoping; read-mostly (`ingest-mcp`
+  writes only into our own DB, never upstream).
+- **AI agents** (LLM-B on the pluggable `local`⇄`groq` backend — Qwen/Llama both do
+  tool calling; a **VLM** step when images matter):
+  - **Insight/Analyst agent** — `trend_query → semantic_search → get_thread →
+synthesize → cite`; generates reports and answers `POST /v1/agents/query`,
+    replacing single-shot RAG with a grounded tool-using loop.
+  - **Coverage deep-dive agent** — when `comment_analysis.coverage` is low or a post
+    is flagged viral, calls `ingest-mcp.fetch_more_comments`, re-runs the comment
+    pass, escalates.
+  - **Alerting agent** (scheduled) — watches `reaction_breakdown` spikes / sentiment
+    shifts / viral signals and raises alerts.
+- **Guardrails:** invoked by request/schedule/router escalation (not per post);
+  per-run tool-call + token budgets; cached by `(agent, inputs, backend, model)`;
+  grounded + cited + auditable (records backend/model/tools/tokens → `/v1/usage`);
+  privacy-locked tenants keep agent calls on `local`. Not required for the MVP —
+  lands with the reporting/insight phase (§20).
 
 ---
 
@@ -964,13 +1031,13 @@ accuracy drift.
 
 ### 15.4 Caching strategy
 
-| Cache                          | Key                                    | Purpose                                   | TTL                  |
-| ------------------------------ | -------------------------------------- | ----------------------------------------- | -------------------- |
-| **Dedup set** (Redis)          | `content_hash`                         | Skip re-analysis of exact dupes/reshares  | long / per-retention |
-| **Embedding cache** (Redis)    | `content_hash`                         | Avoid recomputing vectors                 | long                 |
-| **LLM response cache** (Redis) | `(backend, model, task, content_hash)` | Free repeats of LLM calls                 | medium–long          |
-| **Query cache** (Redis)        | normalized query                       | Fast dashboard aggregations               | short (secs–mins)    |
-| **CDN**                        | URL                                    | Flutter web assets, static report exports | long, versioned      |
+| Cache                          | Key                                    | Purpose                                                        | TTL                  |
+| ------------------------------ | -------------------------------------- | -------------------------------------------------------------- | -------------------- |
+| **Dedup set** (Redis)          | `content_hash`                         | Skip re-analysis of exact dupes/reshares                       | long / per-retention |
+| **Embedding cache** (Redis)    | `content_hash`                         | Avoid recomputing vectors                                      | long                 |
+| **LLM response cache** (Redis) | `(backend, model, task, content_hash)` | Free repeats of LLM calls                                      | medium–long          |
+| **Query cache** (Redis)        | normalized query                       | Fast dashboard aggregations                                    | short (secs–mins)    |
+| **CDN**                        | URL                                    | Static **HTML/CSS/JS** dashboard assets, static report exports | long, versioned      |
 
 On real social feeds these caches remove a large fraction of total work — a primary
 cost lever, not an afterthought.
@@ -1009,15 +1076,16 @@ cost lever, not an afterthought.
 
 ### 16.1 What drives cost
 
-| Driver          | Without hybrid (LLM-per-post)                 | With hybrid (this design)                                           |
-| --------------- | --------------------------------------------- | ------------------------------------------------------------------- |
-| LLM tokens      | **Dominant, runaway** — every post = LLM call | Small — only the selective slice + cluster-level calls              |
-| LLM GPU (local) | Moderate                                      | Fixed GPU line (only on the `local` backend)                        |
-| LLM API (groq)  | **Dominant, runaway**                         | Small per-token line (only on the `groq` backend)                   |
-| NLP GPU compute | Moderate                                      | **The main fixed line**, cheap & predictable (batched small models) |
-| Vision compute  | n/a                                           | Small fixed line — cheap **image-sentiment** (SigLIP/CLIP) on image posts; the **VLM** summary runs only on the selective slice (GPU on `local`, per-token on `groq`) |
-| Storage         | Small                                         | Small                                                               |
-| Networking      | Small–moderate                                | Small–moderate (+ egress to Groq on the `groq` backend)             |
+| Driver          | Without hybrid (LLM-per-post)                 | With hybrid (this design)                                                                                                                                                                                 |
+| --------------- | --------------------------------------------- | --------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- |
+| LLM tokens      | **Dominant, runaway** — every post = LLM call | Small — only the selective slice + cluster-level calls                                                                                                                                                    |
+| LLM GPU (local) | Moderate                                      | Fixed GPU line (only on the `local` backend)                                                                                                                                                              |
+| LLM API (groq)  | **Dominant, runaway**                         | Small per-token line (only on the `groq` backend)                                                                                                                                                         |
+| NLP GPU compute | Moderate                                      | **The main fixed line**, cheap & predictable (batched small models)                                                                                                                                       |
+| Vision compute  | n/a                                           | Small fixed line — cheap **image-sentiment** (SigLIP/CLIP) **+ our OCR** (PaddleOCR/Tesseract) on image posts; the **VLM** summary runs only on the selective slice (GPU on `local`, per-token on `groq`) |
+| Agents + MCP    | n/a                                           | Tiny — stateless FastAPI services (a few CPU replicas); only real cost is **low-volume LLM-B calls** for reports/analyst Q&A, gated + budget-capped, billed under the LLM line (§14.6)                    |
+| Storage         | Small                                         | Small                                                                                                                                                                                                     |
+| Networking      | Small–moderate                                | Small–moderate (+ egress to Groq on the `groq` backend)                                                                                                                                                   |
 
 The hybrid architecture keeps the LLM slice tiny, which caps cost under either
 backend: on `local` it converts an unbounded per-token bill into a **bounded,
@@ -1110,12 +1178,13 @@ error envelope.
 
 ### 17.1 Ingestion — pull from upstream (`POST /v1/ingest/sync`) + push (`POST /v1/posts/upload`)
 
-The **primary** path is a **pull** from the upstream **Post API** (and, per post,
-its **Comment API**, joined by the post's unique `id`) into our own database — see
-[data_contract.md](data_contract.md). `POST /v1/ingest/sync` triggers a pull for a
-selector; the service fetches, copies, and analyzes (**post sentiment first, then
-comments**), with no write-back. The **`POST /v1/posts/upload`** path remains for
-external/replay sources and accepts the **same upstream field names**.
+The **primary** path is a **pull** of the upstream **post-with-details** payload
+(post **with `comments[]` embedded**, plus `engagement`/`reactionBreakdown`/
+`sampleShares`) into our own database — see [data_contract.md](data_contract.md).
+`POST /v1/ingest/sync` triggers a pull for a selector; the service fetches, copies,
+runs OCR, and analyzes (**post first, then its comments**), with no write-back. The
+**`POST /v1/posts/upload`** path remains for external/replay sources and accepts the
+**same field names**.
 
 **Request — pull (`POST /v1/ingest/sync`):**
 
@@ -1123,20 +1192,25 @@ external/replay sources and accepts the **same upstream field names**.
 {
   "source": "upstream",
   "selector": {
-    "campaign_id": "cmpe1djj504zc4otgw94idx0v",
-    "status": "NOT_ANALYZED",
-    "posted_from": "2026-06-10T00:00:00",
-    "posted_to": "2026-06-11T00:00:00"
+    "campaign_id": "cmoldmxzr02d8fu22vhvrg23c",
+    "posted_from": "2026-05-01T00:00:00",
+    "posted_to": "2026-05-31T00:00:00"
   },
-  "pull_comments": true,
-  "options": { "tasks": ["all"], "want_summary": true, "summary_lang": "auto", "llm_backend": "auto" }
+  "options": {
+    "tasks": ["all"],
+    "want_summary": true,
+    "summary_lang": "auto",
+    "llm_backend": "auto"
+  }
 }
 ```
 
 The service reads records keyed by CUID `id`, derives `platform` from each `url`
-host, keeps upstream `sentiment`/`viralPotential` as `baseline_*`, and recomputes
-richer sentiment. `pull_comments: false` runs the **post-only** pass (the path
-available before the Comment API is wired). Re-pulling the same `id` upserts.
+host, keeps upstream `sentiment`/`viralPotential` as `baseline_*`, **runs OCR on
+`photoUrls`**, and recomputes richer sentiment for the post **and every embedded
+comment** (the upstream ships none). Comments arrive as a stored sample
+(`engagement.storedCommentRows` of `commentCount`) → analysis reports **coverage**.
+Re-pulling the same `id` upserts.
 
 **Request — push (`POST /v1/posts/upload`, inline batch, upstream field names):**
 
@@ -1145,28 +1219,57 @@ available before the Comment API is wired). Re-pulling the same `id` upserts.
   "source": "inline",
   "posts": [
     {
-      "id": "cmq7grn1cmplnt0xmpl0a1b2c",
-      "campaignId": "cmpgrn1cmplnt0xmpl0camp01",
-      "platformPostId": "1402233557981234",
-      "url": "https://www.facebook.com/...",
-      "caption": "গ্রিন গার্ডেন এ খাবারের দাম অনেক বেশি... একটা সিংগারা ২০ টাকা চাইল।",
-      "photoUrls": [], "photoOcrTexts": [], "postType": "TEXT",
-      "postedAt": "2026-06-10T05:47:00", "scrapedAt": "2026-06-10T06:26:40.838",
-      "commentCount": 12, "shareCount": 4, "totalReactions": 48,
-      "sentiment": -0.3, "viralPotential": 0.25, "status": "NOT_ANALYZED",
+      "id": "cmosjpp9305n0u9tskgmd1c4k",
+      "campaignId": "cmoldmxzr02d8fu22vhvrg23c",
+      "platformPostId": "4460219584209360",
+      "url": "https://www.facebook.com/4460219584209360",
+      "caption": "শাপলা চত্বরের সেই রাতের কথা ...",
+      "photoUrls": [
+        "posts/cmoldmxzr02d8fu22vhvrg23c/4460219584209360/18f4cbb26803.jpg"
+      ],
+      "postType": "PHOTO_TEXT",
+      "postedAt": "2026-05-04T18:19:14",
+      "scrapedAt": "2026-05-05T17:39:44.464",
+      "sentiment": -0.85,
+      "viralPotential": 0.78,
+      "engagement": {
+        "commentCount": 1562,
+        "totalReactions": 84979,
+        "shareCount": 3189,
+        "storedCommentRows": 112,
+        "storedReactionRows": 0
+      },
+      "reactionBreakdown": {
+        "SAD": 65289,
+        "LIKE": 18235,
+        "LOVE": 682,
+        "ANGRY": 26
+      },
       "comments": [
-        { "id": "cmcmt001", "postId": "cmq7grn1cmplnt0xmpl0a1b2c", "parentId": null,
-          "text": "Green garden e sudhu polao 100 taka baire 30-40 takai e paua jay", "postedAt": "2026-06-10T07:00:00" },
-        { "id": "cmcmt002", "postId": "cmq7grn1cmplnt0xmpl0a1b2c", "parentId": "cmcmt001",
-          "text": "Ami agee breakfast kortam green garden e. Ekhn oitao baad disi.", "postedAt": "2026-06-10T07:30:00" }
+        {
+          "id": "cmosktkag038n8jv53z8hx4ea",
+          "parentId": null,
+          "likes": 574,
+          "replyCount": 14,
+          "sentiment": null,
+          "category": "NEUTRAL",
+          "authorUsername": "Abdur Rahman Wisdom's",
+          "text": "এই ছবিগুলো প্রমাণ করে যে পুলিশ আমাদের বন্ধু ছিল না কখনো।"
+        }
       ]
     }
   ],
-  "options": { "tasks": ["all"], "want_summary": true, "summary_lang": "auto", "llm_backend": "auto" }
+  "options": {
+    "tasks": ["all"],
+    "want_summary": true,
+    "summary_lang": "auto",
+    "llm_backend": "auto"
+  }
 }
 ```
 
-`comments` is optional (a bare post is valid — the post pass runs standalone).
+`comments` carries the embedded thread (a stored sample); comment `sentiment` arrives
+`null` and is **computed by us**.
 `summary_lang: "auto"` keeps the summary in the post's detected language; pass
 `"bn"`/`"en"` to force it. Banglish comments are handled natively. `platform` and
 `baseline_*` are derived on ingest in both paths.
@@ -1283,56 +1386,73 @@ transparency feature tied to the hybrid design.
   },
   "results": [
     {
-      "post_id": "cmq7grn1cmplnt0xmpl0a1b2c",
-      "campaign_id": "cmpgrn1cmplnt0xmpl0camp01",
+      "post_id": "cmouf3g7p0dnae4hkfuk6spet",
+      "campaign_id": "cmold8r5301u8fu22m7flh3pc",
       "platform": "facebook",
-      "platform_post_id": "1402233557981234",
+      "platform_post_id": "122161870454710684",
       "media_type": "TEXT",
       "language": "bn",
       "language_mix": ["bn", "banglish", "en"],
-      "language_confidence": 0.97,
-      "post_type": "complaint",
-      "post_summary": "গ্রিন গার্ডেন ও ট্রান্সপোর্টে খাবারের দাম বাইরের তুলনায় অনেক বেশি; পোস্টদাতা কেনা বন্ধ ও বয়কটের ডাক দিয়েছেন।",
+      "language_confidence": 0.96,
+      "post_type": "opinion",
+      "post_summary": "ভারতে মুসলিমদের পরিস্থিতি নিয়ে একটি ক্ষুব্ধ মতামত পোস্ট; মন্তব্যেও ক্ষোভ ও উদ্বেগ প্রবল।",
       "post_summary_lang": "bn",
       "overall_sentiment": "negative",
-      "sentiment_score": -0.64,
-      "text_sentiment": { "label": "negative", "score": -0.64 },
+      "sentiment_score": -0.8,
+      "text_sentiment": { "label": "negative", "score": -0.8 },
       "image_sentiment": null,
-      "baseline_sentiment": -0.3,
-      "baseline_viral_potential": 0.25,
+      "baseline_sentiment": -0.85,
+      "baseline_viral_potential": 0.78,
       "emotion": "anger",
-      "intents": ["complaint", "call_to_action"],
-      "topics": ["food pricing", "campus transport", "boycott"],
+      "intents": ["express_grievance", "inform"],
+      "topics": ["india", "muslims", "politics"],
       "entities": [
-        { "type": "organization", "value": "Green Garden", "confidence": 0.94 }
+        { "type": "location", "value": "India", "confidence": 0.93 }
       ],
-      "brand_mentions": [
-        { "name": "Green Garden", "sentiment": "negative", "mentions": 9 }
-      ],
-      "keywords": ["দাম", "সিঙ্গারা", "boycott"],
-      "toxicity_score": 0.07,
-      "hate_speech_score": 0.01,
-      "engagement": { "reactions": 48, "comment_count": 12 },
+      "brand_mentions": [],
+      "keywords": ["ভারত", "মুসলিম"],
+      "toxicity_score": 0.34,
+      "hate_speech_score": 0.21,
+      "engagement": {
+        "reactions": 26700,
+        "comment_count": 6567,
+        "share_count": 3136,
+        "stored_comments": 607
+      },
+      "reaction_breakdown": {
+        "SAD": 13047,
+        "LIKE": 11219,
+        "ANGRY": 1363,
+        "HAHA": 948,
+        "LOVE": 80,
+        "WOW": 29,
+        "CARE": 14
+      },
       "comment_analysis": {
-        "analyzed": 12,
-        "sentiment_breakdown": { "positive": 1, "negative": 9, "neutral": 2 },
+        "analyzed": 607,
+        "coverage": "607/6567 stored",
+        "sentiment_breakdown": {
+          "positive": 41,
+          "negative": 466,
+          "neutral": 100
+        },
         "themes": [
-          "prices above market",
-          "same quality cheaper outside",
-          "boycott calls"
+          "anger at India's treatment of Muslims",
+          "calls for awareness",
+          "links shared"
         ]
       },
       "post_summary_source": "llm",
-      "confidence": 0.92,
+      "confidence": 0.9,
       "processing": {
         "unit": "post+thread",
-        "stage1_ms": 58,
+        "stage1_ms": 120,
         "llm_used": true,
         "llm_role": "LLM-A",
         "llm_backend": "local",
         "llm_model": "Qwen2.5-7B-Instruct"
       },
-      "created_at": "2026-06-01T10:00:00Z"
+      "created_at": "2026-05-06T16:45:03"
     }
   ],
   "next_cursor": "eyJvZmZzZXQiOjJ9"
@@ -1383,7 +1503,7 @@ cluster insights). Reports are LLM-generated at the _cluster/corpus_ level.
     }
   ],
   "metrics": { "total_posts": 10000, "languages": { "bn": 6200, "en": 3800 } },
-  "generated_by": "llm",
+  "generated_by": "insight_agent",
   "created_at": "2026-06-07T00:10:00Z"
 }
 ```
@@ -1435,203 +1555,136 @@ upstream error where possible.
 
 ## 18. Worked examples
 
-Real scraped records from the upstream **Post API** (verbatim from
-[social_posts.json](social_posts.json)) run through the smart layer. The unit of
-analysis is a **post + its comment thread**; analysis is **multimodal** (text
-`text_sentiment` + visual `image_sentiment`, fused; `post_summary` grounded on
-caption + OCR + image) in the post's own language. Reminders (see
-[data_contract.md](data_contract.md) §4): **comments come from a separate Comment
-API** that **isn't provided yet**, so post-level analysis is real today while
-`comment_analysis` is shown as the wired-path result (flagged); **sentiment is
-recomputed** with the upstream value kept as `baseline_sentiment`. Order: **post
-text → image → fuse → summary → comments**. Full versions in
-[examples.md](examples.md) (which also has a third example: a `null`-caption PHOTO
-post carried entirely by image + OCR).
+Real records from the upstream **post-with-details** payload (verbatim from
+[posts_with_details.json](posts_with_details.json)) run through the smart layer.
+Analysis is **multimodal and full-thread**: text `text_sentiment` + visual
+`image_sentiment` (we also OCR the image), fused and cross-checked against
+`reaction_breakdown`; `post_summary` grounded on caption + OCR + image; and **our**
+per-comment sentiment over the **embedded** comments (the upstream ships `null`),
+reported with **coverage**. Sentiment is recomputed with the upstream post score
+kept as `baseline_sentiment`. Full versions (incl. a third, `null`-caption PHOTO
+example) in [examples.md](examples.md).
 
-### 18.1 Example 1 — Facebook, Bangla, high-engagement photo post
+### 18.1 Example 1 — Facebook, Bangla, photo+text (grief post, embedded comments)
 
-Short playful Bangla post (`মারিবো মৎস খাইবো সুখে!`) with an image and a large
-thread. Shows the **post + comment** path and **recompute vs. baseline** (upstream
-scored it `0.88`).
+Heavy Bangla photo+text post (Shapla Chattar commemoration); `reaction_breakdown` is
+dominated by `SAD` (65,289), agreeing with the recomputed negative sentiment. 112 of
+1,562 comments are embedded and scored by us.
 
-**Input — real Post API record (verbatim):**
+**Output JSON (input is the §17.1 push example):**
 
 ```json
 {
-  "id": "cmq7o9kvr2u1ix80ttluy8jdr",
-  "campaignId": "cmold6pt601ebfu22bfn6utvl",
-  "platformPostId": "1601153438035164",
-  "url": "https://www.facebook.com/1601153438035164",
-  "caption": "মারিবো মৎস খাইবো সুখে!",
-  "photoUrls": ["https://scontent.xx.fbcdn.net/.../719490530_...n.jpg"],
-  "photoOcrTexts": [], "videoUrl": null, "postType": "PHOTO_TEXT",
-  "postedAt": "2026-06-09T07:37:09", "scrapedAt": "2026-06-10T06:14:50.521",
-  "commentCount": 399, "shareCount": 23, "totalReactions": 9335,
-  "sentiment": 0.88, "viralPotential": 0.65,
-  "aiAnalysisStatus": "COMPLETED", "status": "NOT_ANALYZED",
-  "viralMonitoringStatus": "BASELINE_CREATED"
-}
-```
-
-> The 399 comments are fetched from the Comment API by
-> `postId == "cmq7o9kvr2u1ix80ttluy8jdr"`. That payload isn't available yet, so
-> today's output has `comment_analysis.analyzed = 0`; the `_status` field carries a
-> wired-path preview of what those comments will produce.
-
-**Output JSON:**
-
-```json
-{
-  "post_id": "cmq7o9kvr2u1ix80ttluy8jdr",
-  "campaign_id": "cmold6pt601ebfu22bfn6utvl",
+  "post_id": "cmosjpp9305n0u9tskgmd1c4k",
+  "campaign_id": "cmoldmxzr02d8fu22vhvrg23c",
   "platform": "facebook",
-  "platform_post_id": "1601153438035164",
-  "author": null,
+  "platform_post_id": "4460219584209360",
   "media_type": "PHOTO_TEXT",
   "language": "bn",
-  "language_mix": ["bn"],
-  "language_confidence": 0.95,
-  "post_type": "opinion",
-  "post_summary": "একটি হালকা ও রসাত্মক বাংলা পোস্ট — \"মারিবো মৎস খাইবো সুখে!\" — সঙ্গে একটি ছবিতে এক ব্যক্তি বড় মাছ হাতে দাঁড়িয়ে। উচ্চ রিঅ্যাকশন (৯,৩৩৫) ও মন্তব্যে ইতিবাচক, মজার প্রতিক্রিয়া প্রাধান্য পেয়েছে।",
+  "post_type": "commemoration",
+  "post_summary": "শাপলা চত্বরের ঘটনার স্মরণে একটি আবেগঘন বাংলা পোস্ট; ছবিতে সেই রাতের দৃশ্য। পোস্ট ও মন্তব্যে শোক এবং আওয়ামী লীগের প্রতি ক্ষোভ প্রবল।",
   "post_summary_lang": "bn",
   "post_summary_grounding": ["caption", "image"],
-  "overall_sentiment": "positive",
-  "sentiment_score": 0.71,
-  "text_sentiment": { "label": "positive", "score": 0.66 },
-  "image_sentiment": { "label": "positive", "score": 0.78, "per_image": [0.78] },
-  "baseline_sentiment": 0.88,
-  "baseline_viral_potential": 0.65,
-  "emotion": "joy",
-  "intents": ["expression", "humor"],
-  "topics": ["fishing", "food", "humor"],
-  "entities": [],
-  "brand_mentions": [],
-  "keywords": ["মৎস", "মারিবো", "সুখে"],
-  "toxicity_score": 0.01,
-  "hate_speech_score": 0.0,
-  "engagement": { "reactions": 9335, "comment_count": 399, "shares": 23 },
+  "overall_sentiment": "negative",
+  "sentiment_score": -0.82,
+  "text_sentiment": { "label": "negative", "score": -0.85 },
+  "image_sentiment": {
+    "label": "negative",
+    "score": -0.7,
+    "per_image": [-0.7]
+  },
+  "baseline_sentiment": -0.85,
+  "baseline_viral_potential": 0.78,
+  "emotion": "sadness",
+  "topics": ["shapla chattar", "2013", "politics", "grief"],
+  "engagement": {
+    "reactions": 84979,
+    "comment_count": 1562,
+    "share_count": 3189,
+    "stored_comments": 112
+  },
+  "reaction_breakdown": {
+    "SAD": 65289,
+    "LIKE": 18235,
+    "LOVE": 682,
+    "HAHA": 566,
+    "CARE": 125,
+    "WOW": 56,
+    "ANGRY": 26
+  },
   "image_analysis": {
     "image_count": 1,
     "ocr_text": "",
-    "description": "a smiling person holding up a large fish outdoors",
-    "images": [
-      { "ref": "photoUrls[0]", "sentiment": { "label": "positive", "score": 0.78 }, "ocr_text": "", "description": "a smiling person holding up a large fish outdoors" }
-    ],
-    "vision_model": "SigLIP (sentiment) + Qwen2.5-VL-7B (description)"
+    "description": "a dark night-time scene of a crowd / security forces",
+    "vision_model": "SigLIP + Qwen2.5-VL-7B"
   },
   "comment_analysis": {
-    "analyzed": 0,
-    "sentiment_breakdown": { "positive": 0, "negative": 0, "neutral": 0 },
-    "themes": [],
-    "_status": "399 comments pending the Comment API; wired-path preview → ~250 positive / 28 negative / 121 neutral; themes: playful agreement, fishing/food jokes, tagging friends"
+    "analyzed": 112,
+    "coverage": "112/1562 stored",
+    "sentiment_breakdown": { "positive": 6, "negative": 89, "neutral": 17 },
+    "themes": [
+      "grief and remembrance",
+      "anger at Awami League",
+      "calls for justice"
+    ],
+    "representative_comments": [
+      {
+        "author": "Abdur Rahman Wisdom's",
+        "lang": "bn",
+        "sentiment": "negative",
+        "likes": 574,
+        "text": "এই ছবিগুলো প্রমাণ করে যে পুলিশ আমাদের বন্ধু ছিল না কখনো।"
+      }
+    ]
   },
   "post_summary_source": "vlm",
   "confidence": 0.9,
-  "processing": { "unit": "post+thread", "stage1_ms": 44, "llm_used": true, "llm_role": "LLM-A", "llm_backend": "local", "llm_model": "Qwen2.5-7B-Instruct", "vision_used": true, "vision_model": "Qwen2.5-VL-7B-Instruct" },
-  "upstream_status": "NOT_ANALYZED",
-  "created_at": "2026-06-09T07:37:09",
-  "scraped_at": "2026-06-10T06:14:50.521"
+  "processing": {
+    "unit": "post+thread",
+    "stage1_ms": 95,
+    "llm_used": true,
+    "llm_role": "LLM-A",
+    "llm_backend": "local",
+    "vision_used": true,
+    "vision_model": "Qwen2.5-VL-7B-Instruct"
+  },
+  "created_at": "2026-05-04T18:19:14",
+  "scraped_at": "2026-05-05T17:39:44.464"
 }
 ```
 
-**What did the work:** Stage-1 ran **both modalities** — text on the caption
-(`text_sentiment` `0.66`) and a visual model on the photo (`image_sentiment` `0.78`)
-— fused to `0.71`; the router sent the thread to a **VLM** so the Bangla
-`post_summary` is **grounded on caption + image** (it names the person holding the
-fish, which is only in the picture). The upstream `0.88` is kept as
-`baseline_sentiment`, not overwritten.
+**What did the work:** text sentiment on the caption (`-0.85`) + a visual model and
+**our OCR** on the photo (`image_sentiment -0.7`) fused to `-0.82`, **agreeing with
+the `SAD`-dominated `reaction_breakdown`**. The **112 embedded comments** were each
+scored by us (the upstream shipped `sentiment: null`) → an 89/17/6 breakdown with
+**coverage `112/1562`**. A VLM produced the Bangla summary grounded on caption + image.
 
-### 18.2 Example 2 — X (Twitter), English, text post (post-only path, live today)
+### 18.2 Example 2 — Facebook, Bangla, text-only (embedded comments)
 
-English news-style post about garment exports — `commentCount: 0`, so this is the
-**post-only** path that runs **before the Comment API exists**. Shows **platform
-derived from the URL host** (`x.com` → `x`).
-
-**Input — real Post API record (verbatim, caption abridged):**
-
-```json
-{
-  "id": "cmq7orcjr2w78x80tufd0nza4",
-  "campaignId": "cmpe1djj504zc4otgw94idx0v",
-  "platformPostId": "2064585098553434394",
-  "url": "https://x.com/albd1971/status/2064585098553434394",
-  "caption": "Bangladesh’s Garment Industry Faces Growing Export Pressure ... Garment exports fell by 3.41% in the first 11 months...",
-  "photoUrls": [], "photoOcrTexts": [], "videoUrl": null, "postType": "TEXT",
-  "postedAt": "2026-06-10T05:47:00", "scrapedAt": "2026-06-10T06:26:40.838",
-  "commentCount": 0, "shareCount": 4, "totalReactions": 8,
-  "sentiment": -0.3, "viralPotential": 0.25, "status": "NOT_ANALYZED"
-}
-```
-
-**Output JSON:**
-
-```json
-{
-  "post_id": "cmq7orcjr2w78x80tufd0nza4",
-  "campaign_id": "cmpe1djj504zc4otgw94idx0v",
-  "platform": "x",
-  "platform_post_id": "2064585098553434394",
-  "author": "albd1971",
-  "media_type": "TEXT",
-  "language": "en",
-  "language_mix": ["en"],
-  "language_confidence": 0.99,
-  "post_type": "news",
-  "post_summary": "A news-style post reporting that Bangladesh's ready-made garment exports — the backbone of the economy — are under pressure, falling 3.41% over the first 11 months as orders from major global markets decline.",
-  "post_summary_lang": "en",
-  "post_summary_grounding": ["caption"],
-  "overall_sentiment": "negative",
-  "sentiment_score": -0.41,
-  "text_sentiment": { "label": "negative", "score": -0.41 },
-  "image_sentiment": null,
-  "baseline_sentiment": -0.3,
-  "baseline_viral_potential": 0.25,
-  "emotion": "concern",
-  "intents": ["inform"],
-  "topics": ["garment industry", "exports", "economy", "bangladesh"],
-  "entities": [
-    { "type": "location", "value": "Bangladesh", "confidence": 0.98 },
-    { "type": "industry", "value": "ready-made garments", "confidence": 0.9 }
-  ],
-  "brand_mentions": [],
-  "keywords": ["garment", "exports", "3.41%", "economy", "pressure"],
-  "toxicity_score": 0.0,
-  "hate_speech_score": 0.0,
-  "engagement": { "reactions": 8, "comment_count": 0, "shares": 4 },
-  "comment_analysis": { "analyzed": 0, "sentiment_breakdown": { "positive": 0, "negative": 0, "neutral": 0 }, "themes": [] },
-  "post_summary_source": "llm",
-  "confidence": 0.93,
-  "processing": { "unit": "post+thread", "stage1_ms": 39, "llm_used": true, "llm_role": "LLM-A", "llm_backend": "local", "llm_model": "Qwen2.5-7B-Instruct" },
-  "upstream_status": "NOT_ANALYZED",
-  "created_at": "2026-06-10T05:47:00",
-  "scraped_at": "2026-06-10T06:26:40.838"
-}
-```
-
-**What did the work:** with `commentCount: 0`, `comment_analysis.analyzed = 0` —
-the **post-first** path that is fully runnable today. `platform` was derived from
-the `x.com` host, the source handle (`albd1971`) from the URL path. Stage-1 NLP
-recomputed a calibrated negative `sentiment_score` (`-0.41`); the upstream `-0.3` is
-kept as `baseline_sentiment`. PHOTO/PHOTO_TEXT posts additionally feed
-`photoOcrTexts` into the same pipeline ([data_contract.md](data_contract.md) §1).
+Text-only opinion post (no image → `image_sentiment: null`); 607 of 6,567 comments
+embedded and scored. See §17.3 for the full result object
+(`post_id: cmouf3g7p0dnae4hkfuk6spet`): recomputed `-0.8` (baseline `-0.85`),
+`reaction_breakdown` `SAD`+`ANGRY`-heavy, `comment_analysis` 466/100/41 with coverage
+`607/6567`.
 
 ### 18.3 How these map to the owner's request
 
 The owner asked for `{ post_summary, sentiment_analysis, "and something like
-that" }`, over the **real** upstream records. The schema delivers:
+that" }`, over the **real** post-with-details records. The schema delivers:
 
 - **`post_summary`** — in the original language (`post_summary_lang`), **grounded on
   caption + OCR + image** (`post_summary_grounding`), so a `null`-caption photo post
   is still summarized from its picture.
-- **`sentiment_analysis`** — **multimodal**: `text_sentiment` (caption),
-  `image_sentiment` (the photo, via a visual model), and the fused post-level
-  `overall_sentiment` + `sentiment_score`; the upstream value is preserved as
-  `baseline_sentiment`, plus thread-level (`comment_analysis.sentiment_breakdown`)
-  once the Comment API is wired. **Order: post text → image → fuse → summary →
+- **`sentiment_analysis`** — **multimodal and full-thread**: `text_sentiment`,
+  `image_sentiment`, the fused `overall_sentiment`/`sentiment_score` (cross-checked
+  against `reaction_breakdown`), and **our** per-comment sentiment in
+  `comment_analysis.sentiment_breakdown` with **coverage**. The upstream post score
+  is kept as `baseline_sentiment`. **Order: post text → image → fuse → summary →
   comments.**
-- **"something like that"** — `post_type`, `media_type`, `image_analysis`, `intents`,
-  `topics`, `entities`, `brand_mentions`, `comment_analysis.themes`, toxicity,
-  engagement, and `campaign_id`/`platform` provenance — rich structured signal.
+- **"something like that"** — `post_type`, `media_type`, `image_analysis`,
+  `reaction_breakdown`, `shares`, `intents`, `topics`, `comment_analysis.themes`,
+  toxicity, engagement (with comment **coverage**), and `campaign_id`/`platform`
+  provenance — rich structured signal.
 
 ---
 
@@ -1661,9 +1714,11 @@ Single host with one GPU. One `docker-compose.yml` brings up:
 services:
   gateway        (NGINX)            → TLS, routing, rate limit
   api            (FastAPI)          → auth + ingestion + reporting (combined for MVP)
-  worker-nlp     (Python)           → Stage-1 small-model suite (GPU)
-  worker-llm     (Python)           → Stage-2 worker; LLM_BACKEND=local|groq
-  vllm           (vLLM, optional)   → local backend only: LLM-A (+LLM-B) on GPU
+  worker-nlp     (Python)           → Stage-1 text suite + vision (image sentiment, OCR, GPU)
+  worker-llm     (Python)           → Stage-2 worker (text LLM + VLM); LLM_BACKEND=local|groq
+  vllm           (vLLM, optional)   → local backend only: LLM-A (+LLM-B) + VLM on GPU
+  agent-orch     (FastAPI)          → AI agents (insight/deep-dive/alerting) → LLM-B + MCP [Phase 2]
+  mcp-servers    (FastAPI + MCP)    → analytics-mcp · retrieval-mcp · ingest-mcp (internal) [Phase 2]
   redis          (cache/queue)      → Redis Streams = bus + cache + dedup
   postgres       (ops + jobs)
   clickhouse     (analytics)
@@ -1729,9 +1784,11 @@ services:
 
 **Workload mapping:**
 
-- **Stateless services** (auth, ingestion, reporting, user-mgmt, assembler, router)
-  → `Deployment` + `Service`, HPA on CPU/RPS, `PodDisruptionBudget`,
-  liveness/readiness probes.
+- **Stateless services** (auth, ingestion, reporting, user-mgmt, assembler, router,
+  **agent-orchestrator**, **MCP servers**) → `Deployment` + `Service`, HPA on
+  CPU/RPS, `PodDisruptionBudget`, liveness/readiness probes. Agent-orchestrator + MCP
+  servers are **CPU-only** (they query stores + call the LLM backend); MCP servers
+  are `ClusterIP`-only (internal).
 - **Workers** (nlp, llm) → `Deployment` on **GPU node pools** (nodeSelector +
   tolerations + `nvidia.com/gpu` resource requests), scaled by **KEDA** on Kafka
   consumer lag.
@@ -1742,8 +1799,8 @@ services:
   - `groq`: no vLLM deployments — the Stage-2 worker (a stateless `Deployment`,
     HPA/KEDA on queue depth, **no GPU**) calls Groq over HTTPS. Allow egress to Groq
     in `NetworkPolicy`/egress rules and mount `GROQ_API_KEY` from a Secret.
-  Both are valid simultaneously for **hybrid/failover**; the worker picks per
-  request/policy. Switching backends is a config rollout, not a rebuild.
+    Both are valid simultaneously for **hybrid/failover**; the worker picks per
+    request/policy. Switching backends is a config rollout, not a rebuild.
 - **Stateful infra** (Kafka, PostgreSQL, ClickHouse, Qdrant) → operators or
   `StatefulSet` + `PersistentVolumeClaim`; or managed equivalents.
 - **Object storage** → MinIO operator or cloud S3.
@@ -1786,15 +1843,16 @@ Phased build from MVP (1k) → Production (10k) → Enterprise (100k).
 
 - Repo + monorepo layout (services, workers, infra, models, dashboard).
 - Lock the **input contract** ([data_contract.md](data_contract.md)): the upstream
-  **Post API** schema (real sample [social_posts.json](social_posts.json)), the
-  **Comment API** working contract, the pull + own-DB integration (no write-back),
-  platform-from-URL, and recompute-with-baseline sentiment. Lock the **canonical
-  output JSON schema** (§8) and a shared JSON Schema validator. These contracts
-  (what we pull from upstream, what downstream consumes) are the heart of the
-  microservice; lock them early.
-- Build the **upstream API client + ingestion**: pull posts (and comments when
-  available) keyed by CUID `id`, derive `platform`, keep upstream
-  `sentiment`/`viralPotential` as `baseline_*`, upsert into **our own database**.
+  **post-with-details** schema (real sample
+  [posts_with_details.json](posts_with_details.json)) — post with embedded
+  `comments[]`, `engagement`, `reactionBreakdown`, `sampleShares` — the pull +
+  own-DB integration (no write-back), platform-from-URL, and recompute-with-baseline
+  sentiment. Lock the **canonical output JSON schema** (§8) and a shared JSON Schema
+  validator. These contracts are the heart of the microservice; lock them early.
+- Build the **upstream API client + ingestion**: pull the post-with-details payload
+  keyed by CUID `id` (comments embedded), derive `platform`, keep upstream
+  `sentiment`/`viralPotential` as `baseline_*`, **run OCR on `photoUrls`**, record
+  comment **coverage**, upsert into **our own database**.
 - Stand up local Docker Compose skeleton: Postgres, Redis, Qdrant, ClickHouse,
   MinIO, a stub API, Prometheus/Grafana.
 - Pick and pin model versions (§14); download local weights to object storage.
@@ -1811,25 +1869,28 @@ Phased build from MVP (1k) → Production (10k) → Enterprise (100k).
 
 Goal: prove the hybrid pipeline and output quality end-to-end, cheaply.
 
-> **First target (priority order)** — the multimodal post pipeline, shippable on
-> today's data: **(1) post text sentiment → (2) image sentiment (visual) →
-> (3) fuse → (4) post summary grounded on caption + image/OCR → (5) comments** when
-> the Comment API lands ([data_contract.md](data_contract.md) §4).
+> **First target (priority order)** — the multimodal post-and-thread pipeline,
+> shippable on today's data (comments are **embedded**): **(1) post text sentiment →
+> (2) image sentiment (visual) + our OCR → (3) fuse (cross-check `reactionBreakdown`)
+> → (4) post summary grounded on caption + image/OCR → (5) per-comment sentiment over
+> the embedded thread** ([data_contract.md](data_contract.md) §4).
 
-- **Ingestion service:** **pull from the upstream Post API** (the live data path —
-  comments follow when the Comment API lands), derive `platform` from URL host, keep
-  upstream `sentiment`/`viralPotential` as `baseline_*`, normalize the caption plus
-  `photoOcrTexts`, assemble any available comment thread (keep `parent_id`),
-  content-hash **dedup** (Redis), upsert into **our own DB** keyed by CUID `id`, job
-  creation, enqueue to Redis Streams. `/v1/posts/upload` wired for replay/external.
+- **Ingestion service:** **pull the post-with-details payload** (comments embedded),
+  derive `platform` from URL host, keep upstream `sentiment`/`viralPotential` as
+  `baseline_*`, **run OCR on `photoUrls`** (no OCR is shipped), normalize the caption
+  and OCR text, take the embedded comment thread (record **coverage**
+  `storedCommentRows`/`commentCount`), content-hash **dedup** (Redis), upsert into
+  **our own DB** keyed by CUID `id`, enqueue to Redis Streams. `/v1/posts/upload`
+  wired for replay/external.
 - **Stage-1 NLP + vision worker:** runs **post first, then each comment**. _Text:_
   language/Banglish detection (fastText) → shared XLM-R encoder with
   sentiment/emotion/topic/intent heads (**recomputed** `text_sentiment`, upstream
   score kept as baseline) → toxicity/hate → NER (GLiNER/spaCy) → embedding (bge-m3)
-  → keywords. _Vision (image posts):_ SigLIP/CLIP `image_sentiment` + a small VLM
-  image description; reuse upstream `photoOcrTexts`. _Fuse_ → post
-  `overall_sentiment`. Run the text models over each comment →
-  `sentiment_breakdown`. Micro-batched; confidence per field.
+  → keywords. _Vision (image posts):_ SigLIP/CLIP `image_sentiment`, **our OCR**
+  (PaddleOCR/Tesseract), a small VLM image description. _Fuse_ → post
+  `overall_sentiment` (cross-check `reactionBreakdown`). Run the text models over
+  **each embedded comment** (upstream ships none) → `sentiment_breakdown` with
+  **coverage**. Micro-batched; confidence per field.
 - **Router/Triage:** confidence gates + task flags; decide LLM/VLM routing.
 - **Stage-2 LLM/VLM worker:** a backend-agnostic worker for selective
   summarization/insight, running either backend — `local` (vLLM serving **LLM-A**
@@ -1843,7 +1904,9 @@ Goal: prove the hybrid pipeline and output quality end-to-end, cheaply.
   Qdrant, MinIO.
 - **APIs:** `/posts/upload`, `/analysis/run`, `/analysis/{id}`, `/reports` (basic),
   auth (API key + JWT).
-- **Flutter dashboard (v1):** upload, job status, results table, basic charts.
+- **Web dashboard (v1) — plain HTML/CSS/JS** (vanilla, no framework): job status,
+  results table, per-post sentiment + comment breakdown + reaction chart, static
+  files calling the read APIs.
 - **Monitoring:** Prometheus + Grafana + Loki; track LLM-routing rate + cache hits.
 
 **Exit criteria:** process 1,000-post batches reliably; measured LLM slice in single
@@ -1870,6 +1933,11 @@ Goal: scale, reliability, and the move to Kubernetes.
   clusters, not posts (key cost lever at 10k).
 - **Reporting:** trend analysis, brand-mention tracking, political analysis on
   ClickHouse; grounded report generation via RAG (Qdrant + LLM).
+- **Agentic insight layer (§14.6):** stand up the **MCP servers**
+  (analytics/retrieval/ingest) + **agent orchestrator**; ship the **Insight/Analyst
+  agent** (`POST /v1/agents/query` + agent-generated reports) on LLM-B over those
+  tools, then **coverage deep-dive** and **alerting** agents — gated, cached,
+  budget-capped, tenant-policy-bound; corpus-tier only.
 - **Observability:** OpenTelemetry traces → Jaeger; dashboards for throughput,
   cost-per-batch, LLM slice, cache hit rates, queue lag, DLQ size.
 - **First fine-tune:** LoRA/QLoRA on router-flagged + labeled data; ship only if it

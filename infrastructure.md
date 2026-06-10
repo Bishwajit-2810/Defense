@@ -17,12 +17,12 @@ hundreds of short texts — Stage-1 throughput is better measured in **texts
   order of **hundreds–low-thousands of texts/sec** on a single modern GPU
   depending on text length and quantization. A thread with 50 comments = ~51
   texts.
-- **Stage-1 vision** (image sentiment): a **SigLIP/CLIP** pass on each image post
-  is cheap — **hundreds of images/sec** on one GPU (one forward pass per image),
-  comparable to or lighter than the text encoder. ~80% of posts have an image, so
-  size for roughly one image embed per post on top of the text load. Image
-  **description/summary** uses the VLM and runs only on the **selective** Stage-2
-  slice, not every image.
+- **Stage-1 vision** (image sentiment + **our OCR**): a **SigLIP/CLIP** pass on each
+  image post is cheap — **hundreds of images/sec** on one GPU (one forward pass per
+  image); **OCR** (PaddleOCR/Tesseract) adds a light CPU/GPU pass per image since
+  the payload no longer ships OCR text. Most posts have an image, so size for ~one
+  image embed + OCR per post on top of the text load. Image **description/summary**
+  uses the VLM and runs only on the **selective** Stage-2 slice, not every image.
 - **Stage-2 LLMs** (two roles — **LLM-A** 7B/8B for per-post refinement, **LLM-B**
   14B/32B for cluster/report generation): order of **thousands of output
   tokens/sec** aggregate; but they only see the **selective slice** (single-digit
@@ -35,6 +35,13 @@ So the NLP fleet, not the LLM, dominates raw text throughput; the LLM dominates
 _quality_ work on a small slice (one cluster-level summary per thread, not one
 per comment). Size them independently — and note that the `groq` backend removes
 LLM GPU sizing from the equation entirely (you size only the NLP fleet).
+
+- **Agent orchestrator + MCP servers** ([architecture.md](architecture.md) §11) are
+  **stateless FastAPI services** with a **negligible compute footprint** (a few
+  small CPU replicas) — they orchestrate and query, they don't run models. Their
+  cost is the **LLM-B/VLM calls** they make, which land on the **same Stage-2
+  backend** you already sized (and are gated/budget-capped, so the slice stays
+  small). No extra GPU pool is needed for the agent layer.
 
 ---
 
@@ -148,13 +155,13 @@ accuracy drift.
 
 Detailed rationale in [possible_architecture.md](possible_architecture.md) §6.
 
-| Cache                          | Key                                    | Purpose                                   | TTL                  |
-| ------------------------------ | -------------------------------------- | ----------------------------------------- | -------------------- |
-| **Dedup set** (Redis)          | `content_hash`                         | Skip re-analysis of exact dupes/reshares  | long / per-retention |
-| **Embedding cache** (Redis)    | `content_hash`                         | Avoid recomputing vectors                 | long                 |
-| **LLM response cache** (Redis) | `(backend, model, task, content_hash)` | Free repeats of LLM calls                 | medium–long          |
-| **Query cache** (Redis)        | normalized query                       | Fast dashboard aggregations               | short (secs–mins)    |
-| **CDN**                        | URL                                    | Flutter web assets, static report exports | long, versioned      |
+| Cache                          | Key                                    | Purpose                                                        | TTL                  |
+| ------------------------------ | -------------------------------------- | -------------------------------------------------------------- | -------------------- |
+| **Dedup set** (Redis)          | `content_hash`                         | Skip re-analysis of exact dupes/reshares                       | long / per-retention |
+| **Embedding cache** (Redis)    | `content_hash`                         | Avoid recomputing vectors                                      | long                 |
+| **LLM response cache** (Redis) | `(backend, model, task, content_hash)` | Free repeats of LLM calls                                      | medium–long          |
+| **Query cache** (Redis)        | normalized query                       | Fast dashboard aggregations                                    | short (secs–mins)    |
+| **CDN**                        | URL                                    | Static **HTML/CSS/JS** dashboard assets, static report exports | long, versioned      |
 
 On real social feeds these caches remove a large fraction of total work — they
 are a primary cost lever, not an afterthought.

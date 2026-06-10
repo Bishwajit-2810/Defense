@@ -6,11 +6,11 @@ Auth via `Authorization: Bearer <JWT>` or `X-API-Key: <key>` (see
 [architecture.md](architecture.md) §9). All endpoints are versioned under `/v1`.
 For full real input→output examples see [examples.md](examples.md).
 
-> **Two ingestion paths.** The **primary** path is a **pull** from the upstream
-> platform's Post/Comment APIs into our own database (§1a) — the real input
-> contract is in [data_contract.md](data_contract.md). The **`/v1/posts/upload`**
+> **Two ingestion paths.** The **primary** path is a **pull** of the upstream
+> platform's **post-with-details** payload (comments embedded) into our own database
+> (§1a) — the real input contract is in [data_contract.md](data_contract.md). The **`/v1/posts/upload`**
 > push path (§1b) remains for external/replay sources. These read/analysis/report
-> endpoints below are what *our* downstream consumers call.
+> endpoints below are what _our_ downstream consumers call.
 
 Conventions:
 
@@ -22,13 +22,13 @@ Conventions:
 
 ## 1a. Ingestion (primary) — pull from upstream — `POST /v1/ingest/sync`
 
-The primary input is a **pull** from the existing platform's **Post API** (and,
-per post, its **Comment API**, joined by the post's unique `id`) into our own
-database. The real upstream schemas, the join, and the integration model are in
-[data_contract.md](data_contract.md). This endpoint **triggers** a pull for a
-selector (campaign / time window / `status`); the service then fetches, copies,
-and analyzes — **post sentiment first, then comments** — with no write-back to
-upstream.
+The primary input is a **pull** of the existing platform's **post-with-details**
+payload (post **with its `comments[]` embedded**, plus `engagement`,
+`reactionBreakdown`, `sampleShares`) into our own database. The real upstream
+schema and integration model are in [data_contract.md](data_contract.md). This
+endpoint **triggers** a pull for a selector (campaign / time window / id); the
+service then fetches, copies, and analyzes — **post first, then its comments** —
+with no write-back to upstream.
 
 ### Request
 
@@ -43,12 +43,10 @@ Idempotency-Key: 7d3c...-sync-001
 {
   "source": "upstream",
   "selector": {
-    "campaign_id": "cmpe1djj504zc4otgw94idx0v",
-    "status": "NOT_ANALYZED",
-    "posted_from": "2026-06-10T00:00:00",
-    "posted_to": "2026-06-11T00:00:00"
+    "campaign_id": "cmoldmxzr02d8fu22vhvrg23c",
+    "posted_from": "2026-05-01T00:00:00",
+    "posted_to": "2026-05-31T00:00:00"
   },
-  "pull_comments": true,
   "options": {
     "tasks": ["all"],
     "want_summary": true,
@@ -58,23 +56,24 @@ Idempotency-Key: 7d3c...-sync-001
 }
 ```
 
-The service reads upstream records keyed by their CUID `id`, derives `platform`
-from each `url` host, keeps upstream `sentiment`/`viralPotential` as `baseline_*`,
-and **recomputes** richer sentiment ([data_contract.md](data_contract.md) §4).
-`pull_comments: true` fetches each post's comments by `postId == id`; set it
-`false` to run the **post-only** pass (the path available before the Comment API
-is wired). `summary_lang: "auto"` keeps the summary in the post's detected
-language. Re-pulling the same `id` upserts (idempotent), never duplicates.
+The service reads records keyed by their CUID `id`, derives `platform` from each
+`url` host, keeps upstream `sentiment`/`viralPotential` as `baseline_*`, **runs OCR
+on `photoUrls`** (the payload no longer ships OCR text), and **recomputes** richer
+sentiment for the post **and every embedded comment** (the upstream leaves comment
+sentiment empty) — see [data_contract.md](data_contract.md) §4. Comments arrive
+embedded as a stored sample (`engagement.storedCommentRows` of `commentCount`), so
+analysis reports **coverage**. `summary_lang: "auto"` keeps the summary in the
+post's detected language. Re-pulling the same `id` upserts (idempotent).
 
 ---
 
 ## 1b. Ingestion (push, optional) — `POST /v1/posts/upload`
 
-For external/replay sources, callers may **push** posts (and optional comments)
-directly, instead of pulling from upstream. Records use the **same upstream field
-names** as the Post API ([data_contract.md](data_contract.md) §1) so a raw Post-API
-response can be replayed verbatim. Comments may be attached inline as a flat list
-(each with `id`, `postId`, `parentId`) or pulled separately later.
+For external/replay sources, callers may **push** post-with-details records
+directly, instead of pulling from upstream. Records use the **same field names** as
+the upstream payload ([data_contract.md](data_contract.md) §1) — including the
+embedded `comments[]`, `engagement`, and `reactionBreakdown` — so a raw response can
+be replayed verbatim.
 
 ### Request (inline batch)
 
@@ -90,27 +89,51 @@ Idempotency-Key: 7d3c...-batch-001
   "source": "inline",
   "posts": [
     {
-      "id": "cmq7grn1cmplnt0xmpl0a1b2c",
-      "campaignId": "cmpgrn1cmplnt0xmpl0camp01",
-      "platformPostId": "1402233557981234",
-      "url": "https://www.facebook.com/...",
-      "caption": "গ্রিন গার্ডেন এ খাবারের দাম অনেক বেশি... একটা সিংগারা ২০ টাকা চাইল।",
-      "photoUrls": [],
-      "photoOcrTexts": [],
-      "postType": "TEXT",
-      "postedAt": "2026-06-10T05:47:00",
-      "scrapedAt": "2026-06-10T06:26:40.838",
-      "commentCount": 12,
-      "shareCount": 4,
-      "totalReactions": 48,
-      "sentiment": -0.3,
-      "viralPotential": 0.25,
-      "status": "NOT_ANALYZED",
+      "id": "cmosjpp9305n0u9tskgmd1c4k",
+      "campaignId": "cmoldmxzr02d8fu22vhvrg23c",
+      "platformPostId": "4460219584209360",
+      "url": "https://www.facebook.com/4460219584209360",
+      "caption": "শাপলা চত্বরের সেই রাতের কথা ...",
+      "photoUrls": [
+        "posts/cmoldmxzr02d8fu22vhvrg23c/4460219584209360/18f4cbb26803.jpg"
+      ],
+      "postType": "PHOTO_TEXT",
+      "postedAt": "2026-05-04T18:19:14",
+      "scrapedAt": "2026-05-05T17:39:44.464",
+      "sentiment": -0.85,
+      "viralPotential": 0.78,
+      "engagement": {
+        "commentCount": 1562,
+        "totalReactions": 84979,
+        "shareCount": 3189,
+        "storedCommentRows": 112,
+        "storedReactionRows": 0,
+        "reach": 0,
+        "saves": 0,
+        "impressions": 0
+      },
+      "reactionBreakdown": {
+        "SAD": 65289,
+        "LIKE": 18235,
+        "LOVE": 682,
+        "HAHA": 566,
+        "CARE": 125,
+        "WOW": 56,
+        "ANGRY": 26
+      },
+      "sampleShares": [],
       "comments": [
-        { "id": "cmcmt001", "postId": "cmq7grn1cmplnt0xmpl0a1b2c", "parentId": null,
-          "text": "Green garden e sudhu polao 100 taka baire 30-40 takai e paua jay", "postedAt": "2026-06-10T07:00:00" },
-        { "id": "cmcmt002", "postId": "cmq7grn1cmplnt0xmpl0a1b2c", "parentId": "cmcmt001",
-          "text": "Ami agee breakfast kortam green garden e. Ekhn oitao baad disi.", "postedAt": "2026-06-10T07:30:00" }
+        {
+          "id": "cmosktkag038n8jv53z8hx4ea",
+          "platformCommentId": "…",
+          "parentId": null,
+          "likes": 574,
+          "replyCount": 14,
+          "authorUsername": "Abdur Rahman Wisdom's",
+          "sentiment": null,
+          "category": "NEUTRAL",
+          "text": "এই ছবিগুলো প্রমাণ করে যে পুলিশ আমাদের বন্ধু ছিল না কখনো।"
+        }
       ]
     }
   ],
@@ -123,9 +146,10 @@ Idempotency-Key: 7d3c...-batch-001
 }
 ```
 
-`comments` is optional (a bare post with no thread is valid — the post pass runs
-standalone). Banglish comments (romanized Bangla, as above) are handled natively.
-`platform` and `baseline_*` are derived on ingest exactly as in the pull path.
+`comments` carries the embedded thread (a stored sample of `engagement.commentCount`);
+comment `sentiment` arrives `null` and is **computed by us**. Banglish comments
+(romanized Bangla) are handled natively. `platform`, OCR, and `baseline_*` are
+derived on ingest exactly as in the pull path.
 
 `llm_backend` selects the Stage-2 LLM provider for this request: `"local"`
 (self-hosted vLLM), `"groq"` (Groq Cloud API), or `"auto"` (default — use the
@@ -160,11 +184,12 @@ rejected with `forbidden`). See [models.md](models.md) §2.
 ```
 
 `options.tasks` selects analyses (e.g.
-`["text_sentiment","image_sentiment","ner","toxicity"]` or `["all"]`).
-`image_sentiment` runs the visual model on image posts (no-op for text-only);
-`want_summary`/`want_insight` opt into the LLM/VLM tasks (the summary is
-image-grounded for photo posts). Otherwise the router keeps work on the cheap path
-unless confidence is low.
+`["text_sentiment","image_sentiment","comment_sentiment","ner","toxicity"]` or
+`["all"]`). `image_sentiment` runs the visual model on image posts (no-op for
+text-only); `comment_sentiment` scores the embedded comment thread (the upstream
+ships none); `want_summary`/`want_insight` opt into the LLM/VLM tasks (the summary
+is image-grounded for photo posts). Otherwise the router keeps work on the cheap
+path unless confidence is low.
 
 ---
 
@@ -179,7 +204,15 @@ batch with specific options — useful for reprocessing after a model upgrade.
 {
   "selector": { "job_id": "job_01HZX..." },
   "options": {
-    "tasks": ["text_sentiment", "image_sentiment", "emotion", "topics", "ner", "toxicity"],
+    "tasks": [
+      "text_sentiment",
+      "image_sentiment",
+      "comment_sentiment",
+      "emotion",
+      "topics",
+      "ner",
+      "toxicity"
+    ],
     "want_summary": true,
     "want_cluster_summary": true,
     "model_profile": "default",
@@ -248,59 +281,86 @@ Poll job/analysis status and fetch results. `{id}` is a `job_id` or `analysis_id
   },
   "results": [
     {
-      "post_id": "cmq7grn1cmplnt0xmpl0a1b2c",
-      "campaign_id": "cmpgrn1cmplnt0xmpl0camp01",
+      "post_id": "cmouf3g7p0dnae4hkfuk6spet",
+      "campaign_id": "cmold8r5301u8fu22m7flh3pc",
       "platform": "facebook",
-      "platform_post_id": "1402233557981234",
+      "platform_post_id": "122161870454710684",
       "media_type": "TEXT",
       "language": "bn",
       "language_mix": ["bn", "banglish", "en"],
-      "language_confidence": 0.97,
-      "post_type": "complaint",
-      "post_summary": "গ্রিন গার্ডেন ও ট্রান্সপোর্টে খাবারের দাম বাইরের তুলনায় অনেক বেশি; পোস্টদাতা কেনা বন্ধ ও বয়কটের ডাক দিয়েছেন।",
+      "language_confidence": 0.96,
+      "post_type": "opinion",
+      "post_summary": "ভারতে মুসলিমদের পরিস্থিতি নিয়ে একটি ক্ষুব্ধ মতামত পোস্ট; মন্তব্যেও ক্ষোভ ও উদ্বেগ প্রবল।",
       "post_summary_lang": "bn",
       "overall_sentiment": "negative",
-      "sentiment_score": -0.64,
-      "text_sentiment": { "label": "negative", "score": -0.64 },
+      "sentiment_score": -0.8,
+      "text_sentiment": { "label": "negative", "score": -0.8 },
       "image_sentiment": null,
-      "baseline_sentiment": -0.3,
-      "baseline_viral_potential": 0.25,
+      "baseline_sentiment": -0.85,
+      "baseline_viral_potential": 0.78,
       "emotion": "anger",
-      "intents": ["complaint", "call_to_action"],
-      "topics": ["food pricing", "campus transport", "boycott"],
+      "intents": ["express_grievance", "inform"],
+      "topics": ["india", "muslims", "politics"],
       "entities": [
-        { "type": "organization", "value": "Green Garden", "confidence": 0.94 }
+        { "type": "location", "value": "India", "confidence": 0.93 }
       ],
-      "brand_mentions": [
-        { "name": "Green Garden", "sentiment": "negative", "mentions": 9 }
-      ],
-      "keywords": ["দাম", "সিঙ্গারা", "boycott"],
-      "toxicity_score": 0.07,
-      "hate_speech_score": 0.01,
-      "engagement": { "reactions": 48, "comment_count": 12 },
+      "brand_mentions": [],
+      "keywords": ["ভারত", "মুসলিম"],
+      "toxicity_score": 0.34,
+      "hate_speech_score": 0.21,
+      "engagement": {
+        "reactions": 26700,
+        "comment_count": 6567,
+        "share_count": 3136,
+        "stored_comments": 607
+      },
+      "reaction_breakdown": {
+        "SAD": 13047,
+        "LIKE": 11219,
+        "ANGRY": 1363,
+        "HAHA": 948,
+        "LOVE": 80,
+        "WOW": 29,
+        "CARE": 14
+      },
       "comment_analysis": {
-        "analyzed": 12,
-        "sentiment_breakdown": { "positive": 1, "negative": 9, "neutral": 2 },
-        "themes": ["prices above market", "same quality cheaper outside", "boycott calls"]
+        "analyzed": 607,
+        "coverage": "607/6567 stored",
+        "sentiment_breakdown": {
+          "positive": 41,
+          "negative": 466,
+          "neutral": 100
+        },
+        "themes": [
+          "anger at India's treatment of Muslims",
+          "calls for awareness",
+          "links shared"
+        ]
       },
       "post_summary_source": "llm",
-      "confidence": 0.92,
-      "processing": { "unit": "post+thread", "stage1_ms": 58, "llm_used": true, "llm_role": "LLM-A", "llm_backend": "local", "llm_model": "Qwen2.5-7B-Instruct" },
-      "created_at": "2026-06-01T10:00:00Z"
+      "confidence": 0.9,
+      "processing": {
+        "unit": "post+thread",
+        "stage1_ms": 120,
+        "llm_used": true,
+        "llm_role": "LLM-A",
+        "llm_backend": "local",
+        "llm_model": "Qwen2.5-7B-Instruct"
+      },
+      "created_at": "2026-05-06T16:45:03"
     }
   ],
   "next_cursor": "eyJvZmZzZXQiOjJ9"
 }
 ```
 
-The result object above is **abridged** — fields like `url`, `author`,
-`scraped_at`, `upstream_status`, `post_summary_grounding`, `image_analysis` (per-image
-visual sentiment + OCR + description, present for image posts), and
-`comment_analysis.representative_comments` are omitted for brevity. (Here
-`media_type` is `TEXT`, so `image_sentiment` is `null`.) The full schema and field
-semantics live in
-[architecture.md](architecture.md) §6; the worked examples (a Facebook Bangla
-thread and an X English post) are in [examples.md](examples.md).
+The result object above is **abridged** — fields like `url`, `scraped_at`,
+`post_summary_grounding`, `shares`, and (for image posts) `image_analysis` (per-image
+visual sentiment + our OCR + description) and `representative_comments` are omitted
+for brevity. (Here `media_type` is `TEXT`, so `image_sentiment` is `null`.) The full
+schema and field semantics live in [architecture.md](architecture.md) §6; the
+worked examples (real Facebook posts with their embedded comments analyzed) are in
+[examples.md](examples.md).
 
 Real-time alternative: `GET /v1/analysis/{id}/stream` (SSE) pushes per-post
 results as they complete, for live dashboards.
@@ -310,7 +370,9 @@ results as they complete, for live dashboards.
 ## 4. Reporting — `GET /v1/reports`
 
 List and fetch generated reports (trends, brand mentions, political analysis,
-cluster insights). Reports are LLM-generated at the _cluster/corpus_ level.
+cluster insights). Reports are generated by the **Insight/Analyst agent** at the
+_cluster/corpus_ level — a tool-using loop over MCP servers, grounded and cited
+(see [architecture.md](architecture.md) §11).
 
 ### List — `GET /v1/reports?type=trend&from=2026-06-01&to=2026-06-07`
 
@@ -348,7 +410,7 @@ cluster insights). Reports are LLM-generated at the _cluster/corpus_ level.
     }
   ],
   "metrics": { "total_posts": 10000, "languages": { "bn": 6200, "en": 3800 } },
-  "generated_by": "llm",
+  "generated_by": "insight_agent",
   "created_at": "2026-06-07T00:10:00Z"
 }
 ```
@@ -363,8 +425,63 @@ cluster insights). Reports are LLM-generated at the _cluster/corpus_ level.
 }
 ```
 
-→ `202 Accepted` with `report_id` and `status_url`. `grounded: true` uses RAG
-(Qdrant retrieval + LLM) for citation-backed output — see [models.md](models.md).
+→ `202 Accepted` with `report_id` and `status_url`. `grounded: true` runs the
+**Insight agent** (MCP retrieval + analytics tools + LLM-B) for citation-backed
+output — see [models.md](models.md) §5 and [architecture.md](architecture.md) §11.
+
+---
+
+## 4a. Analyst Q&A (agentic) — `POST /v1/agents/query`
+
+Ask a natural-language question over the analyzed corpus; the **Insight/Analyst
+agent** plans across the MCP tools (analytics + retrieval, +VLM if images matter)
+and returns a grounded, cited answer. Async (`202` + `status_url`) since it may make
+several tool/LLM calls; budget-capped per run.
+
+### Request
+
+```json
+{
+  "question": "What are people saying about the Shapla Chattar posts this month, and how is sentiment trending?",
+  "filter": {
+    "campaign_id": "cmoldmxzr02d8fu22vhvrg23c",
+    "from": "2026-05-01",
+    "to": "2026-05-31"
+  },
+  "options": {
+    "max_tool_calls": 12,
+    "llm_backend": "auto",
+    "want_citations": true
+  }
+}
+```
+
+### Response (on completion)
+
+```json
+{
+  "answer": "Sentiment is strongly negative (grief + anger); volume peaked around 4–5 May...",
+  "citations": [
+    {
+      "post_id": "cmosjpp9305n0u9tskgmd1c4k",
+      "quote": "এই ছবিগুলো প্রমাণ করে...",
+      "kind": "comment"
+    }
+  ],
+  "tools_used": [
+    "analytics-mcp.trend_query",
+    "retrieval-mcp.semantic_search",
+    "retrieval-mcp.get_thread"
+  ],
+  "backend": "local",
+  "model": "Qwen2.5-32B-Instruct",
+  "usage": { "tool_calls": 7, "llm_tokens": 4200 }
+}
+```
+
+`tools_used`/`backend`/`usage` make each agent run auditable (ties into `/v1/usage`).
+Tenant `local`-pinning applies — a privacy-locked tenant's retrieved content never
+egresses to Groq.
 
 ---
 
@@ -376,7 +493,13 @@ cluster insights). Reports are LLM-generated at the _cluster/corpus_ level.
 | `GET /v1/health` / `GET /v1/ready` | Liveness / readiness probes                                                            |
 | `GET /v1/usage`                    | Per-tenant usage + cost metering (posts, LLM calls, by backend incl. Groq tokens/cost) |
 | `GET /v1/search?q=&semantic=true`  | Semantic/keyword search over analyzed posts (Qdrant + ClickHouse)                      |
+| `GET /v1/agents/{id}`              | Poll an agent run (analyst query / report) — status, answer, citations, usage          |
 | `DELETE /v1/posts/{id}`            | Data deletion (retention / GDPR-style)                                                 |
+
+> The **MCP servers** (`analytics-mcp`, `retrieval-mcp`, `ingest-mcp` — see
+> [architecture.md](architecture.md) §11) are **internal** tool interfaces consumed
+> by the agent orchestrator, not part of this public REST surface. They speak MCP
+> (stdio/HTTP) and enforce the same auth/tenant scoping.
 
 ---
 

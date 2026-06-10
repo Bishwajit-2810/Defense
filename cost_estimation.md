@@ -29,15 +29,16 @@ comment.
 
 ## 1. What drives cost
 
-| Driver           | Without hybrid (LLM-per-post)                 | With hybrid (this design)                                             |
-| ---------------- | --------------------------------------------- | --------------------------------------------------------------------- |
-| LLM tokens       | **Dominant, runaway** — every post = LLM call | Small — only the selective slice + cluster-level calls                |
-| LLM GPU (local)  | Moderate                                      | Fixed GPU line (only on the `local` backend)                          |
-| LLM API (groq)   | **Dominant, runaway**                         | Small per-token line (only on the `groq` backend)                     |
-| NLP GPU compute  | Moderate                                      | **The main fixed line**, cheap & predictable (batched small models)   |
-| Vision compute   | n/a                                           | Small fixed line — cheap **image-sentiment** (SigLIP/CLIP) on image posts; the **VLM** summary runs only on the selective slice (GPU on `local`, per-token vision calls on `groq`) |
-| Storage          | Small                                         | Small                                                                 |
-| Networking       | Small–moderate                                | Small–moderate (+ egress to Groq on the `groq` backend)               |
+| Driver          | Without hybrid (LLM-per-post)                 | With hybrid (this design)                                                                                                                                                                                                     |
+| --------------- | --------------------------------------------- | ----------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- |
+| LLM tokens      | **Dominant, runaway** — every post = LLM call | Small — only the selective slice + cluster-level calls                                                                                                                                                                        |
+| LLM GPU (local) | Moderate                                      | Fixed GPU line (only on the `local` backend)                                                                                                                                                                                  |
+| LLM API (groq)  | **Dominant, runaway**                         | Small per-token line (only on the `groq` backend)                                                                                                                                                                             |
+| NLP GPU compute | Moderate                                      | **The main fixed line**, cheap & predictable (batched small models)                                                                                                                                                           |
+| Vision compute  | n/a                                           | Small fixed line — cheap **image-sentiment** (SigLIP/CLIP) **+ our OCR** (PaddleOCR/Tesseract) on image posts; the **VLM** summary runs only on the selective slice (GPU on `local`, per-token vision calls on `groq`)        |
+| Agents + MCP    | n/a                                           | Tiny — stateless FastAPI services (a few CPU replicas); their only real cost is **low-volume LLM-B calls** for reports/analyst Q&A, gated + budget-capped, billed under the LLM line ([architecture.md](architecture.md) §11) |
+| Storage         | Small                                         | Small                                                                                                                                                                                                                         |
+| Networking      | Small–moderate                                | Small–moderate (+ egress to Groq on the `groq` backend)                                                                                                                                                                       |
 
 The hybrid architecture keeps the LLM slice tiny, which caps cost under either
 backend: on `local` it converts an unbounded per-token bill into a **bounded,

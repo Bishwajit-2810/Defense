@@ -13,43 +13,46 @@ bulk work; the LLM is selective.** So the table below is mostly _small_ models,
 plus **two LLM roles** (LLM-A fast / LLM-B quality) served by the chosen backend
 for the selective stage (see §2).
 
-**The input is a post + its comment thread** — a post pulled from the upstream
-**Post API** joined to comments from the **Comment API**
-([data_contract.md](data_contract.md)), spanning Facebook, Telegram, X, Instagram,
-… — **and the content is heavily "Banglish"** (romanized Bangla, often mixed with
+**The input is a post + its comment thread** — a **post-with-details** payload
+with the comments **embedded** ([data_contract.md](data_contract.md)), Facebook in
+the current sample (others by URL host)
+— **and the content is heavily "Banglish"** (romanized Bangla, often mixed with
 English in one sentence, e.g. "Green garden e vat 25 taka baire 10 taka"). Every
 model choice below is judged on how well it handles **bn + en + code-mixed
 Banglish**, because that — not clean Bangla or clean English — is the real traffic
-(see [examples.md](examples.md)). The input is also **multimodal**: ~80% of posts
-carry an **image**, and ~half have a `null` caption ([data_contract.md](data_contract.md)
-§1), so the image is not optional. Small models run **post first — text
-(caption + OCR) sentiment _and_ a visual `image_sentiment` on the photo, fused —
-then each comment**; a selective LLM/**VLM** summarizes the **thread** grounded on
-caption + OCR + image, in the post's original language. The post's analyzable text
-includes upstream `photoOcrTexts` (OCR is already done upstream). The
-text+image+summary pipeline order is the **first target** — see
-[data_contract.md](data_contract.md) §4.
+(see [examples.md](examples.md)). The input is also **multimodal**: most posts
+carry an **image** and the comment thread arrives **embedded**
+([data_contract.md](data_contract.md)), so the image and comments are not optional.
+Small models run **post first — text (caption + OCR) sentiment _and_ a visual
+`image_sentiment` on the photo, fused — then each comment**; a selective
+LLM/**VLM** summarizes the **thread** grounded on caption + OCR + image, in the
+post's original language. **OCR is our job** — the payload no longer ships OCR
+text, so we run it on `photoUrls`. **Comment sentiment is also ours** — the
+upstream leaves it empty. The crowd `reactionBreakdown`
+(LIKE/LOVE/HAHA/WOW/SAD/ANGRY/CARE) is a free **emotion prior** we cross-check
+against. The text+image+summary→comments pipeline order is the **first target** —
+see [data_contract.md](data_contract.md) §4.
 
 ---
 
 ## 1. Model recommendations per task
 
-| Task                                | Recommended model(s)                                                       | Bangla | English | Notes                                                                  |
-| ----------------------------------- | -------------------------------------------------------------------------- | ------ | ------- | ---------------------------------------------------------------------- |
-| **Language + Banglish detection**   | `fastText lid.176` + CLD3 + transliteration heuristic                      | ✅      | ✅       | <1 ms/item; flags `banglish` (romanized bn) → multilingual path        |
-| **Text sentiment** (caption + per comment) | `XLM-RoBERTa`/`mBERT` fine-tuned; BanglaBERT for bn                 | ✅      | ✅       | **Recompute** ours (caption first, then each comment) → `text_sentiment` + `sentiment_breakdown`; keep upstream `sentiment` as `baseline_sentiment` (never overwrite — [data_contract.md](data_contract.md) §4) |
-| **Image sentiment** (visual)        | `SigLIP 2` / `CLIP` zero-shot (positive/negative/neutral prompts), or a fine-tuned ViT | n/a (language-agnostic) | n/a | Cheap Stage-1 model on **every image post** → `image_sentiment` (per image + aggregate). Visual, independent of caption/OCR. Fused with text sentiment |
-| **Image description / caption**     | small **VLM** (`Qwen2.5-VL-3B/7B`) or `BLIP-2`                              | ✅      | ✅       | Short description of the image → grounds `post_summary` (esp. `null`-caption photo posts); feeds `image_analysis.description` |
-| **OCR (image text)**                | **reuse upstream `photoOcrTexts`**; fallback `PaddleOCR`/`Tesseract` (bn+en) | ✅    | ✅       | Already produced upstream for 25/50; only run if missing. Folded into the text path |
-| **Emotion**                         | XLM-R fine-tuned (joy/anger/sadness/fear/…); GoEmotions heads for en       | ✅      | ✅       | Shares encoder with sentiment to save GPU                              |
-| **Topic classification**            | XLM-R / embedding + classifier head; or zero-shot via small NLI model      | ✅      | ✅       | Use embeddings + lightweight classifier; reduces per-label models      |
-| **Intent**                          | XLM-R fine-tuned (inform/promote/complain/request/…)                       | ✅      | ✅       | Per comment too (price/availability/location inquiries)                |
-| **Toxicity / hate / offensive**     | `XLM-R`/`mBERT` fine-tuned; Detoxify (en) + Bangla hate datasets           | ✅      | ✅       | Bangla hate-speech corpora exist (e.g. Bengali Hate Speech); fine-tune |
-| **NER (person/org/location/brand)** | `GLiNER` (multilingual, zero/few-shot), `spaCy` (en), BanglaBERT-NER (bn)  | ✅      | ✅       | GLiNER gives flexible entity types without per-type models             |
-| **Embeddings**                      | `BAAI/bge-m3` (multilingual, incl. Bangla) or `intfloat/multilingual-e5`   | ✅      | ✅       | Powers dedup, comment clustering, semantic search, RAG                 |
-| **Summarization** (multimodal)      | text: **LLM-A**/**LLM-B**; image posts: a **VLM** (`Qwen2.5-VL` local ⇄ a Groq vision model) — §2 | ✅      | ✅       | Selective; **grounded on caption + OCR + image**; summary in the post's original language |
-| **Insight / report generation**     | **LLM-B** role + RAG, on the active backend (see §2)                       | ✅      | ✅       | Cluster summaries → corpus-level insight                               |
-| **Keyword extraction**              | KeyBERT (on embeddings) / YAKE                                             | ✅      | ✅       | Cheap, no extra GPU model                                              |
+| Task                                       | Recommended model(s)                                                                              | Bangla                  | English | Notes                                                                                                                                                                                                                                                                  |
+| ------------------------------------------ | ------------------------------------------------------------------------------------------------- | ----------------------- | ------- | ---------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- |
+| **Language + Banglish detection**          | `fastText lid.176` + CLD3 + transliteration heuristic                                             | ✅                      | ✅      | <1 ms/item; flags `banglish` (romanized bn) → multilingual path                                                                                                                                                                                                        |
+| **Text sentiment** (caption + per comment) | `XLM-RoBERTa`/`mBERT` fine-tuned; BanglaBERT for bn                                               | ✅                      | ✅      | **Recompute** ours (caption first, then each embedded comment) → `text_sentiment` + `sentiment_breakdown`. Post `sentiment` kept as `baseline_sentiment`; **comment sentiment is entirely ours** (upstream leaves it `null`) — [data_contract.md](data_contract.md) §4 |
+| **Image sentiment** (visual)               | `SigLIP 2` / `CLIP` zero-shot (positive/negative/neutral prompts), or a fine-tuned ViT            | n/a (language-agnostic) | n/a     | Cheap Stage-1 model on **every image post** → `image_sentiment` (per image + aggregate). Visual, independent of caption/OCR. Fused with text sentiment                                                                                                                 |
+| **Image description / caption**            | small **VLM** (`Qwen2.5-VL-3B/7B`) or `BLIP-2`                                                    | ✅                      | ✅      | Short description of the image → grounds `post_summary` (esp. `null`-caption photo posts); feeds `image_analysis.description`                                                                                                                                          |
+| **OCR (image text)**                       | **ours** — `PaddleOCR` / `Tesseract` (bn+en), or the VLM                                          | ✅                      | ✅      | The payload no longer ships OCR text, so we **run OCR ourselves** on `photoUrls`; result folded into the text path + `image_analysis.ocr_text`                                                                                                                         |
+| **Emotion**                                | XLM-R fine-tuned (joy/anger/sadness/fear/…); GoEmotions heads for en                              | ✅                      | ✅      | Shares encoder with sentiment to save GPU; **cross-checked against `reactionBreakdown`** (SAD/ANGRY/HAHA/LOVE crowd signal)                                                                                                                                            |
+| **Topic classification**                   | XLM-R / embedding + classifier head; or zero-shot via small NLI model                             | ✅                      | ✅      | Use embeddings + lightweight classifier; reduces per-label models                                                                                                                                                                                                      |
+| **Intent**                                 | XLM-R fine-tuned (inform/promote/complain/request/…)                                              | ✅                      | ✅      | Per comment too (price/availability/location inquiries)                                                                                                                                                                                                                |
+| **Toxicity / hate / offensive**            | `XLM-R`/`mBERT` fine-tuned; Detoxify (en) + Bangla hate datasets                                  | ✅                      | ✅      | Bangla hate-speech corpora exist (e.g. Bengali Hate Speech); fine-tune                                                                                                                                                                                                 |
+| **NER (person/org/location/brand)**        | `GLiNER` (multilingual, zero/few-shot), `spaCy` (en), BanglaBERT-NER (bn)                         | ✅                      | ✅      | GLiNER gives flexible entity types without per-type models                                                                                                                                                                                                             |
+| **Embeddings**                             | `BAAI/bge-m3` (multilingual, incl. Bangla) or `intfloat/multilingual-e5`                          | ✅                      | ✅      | Powers dedup, comment clustering, semantic search, RAG                                                                                                                                                                                                                 |
+| **Summarization** (multimodal)             | text: **LLM-A**/**LLM-B**; image posts: a **VLM** (`Qwen2.5-VL` local ⇄ a Groq vision model) — §2 | ✅                      | ✅      | Selective; **grounded on caption + OCR + image**; summary in the post's original language                                                                                                                                                                              |
+| **Insight / report generation**            | **LLM-B** role + RAG, on the active backend (see §2)                                              | ✅                      | ✅      | Cluster summaries → corpus-level insight                                                                                                                                                                                                                               |
+| **Keyword extraction**                     | KeyBERT (on embeddings) / YAKE                                                                    | ✅                      | ✅      | Cheap, no extra GPU model                                                                                                                                                                                                                                              |
 
 ### Bangla-specific resources worth using/fine-tuning on
 
@@ -98,10 +101,10 @@ report bursts, or fail over local→Groq under load.
 
 ### Role → model mapping per backend
 
-| Role                               | `local` backend (vLLM, our GPUs)                                               | `groq` backend (Groq Cloud API)                                  | Serves                                                                             |
-| ---------------------------------- | ------------------------------------------------------------------------------ | ---------------------------------------------------------------- | ---------------------------------------------------------------------------------- |
-| **LLM-A — fast / high-throughput** | `Qwen2.5-7B-Instruct` (or `Llama-3.1-8B-Instruct`), AWQ/GPTQ quantized         | a fast Groq model (e.g. `llama-3.1-8b-instant`)                  | Per-post selective refinement, hardest classification, short single-post summaries |
-| **LLM-B — large / high-quality**   | `Qwen2.5-32B-Instruct` (or `Qwen2.5-14B-Instruct` at smaller scale), quantized | a larger Groq model (e.g. `llama-3.3-70b-versatile`)             | Cluster summarization, corpus insight, grounded report generation (RAG)            |
+| Role                               | `local` backend (vLLM, our GPUs)                                               | `groq` backend (Groq Cloud API)                                 | Serves                                                                                             |
+| ---------------------------------- | ------------------------------------------------------------------------------ | --------------------------------------------------------------- | -------------------------------------------------------------------------------------------------- |
+| **LLM-A — fast / high-throughput** | `Qwen2.5-7B-Instruct` (or `Llama-3.1-8B-Instruct`), AWQ/GPTQ quantized         | a fast Groq model (e.g. `llama-3.1-8b-instant`)                 | Per-post selective refinement, hardest classification, short single-post summaries                 |
+| **LLM-B — large / high-quality**   | `Qwen2.5-32B-Instruct` (or `Qwen2.5-14B-Instruct` at smaller scale), quantized | a larger Groq model (e.g. `llama-3.3-70b-versatile`)            | Cluster summarization, corpus insight, grounded report generation (RAG)                            |
 | **VLM — vision-language**          | `Qwen2.5-VL-7B-Instruct` (or `-3B` at MVP), on vLLM                            | a Groq vision model (e.g. a Llama Vision / multimodal model id) | **Image-grounded `post_summary`** for photo posts (takes caption + OCR + image); image description |
 
 > Groq model IDs change as their catalog evolves — treat the examples above as
@@ -158,8 +161,8 @@ notes (Groq).
     throughput.
   - `groq`: the **Groq Cloud endpoint**, with role→model-ID mapping in config; no
     GPU, no model loading, just outbound HTTPS.
-  The worker picks the **role** (A or B) by task; the **backend** is selected by
-  config/flag and switchable at runtime.
+    The worker picks the **role** (A or B) by task; the **backend** is selected by
+    config/flag and switchable at runtime.
 - **Versioning:** every result records `processing.llm_backend` + `llm_model` +
   `model_versions` so re-runs (and a backend switch) are auditable and
   reproducible (replay from Kafka).
@@ -192,7 +195,8 @@ entities/brands) without training from scratch.
    further.
 6. **Evaluation gate.** No model ships without beating the current one on the
    per-language eval set; track per-task F1 and the LLM-routing rate (a good
-   fine-tune should _lower_ how often Stage 2 is needed).
+   fine-tune should _lower_ how often Stage 2 is needed). The full scoring rubric,
+   gold sets, and gates are in [evaluation.md](evaluation.md).
 7. **Continuous loop.** Periodically retrain on freshly labeled router-flagged
    data; version models, replay a sample batch from Kafka to compare.
 
@@ -223,3 +227,16 @@ for faster report generation when the retrieved context may leave the cluster.
 This reuses the same Qdrant + embeddings already in the core pipeline, so RAG is
 nearly free to add at the reporting layer; retrieval/embeddings stay local in
 both cases — only the final generation call follows the chosen backend.
+
+### Delivered as an agentic loop over MCP tools
+
+In practice RAG here is driven by the **Insight/Analyst agent**
+([architecture.md](architecture.md) §11), not a single retrieve→generate call. The
+agent runs on **LLM-B** (Qwen/Llama — both support tool/function calling, which MCP
+builds on) and plans over **MCP tools**: `retrieval-mcp.semantic_search` /
+`get_thread` (Qdrant + Postgres) for grounding, `analytics-mcp.trend_query` /
+`reaction_mix` (ClickHouse) for the numbers, and a **VLM** step when an answer needs
+the images. This keeps reports **grounded and cited**, lets the agent decide _how
+much_ to retrieve, and stays on the chosen backend (`local` for in-cluster, `groq`
+for speed) under the same tenant policy. Agents are corpus/report-tier and gated —
+**never per post** — so the cost model is unchanged.
