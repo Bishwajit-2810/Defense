@@ -36,16 +36,32 @@ roadmap — into one source of truth.
 
 ## 1. What this service is
 
-A **scraper** feeds 1,000+ real-time Bangla/English/Banglish posts (Facebook,
-Instagram, …), **each with its comment thread**, into this system. The service is
-a **smart, self-contained microservice** — a "thinking layer" — that:
+An **existing social-media monitoring platform** scrapes 1,000+ real-time
+Bangla/English/Banglish posts (Facebook, Telegram, X, Instagram, …), **each with
+its comment thread**, and exposes them over a **Post API** and a **Comment API**.
+This service is a **smart, self-contained microservice** — a "thinking layer" —
+that sits on top of that platform and:
 
-- takes a post **and its comments** as input,
+- **pulls** posts and their comments from the upstream APIs (joined by the post's
+  unique CUID `id`) into its **own separate database** — read-only consumer, no
+  write-back (full input contract: [data_contract.md](data_contract.md), real
+  sample [social_posts.json](social_posts.json)),
 - decides _per item_ how much intelligence each one needs (cheap NLP models vs. an
   LLM — this routing is the "smart" part), and
 - returns one **structured JSON** object per thread (summary in the post's own
   language, sentiment, topics, intents, entities, brand mentions, comment
   analysis — see §8) that downstream projects consume directly.
+
+Platform is **derived from each post's URL host** (Facebook/Telegram/X/Instagram/…),
+so the service is platform-agnostic. The upstream already stores a coarse
+`sentiment` and `viralPotential`; we keep those as a **baseline** and **recompute**
+our own richer sentiment (see [data_contract.md](data_contract.md) §4).
+
+**Posts are multimodal, and that is the first target** (in order): (1) **text
+sentiment** on the caption, (2) **image sentiment** from a _visual_ model on the
+photo when present (separate from its OCR), (3) **fuse** into the post's overall
+sentiment, (4) a **post summary grounded on caption + image/OCR** (so a photo-only,
+`null`-caption post is still summarized from its picture), then (5) **comments**.
 
 Hard product constraints from the owner: **fast**, **cost-effective**,
 **efficient**, and **accurate on Bangla and Banglish** (with fine-tuning hooks for
@@ -60,9 +76,10 @@ config- and request-level, so the operator can flip between them at any time
 without redeploying.
 
 **The unit of analysis is a _post together with its comment thread_, not an
-isolated post.** A scraped item is a parent post plus N nested comments/replies
-(author, text, reactions, timestamp). The smart layer analyzes the whole thread
-and emits one JSON object per thread.
+isolated post.** A post (upstream Post API) is joined to N comments/replies pulled
+from the Comment API by the post's unique `id` ([data_contract.md](data_contract.md));
+the thread is **assembled** from two API responses rather than received pre-nested.
+The smart layer analyzes the whole thread and emits one JSON object per thread.
 
 ---
 
@@ -178,12 +195,16 @@ strategy — see §7.
 
 ## 5. Data flow (end to end)
 
-1. **Upload.** The scraper calls `POST /v1/posts/upload` with a batch of
-   **threads** (each = a parent post + its nested comments/replies), or a presigned
-   link to a large JSONL file in object storage. Ingestion validates schema,
-   normalizes text (Unicode NFC, emoji handling, Bangla/English/Banglish script
-   tagging), flattens the comment tree to an ordered list, and computes a content
-   hash over the post + comments.
+1. **Ingest (pull).** The Ingestion Service **pulls from the upstream Post API**
+   (poll `status: NOT_ANALYZED` / a campaign / time window) and, per post, **pulls
+   its comments from the Comment API** joined by the post's unique `id`
+   ([data_contract.md](data_contract.md)). It copies records into **our own
+   database** (no write-back), derives `platform` from the URL host, keeps upstream
+   `sentiment`/`viralPotential` as `baseline_*`, normalizes the caption + OCR text
+   (`photoOcrTexts`; Unicode NFC, emoji, Bangla/English/Banglish script tagging),
+   assembles the comment thread (ordered, `parent_id` preserved), and computes a
+   content hash over the post + comments. A pushed batch (`POST /v1/posts/upload`)
+   is also accepted for external/replay sources.
 2. **Dedup gate.** Hash is checked against Redis (recent) and Qdrant/Postgres
    (historical). Exact duplicates short-circuit to the cached result; near
    duplicates (cosine > threshold on embedding) can reuse prior analysis. This
@@ -191,12 +212,19 @@ strategy — see §7.
 3. **Enqueue.** A `job` row is created in PostgreSQL (`status=queued`). One message
    per post is produced to the bus, partitioned by `post_id` hash so a post's
    ordering is stable and load spreads evenly.
-4. **Stage 1 — Fast NLP (parallel).** Worker pulls a batch (micro-batching) and
-   runs the small-model suite in one GPU/CPU pass over the **post and each
-   comment**: language/Banglish detection → sentiment, emotion, topic, intent,
-   toxicity/hate, NER, keyword extraction, and a sentence embedding. Per-comment
-   sentiment is aggregated into the thread's `sentiment_breakdown`. Each output
-   carries a **confidence** score. Results are written to a partial-result store.
+4. **Stage 1 — Fast NLP + vision (parallel).** Worker pulls a batch
+   (micro-batching). **Multimodal, post first, then comments:** the **text path**
+   (caption + OCR) gets language/Banglish detection → **recomputed** `text_sentiment`,
+   emotion, topic, intent, toxicity/hate, NER, keywords, embedding; the **vision
+   path** runs a cheap **visual** model on each image → `image_sentiment` + a short
+   image description (skipped for text-only posts); the two are **fused** into
+   post-level `overall_sentiment`/`sentiment_score` (text-weighted when a caption
+   exists; image + OCR-weighted for `null`-caption photo posts). Upstream
+   `sentiment`/`viralPotential` are retained as `baseline_*`. The **same text
+   models** then run over **each comment**, aggregated into the thread's
+   `sentiment_breakdown`. (Before the Comment API is wired, the post pass runs
+   standalone and `comment_analysis.analyzed = 0`.) Each output carries a
+   **confidence** score. Results are written to a partial-result store.
 5. **Router/Triage (the "smart thinking layer").** For each thread the router
    decides:
    - All required fields produced with confidence ≥ threshold, and no LLM-only task
@@ -205,16 +233,19 @@ strategy — see §7.
      is ambiguous / heavily Banglish / long → **route to Stage 2** with a compact,
      token-minimized prompt (post + a representative/clustered subset of comments,
      truncated). This selectivity is what keeps the service fast and cheap.
-6. **Stage 2 — LLM (selective).** The Stage-2 worker produces summaries, insights,
-   and refined labels through two **logical roles** — **LLM-A** (fast 7B/8B) for
-   per-post refinement and short summaries, **LLM-B** (large 14B/32B) for cluster
-   summarization, insight, and report generation. Each role is served by a
-   **pluggable backend, switchable at runtime**: `local` (self-hosted vLLM on our
-   own GPUs — no per-token bill, no data egress) or `groq` (Groq Cloud API —
-   fastest inference, zero GPU ops, per-token cost). Both speak an OpenAI-compatible
-   API, so the worker code is backend-agnostic; switching is a config/flag change,
-   not a redeploy. Responses are cached by `(backend, model, task, content_hash)`
-   in Redis so repeats are free.
+6. **Stage 2 — LLM / VLM (selective).** The Stage-2 worker produces summaries,
+   insights, and refined labels through two **logical roles** — **LLM-A** (fast
+   7B/8B) for per-post refinement and short summaries, **LLM-B** (large 14B/32B) for
+   cluster summarization, insight, and report generation. **The `post_summary` is
+   grounded on caption + OCR + image:** image posts run the summary on a
+   **vision-language model (VLM)** that receives the caption, OCR, and the image (or
+   the Stage-1 image description); text-only posts use the text LLM. Each role is
+   served by a **pluggable backend, switchable at runtime**: `local` (self-hosted
+   vLLM on our own GPUs — no per-token bill, no data egress) or `groq` (Groq Cloud
+   API — fastest inference, zero GPU ops, per-token cost), each exposing a text and a
+   vision model id. Both speak an OpenAI-compatible API, so the worker code is
+   backend-agnostic; switching is a config/flag change, not a redeploy. Responses are
+   cached by `(backend, model, task, content_hash)` in Redis so repeats are free.
 7. **Assemble + validate.** The Result Assembler merges Stage 1 + Stage 2 into the
    canonical JSON (see §8), validates against the JSON Schema, and sets
    `confidence` = aggregate.
@@ -235,9 +266,9 @@ strategy — see §7.
 | **API Gateway**             | TLS termination, routing, rate limiting, request size limits, CORS | NGINX / K8s Ingress (+ optional Kong)                  | replicas behind LB  |
 | **Auth Service**            | API keys, JWT issue/verify, RBAC, per-tenant quotas                | FastAPI + PostgreSQL + Redis                           | stateless replicas  |
 | **Ingestion Service**       | Validate, normalize, dedup, create job, enqueue                    | FastAPI (async)                                        | stateless replicas  |
-| **Stage-1 NLP Workers**     | Run small-model suite, micro-batched, emit features + confidence   | Python (Ray/Celery consumer) + Triton/ONNX/CTranslate2 | GPU/CPU worker pool |
-| **Router/Triage**           | Apply confidence gates + task flags; decide LLM routing            | lightweight Python service or in-worker rule module    | stateless           |
-| **Stage-2 LLM Workers**     | Selective summarization / insight / report / hard cases            | Thin worker → local vLLM (LLM-A+LLM-B) **or** Groq API | GPU pool, stateless |
+| **Stage-1 NLP + Vision Workers** | Text small-model suite **and the visual model on image posts** (`image_sentiment` + description), micro-batched, emit features + confidence | Python + Triton/ONNX/CTranslate2; SigLIP/CLIP + light VLM | GPU/CPU worker pool |
+| **Router/Triage**           | Apply confidence gates + task flags; decide LLM/VLM routing        | lightweight Python service or in-worker rule module    | stateless           |
+| **Stage-2 LLM/VLM Workers** | Selective summarization (text **and image-grounded via a VLM**) / insight / report / hard cases | Thin worker → local vLLM (LLM-A+LLM-B + VLM) **or** Groq API (text + vision) | GPU pool, stateless |
 | **Result Assembler**        | Merge, JSON-schema validate, compute aggregate confidence          | Python consumer                                        | stateless replicas  |
 | **Reporting/Query Service** | Read APIs, report generation, exports                              | FastAPI + ClickHouse + PostgreSQL                      | stateless replicas  |
 | **User Management**         | Tenants, users, roles, billing/usage metering                      | FastAPI + PostgreSQL                                   | stateless replicas  |
@@ -296,25 +327,39 @@ per-post calls.
 
 ## 8. Canonical output JSON
 
-The assembler emits and validates this schema. `post_summary` is written **in the
-post's own language** (Bangla post → Bangla summary; English post → English
-summary; the language is detected, never forced). Banglish (romanized Bangla) is
-normalized to the dominant language for the summary.
+The assembler emits and validates this schema. `overall_sentiment`/`sentiment_score`
+are a **fusion of `text_sentiment` (caption) and `image_sentiment` (the photo)**
+([data_contract.md](data_contract.md) §4); `image_sentiment`/`image_analysis` are
+`null` for text-only posts and `text_sentiment` is `null` for `null`-caption posts.
+`post_summary` is **grounded on caption + OCR + image** (`post_summary_grounding`
+records which) and written **in the post's own language** (detected, never forced;
+Banglish normalized to the dominant language). Field provenance: the
+`post_id`/`campaign_id`/`platform_post_id`/`media_type`/`baseline_*` fields come
+from the upstream Post API ([data_contract.md](data_contract.md) §5), `platform` is
+derived from the URL host, and everything else is computed by this service.
 
 ```json
 {
-  "post_id": "fb_12345",
+  "post_id": "cmq7phcmplnt00xmpl0a1b2cx",
+  "campaign_id": "cmpgrn1cmplnt0xmpl0camp01",
   "platform": "facebook",
-  "url": "https://facebook.com/...",
-  "author": "TalentedOstrich6332",
+  "platform_post_id": "1402233557981288",
+  "url": "https://www.facebook.com/...",
+  "author": null,
+  "media_type": "PHOTO_TEXT",
   "language": "bn",
   "language_mix": ["bn", "banglish", "en"],
   "language_confidence": 0.97,
   "post_type": "complaint",
-  "post_summary": "গ্রিন গার্ডেন ও ট্রান্সপোর্টে খাবারের দাম বাইরের তুলনায় অনেক বেশি — একটি সিঙ্গারা ২০ টাকা; পোস্টদাতা কেনা বন্ধ করার ও বয়কটের ডাক দিয়েছেন।",
+  "post_summary": "গ্রিন গার্ডেন ও ট্রান্সপোর্টে খাবারের দাম বাইরের তুলনায় অনেক বেশি — একটি সিঙ্গারা ২০ টাকা; পোস্টদাতা কেনা বন্ধ করার ও বয়কটের ডাক দিয়েছেন। ছবিতে দামের তালিকা দেখা যাচ্ছে।",
   "post_summary_lang": "bn",
+  "post_summary_grounding": ["caption", "ocr", "image"],
   "overall_sentiment": "negative",
   "sentiment_score": -0.64,
+  "text_sentiment": { "label": "negative", "score": -0.7 },
+  "image_sentiment": { "label": "neutral", "score": -0.1, "per_image": [-0.1] },
+  "baseline_sentiment": -0.3,
+  "baseline_viral_potential": 0.25,
   "emotion": "anger",
   "intents": ["complaint", "call_to_action"],
   "topics": ["food pricing", "campus transport", "boycott"],
@@ -329,6 +374,15 @@ normalized to the dominant language for the summary.
   "toxicity_score": 0.07,
   "hate_speech_score": 0.01,
   "engagement": { "reactions": 48, "comment_count": 12 },
+  "image_analysis": {
+    "image_count": 1,
+    "ocr_text": "মেনু: সিঙ্গারা ২০৳ ...",
+    "description": "a printed café price list / menu board",
+    "images": [
+      { "ref": "photoUrls[0]", "sentiment": { "label": "neutral", "score": -0.1 }, "ocr_text": "মেনু: সিঙ্গারা ২০৳ ...", "description": "a printed café price list / menu board" }
+    ],
+    "vision_model": "SigLIP (sentiment) + Qwen2.5-VL-7B (description)"
+  },
   "comment_analysis": {
     "analyzed": 12,
     "sentiment_breakdown": { "positive": 1, "negative": 9, "neutral": 2 },
@@ -346,7 +400,7 @@ normalized to the dominant language for the summary.
       }
     ]
   },
-  "post_summary_source": "llm",
+  "post_summary_source": "vlm",
   "confidence": 0.92,
   "processing": {
     "unit": "post+thread",
@@ -355,18 +409,31 @@ normalized to the dominant language for the summary.
     "llm_role": "LLM-A",
     "llm_backend": "local",
     "llm_model": "Qwen2.5-7B-Instruct",
+    "vision_used": true,
+    "vision_model": "Qwen2.5-VL-7B-Instruct",
     "model_versions": {}
   },
-  "created_at": "2026-06-01T10:00:00Z"
+  "upstream_status": "NOT_ANALYZED",
+  "created_at": "2026-06-10T05:47:00",
+  "scraped_at": "2026-06-10T06:26:40.838"
 }
 ```
 
 Notes:
 
-- **`sentiment_analysis` the owner asked for** maps to `overall_sentiment` +
-  `sentiment_score` (post-level) and `comment_analysis.sentiment_breakdown`
-  (positive/negative/neutral counts across the thread).
-- `post_summary` + `post_summary_lang` capture "summary in the original language."
+- **`sentiment_analysis` the owner asked for** is **multimodal**: `text_sentiment`
+  (caption), `image_sentiment` (the photo, via a visual model), and the **fused**
+  post-level `overall_sentiment` + `sentiment_score` — all **recomputed** — plus
+  `comment_analysis.sentiment_breakdown` across the thread. `image_*` are `null` for
+  text-only posts; `text_sentiment` is `null` for `null`-caption posts. The upstream
+  coarse score is kept as `baseline_sentiment` (and `baseline_viral_potential`),
+  never overwritten ([data_contract.md](data_contract.md) §4).
+- **`image_analysis`** holds per-image visual `sentiment`, `ocr_text` (from upstream
+  `photoOcrTexts`), and a `description` that grounds the summary.
+- **`media_type`** (upstream `postType`: TEXT/PHOTO/PHOTO_TEXT/UNKNOWN) is distinct
+  from the semantic `post_type`.
+- `post_summary` is **grounded on caption + OCR + image** (`post_summary_grounding`);
+  `post_summary_source` is `vlm` when a vision-language model produced it, else `llm`.
 - `post_type`, `intents`, `brand_mentions`, and `comment_analysis.themes` are the
   "and something like that" fields — useful structured signal for downstream use.
 - `post_summary_source` and
@@ -389,7 +456,7 @@ created_at`) is preserved as a subset of the above richer object.
 | -------------- | ------------------------------------------------------------ | ------------------------------------------------------------------------ |
 | API services   | **Python + FastAPI** (async)                                 | Matches team skills; great for I/O-bound APIs and ML glue                |
 | Workers        | **Python**, Celery or Ray for orchestration                  | Native ML ecosystem; Ray scales to multi-node cleanly                    |
-| Model serving  | **Triton/ONNX/CTranslate2** (NLP); Stage-2 **vLLM**⇄**Groq** | High GPU utilization for NLP; Stage-2 LLM backend switchable local↔Groq  |
+| Model serving  | **Triton/ONNX/CTranslate2** (NLP); **SigLIP/CLIP + VLM** (vision); Stage-2 **vLLM**⇄**Groq** | High GPU util for NLP; cheap visual sentiment + a VLM for image-grounded summaries; Stage-2 backend switchable local↔Groq |
 | Message bus    | **Kafka** (prod), **Redis Streams** (MVP)                    | Durable, partitioned, replayable at scale; simple to start               |
 | Operational DB | **PostgreSQL**                                               | ACID jobs/state, JSONB flexibility, mature                               |
 | Analytics DB   | **ClickHouse**                                               | Columnar, billions of rows, sub-second aggregations for trends           |
@@ -654,14 +721,17 @@ judged on **bn + en + code-mixed Banglish**.
 | Task                                | Recommended model(s)                                                      | Bangla | English | Notes                                                                  |
 | ----------------------------------- | ------------------------------------------------------------------------- | ------ | ------- | ---------------------------------------------------------------------- |
 | **Language + Banglish detection**   | `fastText lid.176` + CLD3 + transliteration heuristic                     | ✅     | ✅      | <1 ms/item; flags `banglish` (romanized bn) → multilingual path        |
-| **Sentiment** (post + per comment)  | `XLM-RoBERTa`/`mBERT` fine-tuned; BanglaBERT for bn                       | ✅     | ✅      | Run on post + every comment; aggregate into `sentiment_breakdown`      |
+| **Text sentiment** (caption + per comment) | `XLM-RoBERTa`/`mBERT` fine-tuned; BanglaBERT for bn                | ✅     | ✅      | **Recompute** → `text_sentiment` + `sentiment_breakdown`; upstream `sentiment` kept as `baseline_sentiment` |
+| **Image sentiment** (visual)        | `SigLIP 2` / `CLIP` zero-shot, or fine-tuned ViT                          | n/a    | n/a     | Cheap Stage-1 model on **every image post** → `image_sentiment`; visual, fused with text sentiment |
+| **Image description / caption**     | small **VLM** (`Qwen2.5-VL-3B/7B`) or `BLIP-2`                            | ✅     | ✅      | Short image description → grounds `post_summary` (esp. `null`-caption posts) |
+| **OCR (image text)**                | reuse upstream `photoOcrTexts`; fallback `PaddleOCR`/`Tesseract`          | ✅     | ✅      | Already upstream for 25/50; folded into the text path                  |
 | **Emotion**                         | XLM-R fine-tuned (joy/anger/sadness/fear/…); GoEmotions heads for en      | ✅     | ✅      | Shares encoder with sentiment to save GPU                              |
 | **Topic classification**            | XLM-R / embedding + classifier head; or zero-shot via small NLI model     | ✅     | ✅      | Use embeddings + lightweight classifier; reduces per-label models      |
 | **Intent**                          | XLM-R fine-tuned (inform/promote/complain/request/…)                      | ✅     | ✅      | Per comment too (price/availability/location inquiries)                |
 | **Toxicity / hate / offensive**     | `XLM-R`/`mBERT` fine-tuned; Detoxify (en) + Bangla hate datasets          | ✅     | ✅      | Bangla hate-speech corpora exist (e.g. Bengali Hate Speech); fine-tune |
 | **NER (person/org/location/brand)** | `GLiNER` (multilingual, zero/few-shot), `spaCy` (en), BanglaBERT-NER (bn) | ✅     | ✅      | GLiNER gives flexible entity types without per-type models             |
 | **Embeddings**                      | `BAAI/bge-m3` (multilingual, incl. Bangla) or `intfloat/multilingual-e5`  | ✅     | ✅      | Powers dedup, comment clustering, semantic search, RAG                 |
-| **Summarization** (thread)          | **LLM-A** (small thread) / **LLM-B** (large/clustered), any backend §14.2 | ✅     | ✅      | Selective; summary in the post's original language                     |
+| **Summarization** (multimodal)      | text: **LLM-A**/**LLM-B**; image posts: a **VLM** (`Qwen2.5-VL` ⇄ Groq vision) §14.2 | ✅     | ✅      | Selective; **grounded on caption + OCR + image**; original language    |
 | **Insight / report generation**     | **LLM-B** role + RAG, on the active backend (see §14.5)                   | ✅     | ✅      | Cluster summaries → corpus-level insight                               |
 | **Keyword extraction**              | KeyBERT (on embeddings) / YAKE                                            | ✅     | ✅      | Cheap, no extra GPU model                                              |
 
@@ -703,6 +773,7 @@ over local→Groq under load.
 | ---------------------------------- | ------------------------------------------------------------------------------ | ---------------------------------------------------- | ---------------------------------------------------------------------------------- |
 | **LLM-A — fast / high-throughput** | `Qwen2.5-7B-Instruct` (or `Llama-3.1-8B-Instruct`), AWQ/GPTQ quantized         | a fast Groq model (e.g. `llama-3.1-8b-instant`)      | Per-post selective refinement, hardest classification, short single-post summaries |
 | **LLM-B — large / high-quality**   | `Qwen2.5-32B-Instruct` (or `Qwen2.5-14B-Instruct` at smaller scale), quantized | a larger Groq model (e.g. `llama-3.3-70b-versatile`) | Cluster summarization, corpus insight, grounded report generation (RAG)            |
+| **VLM — vision-language**          | `Qwen2.5-VL-7B-Instruct` (or `-3B` at MVP), on vLLM                            | a Groq vision/multimodal model id | **Image-grounded `post_summary`** (caption + OCR + image); image description |
 
 Groq model IDs change as their catalog evolves — treat the examples above as
 placeholders and pin the current IDs in config. The prompts and JSON output schema
@@ -944,6 +1015,7 @@ cost lever, not an afterthought.
 | LLM GPU (local) | Moderate                                      | Fixed GPU line (only on the `local` backend)                        |
 | LLM API (groq)  | **Dominant, runaway**                         | Small per-token line (only on the `groq` backend)                   |
 | NLP GPU compute | Moderate                                      | **The main fixed line**, cheap & predictable (batched small models) |
+| Vision compute  | n/a                                           | Small fixed line — cheap **image-sentiment** (SigLIP/CLIP) on image posts; the **VLM** summary runs only on the selective slice (GPU on `local`, per-token on `groq`) |
 | Storage         | Small                                         | Small                                                               |
 | Networking      | Small–moderate                                | Small–moderate (+ egress to Groq on the `groq` backend)             |
 
@@ -1036,57 +1108,68 @@ endpoints versioned under `/v1`. Conventions: `202 Accepted` for async work;
 idempotency via `Idempotency-Key`; pagination via `?limit=&cursor=`; consistent
 error envelope.
 
-### 17.1 Ingestion — `POST /v1/posts/upload`
+### 17.1 Ingestion — pull from upstream (`POST /v1/ingest/sync`) + push (`POST /v1/posts/upload`)
 
-Upload one or many **threads** inline (a parent post plus its comments/replies), or
-register a large JSONL file already in object storage. The comment tree may be
-nested; the service flattens it but preserves `parent_id`.
+The **primary** path is a **pull** from the upstream **Post API** (and, per post,
+its **Comment API**, joined by the post's unique `id`) into our own database — see
+[data_contract.md](data_contract.md). `POST /v1/ingest/sync` triggers a pull for a
+selector; the service fetches, copies, and analyzes (**post sentiment first, then
+comments**), with no write-back. The **`POST /v1/posts/upload`** path remains for
+external/replay sources and accepts the **same upstream field names**.
 
-**Request (inline batch):**
+**Request — pull (`POST /v1/ingest/sync`):**
+
+```json
+{
+  "source": "upstream",
+  "selector": {
+    "campaign_id": "cmpe1djj504zc4otgw94idx0v",
+    "status": "NOT_ANALYZED",
+    "posted_from": "2026-06-10T00:00:00",
+    "posted_to": "2026-06-11T00:00:00"
+  },
+  "pull_comments": true,
+  "options": { "tasks": ["all"], "want_summary": true, "summary_lang": "auto", "llm_backend": "auto" }
+}
+```
+
+The service reads records keyed by CUID `id`, derives `platform` from each `url`
+host, keeps upstream `sentiment`/`viralPotential` as `baseline_*`, and recomputes
+richer sentiment. `pull_comments: false` runs the **post-only** pass (the path
+available before the Comment API is wired). Re-pulling the same `id` upserts.
+
+**Request — push (`POST /v1/posts/upload`, inline batch, upstream field names):**
 
 ```json
 {
   "source": "inline",
   "posts": [
     {
-      "post_id": "fb_12345",
-      "platform": "facebook",
-      "url": "https://facebook.com/...",
-      "author": "TalentedOstrich6332",
-      "text": "গ্রিন গার্ডেন এ খাবারের দাম অনেক বেশি... একটা সিংগারা ২০ টাকা চাইল।",
-      "created_at": "2026-06-01T10:00:00Z",
-      "engagement": { "reactions": 48, "comment_count": 12 },
+      "id": "cmq7grn1cmplnt0xmpl0a1b2c",
+      "campaignId": "cmpgrn1cmplnt0xmpl0camp01",
+      "platformPostId": "1402233557981234",
+      "url": "https://www.facebook.com/...",
+      "caption": "গ্রিন গার্ডেন এ খাবারের দাম অনেক বেশি... একটা সিংগারা ২০ টাকা চাইল।",
+      "photoUrls": [], "photoOcrTexts": [], "postType": "TEXT",
+      "postedAt": "2026-06-10T05:47:00", "scrapedAt": "2026-06-10T06:26:40.838",
+      "commentCount": 12, "shareCount": 4, "totalReactions": 48,
+      "sentiment": -0.3, "viralPotential": 0.25, "status": "NOT_ANALYZED",
       "comments": [
-        {
-          "comment_id": "c1",
-          "parent_id": null,
-          "author": "GenuineJackfruit1970",
-          "text": "Green garden e sudhu polao 100 taka baire 30-40 takai e paua jay",
-          "created_at": "2026-06-01T13:00:00Z"
-        },
-        {
-          "comment_id": "c2",
-          "parent_id": "c1",
-          "author": "TalentedOstrich6332",
-          "text": "Ami agee breakfast kortam green garden e. Ekhn oitao baad disi.",
-          "created_at": "2026-06-01T13:30:00Z"
-        }
-      ],
-      "meta": { "page_id": "p_99", "lang_hint": "bn" }
+        { "id": "cmcmt001", "postId": "cmq7grn1cmplnt0xmpl0a1b2c", "parentId": null,
+          "text": "Green garden e sudhu polao 100 taka baire 30-40 takai e paua jay", "postedAt": "2026-06-10T07:00:00" },
+        { "id": "cmcmt002", "postId": "cmq7grn1cmplnt0xmpl0a1b2c", "parentId": "cmcmt001",
+          "text": "Ami agee breakfast kortam green garden e. Ekhn oitao baad disi.", "postedAt": "2026-06-10T07:30:00" }
+      ]
     }
   ],
-  "options": {
-    "tasks": ["all"],
-    "want_summary": true,
-    "summary_lang": "auto",
-    "llm_backend": "auto"
-  }
+  "options": { "tasks": ["all"], "want_summary": true, "summary_lang": "auto", "llm_backend": "auto" }
 }
 ```
 
-`comments` is optional (a bare post is valid). `summary_lang: "auto"` keeps the
-summary in the post's detected language; pass `"bn"`/`"en"` to force it. Banglish
-comments are handled natively.
+`comments` is optional (a bare post is valid — the post pass runs standalone).
+`summary_lang: "auto"` keeps the summary in the post's detected language; pass
+`"bn"`/`"en"` to force it. Banglish comments are handled natively. `platform` and
+`baseline_*` are derived on ingest in both paths.
 
 `llm_backend` selects the Stage-2 LLM provider for this request: `"local"`
 (self-hosted vLLM), `"groq"` (Groq Cloud API), or `"auto"` (default — use the
@@ -1142,8 +1225,11 @@ reprocessing after a model upgrade.
 }
 ```
 
-`selector` may instead be `{ "post_ids": [...] }` or
-`{ "filter": { "platform": "instagram", "from": "...", "to": "..." } }`.
+`selector` may instead be `{ "post_ids": [...] }` (upstream CUIDs),
+`{ "campaign_id": "cmpe1djj…" }`, or
+`{ "filter": { "platform": "telegram", "from": "...", "to": "..." } }`
+(`platform` is the derived host value: `facebook` | `telegram` | `x` |
+`instagram` | …).
 `llm_backend` (`auto` | `local` | `groq`) overrides the Stage-2 provider for this
 run — handy to reprocess a batch on a different backend (e.g. compare local vs Groq
 output, or rerun on `groq` while LLM GPUs are down), subject to tenant policy.
@@ -1197,9 +1283,11 @@ transparency feature tied to the hybrid design.
   },
   "results": [
     {
-      "post_id": "fb_12345",
+      "post_id": "cmq7grn1cmplnt0xmpl0a1b2c",
+      "campaign_id": "cmpgrn1cmplnt0xmpl0camp01",
       "platform": "facebook",
-      "author": "TalentedOstrich6332",
+      "platform_post_id": "1402233557981234",
+      "media_type": "TEXT",
       "language": "bn",
       "language_mix": ["bn", "banglish", "en"],
       "language_confidence": 0.97,
@@ -1208,6 +1296,10 @@ transparency feature tied to the hybrid design.
       "post_summary_lang": "bn",
       "overall_sentiment": "negative",
       "sentiment_score": -0.64,
+      "text_sentiment": { "label": "negative", "score": -0.64 },
+      "image_sentiment": null,
+      "baseline_sentiment": -0.3,
+      "baseline_viral_potential": 0.25,
       "emotion": "anger",
       "intents": ["complaint", "call_to_action"],
       "topics": ["food pricing", "campus transport", "boycott"],
@@ -1287,7 +1379,7 @@ cluster insights). Reports are LLM-generated at the _cluster/corpus_ level.
       "post_count": 1840,
       "top_sentiment": "positive",
       "summary": "...",
-      "sample_post_ids": ["fb_12345"]
+      "sample_post_ids": ["cmq7orcjr2w78x80tufd0nza4"]
     }
   ],
   "metrics": { "total_posts": 10000, "languages": { "bn": 6200, "en": 3800 } },
@@ -1325,9 +1417,9 @@ cluster insights). Reports are LLM-generated at the _cluster/corpus_ level.
 {
   "error": {
     "code": "validation_error",
-    "message": "post[1].text exceeds max length",
+    "message": "post[1].caption exceeds max length",
     "request_id": "req_01J0...",
-    "details": [{ "field": "posts[1].text", "issue": "too_long" }]
+    "details": [{ "field": "posts[1].caption", "issue": "too_long" }]
   }
 }
 ```
@@ -1343,301 +1435,203 @@ upstream error where possible.
 
 ## 18. Worked examples
 
-Two real scraped threads run through the smart layer. The unit of analysis is
-always a **post + its comment thread**; `post_summary` is in the post's own
-language; Banglish is detected and folded into the dominant language.
+Real scraped records from the upstream **Post API** (verbatim from
+[social_posts.json](social_posts.json)) run through the smart layer. The unit of
+analysis is a **post + its comment thread**; analysis is **multimodal** (text
+`text_sentiment` + visual `image_sentiment`, fused; `post_summary` grounded on
+caption + OCR + image) in the post's own language. Reminders (see
+[data_contract.md](data_contract.md) §4): **comments come from a separate Comment
+API** that **isn't provided yet**, so post-level analysis is real today while
+`comment_analysis` is shown as the wired-path result (flagged); **sentiment is
+recomputed** with the upstream value kept as `baseline_sentiment`. Order: **post
+text → image → fuse → summary → comments**. Full versions in
+[examples.md](examples.md) (which also has a third example: a `null`-caption PHOTO
+post carried entirely by image + OCR).
 
-### 18.1 Example 1 — Bangla complaint thread (campus food prices)
+### 18.1 Example 1 — Facebook, Bangla, high-engagement photo post
 
-A Bangla post complaining about Green Garden / campus-transport food prices, with a
-thread of mostly Banglish comments agreeing and calling for a boycott.
+Short playful Bangla post (`মারিবো মৎস খাইবো সুখে!`) with an image and a large
+thread. Shows the **post + comment** path and **recompute vs. baseline** (upstream
+scored it `0.88`).
 
-**Input (abridged):**
+**Input — real Post API record (verbatim):**
 
 ```json
 {
-  "post_id": "fb_greengarden_001",
-  "platform": "facebook",
-  "author": "TalentedOstrich6332",
-  "text": "সাধারণত দেখা যায় যে গ্রিণ গার্ডেন এ খাবারের দাম অনেক বেশি... আজকে ট্রান্সপোর্টে একটা সিংগারা ২০ টাকা চাইল। এটা তো জুলুম। এই বিষয়ে কথা বলা প্রয়োজন মনে হয়েছে।",
-  "created_at": "2026-06-01T09:00:00Z",
-  "engagement": { "reactions": 48, "comment_count": 12 },
-  "comments": [
-    {
-      "comment_id": "c1",
-      "parent_id": null,
-      "author": "GenuineJackfruit1970",
-      "text": "Green garden e sudhu polao 100 taka baire 30-40 takai e paua jay. Quality same. Mone hoy gold dhuya pani diye ranna kore"
-    },
-    {
-      "comment_id": "c2",
-      "parent_id": null,
-      "author": "Anonymous participant 558",
-      "text": "নুনুর গার্ডেনে এক প্লেট ভাতের দাম ২০ টাকা 🤣 বাইরে ৫ টাকা একই চাল"
-    },
-    {
-      "comment_id": "c3",
-      "parent_id": null,
-      "author": "AuthenticDragon4378",
-      "text": "Eder boycott koray uttom karon era kokokhnoi apnake value korbe na"
-    },
-    {
-      "comment_id": "c4",
-      "parent_id": null,
-      "author": "Munam Mira",
-      "text": "Even 50 taka lekha Ice-cream gula naki 150! Ajob kahini."
-    },
-    {
-      "comment_id": "c5",
-      "parent_id": null,
-      "author": "StunningDolphin9938",
-      "text": "ট্রান্সপোর্টের ওই ভাইয়ার দোকান ভাড়াও নাই... ১০০% প্রফিট করছে উনি।"
-    }
-  ]
+  "id": "cmq7o9kvr2u1ix80ttluy8jdr",
+  "campaignId": "cmold6pt601ebfu22bfn6utvl",
+  "platformPostId": "1601153438035164",
+  "url": "https://www.facebook.com/1601153438035164",
+  "caption": "মারিবো মৎস খাইবো সুখে!",
+  "photoUrls": ["https://scontent.xx.fbcdn.net/.../719490530_...n.jpg"],
+  "photoOcrTexts": [], "videoUrl": null, "postType": "PHOTO_TEXT",
+  "postedAt": "2026-06-09T07:37:09", "scrapedAt": "2026-06-10T06:14:50.521",
+  "commentCount": 399, "shareCount": 23, "totalReactions": 9335,
+  "sentiment": 0.88, "viralPotential": 0.65,
+  "aiAnalysisStatus": "COMPLETED", "status": "NOT_ANALYZED",
+  "viralMonitoringStatus": "BASELINE_CREATED"
 }
 ```
+
+> The 399 comments are fetched from the Comment API by
+> `postId == "cmq7o9kvr2u1ix80ttluy8jdr"`. That payload isn't available yet, so
+> today's output has `comment_analysis.analyzed = 0`; the `_status` field carries a
+> wired-path preview of what those comments will produce.
 
 **Output JSON:**
 
 ```json
 {
-  "post_id": "fb_greengarden_001",
+  "post_id": "cmq7o9kvr2u1ix80ttluy8jdr",
+  "campaign_id": "cmold6pt601ebfu22bfn6utvl",
   "platform": "facebook",
-  "author": "TalentedOstrich6332",
+  "platform_post_id": "1601153438035164",
+  "author": null,
+  "media_type": "PHOTO_TEXT",
   "language": "bn",
-  "language_mix": ["bn", "banglish", "en"],
-  "language_confidence": 0.97,
-  "post_type": "complaint",
-  "post_summary": "পোস্টদাতা অভিযোগ করছেন গ্রিন গার্ডেন ও ক্যাম্পাস ট্রান্সপোর্টে খাবারের দাম বাইরের তুলনায় অনেক বেশি (একটি সিঙ্গারা ২০ টাকা), যা তিনি অন্যায্য মনে করছেন এবং কেনা বন্ধ করার ডাক দিয়েছেন। মন্তব্যকারীরা একমত — একই মানের খাবার বাইরে অনেক সস্তা — এবং অনেকে বয়কটের প্রস্তাব দিয়েছেন।",
+  "language_mix": ["bn"],
+  "language_confidence": 0.95,
+  "post_type": "opinion",
+  "post_summary": "একটি হালকা ও রসাত্মক বাংলা পোস্ট — \"মারিবো মৎস খাইবো সুখে!\" — সঙ্গে একটি ছবিতে এক ব্যক্তি বড় মাছ হাতে দাঁড়িয়ে। উচ্চ রিঅ্যাকশন (৯,৩৩৫) ও মন্তব্যে ইতিবাচক, মজার প্রতিক্রিয়া প্রাধান্য পেয়েছে।",
   "post_summary_lang": "bn",
-  "overall_sentiment": "negative",
-  "sentiment_score": -0.64,
-  "emotion": "anger",
-  "intents": ["complaint", "call_to_action"],
-  "topics": ["food pricing", "campus transport", "boycott"],
-  "entities": [
-    { "type": "organization", "value": "Green Garden", "confidence": 0.94 },
-    { "type": "product", "value": "singara", "confidence": 0.82 },
-    { "type": "product", "value": "polao", "confidence": 0.79 }
-  ],
-  "brand_mentions": [
-    { "name": "Green Garden", "sentiment": "negative", "mentions": 9 }
-  ],
-  "keywords": ["দাম", "সিঙ্গারা", "polao", "boycott", "transport"],
-  "toxicity_score": 0.08,
-  "hate_speech_score": 0.01,
-  "engagement": { "reactions": 48, "comment_count": 12 },
-  "comment_analysis": {
-    "analyzed": 12,
-    "sentiment_breakdown": { "positive": 1, "negative": 9, "neutral": 2 },
-    "themes": [
-      "prices far above outside market",
-      "same quality cheaper elsewhere",
-      "calls to boycott",
-      "transport vendor over-charging"
-    ],
-    "representative_comments": [
-      {
-        "author": "GenuineJackfruit1970",
-        "lang": "banglish",
-        "sentiment": "negative",
-        "text": "Green garden e sudhu polao 100 taka baire 30-40 takai e paua jay"
-      },
-      {
-        "author": "AuthenticDragon4378",
-        "lang": "banglish",
-        "sentiment": "negative",
-        "text": "Eder boycott koray uttom"
-      }
-    ]
-  },
-  "post_summary_source": "llm",
-  "confidence": 0.92,
-  "processing": {
-    "unit": "post+thread",
-    "stage1_ms": 61,
-    "llm_used": true,
-    "llm_role": "LLM-A",
-    "llm_backend": "local",
-    "llm_model": "Qwen2.5-7B-Instruct"
-  },
-  "created_at": "2026-06-01T09:00:00Z"
-}
-```
-
-**What did the work:** Stage-1 NLP detected language/Banglish, per-comment
-sentiment, entities (Green Garden), and toxicity cheaply. The router sent the thread
-to **LLM-A** (the fast per-post model) only for the Bangla `post_summary` and the
-comment `themes` (generative fields) — everything else is small-model output.
-
-### 18.2 Example 2 — English brand-page thread (Fabrilife jerseys)
-
-An English promotional post from a clothing brand, with a large thread of
-product-availability and price inquiries (many Banglish), plus the brand's own
-replies. Summary requested in English.
-
-**Input (abridged — the real thread has 100+ comments):**
-
-```json
-{
-  "post_id": "fb_fabrilife_001",
-  "platform": "facebook",
-  "author": "Fabrilife",
-  "text": "Unlock Your Confidence! Fabrilife, Bangladesh's fastest growing clothing brand, brings you premium quality comfort. Shop Now and discover your new favorite piece of confidence!",
-  "created_at": "2026-05-28T08:00:00Z",
-  "engagement": { "reactions": 76000, "comment_count": 2000 },
-  "comments": [
-    {
-      "comment_id": "c1",
-      "parent_id": null,
-      "author": "Kamrul Islam",
-      "text": "ইরান, তুরস্কের জার্সি আনেন!"
-    },
-    {
-      "comment_id": "c2",
-      "parent_id": null,
-      "author": "Sayeed Islam",
-      "text": "আর্জেন্টিনা জার্সি নিতে চাচ্ছি।"
-    },
-    {
-      "comment_id": "c3",
-      "parent_id": "c2",
-      "author": "Fabrilife",
-      "text": "The offer price of Argentina 2026 World Cup Home Jersey is 1290 taka..."
-    },
-    {
-      "comment_id": "c4",
-      "parent_id": null,
-      "author": "Monir Zaman",
-      "text": "৪ বছরের বাচ্চাদের jersey হবে।"
-    },
-    {
-      "comment_id": "c5",
-      "parent_id": "c4",
-      "author": "Fabrilife",
-      "text": "We are sorry, Kids Jersey is not available."
-    },
-    {
-      "comment_id": "c6",
-      "parent_id": null,
-      "author": "Mohammad Zahirul Haque",
-      "text": "Eta copy naki original?"
-    },
-    {
-      "comment_id": "c7",
-      "parent_id": "c6",
-      "author": "Fabrilife",
-      "text": "All of our jerseys are imported from Thailand and are high-quality 1:1 replicas."
-    }
-  ]
-}
-```
-
-**Output JSON:**
-
-```json
-{
-  "post_id": "fb_fabrilife_001",
-  "platform": "facebook",
-  "author": "Fabrilife",
-  "language": "en",
-  "language_mix": ["en", "bn", "banglish"],
-  "language_confidence": 0.96,
-  "post_type": "promotion",
-  "post_summary": "A promotional post from Fabrilife (a Bangladeshi clothing brand) marketing premium, comfortable clothing. The comment thread is dominated by customer inquiries about World Cup football jerseys — availability of specific national teams (Argentina, Portugal, Germany, Brazil, England), prices (~1270–1290 taka), kids' sizes, outlet locations, and whether the jerseys are original. The brand actively replies with prices, order links, and outlet addresses; kids' jerseys and several teams are out of stock.",
-  "post_summary_lang": "en",
+  "post_summary_grounding": ["caption", "image"],
   "overall_sentiment": "positive",
-  "sentiment_score": 0.34,
-  "emotion": "interest",
-  "intents": [
-    "promotion",
-    "product_inquiry",
-    "price_inquiry",
-    "availability_inquiry"
-  ],
-  "topics": [
-    "football jerseys",
-    "world cup 2026",
-    "pricing",
-    "product availability",
-    "outlet locations"
-  ],
-  "entities": [
-    { "type": "organization", "value": "Fabrilife", "confidence": 0.98 },
-    { "type": "product", "value": "World Cup jersey", "confidence": 0.9 },
-    { "type": "location", "value": "Argentina", "confidence": 0.7 },
-    { "type": "location", "value": "Portugal", "confidence": 0.7 }
-  ],
-  "brand_mentions": [
-    { "name": "Fabrilife", "sentiment": "positive", "mentions": 60 }
-  ],
-  "keywords": [
-    "jersey",
-    "argentina",
-    "portugal",
-    "price",
-    "available",
-    "outlet"
-  ],
+  "sentiment_score": 0.71,
+  "text_sentiment": { "label": "positive", "score": 0.66 },
+  "image_sentiment": { "label": "positive", "score": 0.78, "per_image": [0.78] },
+  "baseline_sentiment": 0.88,
+  "baseline_viral_potential": 0.65,
+  "emotion": "joy",
+  "intents": ["expression", "humor"],
+  "topics": ["fishing", "food", "humor"],
+  "entities": [],
+  "brand_mentions": [],
+  "keywords": ["মৎস", "মারিবো", "সুখে"],
   "toxicity_score": 0.01,
   "hate_speech_score": 0.0,
-  "engagement": { "reactions": 76000, "comment_count": 2000 },
-  "comment_analysis": {
-    "analyzed": 2000,
-    "sentiment_breakdown": {
-      "positive": 420,
-      "negative": 110,
-      "neutral": 1470
-    },
-    "themes": [
-      "which national-team jerseys are available",
-      "price requests (mostly answered: ~1290 taka)",
-      "kids' jersey availability (out of stock)",
-      "original vs replica questions",
-      "outlet / showroom locations across cities"
+  "engagement": { "reactions": 9335, "comment_count": 399, "shares": 23 },
+  "image_analysis": {
+    "image_count": 1,
+    "ocr_text": "",
+    "description": "a smiling person holding up a large fish outdoors",
+    "images": [
+      { "ref": "photoUrls[0]", "sentiment": { "label": "positive", "score": 0.78 }, "ocr_text": "", "description": "a smiling person holding up a large fish outdoors" }
     ],
-    "top_intents": [
-      { "intent": "price_inquiry", "count": 540 },
-      { "intent": "availability_inquiry", "count": 430 },
-      { "intent": "location_inquiry", "count": 180 }
-    ]
+    "vision_model": "SigLIP (sentiment) + Qwen2.5-VL-7B (description)"
   },
-  "post_summary_source": "llm",
+  "comment_analysis": {
+    "analyzed": 0,
+    "sentiment_breakdown": { "positive": 0, "negative": 0, "neutral": 0 },
+    "themes": [],
+    "_status": "399 comments pending the Comment API; wired-path preview → ~250 positive / 28 negative / 121 neutral; themes: playful agreement, fishing/food jokes, tagging friends"
+  },
+  "post_summary_source": "vlm",
   "confidence": 0.9,
-  "processing": {
-    "unit": "post+thread",
-    "stage1_ms": 240,
-    "llm_used": true,
-    "llm_role": "LLM-B",
-    "llm_backend": "groq",
-    "llm_model": "llama-3.3-70b-versatile"
-  },
-  "created_at": "2026-05-28T08:00:00Z"
+  "processing": { "unit": "post+thread", "stage1_ms": 44, "llm_used": true, "llm_role": "LLM-A", "llm_backend": "local", "llm_model": "Qwen2.5-7B-Instruct", "vision_used": true, "vision_model": "Qwen2.5-VL-7B-Instruct" },
+  "upstream_status": "NOT_ANALYZED",
+  "created_at": "2026-06-09T07:37:09",
+  "scraped_at": "2026-06-10T06:14:50.521"
 }
 ```
 
-**What did the work:** with 2,000 comments, the router does **not** send every
-comment to the LLM. Stage-1 NLP classifies each comment's language, sentiment, and
-intent cheaply; comments are **clustered by embedding**, and only cluster
-representatives + the post go to the **LLM-B** role for the English `post_summary`
-and `themes`. This keeps a 2,000-comment thread to a single cluster-level LLM call
-instead of thousands. Note `processing.llm_backend` here is **`groq`**: this thread
-was summarized via the Groq Cloud API (Example 1 used the `local` vLLM backend) —
-the same prompts and output schema, just a different Stage-2 backend, chosen at
-runtime. The `llm_backend` field records which one served each result.
+**What did the work:** Stage-1 ran **both modalities** — text on the caption
+(`text_sentiment` `0.66`) and a visual model on the photo (`image_sentiment` `0.78`)
+— fused to `0.71`; the router sent the thread to a **VLM** so the Bangla
+`post_summary` is **grounded on caption + image** (it names the person holding the
+fish, which is only in the picture). The upstream `0.88` is kept as
+`baseline_sentiment`, not overwritten.
+
+### 18.2 Example 2 — X (Twitter), English, text post (post-only path, live today)
+
+English news-style post about garment exports — `commentCount: 0`, so this is the
+**post-only** path that runs **before the Comment API exists**. Shows **platform
+derived from the URL host** (`x.com` → `x`).
+
+**Input — real Post API record (verbatim, caption abridged):**
+
+```json
+{
+  "id": "cmq7orcjr2w78x80tufd0nza4",
+  "campaignId": "cmpe1djj504zc4otgw94idx0v",
+  "platformPostId": "2064585098553434394",
+  "url": "https://x.com/albd1971/status/2064585098553434394",
+  "caption": "Bangladesh’s Garment Industry Faces Growing Export Pressure ... Garment exports fell by 3.41% in the first 11 months...",
+  "photoUrls": [], "photoOcrTexts": [], "videoUrl": null, "postType": "TEXT",
+  "postedAt": "2026-06-10T05:47:00", "scrapedAt": "2026-06-10T06:26:40.838",
+  "commentCount": 0, "shareCount": 4, "totalReactions": 8,
+  "sentiment": -0.3, "viralPotential": 0.25, "status": "NOT_ANALYZED"
+}
+```
+
+**Output JSON:**
+
+```json
+{
+  "post_id": "cmq7orcjr2w78x80tufd0nza4",
+  "campaign_id": "cmpe1djj504zc4otgw94idx0v",
+  "platform": "x",
+  "platform_post_id": "2064585098553434394",
+  "author": "albd1971",
+  "media_type": "TEXT",
+  "language": "en",
+  "language_mix": ["en"],
+  "language_confidence": 0.99,
+  "post_type": "news",
+  "post_summary": "A news-style post reporting that Bangladesh's ready-made garment exports — the backbone of the economy — are under pressure, falling 3.41% over the first 11 months as orders from major global markets decline.",
+  "post_summary_lang": "en",
+  "post_summary_grounding": ["caption"],
+  "overall_sentiment": "negative",
+  "sentiment_score": -0.41,
+  "text_sentiment": { "label": "negative", "score": -0.41 },
+  "image_sentiment": null,
+  "baseline_sentiment": -0.3,
+  "baseline_viral_potential": 0.25,
+  "emotion": "concern",
+  "intents": ["inform"],
+  "topics": ["garment industry", "exports", "economy", "bangladesh"],
+  "entities": [
+    { "type": "location", "value": "Bangladesh", "confidence": 0.98 },
+    { "type": "industry", "value": "ready-made garments", "confidence": 0.9 }
+  ],
+  "brand_mentions": [],
+  "keywords": ["garment", "exports", "3.41%", "economy", "pressure"],
+  "toxicity_score": 0.0,
+  "hate_speech_score": 0.0,
+  "engagement": { "reactions": 8, "comment_count": 0, "shares": 4 },
+  "comment_analysis": { "analyzed": 0, "sentiment_breakdown": { "positive": 0, "negative": 0, "neutral": 0 }, "themes": [] },
+  "post_summary_source": "llm",
+  "confidence": 0.93,
+  "processing": { "unit": "post+thread", "stage1_ms": 39, "llm_used": true, "llm_role": "LLM-A", "llm_backend": "local", "llm_model": "Qwen2.5-7B-Instruct" },
+  "upstream_status": "NOT_ANALYZED",
+  "created_at": "2026-06-10T05:47:00",
+  "scraped_at": "2026-06-10T06:26:40.838"
+}
+```
+
+**What did the work:** with `commentCount: 0`, `comment_analysis.analyzed = 0` —
+the **post-first** path that is fully runnable today. `platform` was derived from
+the `x.com` host, the source handle (`albd1971`) from the URL path. Stage-1 NLP
+recomputed a calibrated negative `sentiment_score` (`-0.41`); the upstream `-0.3` is
+kept as `baseline_sentiment`. PHOTO/PHOTO_TEXT posts additionally feed
+`photoOcrTexts` into the same pipeline ([data_contract.md](data_contract.md) §1).
 
 ### 18.3 How these map to the owner's request
 
 The owner asked for `{ post_summary, sentiment_analysis, "and something like
-that" }`. The schema delivers:
+that" }`, over the **real** upstream records. The schema delivers:
 
-- **`post_summary`** — in the original language (`post_summary_lang` records it).
-- **`sentiment_analysis`** — split into post-level (`overall_sentiment` +
-  `sentiment_score`) and thread-level (`comment_analysis.sentiment_breakdown` =
-  positive / negative / neutral counts).
-- **"something like that"** — `post_type`, `intents`, `topics`, `entities`,
-  `brand_mentions`, `comment_analysis.themes`/`top_intents`, toxicity, and
-  engagement — rich structured signal, not just two fields.
+- **`post_summary`** — in the original language (`post_summary_lang`), **grounded on
+  caption + OCR + image** (`post_summary_grounding`), so a `null`-caption photo post
+  is still summarized from its picture.
+- **`sentiment_analysis`** — **multimodal**: `text_sentiment` (caption),
+  `image_sentiment` (the photo, via a visual model), and the fused post-level
+  `overall_sentiment` + `sentiment_score`; the upstream value is preserved as
+  `baseline_sentiment`, plus thread-level (`comment_analysis.sentiment_breakdown`)
+  once the Comment API is wired. **Order: post text → image → fuse → summary →
+  comments.**
+- **"something like that"** — `post_type`, `media_type`, `image_analysis`, `intents`,
+  `topics`, `entities`, `brand_mentions`, `comment_analysis.themes`, toxicity,
+  engagement, and `campaign_id`/`platform` provenance — rich structured signal.
 
 ---
 
@@ -1791,9 +1785,16 @@ Phased build from MVP (1k) → Production (10k) → Enterprise (100k).
 ### Phase 0 — Foundations (week 0–1)
 
 - Repo + monorepo layout (services, workers, infra, models, dashboard).
-- Define the **input schema** (post + nested comment thread) and the **canonical
-  output JSON schema** (§8), plus a JSON Schema validator shared by all services.
-  These two contracts are the heart of the microservice; lock them early.
+- Lock the **input contract** ([data_contract.md](data_contract.md)): the upstream
+  **Post API** schema (real sample [social_posts.json](social_posts.json)), the
+  **Comment API** working contract, the pull + own-DB integration (no write-back),
+  platform-from-URL, and recompute-with-baseline sentiment. Lock the **canonical
+  output JSON schema** (§8) and a shared JSON Schema validator. These contracts
+  (what we pull from upstream, what downstream consumes) are the heart of the
+  microservice; lock them early.
+- Build the **upstream API client + ingestion**: pull posts (and comments when
+  available) keyed by CUID `id`, derive `platform`, keep upstream
+  `sentiment`/`viralPotential` as `baseline_*`, upsert into **our own database**.
 - Stand up local Docker Compose skeleton: Postgres, Redis, Qdrant, ClickHouse,
   MinIO, a stub API, Prometheus/Grafana.
 - Pick and pin model versions (§14); download local weights to object storage.
@@ -1810,20 +1811,32 @@ Phased build from MVP (1k) → Production (10k) → Enterprise (100k).
 
 Goal: prove the hybrid pipeline and output quality end-to-end, cheaply.
 
-- **Ingestion service:** validate the post+comment-thread payload, flatten the
-  comment tree (keep `parent_id`), Unicode normalization, Bangla/English/Banglish
-  script tagging, content-hash **dedup** (Redis), job creation, enqueue to Redis
-  Streams.
-- **Stage-1 NLP worker:** runs over the **post and each comment** —
+> **First target (priority order)** — the multimodal post pipeline, shippable on
+> today's data: **(1) post text sentiment → (2) image sentiment (visual) →
+> (3) fuse → (4) post summary grounded on caption + image/OCR → (5) comments** when
+> the Comment API lands ([data_contract.md](data_contract.md) §4).
+
+- **Ingestion service:** **pull from the upstream Post API** (the live data path —
+  comments follow when the Comment API lands), derive `platform` from URL host, keep
+  upstream `sentiment`/`viralPotential` as `baseline_*`, normalize the caption plus
+  `photoOcrTexts`, assemble any available comment thread (keep `parent_id`),
+  content-hash **dedup** (Redis), upsert into **our own DB** keyed by CUID `id`, job
+  creation, enqueue to Redis Streams. `/v1/posts/upload` wired for replay/external.
+- **Stage-1 NLP + vision worker:** runs **post first, then each comment**. _Text:_
   language/Banglish detection (fastText) → shared XLM-R encoder with
-  sentiment/emotion/topic/intent heads → toxicity/hate → NER (GLiNER/spaCy) →
-  embedding (bge-m3) → keywords. Aggregate per-comment sentiment into the thread
-  `sentiment_breakdown`. Micro-batched. Emit confidence per field.
-- **Router/Triage:** confidence gates + task flags; decide LLM routing.
-- **Stage-2 LLM worker:** a backend-agnostic worker for selective
-  summarization/insight, running either backend — `local` (vLLM serving **LLM-A**,
-  quantized 7B) or `groq` (call Groq's fast model). Ship both adapters in the MVP so
-  the switch is exercised early; **LLM response cache** in Redis keyed by
+  sentiment/emotion/topic/intent heads (**recomputed** `text_sentiment`, upstream
+  score kept as baseline) → toxicity/hate → NER (GLiNER/spaCy) → embedding (bge-m3)
+  → keywords. _Vision (image posts):_ SigLIP/CLIP `image_sentiment` + a small VLM
+  image description; reuse upstream `photoOcrTexts`. _Fuse_ → post
+  `overall_sentiment`. Run the text models over each comment →
+  `sentiment_breakdown`. Micro-batched; confidence per field.
+- **Router/Triage:** confidence gates + task flags; decide LLM/VLM routing.
+- **Stage-2 LLM/VLM worker:** a backend-agnostic worker for selective
+  summarization/insight, running either backend — `local` (vLLM serving **LLM-A**
+  quantized 7B **plus a VLM** `Qwen2.5-VL` for image-grounded summaries) or `groq`
+  (fast text model + a vision model). The **`post_summary` is grounded on caption +
+  OCR + image** for photo posts. Ship both adapters in the MVP so the switch is
+  exercised early; **LLM response cache** in Redis keyed by
   `(backend, model, task, content_hash)`. (LLM-B is added in Phase 2 for
   cluster/report quality.)
 - **Result assembler:** merge + JSON-schema validate + write to Postgres, ClickHouse,

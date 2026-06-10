@@ -5,9 +5,13 @@ why the recommended choice in [architecture.md](architecture.md) won. Use it to
 revisit a decision if constraints change.
 
 Context for every choice below: the service is a **self-hosted microservice** that
-ingests scraped **post + comment threads** (Bangla/English/Banglish) and emits
-structured JSON, under hard constraints — fast, cheap, Bangla-accurate. The data
-stores and NLP fleet are self-hosted (no data egress there). The **Stage-2 LLM is
+**pulls** scraped **posts + comment threads** (Bangla/English/Banglish, across
+Facebook/Telegram/X/Instagram) — **multimodal: caption text _and_ images (with
+OCR), so it runs both text and vision models** ([data_contract.md](data_contract.md)
+§4) — from an upstream platform's Post/Comment APIs into
+**its own database** and emits structured JSON, under hard constraints — fast,
+cheap, Bangla-accurate (input contract: [data_contract.md](data_contract.md)). The
+data stores and NLP fleet are self-hosted (no data egress there). The **Stage-2 LLM is
 the one pluggable piece**: a switchable backend, `local` (self-hosted vLLM,
 default — no egress, no per-token bill) ⇄ `groq` (Groq Cloud API — fastest, no
 GPU, per-token). See §8.
@@ -228,7 +232,7 @@ Summarized here; full plan in [deployment.md](deployment.md).
 ## 10. RAG: needed or not?
 
 Short answer: **not for per-post analysis; yes for the reporting/insight layer.**
-Full reasoning in [models.md](models.md) §RAG. Per-post classification needs no
+Full reasoning in [models.md](models.md) §5. Per-post classification needs no
 retrieval. RAG becomes valuable for analyst Q&A over the corpus, grounded report
 generation, and "what are people saying about X" queries — backed by Qdrant +
 the embeddings you already compute.

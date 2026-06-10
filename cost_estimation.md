@@ -35,6 +35,7 @@ comment.
 | LLM GPU (local)  | Moderate                                      | Fixed GPU line (only on the `local` backend)                          |
 | LLM API (groq)   | **Dominant, runaway**                         | Small per-token line (only on the `groq` backend)                     |
 | NLP GPU compute  | Moderate                                      | **The main fixed line**, cheap & predictable (batched small models)   |
+| Vision compute   | n/a                                           | Small fixed line — cheap **image-sentiment** (SigLIP/CLIP) on image posts; the **VLM** summary runs only on the selective slice (GPU on `local`, per-token vision calls on `groq`) |
 | Storage          | Small                                         | Small                                                                 |
 | Networking       | Small–moderate                                | Small–moderate (+ egress to Groq on the `groq` backend)               |
 

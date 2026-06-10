@@ -3,9 +3,23 @@
 > **Note:** This is the original request. The authoritative, refined requirements
 > now live in [what.txt](what.txt), and the design docs are written against that.
 > This file has been reconciled with what.txt on the points that matter most:
-> **no external/paid LLM API** (two local open-source LLMs only), **Banglish**
-> (romanized Bangla) as a first-class language, and the **post + comment thread**
-> as the unit of analysis.
+> a **pluggable Stage-2 LLM backend — `local` (self-hosted vLLM, the default, no
+> per-token bill / no egress) ⇄ `groq` (Groq Cloud API, optional)** rather than the
+> original "no external API, local-only" framing; **Banglish** (romanized Bangla)
+> as a first-class language; and the **post + comment thread** as the unit of
+> analysis. (The "AI Layer" and "Cost Optimization" sections below still say
+> local-only — superseded by the pluggable backend in
+> [models.md](models.md) §2 and [architecture.md](architecture.md) §0.)
+>
+> **Superseded on input/integration:** the real input is **pulled** from an
+> existing platform's **Post API / Comment API** into the service's **own
+> database** (not pushed by a scraper), spans **Facebook, Telegram, X, Instagram,
+> …** (platform derived from the URL host, not Facebook/Instagram only), and the
+> upstream's coarse `sentiment`/`viralPotential` are kept as a **baseline** while we
+> **recompute** our own. The authoritative input contract is
+> [data_contract.md](data_contract.md) (real sample:
+> [social_posts.json](social_posts.json)). The `Expected JSON Output` sketch below
+> is the original ask; the delivered schema is in [architecture.md](architecture.md) §6.
 
 ## Project Overview
 

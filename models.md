@@ -13,13 +13,22 @@ bulk work; the LLM is selective.** So the table below is mostly _small_ models,
 plus **two LLM roles** (LLM-A fast / LLM-B quality) served by the chosen backend
 for the selective stage (see §2).
 
-**The input is a post + its comment thread, and the content is heavily
-"Banglish"** (romanized Bangla, often mixed with English in one sentence, e.g.
-"Green garden e vat 25 taka baire 10 taka"). Every model choice below is judged on
-how well it handles **bn + en + code-mixed Banglish**, because that — not clean
-Bangla or clean English — is the real traffic (see [examples.md](examples.md)).
-Small models run over the **post and each comment**; the LLM summarizes the
-**thread** in the post's original language.
+**The input is a post + its comment thread** — a post pulled from the upstream
+**Post API** joined to comments from the **Comment API**
+([data_contract.md](data_contract.md)), spanning Facebook, Telegram, X, Instagram,
+… — **and the content is heavily "Banglish"** (romanized Bangla, often mixed with
+English in one sentence, e.g. "Green garden e vat 25 taka baire 10 taka"). Every
+model choice below is judged on how well it handles **bn + en + code-mixed
+Banglish**, because that — not clean Bangla or clean English — is the real traffic
+(see [examples.md](examples.md)). The input is also **multimodal**: ~80% of posts
+carry an **image**, and ~half have a `null` caption ([data_contract.md](data_contract.md)
+§1), so the image is not optional. Small models run **post first — text
+(caption + OCR) sentiment _and_ a visual `image_sentiment` on the photo, fused —
+then each comment**; a selective LLM/**VLM** summarizes the **thread** grounded on
+caption + OCR + image, in the post's original language. The post's analyzable text
+includes upstream `photoOcrTexts` (OCR is already done upstream). The
+text+image+summary pipeline order is the **first target** — see
+[data_contract.md](data_contract.md) §4.
 
 ---
 
@@ -28,14 +37,17 @@ Small models run over the **post and each comment**; the LLM summarizes the
 | Task                                | Recommended model(s)                                                       | Bangla | English | Notes                                                                  |
 | ----------------------------------- | -------------------------------------------------------------------------- | ------ | ------- | ---------------------------------------------------------------------- |
 | **Language + Banglish detection**   | `fastText lid.176` + CLD3 + transliteration heuristic                      | ✅      | ✅       | <1 ms/item; flags `banglish` (romanized bn) → multilingual path        |
-| **Sentiment** (post + per comment)  | `XLM-RoBERTa`/`mBERT` fine-tuned; BanglaBERT for bn                        | ✅      | ✅       | Run on post + every comment; aggregate into `sentiment_breakdown`      |
+| **Text sentiment** (caption + per comment) | `XLM-RoBERTa`/`mBERT` fine-tuned; BanglaBERT for bn                 | ✅      | ✅       | **Recompute** ours (caption first, then each comment) → `text_sentiment` + `sentiment_breakdown`; keep upstream `sentiment` as `baseline_sentiment` (never overwrite — [data_contract.md](data_contract.md) §4) |
+| **Image sentiment** (visual)        | `SigLIP 2` / `CLIP` zero-shot (positive/negative/neutral prompts), or a fine-tuned ViT | n/a (language-agnostic) | n/a | Cheap Stage-1 model on **every image post** → `image_sentiment` (per image + aggregate). Visual, independent of caption/OCR. Fused with text sentiment |
+| **Image description / caption**     | small **VLM** (`Qwen2.5-VL-3B/7B`) or `BLIP-2`                              | ✅      | ✅       | Short description of the image → grounds `post_summary` (esp. `null`-caption photo posts); feeds `image_analysis.description` |
+| **OCR (image text)**                | **reuse upstream `photoOcrTexts`**; fallback `PaddleOCR`/`Tesseract` (bn+en) | ✅    | ✅       | Already produced upstream for 25/50; only run if missing. Folded into the text path |
 | **Emotion**                         | XLM-R fine-tuned (joy/anger/sadness/fear/…); GoEmotions heads for en       | ✅      | ✅       | Shares encoder with sentiment to save GPU                              |
 | **Topic classification**            | XLM-R / embedding + classifier head; or zero-shot via small NLI model      | ✅      | ✅       | Use embeddings + lightweight classifier; reduces per-label models      |
 | **Intent**                          | XLM-R fine-tuned (inform/promote/complain/request/…)                       | ✅      | ✅       | Per comment too (price/availability/location inquiries)                |
 | **Toxicity / hate / offensive**     | `XLM-R`/`mBERT` fine-tuned; Detoxify (en) + Bangla hate datasets           | ✅      | ✅       | Bangla hate-speech corpora exist (e.g. Bengali Hate Speech); fine-tune |
 | **NER (person/org/location/brand)** | `GLiNER` (multilingual, zero/few-shot), `spaCy` (en), BanglaBERT-NER (bn)  | ✅      | ✅       | GLiNER gives flexible entity types without per-type models             |
 | **Embeddings**                      | `BAAI/bge-m3` (multilingual, incl. Bangla) or `intfloat/multilingual-e5`   | ✅      | ✅       | Powers dedup, comment clustering, semantic search, RAG                 |
-| **Summarization** (thread)          | **LLM-A** (small thread) / **LLM-B** (large/clustered), any backend — §2   | ✅      | ✅       | Selective; summary in the post's original language                     |
+| **Summarization** (multimodal)      | text: **LLM-A**/**LLM-B**; image posts: a **VLM** (`Qwen2.5-VL` local ⇄ a Groq vision model) — §2 | ✅      | ✅       | Selective; **grounded on caption + OCR + image**; summary in the post's original language |
 | **Insight / report generation**     | **LLM-B** role + RAG, on the active backend (see §2)                       | ✅      | ✅       | Cluster summaries → corpus-level insight                               |
 | **Keyword extraction**              | KeyBERT (on embeddings) / YAKE                                             | ✅      | ✅       | Cheap, no extra GPU model                                              |
 
@@ -56,7 +68,8 @@ Small models run over the **post and each comment**; the LLM summarizes the
 **Why a shared multilingual encoder (XLM-R family) for most classifiers:** one
 encoder pass can feed multiple lightweight task heads (sentiment, emotion,
 intent, topic), cutting GPU cost vs. running a separate full model per task. It
-also handles code-mixed Bangla-English in a single model — critical for real FB/IG content.
+also handles code-mixed Bangla-English in a single model — critical for the real
+multi-platform content (Facebook, Telegram, X, Instagram, …).
 
 ---
 
@@ -89,6 +102,7 @@ report bursts, or fail over local→Groq under load.
 | ---------------------------------- | ------------------------------------------------------------------------------ | ---------------------------------------------------------------- | ---------------------------------------------------------------------------------- |
 | **LLM-A — fast / high-throughput** | `Qwen2.5-7B-Instruct` (or `Llama-3.1-8B-Instruct`), AWQ/GPTQ quantized         | a fast Groq model (e.g. `llama-3.1-8b-instant`)                  | Per-post selective refinement, hardest classification, short single-post summaries |
 | **LLM-B — large / high-quality**   | `Qwen2.5-32B-Instruct` (or `Qwen2.5-14B-Instruct` at smaller scale), quantized | a larger Groq model (e.g. `llama-3.3-70b-versatile`)             | Cluster summarization, corpus insight, grounded report generation (RAG)            |
+| **VLM — vision-language**          | `Qwen2.5-VL-7B-Instruct` (or `-3B` at MVP), on vLLM                            | a Groq vision model (e.g. a Llama Vision / multimodal model id) | **Image-grounded `post_summary`** for photo posts (takes caption + OCR + image); image description |
 
 > Groq model IDs change as their catalog evolves — treat the examples above as
 > placeholders and pin the current IDs in config. The prompts and JSON output
@@ -154,7 +168,7 @@ notes (Groq).
 
 ## 4. Fine-tuning strategy (Bangla + English)
 
-Goal: lift accuracy on _your_ domain (FB/IG, code-mixed Banglish, local
+Goal: lift accuracy on _your_ domain (Facebook/Telegram/X/Instagram, code-mixed Banglish, local
 entities/brands) without training from scratch.
 
 1. **Start zero-shot / off-the-shelf.** Ship MVP with pretrained multilingual

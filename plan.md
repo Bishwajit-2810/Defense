@@ -9,16 +9,25 @@ posts efficiently. Read alongside [architecture.md](architecture.md).
 ## Phase 0 — Foundations (week 0–1)
 
 - Repo + monorepo layout (services, workers, infra, models, dashboard).
-- Define the **input schema** (post + nested comment thread) and the **canonical
-  output JSON schema** ([architecture.md](architecture.md) §6, worked out in
-  [examples.md](examples.md)), plus a JSON Schema validator shared by all
-  services. These two contracts (what the scraper sends, what downstream
-  consumes) are the heart of the microservice; lock them early.
+- Lock the **input contract** ([data_contract.md](data_contract.md)): the upstream
+  **Post API** schema (real sample in [social_posts.json](social_posts.json)), the
+  **Comment API** schema (working contract until the real payload arrives), the
+  pull + own-DB integration (no write-back), platform-from-URL, and the
+  recompute-with-baseline sentiment policy. Lock the **canonical output JSON
+  schema** ([architecture.md](architecture.md) §6, worked in
+  [examples.md](examples.md)) and a shared JSON Schema validator. These contracts
+  (what we pull from upstream, what downstream consumes) are the heart of the
+  microservice; lock them early.
+- Build the **upstream API client + ingestion**: pull posts (and comments when
+  available) keyed by CUID `id`, derive `platform`, keep upstream
+  `sentiment`/`viralPotential` as `baseline_*`, upsert into **our own database**.
 - Stand up local Docker Compose skeleton: Postgres, Redis, Qdrant, ClickHouse,
   MinIO, a stub API, Prometheus/Grafana.
-- Pick and pin model versions ([models.md](models.md)); download local weights to
-  object storage. Define the **Stage-2 LLM backend interface** (OpenAI-compatible)
-  and wire both providers behind it — `local` (vLLM) and `groq` — selected by
+- Pick and pin model versions ([models.md](models.md)), **including the vision
+  models** (image-sentiment: SigLIP/CLIP; image-description/summary VLM:
+  Qwen2.5-VL); download local weights to object storage. Define the **Stage-2 LLM
+  backend interface** (OpenAI-compatible, with a text and a vision model id per
+  backend) and wire both providers behind it — `local` (vLLM) and `groq` — selected by
   `LLM_BACKEND` config with a per-request override and per-tenant policy. Pin the
   Groq role→model IDs and store `GROQ_API_KEY` as a secret.
 - Build a small **labeled eval set** per task and per language (bn / en /
@@ -33,22 +42,40 @@ Postgres → `GET /analysis/{id}`, with valid JSON.
 
 Goal: prove the hybrid pipeline and output quality end-to-end, cheaply.
 
-- **Ingestion service:** validate the post+comment-thread payload, flatten the
-  comment tree (keep `parent_id`), Unicode normalization, Bangla/English/Banglish
-  script tagging, content-hash **dedup** (Redis), job creation, enqueue to Redis
-  Streams.
-- **Stage-1 NLP worker:** runs over the **post and each comment** —
-  language/Banglish detection (fastText) → shared XLM-R encoder with
-  sentiment/emotion/topic/intent heads → toxicity/hate → NER (GLiNER/spaCy) →
-  embedding (bge-m3) → keywords. Aggregate per-comment sentiment into the thread
-  `sentiment_breakdown`. Micro-batched. Emit confidence per field.
-- **Router/Triage:** confidence gates + task flags; decide LLM routing.
-- **Stage-2 LLM worker:** a backend-agnostic worker for selective
-  summarization/insight, running either backend — `local` (vLLM serving **LLM-A**,
-  quantized 7B) or `groq` (call Groq's fast model). Ship both adapters in the MVP
-  so the switch is exercised early; **LLM response cache** in Redis keyed by
-  `(backend, model, task, content_hash)`. (LLM-B is added in Phase 2 for
-  cluster/report quality.)
+> **First target (priority order)** — the multimodal post pipeline, shippable on
+> the data we have today (post API; comments follow):
+> **(1) post text sentiment** (caption) → **(2) image sentiment** (visual model on
+> the photo, when present) → **(3) fuse** into post `overall_sentiment` →
+> **(4) post summary grounded on caption + image/OCR** → **(5) comments** when the
+> Comment API lands. See [data_contract.md](data_contract.md) §4.
+
+- **Ingestion service:** **pull from the upstream Post API** (the live data path —
+  comments follow when the Comment API lands), derive `platform` from URL host,
+  keep upstream `sentiment`/`viralPotential` as `baseline_*`, normalize the caption
+  plus `photoOcrTexts` (Unicode, Bangla/English/Banglish script tagging), assemble any
+  available comment thread (keep `parent_id`), content-hash **dedup** (Redis),
+  upsert into **our own DB** keyed by CUID `id`, job creation, enqueue to Redis
+  Streams. The `/v1/posts/upload` push path is wired for replay/external sources.
+- **Stage-1 NLP + vision worker:** runs **post first, then each comment**.
+  - _Text:_ language/Banglish detection (fastText) → shared XLM-R encoder with
+    sentiment/emotion/topic/intent heads (**recomputed** `text_sentiment`, upstream
+    score kept as baseline) → toxicity/hate → NER (GLiNER/spaCy) → embedding
+    (bge-m3) → keywords.
+  - _Vision (image posts):_ a cheap **visual** model (SigLIP/CLIP zero-shot or a
+    fine-tuned ViT) scores `image_sentiment`; a small VLM (Qwen2.5-VL) produces an
+    image description; reuse upstream `photoOcrTexts`.
+  - _Fuse_ `text_sentiment` + `image_sentiment` → post `overall_sentiment`. Run the
+    text models over each comment → thread `sentiment_breakdown`. Micro-batched;
+    confidence per field.
+- **Router/Triage:** confidence gates + task flags; decide LLM/VLM routing.
+- **Stage-2 LLM/VLM worker:** a backend-agnostic worker for selective summarization
+  /insight — running either backend, `local` (vLLM serving **LLM-A** quantized 7B
+  **plus a VLM** `Qwen2.5-VL` for image-grounded summaries) or `groq` (fast text
+  model plus a vision model). The **`post_summary` is grounded on caption + OCR +
+  image** for
+  photo posts. Ship both adapters in the MVP so the switch is exercised early;
+  **LLM response cache** in Redis keyed by `(backend, model, task, content_hash)`.
+  (LLM-B is added in Phase 2 for cluster/report quality.)
 - **Result assembler:** merge + JSON-schema validate + write to Postgres,
   ClickHouse, Qdrant, MinIO.
 - **APIs:** `/posts/upload`, `/analysis/run`, `/analysis/{id}`, `/reports`
@@ -153,6 +180,10 @@ Production; graceful degradation under failure proven (chaos test).
 
 | Risk                                    | Mitigation                                                                                                    |
 | --------------------------------------- | ------------------------------------------------------------------------------------------------------------- |
+| Comment API not yet available           | Ship the **post-first** path now (post sentiment runs standalone); build comments against the working contract ([data_contract.md](data_contract.md) §2) and finalize when the real payload arrives |
+| Image/VLM cost or latency (every image post) | Cheap visual model (SigLIP/CLIP) for `image_sentiment` on all images; VLM only **selectively** for the grounded summary (router-gated); cache by image hash; batch on GPU |
+| Visual sentiment accuracy on local content | Calibrate against `baseline_sentiment`; eval set including news-graphics/memes; fall back to OCR-text sentiment when image confidence is low |
+| Upstream schema / platform drift        | Platform derived from URL host (open-ended); ingest keyed by CUID `id`; tolerate new fields, validate the ones we use |
 | Bangla / Banglish accuracy below bar    | Multilingual encoder + Bangla fine-tune + Banglish-heavy eval set                                             |
 | LLM slice creeps up → cost spikes       | Confidence-gate tuning, caching, clustering, alert on LLM-share metric                                        |
 | GPU cost overrun                        | Spot for batch, reserved base, quantization, right-sizing                                                     |

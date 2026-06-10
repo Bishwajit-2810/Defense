@@ -17,6 +17,12 @@ hundreds of short texts — Stage-1 throughput is better measured in **texts
   order of **hundreds–low-thousands of texts/sec** on a single modern GPU
   depending on text length and quantization. A thread with 50 comments = ~51
   texts.
+- **Stage-1 vision** (image sentiment): a **SigLIP/CLIP** pass on each image post
+  is cheap — **hundreds of images/sec** on one GPU (one forward pass per image),
+  comparable to or lighter than the text encoder. ~80% of posts have an image, so
+  size for roughly one image embed per post on top of the text load. Image
+  **description/summary** uses the VLM and runs only on the **selective** Stage-2
+  slice, not every image.
 - **Stage-2 LLMs** (two roles — **LLM-A** 7B/8B for per-post refinement, **LLM-B**
   14B/32B for cluster/report generation): order of **thousands of output
   tokens/sec** aggregate; but they only see the **selective slice** (single-digit
@@ -43,9 +49,12 @@ LLM GPU sizing from the equation entirely (you size only the NLP fleet).
 > owning a GPU; switch to `local` later for cost/privacy as volume grows.
 
 - **`local` backend:** **1 × consumer GPU** (e.g. RTX 4090 / 3090, 24 GB) runs the
-  whole show: the NLP suite (quantized) + the local LLMs via vLLM, time-sliced. At
-  MVP scale run just **LLM-A** (quantized 7B) for all Stage-2 work; add **LLM-B**
-  when cluster/report quality demands it.
+  whole show: the NLP suite (quantized) + a **vision model** (SigLIP/CLIP for image
+  sentiment — tiny) + the local LLMs/VLM via vLLM, time-sliced. At MVP scale run
+  just **LLM-A** (quantized 7B) plus a small **VLM** (`Qwen2.5-VL-3B/7B`, quantized)
+  for image-grounded summaries; add **LLM-B** when cluster/report quality demands
+  it. The 7B VLM fits alongside a 7B LLM-A on 24 GB when quantized and time-sliced;
+  on the **`groq`** backend the VLM is just a hosted vision model id — no extra GPU.
 - CPU-only is even possible for the smallest NLP models if no GPU is available,
   at lower throughput (pair with the `groq` backend to skip GPUs entirely).
 - **Recommendation:** single workstation/server with one 24 GB consumer GPU, or a

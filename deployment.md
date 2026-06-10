@@ -32,9 +32,9 @@ Single host with one GPU. One `docker-compose.yml` brings up:
 services:
   gateway        (NGINX)            → TLS, routing, rate limit
   api            (FastAPI)          → auth + ingestion + reporting (combined for MVP)
-  worker-nlp     (Python)           → Stage-1 small-model suite (GPU)
-  worker-llm     (Python)           → Stage-2 worker; LLM_BACKEND=local|groq
-  vllm           (vLLM, optional)   → local backend only: LLM-A (+LLM-B) on GPU
+  worker-nlp     (Python)           → Stage-1 text suite + vision (image sentiment, GPU)
+  worker-llm     (Python)           → Stage-2 worker (text LLM + VLM); LLM_BACKEND=local|groq
+  vllm           (vLLM, optional)   → local backend only: LLM-A (+LLM-B) + VLM (Qwen2.5-VL) on GPU
   redis          (cache/queue)      → Redis Streams = bus + cache + dedup
   postgres       (ops + jobs)
   clickhouse     (analytics)
@@ -52,7 +52,8 @@ services:
     `GROQ_API_KEY` + role→model IDs; the worker calls Groq over HTTPS and needs
     **no GPU**. Flip the env var to switch at any time (no image rebuild).
 - Goal: prove the hybrid pipeline end-to-end on 1k post+comment-thread batches —
-  scraper payload in, structured JSON out (see [examples.md](examples.md)).
+  posts pulled from the upstream Post/Comment APIs into our own DB, structured
+  JSON out (see [examples.md](examples.md), [data_contract.md](data_contract.md)).
 
 ---
 
