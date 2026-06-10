@@ -1,14 +1,17 @@
 # AI Model Selection, RAG & Fine-Tuning
 
 Model recommendations per task, the Bangla/Banglish/English fine-tuning strategy,
-and the RAG evaluation for the smart layer in [what.txt](what.txt). All choices
-favor open-source, GPU-efficient models with genuine Bangla support, and are
-**100% self-hosted — no external/paid LLM API is used anywhere in the design**
-(the owner's hard "no api/paid models" constraint).
+and the RAG evaluation for the smart layer in [what.txt](what.txt). All small-model
+choices favor open-source, GPU-efficient models with genuine Bangla support and
+run **self-hosted**. The Stage-2 LLM runs behind a **pluggable backend with two
+interchangeable providers — `local` (self-hosted vLLM) and `groq` (Groq Cloud
+API) — switchable at runtime** (see §2). Default is `local` (no per-token bill, no
+data egress); `groq` is an opt-in switch for fastest inference and zero GPU ops.
 
 The guiding rule from [architecture.md](architecture.md): **small models do the
 bulk work; the LLM is selective.** So the table below is mostly _small_ models,
-plus **two self-hosted local LLMs** for the selective stage (see §2).
+plus **two LLM roles** (LLM-A fast / LLM-B quality) served by the chosen backend
+for the selective stage (see §2).
 
 **The input is a post + its comment thread, and the content is heavily
 "Banglish"** (romanized Bangla, often mixed with English in one sentence, e.g.
@@ -32,8 +35,8 @@ Small models run over the **post and each comment**; the LLM summarizes the
 | **Toxicity / hate / offensive**     | `XLM-R`/`mBERT` fine-tuned; Detoxify (en) + Bangla hate datasets           | ✅      | ✅       | Bangla hate-speech corpora exist (e.g. Bengali Hate Speech); fine-tune |
 | **NER (person/org/location/brand)** | `GLiNER` (multilingual, zero/few-shot), `spaCy` (en), BanglaBERT-NER (bn)  | ✅      | ✅       | GLiNER gives flexible entity types without per-type models             |
 | **Embeddings**                      | `BAAI/bge-m3` (multilingual, incl. Bangla) or `intfloat/multilingual-e5`   | ✅      | ✅       | Powers dedup, comment clustering, semantic search, RAG                 |
-| **Summarization** (thread)          | **Local LLM-A** (small thread) / **LLM-B** (large/clustered) — see §2      | ✅      | ✅       | Selective; summary in the post's original language                     |
-| **Insight / report generation**     | **Local LLM-B** + RAG (see §2)                                             | ✅      | ✅       | Cluster summaries → corpus-level insight                               |
+| **Summarization** (thread)          | **LLM-A** (small thread) / **LLM-B** (large/clustered), any backend — §2   | ✅      | ✅       | Selective; summary in the post's original language                     |
+| **Insight / report generation**     | **LLM-B** role + RAG, on the active backend (see §2)                       | ✅      | ✅       | Cluster summaries → corpus-level insight                               |
 | **Keyword extraction**              | KeyBERT (on embeddings) / YAKE                                             | ✅      | ✅       | Cheap, no extra GPU model                                              |
 
 ### Bangla-specific resources worth using/fine-tuning on
@@ -57,62 +60,95 @@ also handles code-mixed Bangla-English in a single model — critical for real F
 
 ---
 
-## 2. The selective LLMs — two local models, no API
+## 2. The selective LLMs — two roles, a pluggable backend (local ⇄ Groq)
 
-The selective Stage-2 work is split across **two self-hosted local LLMs**, both
-served on **vLLM**. There is **no external/paid API**: everything runs on our own
-GPUs, so post content never leaves the cluster and there is no per-token bill.
+The selective Stage-2 work is split across **two logical roles** — **LLM-A**
+(fast / high-throughput) and **LLM-B** (large / high-quality). Each role is
+fulfilled by a **pluggable backend, switchable at runtime**:
 
-| Role                                | Model                                                                            | Serves                                                                                | Why                                                                                              |
-| ----------------------------------- | -------------------------------------------------------------------------------- | ------------------------------------------------------------------------------------- | ------------------------------------------------------------------------------------------------ |
-| **LLM-A — fast / high-throughput**  | `Qwen2.5-7B-Instruct` (or `Llama-3.1-8B-Instruct`), AWQ/GPTQ quantized           | Per-post selective refinement, hardest classification, short single-post summaries    | Strong multilingual incl. Bangla, fits one mid (24 GB) GPU, continuous batching → high post rate |
-| **LLM-B — large / high-quality**    | `Qwen2.5-32B-Instruct` (or `Qwen2.5-14B-Instruct` at smaller scale), quantized   | Cluster summarization, corpus insight, grounded report generation (RAG)               | Higher reasoning/quality for the low-volume, quality-critical generation work                    |
+- **`local` (default)** — self-hosted models on **vLLM**, on our own GPUs. Post
+  content never leaves the cluster and there is no per-token bill; capacity grows
+  by adding GPUs. Best for privacy-sensitive data, steady high volume, and
+  predictable cost.
+- **`groq`** — the **Groq Cloud API** (OpenAI-compatible), serving the same open
+  model families (Llama 3.x, Qwen, etc.) on Groq's LPU hardware. Extremely fast
+  inference, **zero GPU/model-serving ops**, elastic burst — billed per token,
+  and prompt content leaves the cluster. Best for bursty load, no/low local GPU,
+  or when you want the lowest latency.
 
-Why two and not one: the two jobs have opposite profiles. Per-post refinement is
-**high-volume, low-difficulty** (favor a small fast model); cluster/report
+Because both backends speak the **same OpenAI-compatible API**, the Stage-2 worker
+is backend-agnostic — only the base URL, API key, and model name differ. Switching
+is a config/flag change (env `LLM_BACKEND=local|groq`, or a per-request override —
+see [api_design.md](api_design.md)), applied **at runtime without a redeploy**. You
+can even run **hybrid**: e.g. `local` LLM-A for per-post volume + `groq` for LLM-B
+report bursts, or fail over local→Groq under load.
+
+### Role → model mapping per backend
+
+| Role                               | `local` backend (vLLM, our GPUs)                                               | `groq` backend (Groq Cloud API)                                  | Serves                                                                             |
+| ---------------------------------- | ------------------------------------------------------------------------------ | ---------------------------------------------------------------- | ---------------------------------------------------------------------------------- |
+| **LLM-A — fast / high-throughput** | `Qwen2.5-7B-Instruct` (or `Llama-3.1-8B-Instruct`), AWQ/GPTQ quantized         | a fast Groq model (e.g. `llama-3.1-8b-instant`)                  | Per-post selective refinement, hardest classification, short single-post summaries |
+| **LLM-B — large / high-quality**   | `Qwen2.5-32B-Instruct` (or `Qwen2.5-14B-Instruct` at smaller scale), quantized | a larger Groq model (e.g. `llama-3.3-70b-versatile`)             | Cluster summarization, corpus insight, grounded report generation (RAG)            |
+
+> Groq model IDs change as their catalog evolves — treat the examples above as
+> placeholders and pin the current IDs in config. The prompts and JSON output
+> schema are identical across backends, so a switch needs no prompt changes.
+
+Why two roles and not one: the two jobs have opposite profiles. Per-post refinement
+is **high-volume, low-difficulty** (favor a small fast model); cluster/report
 generation is **low-volume, high-quality** (favor a larger model). Splitting them
-lets each run on right-sized GPUs and scale independently, instead of paying
-32B-class cost for every per-post call or accepting 7B-class quality on reports.
-At MVP scale the two can be **time-sliced on a single GPU**, or LLM-B can be
-dropped and LLM-A used for both until volume justifies the second model.
+lets each be right-sized and scaled independently, instead of paying 32B-class cost
+for every per-post call or accepting 7B-class quality on reports. On the `local`
+backend at MVP scale the two can be **time-sliced on a single GPU**, or LLM-B
+dropped and LLM-A used for both until volume justifies the second model; on the
+`groq` backend the two roles are just two model IDs with no extra infrastructure.
 
-Both expose an **OpenAI-compatible HTTP API** (the vLLM wire protocol — this is a
-local server, not a paid service) with structured JSON output mode to minimize
-tokens. See [cost_estimation.md](cost_estimation.md) for per-batch LLM economics
-and [infrastructure.md](infrastructure.md) for GPU sizing.
+Both backends use **structured JSON output mode** to minimize tokens. See
+[cost_estimation.md](cost_estimation.md) for per-batch economics of each backend
+and [infrastructure.md](infrastructure.md) for GPU sizing (local) / sizing-free
+notes (Groq).
 
-> No external API, by design. If LLM-B is saturated the router degrades to LLM-A
-> (lower quality, still local) or returns Stage-1-only results — see
-> [architecture.md](architecture.md) §8. Capacity is added by scaling GPUs, never
-> by sending data to a third-party API.
+> **Switchable by design.** If a backend is saturated or unhealthy the router can
+> degrade LLM-B→LLM-A, **fail over to the other backend** (when both are
+> configured), or return Stage-1-only results — see
+> [architecture.md](architecture.md) §8. Privacy-locked tenants can be pinned to
+> `local` so a switch never routes their data to Groq.
 
 ---
 
 ## 3. Model serving architecture
 
 ```text
-   NLP fleet (Stage 1)                         LLMs (Stage 2) — both local
- ┌───────────────────────┐                 ┌────────────────────────────┐
- │ Triton / ONNX Runtime │                 │ vLLM: LLM-A (7B/8B, fast)  │
- │  + CTranslate2        │                 │ vLLM: LLM-B (14B/32B, qual)│
- │  dynamic batching     │                 │  continuous batching,      │
- │  many small models    │                 │  quantized, paged-attn KV  │
- └──────────┬────────────┘                 └───────────┬────────────────┘
-            │ gRPC/HTTP                                 │ HTTP (OpenAI-compat, local)
-   Stage-1 worker pulls batch                  Stage-2 worker pulls from LLM
-   from queue, calls Triton                    sub-queue, calls LLM-A or LLM-B
+   NLP fleet (Stage 1)                  LLM roles (Stage 2) — pluggable backend
+ ┌───────────────────────┐          ┌──────────────────────────────────────────┐
+ │ Triton / ONNX Runtime │          │  Stage-2 worker (OpenAI-compatible client) │
+ │  + CTranslate2        │          │      picks role LLM-A / LLM-B by task      │
+ │  dynamic batching     │          └───────────────┬────────────────┬───────────┘
+ │  many small models    │            LLM_BACKEND=local│        =groq │
+ └──────────┬────────────┘          ┌─────────────────▼──┐   ┌───────▼──────────┐
+            │ gRPC/HTTP             │ vLLM (our GPUs):    │   │ Groq Cloud API   │
+   Stage-1 worker pulls batch       │  LLM-A 7B/8B fast   │   │ OpenAI-compatible│
+   from queue, calls Triton         │  LLM-B 14B/32B qual │   │ Llama/Qwen on LPU│
+                                     │  quantized, paged KV│   │ per-token, no GPU│
+                                     └─────────────────────┘   └──────────────────┘
 ```
 
 - **NLP models** → **Triton Inference Server** (or ONNX Runtime / CTranslate2)
   with dynamic batching and INT8/FP16 quantization. Multiple models share GPUs;
-  Triton handles concurrent model execution and batching.
-- **LLMs** → **two vLLM deployments** (paged attention + continuous batching),
-  **LLM-A** (fast, per-post) and **LLM-B** (large, cluster/report), each exposing
-  a local OpenAI-compatible API; quantized weights (AWQ/GPTQ) to fit GPU and raise
-  throughput. The Stage-2 worker picks A or B by task. No external API endpoint is
-  configured.
-- **Versioning:** every result records `model_versions` so re-runs after a model
-  upgrade are auditable and reproducible (replay from Kafka).
+  Triton handles concurrent model execution and batching. (NLP is always
+  self-hosted — only the Stage-2 LLM has a Groq option.)
+- **LLM (Stage 2)** → one **OpenAI-compatible Stage-2 worker** that targets the
+  configured backend:
+  - `local`: **two vLLM deployments** (paged attention + continuous batching),
+    LLM-A (fast) and LLM-B (large), quantized (AWQ/GPTQ) to fit GPU and raise
+    throughput.
+  - `groq`: the **Groq Cloud endpoint**, with role→model-ID mapping in config; no
+    GPU, no model loading, just outbound HTTPS.
+  The worker picks the **role** (A or B) by task; the **backend** is selected by
+  config/flag and switchable at runtime.
+- **Versioning:** every result records `processing.llm_backend` + `llm_model` +
+  `model_versions` so re-runs (and a backend switch) are auditable and
+  reproducible (replay from Kafka).
 
 ---
 
@@ -127,9 +163,13 @@ entities/brands) without training from scratch.
    posts as an active-learning pool — those are exactly the examples worth
    labeling. Build a held-out eval set per task and per language.
 3. **Parameter-efficient fine-tuning (LoRA/QLoRA).** Fine-tune the shared XLM-R
-   encoder + task heads, and optionally LLM-A (the 7B/8B local model), with
-   LoRA/QLoRA. Cheap (single GPU), fast, easy to version and roll back. Both LLMs
-   are local, so fine-tuned weights stay in-house — no API to depend on.
+   encoder + task heads, and optionally LLM-A (the 7B/8B model) on the **`local`
+   backend**, with LoRA/QLoRA. Cheap (single GPU), fast, easy to version and roll
+   back; fine-tuned weights stay in-house. Note this is a **local-backend
+   advantage**: the `groq` backend runs Groq's hosted models, which we can steer
+   only via prompting/few-shot, not custom fine-tunes. Teams that need fine-tuned
+   LLM behavior should keep those tasks on `local` (the NLP fleet is fine-tuned
+   regardless of which LLM backend is active).
 4. **Code-mixed focus.** Explicitly include Banglish (Bangla in Latin script,
    mixed sentences) in training data — this is where off-the-shelf models fail
    most on social content.
@@ -163,6 +203,9 @@ if retrieval is poor — mitigate with good chunking, metadata filters, and
 showing source posts.
 
 **Recommended stack:** **Qdrant** vector DB + **bge-m3 / multilingual-e5**
-embeddings (Bangla-capable) + **LLM-B** (the large local model) for generation.
-This is the same Qdrant + embeddings already in the core pipeline, so RAG is
-nearly free to add at the reporting layer — and fully local end to end.
+embeddings (Bangla-capable) + **LLM-B** (the large role) for generation, on
+whichever Stage-2 backend is active — `local` for fully in-cluster RAG, or `groq`
+for faster report generation when the retrieved context may leave the cluster.
+This reuses the same Qdrant + embeddings already in the core pipeline, so RAG is
+nearly free to add at the reporting layer; retrieval/embeddings stay local in
+both cases — only the final generation call follows the chosen backend.

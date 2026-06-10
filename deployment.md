@@ -33,7 +33,8 @@ services:
   gateway        (NGINX)            → TLS, routing, rate limit
   api            (FastAPI)          → auth + ingestion + reporting (combined for MVP)
   worker-nlp     (Python)           → Stage-1 small-model suite (GPU)
-  worker-llm     (Python + vLLM)    → Stage-2 local LLMs A+B (share GPU, no API)
+  worker-llm     (Python)           → Stage-2 worker; LLM_BACKEND=local|groq
+  vllm           (vLLM, optional)   → local backend only: LLM-A (+LLM-B) on GPU
   redis          (cache/queue)      → Redis Streams = bus + cache + dedup
   postgres       (ops + jobs)
   clickhouse     (analytics)
@@ -44,8 +45,12 @@ services:
 
 - Queue = **Redis Streams** (no separate Kafka to operate yet).
 - API services can be one process for the MVP; split later.
-- GPU shared between NLP and the local LLM(s) via time-slicing (run LLM-A only at
-  MVP scale; both LLM-A and LLM-B are self-hosted — no external API).
+- **Stage-2 backend is a config switch** on `worker-llm`:
+  - `LLM_BACKEND=local` → it talks to the `vllm` service; GPU is shared between
+    NLP and the local LLM(s) via time-slicing (run LLM-A only at MVP scale).
+  - `LLM_BACKEND=groq` → drop the `vllm` service entirely and set
+    `GROQ_API_KEY` + role→model IDs; the worker calls Groq over HTTPS and needs
+    **no GPU**. Flip the env var to switch at any time (no image rebuild).
 - Goal: prove the hybrid pipeline end-to-end on 1k post+comment-thread batches —
   scraper payload in, structured JSON out (see [examples.md](examples.md)).
 
@@ -78,9 +83,11 @@ services:
    │ KEDA-scaled  │      │ KEDA-scaled   │
    └──────┬───────┘      └─────┬─────────┘
           │ Triton svc          │ vLLM svc
-   ┌──────▼───────┐      ┌──────▼────────┐
-   │ triton (GPU) │      │ vllm A + B    │   model servers (2 local LLMs, no API)
-   └──────────────┘      └───────────────┘
+   ┌──────▼───────┐      ┌──────▼────────────────────┐
+   │ triton (GPU) │      │ Stage-2 backend:          │   LLM_BACKEND switch:
+   └──────────────┘      │  vllm A+B (GPU)  ⇄  Groq  │   local (in-cluster GPU)
+                         │                    (API)  │   or groq (egress HTTPS)
+                         └───────────────────────────┘
           │ writes (assembler Deployment) │
    ┌──────▼───────┬──────────┬────────────▼──────┬───────────┐
    │ postgres     │clickhouse│ qdrant            │ minio/S3  │  StatefulSets / managed
@@ -106,9 +113,15 @@ services:
 - **Workers** (nlp, llm) → `Deployment` on **GPU node pools** (nodeSelector +
   tolerations + `nvidia.com/gpu` resource requests), scaled by **KEDA** on Kafka
   consumer lag.
-- **Model servers** (Triton + two vLLM deployments, LLM-A and LLM-B) →
-  `Deployment`/`StatefulSet` on GPU pool, `Service` each for in-cluster
-  gRPC/HTTP. Both LLMs are local; no egress to an external API.
+- **Model servers** → Triton (NLP) always on the GPU pool. The **Stage-2 LLM
+  backend is selected per environment** via `LLM_BACKEND`:
+  - `local`: two vLLM `Deployment`s (LLM-A, LLM-B) on the GPU pool, a `Service`
+    each for in-cluster HTTP; no egress.
+  - `groq`: no vLLM deployments — the Stage-2 worker (a stateless `Deployment`,
+    HPA/KEDA on queue depth, **no GPU**) calls Groq over HTTPS. Allow egress to
+    Groq in `NetworkPolicy`/egress rules and mount `GROQ_API_KEY` from a Secret.
+  Both are valid simultaneously for **hybrid/failover**; the worker picks per
+  request/policy. Switching backends is a config rollout, not a rebuild.
 - **Stateful infra** (Kafka, PostgreSQL, ClickHouse, Qdrant) → operators or
   `StatefulSet` + `PersistentVolumeClaim`; or managed equivalents to cut ops.
 - **Object storage** → MinIO operator or cloud S3.
@@ -126,10 +139,14 @@ services:
 
 - **Ingress controller** (NGINX) terminates TLS; cert-manager for certs.
 - **NetworkPolicies**: only ingress reaches services; only services reach data
-  namespace; model servers reachable only by workers.
+  namespace; model servers reachable only by workers. On the `groq` backend,
+  allow **egress from the Stage-2 worker to the Groq API only** (default-deny
+  egress elsewhere); on `local` the workers need no internet egress at all.
 - Optional **Linkerd** service mesh for mTLS + retries + traffic splitting
   (canary) east-west.
-- **Secrets** via Kubernetes Secrets + (recommended) Vault/External Secrets.
+- **Secrets** via Kubernetes Secrets + (recommended) Vault/External Secrets —
+  including the **`GROQ_API_KEY`**, mounted only into the Stage-2 worker when the
+  `groq` backend is enabled.
 - Private node pools for `data` and `models`; only ingress is internet-facing.
 
 ### Reliability

@@ -90,7 +90,7 @@ a thread of mostly Banglish comments agreeing and calling for a boycott.
   },
   "post_summary_source": "llm",
   "confidence": 0.92,
-  "processing": { "unit": "post+thread", "stage1_ms": 61, "llm_used": true, "llm_model": "LLM-A" },
+  "processing": { "unit": "post+thread", "stage1_ms": 61, "llm_used": true, "llm_role": "LLM-A", "llm_backend": "local", "llm_model": "Qwen2.5-7B-Instruct" },
   "created_at": "2026-06-01T09:00:00Z"
 }
 ```
@@ -187,7 +187,7 @@ replies. The summary is requested in English.
   },
   "post_summary_source": "llm",
   "confidence": 0.9,
-  "processing": { "unit": "post+thread", "stage1_ms": 240, "llm_used": true, "llm_model": "LLM-B" },
+  "processing": { "unit": "post+thread", "stage1_ms": 240, "llm_used": true, "llm_role": "LLM-B", "llm_backend": "groq", "llm_model": "llama-3.3-70b-versatile" },
   "created_at": "2026-05-28T08:00:00Z"
 }
 ```
@@ -195,10 +195,13 @@ replies. The summary is requested in English.
 **What did the work:** with 2,000 comments, the router does **not** send every
 comment to the LLM. Stage-1 NLP classifies each comment's language, sentiment, and
 intent cheaply; comments are **clustered by embedding**, and only cluster
-representatives + the post go to **LLM-B** for the English `post_summary` and
-`themes`. This is the cost lever that keeps a 2,000-comment thread to a single
+representatives + the post go to the **LLM-B** role for the English `post_summary`
+and `themes`. This is the cost lever that keeps a 2,000-comment thread to a single
 cluster-level LLM call instead of thousands — see [architecture.md](architecture.md)
-§5 and [models.md](models.md).
+§5 and [models.md](models.md). Note `processing.llm_backend` here is **`groq`**:
+this thread was summarized via the Groq Cloud API (Example 1 used the `local` vLLM
+backend) — the same prompts and output schema, just a different Stage-2 backend,
+chosen at runtime. The `llm_backend` field records which one served each result.
 
 ---
 

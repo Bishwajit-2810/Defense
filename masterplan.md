@@ -47,11 +47,17 @@ a **smart, self-contained microservice** — a "thinking layer" — that:
   language, sentiment, topics, intents, entities, brand mentions, comment
   analysis — see §8) that downstream projects consume directly.
 
-Hard product constraints from the owner: **fast**, **cost-effective with no
-external/paid API** (two local open-source LLMs only — see §14), **efficient**,
-and **accurate on Bangla and Banglish** (with fine-tuning hooks for when accuracy
-must improve). It must **scale** horizontally to handle batches of 1k → 10k →
-100k threads.
+Hard product constraints from the owner: **fast**, **cost-effective**,
+**efficient**, and **accurate on Bangla and Banglish** (with fine-tuning hooks for
+when accuracy must improve). It must **scale** horizontally to handle batches of
+1k → 10k → 100k threads.
+
+The Stage-2 LLM is a **pluggable backend with two interchangeable providers —
+`local` (self-hosted vLLM) and `groq` (Groq Cloud API) — switchable at runtime**
+(see §14). The default backend is **local** (no per-token bill, no data egress);
+**Groq** is an opt-in switch for fastest inference and zero GPU ops. The choice is
+config- and request-level, so the operator can flip between them at any time
+without redeploying.
 
 **The unit of analysis is a _post together with its comment thread_, not an
 isolated post.** A scraped item is a parent post plus N nested comments/replies
@@ -69,10 +75,14 @@ and emits one JSON object per thread.
   ~90–95% of the work. An LLM is invoked **selectively** only for the
   original-language summary, insight, and low-confidence/ambiguous cases. This is
   the central cost-control idea.
-- **Two local LLMs, no external/paid API.** The selective stage runs entirely on
-  self-hosted models: **LLM-A** (fast 7B/8B) for per-post refinement and **LLM-B**
-  (larger 14B/32B) for cluster summarization, insight, and grounded reports.
-  Everything stays on our own GPUs — no per-token bill, no data egress.
+- **Two LLM roles, a pluggable backend (local ⇄ Groq), switchable at runtime.**
+  The selective stage uses **LLM-A** (fast 7B/8B) for per-post refinement and
+  **LLM-B** (larger 14B/32B) for cluster summarization, insight, and grounded
+  reports. Each role is served by the chosen backend: **`local`** (self-hosted
+  vLLM — no per-token bill, no data egress; the default) or **`groq`** (Groq Cloud
+  API — fastest inference, zero GPU ops, per-token cost). Both speak an
+  OpenAI-compatible API, so switching is a config/flag change, and you can run
+  hybrid/failover. Pin privacy-sensitive tenants to `local`.
 - **Queue-based, horizontally scalable.** API → ingestion → message bus →
   stateless GPU/CPU workers → result store. Workers scale independently per stage.
 - **Queue: Kafka for Production/Enterprise, Redis Streams for the MVP.** Start
@@ -143,10 +153,10 @@ and emits one JSON object per thread.
                                 └─────┬───────┬─────┘
                           done│             │needs LLM (selective)
                               │       ┌─────▼──────────┐
-                              │       │ STAGE 2 — LLM   │  2 local vLLM models
-                              │       │ workers         │  LLM-A fast / LLM-B qual
-                              │       │ summarize·insight│  (no external API)
-                              │       │ ·report·hard NER │
+                              │       │ STAGE 2 — LLM   │  pluggable backend:
+                              │       │ workers         │  local vLLM ⇄ Groq API
+                              │       │ summarize·insight│  roles LLM-A / LLM-B
+                              │       │ ·report·hard NER │  (switchable runtime)
                               │       └─────┬───────────┘
                               └─────────────┤
                                 ┌───────────▼───────────┐
@@ -195,12 +205,16 @@ strategy — see §7.
      is ambiguous / heavily Banglish / long → **route to Stage 2** with a compact,
      token-minimized prompt (post + a representative/clustered subset of comments,
      truncated). This selectivity is what keeps the service fast and cheap.
-6. **Stage 2 — LLM (selective).** Two self-hosted local models on vLLM produce
-   summaries, insights, refined labels — **LLM-A** (fast 7B/8B) for per-post
-   refinement and short summaries, **LLM-B** (large 14B/32B) for cluster
-   summarization, insight, and report generation. No external/paid API is used.
-   Responses are cached by `(model, task, content_hash)` in Redis so repeats are
-   free.
+6. **Stage 2 — LLM (selective).** The Stage-2 worker produces summaries, insights,
+   and refined labels through two **logical roles** — **LLM-A** (fast 7B/8B) for
+   per-post refinement and short summaries, **LLM-B** (large 14B/32B) for cluster
+   summarization, insight, and report generation. Each role is served by a
+   **pluggable backend, switchable at runtime**: `local` (self-hosted vLLM on our
+   own GPUs — no per-token bill, no data egress) or `groq` (Groq Cloud API —
+   fastest inference, zero GPU ops, per-token cost). Both speak an OpenAI-compatible
+   API, so the worker code is backend-agnostic; switching is a config/flag change,
+   not a redeploy. Responses are cached by `(backend, model, task, content_hash)`
+   in Redis so repeats are free.
 7. **Assemble + validate.** The Result Assembler merges Stage 1 + Stage 2 into the
    canonical JSON (see §8), validates against the JSON Schema, and sets
    `confidence` = aggregate.
@@ -223,13 +237,18 @@ strategy — see §7.
 | **Ingestion Service**       | Validate, normalize, dedup, create job, enqueue                    | FastAPI (async)                                        | stateless replicas  |
 | **Stage-1 NLP Workers**     | Run small-model suite, micro-batched, emit features + confidence   | Python (Ray/Celery consumer) + Triton/ONNX/CTranslate2 | GPU/CPU worker pool |
 | **Router/Triage**           | Apply confidence gates + task flags; decide LLM routing            | lightweight Python service or in-worker rule module    | stateless           |
-| **Stage-2 LLM Workers**     | Selective summarization / insight / report / hard cases            | 2 local vLLM servers (LLM-A + LLM-B) + thin worker     | GPU worker pool     |
+| **Stage-2 LLM Workers**     | Selective summarization / insight / report / hard cases            | Thin worker → local vLLM (LLM-A+LLM-B) **or** Groq API | GPU pool, stateless |
 | **Result Assembler**        | Merge, JSON-schema validate, compute aggregate confidence          | Python consumer                                        | stateless replicas  |
 | **Reporting/Query Service** | Read APIs, report generation, exports                              | FastAPI + ClickHouse + PostgreSQL                      | stateless replicas  |
 | **User Management**         | Tenants, users, roles, billing/usage metering                      | FastAPI + PostgreSQL                                   | stateless replicas  |
 
 Workers are split into **separate pools per stage** so the expensive LLM GPUs
-scale independently from the cheap NLP fleet.
+scale independently from the cheap NLP fleet. The Stage-2 worker itself is a thin
+client that calls the configured **LLM backend**: with the `local` backend it
+talks to in-cluster vLLM servers (GPU-bound); with the `groq` backend it makes
+outbound HTTPS calls to Groq and needs no GPU at all (a stateless pool that scales
+on CPU/queue depth). The backend is selected by config and can be flipped at
+runtime per the routing rules in §7.
 
 ---
 
@@ -260,11 +279,14 @@ Levers that keep token usage and cost low:
   _cluster_ or representative samples → one LLM call per cluster, not per post.
 - **Token minimization.** Send only truncated, cleaned text and only the fields the
   LLM must produce. Use structured/JSON-mode output to avoid wasted tokens.
-- **Two local LLMs, no API.** Both Stage-2 models run on owned/cloud GPUs via vLLM
-  with continuous batching — no per-token API bill and no data egress. The cheap
-  LLM-A absorbs per-post work; the larger LLM-B is reserved for low-volume
-  cluster/report generation.
-- **LLM response cache** keyed by `(model, task, content_hash)`.
+- **Two LLM roles, pluggable backend.** LLM-A (fast) absorbs per-post work; the
+  larger LLM-B is reserved for low-volume cluster/report generation. Each role is
+  served by the configured backend: `local` (vLLM, continuous batching — no
+  per-token bill, no data egress) or `groq` (Groq Cloud — fastest inference, no GPU
+  to run, billed per token). The backend is switchable at runtime, so the operator
+  can run fully local for cost/privacy, burst to Groq under load, or mix (e.g.
+  local LLM-A + Groq for LLM-B reports).
+- **LLM response cache** keyed by `(backend, model, task, content_hash)`.
 
 Expected outcome: LLM touches a single-digit-to-low-double-digit percentage of
 posts, and the per-batch LLM bill is dominated by _cluster-level_ generation, not
@@ -330,7 +352,9 @@ normalized to the dominant language for the summary.
     "unit": "post+thread",
     "stage1_ms": 58,
     "llm_used": true,
-    "llm_model": "LLM-A",
+    "llm_role": "LLM-A",
+    "llm_backend": "local",
+    "llm_model": "Qwen2.5-7B-Instruct",
     "model_versions": {}
   },
   "created_at": "2026-06-01T10:00:00Z"
@@ -345,8 +369,10 @@ Notes:
 - `post_summary` + `post_summary_lang` capture "summary in the original language."
 - `post_type`, `intents`, `brand_mentions`, and `comment_analysis.themes` are the
   "and something like that" fields — useful structured signal for downstream use.
-- `post_summary_source` and `processing.llm_used`/`llm_model` make the hybrid
-  behavior auditable (did we call an LLM, which one, was it worth it).
+- `post_summary_source` and
+  `processing.llm_used`/`llm_role`/`llm_backend`/`llm_model` make the hybrid
+  behavior auditable (did we call an LLM, which role, on which backend — `local`
+  or `groq` — which concrete model, was it worth it).
 - All fields except `post_summary`, `comment_analysis.themes`, and
   `representative_comments` come from cheap Stage-1 NLP; the LLM fills only the
   generative fields when the router asks for them.
@@ -359,38 +385,43 @@ created_at`) is preserved as a subset of the above richer object.
 
 ## 9. Technology stack
 
-| Layer          | Choice                                                    | Why                                                                      |
-| -------------- | --------------------------------------------------------- | ------------------------------------------------------------------------ |
-| API services   | **Python + FastAPI** (async)                              | Matches team skills; great for I/O-bound APIs and ML glue                |
-| Workers        | **Python**, Celery or Ray for orchestration               | Native ML ecosystem; Ray scales to multi-node cleanly                    |
-| Model serving  | **Triton / ONNX / CTranslate2** (NLP) + **vLLM x2 local** | High GPU utilization, dynamic batching; all local, no API                |
-| Message bus    | **Kafka** (prod), **Redis Streams** (MVP)                 | Durable, partitioned, replayable at scale; simple to start               |
-| Operational DB | **PostgreSQL**                                            | ACID jobs/state, JSONB flexibility, mature                               |
-| Analytics DB   | **ClickHouse**                                            | Columnar, billions of rows, sub-second aggregations for trends           |
-| Vector DB      | **Qdrant**                                                | Fast, open-source, easy ops, good filtering; for dedup/search/clustering |
-| Cache          | **Redis**                                                 | LLM/embedding/query cache, dedup set, rate limits                        |
-| Object storage | **S3 / MinIO**                                            | Raw payloads, reports, model artifacts                                   |
-| Orchestration  | **Kubernetes** (prod), **Docker Compose** (MVP)           | Autoscaling + HA vs simplicity                                           |
-| Autoscaling    | **KEDA** (scale on queue depth) + HPA                     | Workers track backlog, not just CPU                                      |
-| Observability  | **Prometheus + Grafana + Loki + OpenTelemetry + Jaeger**  | Metrics, logs, traces                                                    |
-| Frontend       | **Flutter**                                               | Matches team skills; one codebase for web/mobile dashboard               |
+| Layer          | Choice                                                       | Why                                                                      |
+| -------------- | ------------------------------------------------------------ | ------------------------------------------------------------------------ |
+| API services   | **Python + FastAPI** (async)                                 | Matches team skills; great for I/O-bound APIs and ML glue                |
+| Workers        | **Python**, Celery or Ray for orchestration                  | Native ML ecosystem; Ray scales to multi-node cleanly                    |
+| Model serving  | **Triton/ONNX/CTranslate2** (NLP); Stage-2 **vLLM**⇄**Groq** | High GPU utilization for NLP; Stage-2 LLM backend switchable local↔Groq  |
+| Message bus    | **Kafka** (prod), **Redis Streams** (MVP)                    | Durable, partitioned, replayable at scale; simple to start               |
+| Operational DB | **PostgreSQL**                                               | ACID jobs/state, JSONB flexibility, mature                               |
+| Analytics DB   | **ClickHouse**                                               | Columnar, billions of rows, sub-second aggregations for trends           |
+| Vector DB      | **Qdrant**                                                   | Fast, open-source, easy ops, good filtering; for dedup/search/clustering |
+| Cache          | **Redis**                                                    | LLM/embedding/query cache, dedup set, rate limits                        |
+| Object storage | **S3 / MinIO**                                               | Raw payloads, reports, model artifacts                                   |
+| Orchestration  | **Kubernetes** (prod), **Docker Compose** (MVP)              | Autoscaling + HA vs simplicity                                           |
+| Autoscaling    | **KEDA** (scale on queue depth) + HPA                        | Workers track backlog, not just CPU                                      |
+| Observability  | **Prometheus + Grafana + Loki + OpenTelemetry + Jaeger**     | Metrics, logs, traces                                                    |
+| Frontend       | **Flutter**                                                  | Matches team skills; one codebase for web/mobile dashboard               |
 
 ---
 
 ## 10. Reliability & fault tolerance
 
-- **Retries with backoff** at every worker; transient failures (OOM, GPU hiccup)
-  retried up to N times.
+- **Retries with backoff** at every worker; transient failures (OOM, GPU hiccup,
+  local vLLM 5xx, or Groq 429/5xx) retried up to N times. Groq rate-limit (429)
+  responses honor `Retry-After` and back off per-key.
 - **Dead-letter queue (DLQ).** Messages that exhaust retries go to a DLQ topic with
   the error context for inspection/replay.
 - **Idempotency.** Content hash + job id make reprocessing safe; assembler upserts.
 - **At-least-once delivery** from the bus + idempotent writes = no lost or
   double-counted posts.
-- **Graceful degradation (all local).** If the LLMs are saturated, the router can
-  (a) queue, (b) degrade LLM-B work to LLM-A (lower quality, still local), or
-  (c) return Stage-1-only results flagged `summary_source: "skipped"` — never block
-  the whole batch and never fall out to a third-party API.
-- **Health/readiness probes** on every service; circuit breakers around each LLM.
+- **Graceful degradation + backend failover.** If the active backend is saturated
+  or unhealthy, the router can (a) queue, (b) degrade LLM-B work to LLM-A (lower
+  quality), (c) **fail over to the other backend** — local↔Groq — when both are
+  configured, or (d) return Stage-1-only results flagged `summary_source:
+  "skipped"`. Failover is policy-driven: a privacy-locked tenant can be pinned to
+  `local` and will never spill to Groq even under load (it degrades to
+  Stage-1-only instead). Never block the whole batch.
+- **Health/readiness probes** on every service; circuit breakers around each LLM
+  backend (per local vLLM server and around the Groq endpoint).
 
 ---
 
@@ -407,7 +438,15 @@ created_at`) is preserved as a subset of the above richer object.
 - **PII handling:** social content contains personal data. Encrypt at rest (DB +
   object storage), encrypt in transit, support per-tenant data retention / deletion
   (GDPR-style), and access logging.
-- **Secrets:** Kubernetes Secrets / Vault; no secrets in images or env files.
+- **LLM backend data residency.** The `local` backend keeps all post/comment text
+  inside the cluster (no egress). The `groq` backend **sends prompt content to a
+  third party (Groq)** over TLS — a deliberate trade for speed/elasticity. Make it
+  an explicit, audited choice: default to `local`, allow `groq` per-tenant/per-job
+  only where the data classification permits it, and **pin privacy-sensitive
+  tenants to `local`** so a runtime switch can never route their PII to Groq.
+  Record the backend used on every result (`processing.llm_backend`) for audit.
+- **Secrets:** Kubernetes Secrets / Vault; no secrets in images or env files —
+  including the **Groq API key**, which is mounted only into Stage-2 workers.
 - **Network:** private subnets for DBs and model servers; only the gateway is
   internet-facing. NetworkPolicies in K8s.
 - **Audit logging** of admin and data-access actions.
@@ -435,9 +474,12 @@ created_at`) is preserved as a subset of the above richer object.
 
 Records the major options considered for each decision point and why the
 recommended choice won. Use it to revisit a decision if constraints change.
-Context for every choice: a **self-hosted microservice** ingesting
-post+comment threads (Bangla/English/Banglish), under hard constraints — **no
-external/paid API**, fast, cheap, Bangla-accurate.
+Context for every choice: a **self-hosted microservice** ingesting post+comment
+threads (Bangla/English/Banglish), under hard constraints — fast, cheap,
+Bangla-accurate. The data stores and NLP fleet are self-hosted (no data egress
+there). The **Stage-2 LLM is the one pluggable piece**: a switchable backend,
+`local` (self-hosted vLLM, default — no egress, no per-token bill) ⇄ `groq` (Groq
+Cloud API — fastest, no GPU, per-token). See §13.8.
 
 ### 13.1 Overall topology
 
@@ -531,7 +573,7 @@ over BYO simplicity.
 
 All complementary, not alternatives: **Redis** (LLM/embedding/query cache, dedup
 set, rate-limit counters), **embedding cache** (keyed by `content_hash`), **LLM
-response cache** (keyed by `(model, task, content_hash)`), **query cache**
+response cache** (keyed by `(backend, model, task, content_hash)`), **query cache**
 (short-TTL ClickHouse aggregations), **CDN** (Flutter web assets + static report
 exports; not dynamic per-tenant data). See §15.4.
 
@@ -549,21 +591,29 @@ exports; not dynamic per-tenant data). See §15.4.
   **Linkerd** at Production for mTLS + retries if security/observability needs it
   (**Istio** if you need its full feature set).
 
-### 13.8 LLM serving: self-host vs API, and why two local models
+### 13.8 LLM serving: a pluggable backend (local ⇄ Groq), and two LLM roles
 
-**Hard constraint: no external/paid LLM API.** Every model runs on our own GPUs.
+**The Stage-2 LLM runs behind a pluggable backend, switchable at runtime.** Two
+interchangeable providers fulfill the same two LLM roles; the operator picks one
+(or mixes them) by config/flag without redeploying. The NLP fleet and all data
+stores remain self-hosted regardless.
 
-| Option                            | Pros                                                                         | Cons                                                                          | Verdict                                 |
-| --------------------------------- | ---------------------------------------------------------------------------- | ----------------------------------------------------------------------------- | --------------------------------------- |
-| **External API**                  | Zero ops; frontier quality; elastic                                          | Per-token cost; data leaves the cluster; rate limits                          | **Rejected** — violates the no-API rule |
-| **Single self-hosted LLM**        | One model to run; simplest                                                   | Either overpay (big model per post) or under-deliver (small model on reports) | Workable for the MVP only               |
-| **Two self-hosted LLMs (CHOSEN)** | Right-sized per job; data in-house; no per-token bill; scale each separately | Two model deployments to run                                                  | **Chosen** for Production/Enterprise    |
+| Backend option                 | Pros                                                                  | Cons                                                               | Verdict                                             |
+| ------------------------------ | --------------------------------------------------------------------- | ------------------------------------------------------------------ | --------------------------------------------------- |
+| **`local` — self-hosted vLLM** | No per-token bill; data stays in-cluster; fine-tunable; no rate limit | Needs GPUs + serving ops; capacity = GPUs you run                  | **Default.** Privacy/cost-sensitive, steady volume  |
+| **`groq` — Groq Cloud API**    | Fastest inference (LPU); zero GPU/model ops; elastic burst; tiny MVP  | Per-token cost; prompt data leaves the cluster; rate limits/quotas | **Opt-in switch.** Bursty load, no GPU, low latency |
+| **Both (hybrid / failover)**   | Local for steady/private work, Groq for burst or report spikes        | Two integrations to keep configured; per-tenant policy needed      | **Recommended** where data policy allows            |
 
-**LLM-A** — fast 7B/8B (AWQ/GPTQ) for **high-volume, low-difficulty** per-post
-refinement and short summaries. **LLM-B** — larger 14B/32B for **low-volume,
-high-quality** cluster summarization, corpus insight, and grounded report
-generation (RAG). At MVP scale the two can time-slice one GPU, or run LLM-A alone
-until volume justifies LLM-B.
+Rejected: a **single LLM** (either overpay running a big model per post, or
+under-deliver running a small model on reports) — so we keep **two roles** instead.
+**LLM-A** — fast 7B/8B for **high-volume, low-difficulty** per-post refinement and
+short summaries. **LLM-B** — larger 14B/32B for **low-volume, high-quality** cluster
+summarization, corpus insight, and grounded report generation (RAG). Each role maps
+to a `local` model (vLLM) or a `groq` model ID — same prompts, same JSON schema, so
+a backend switch needs no code or prompt changes. On `local` at MVP scale the two
+roles time-slice one GPU (or run LLM-A alone until volume justifies LLM-B); on
+`groq` they are just two model IDs with no infrastructure. **Privacy note:** pin
+sensitive tenants to `local` so a runtime switch can never send their data to Groq.
 
 ### 13.9 Deployment: Docker Compose vs Kubernetes
 
@@ -589,12 +639,15 @@ backed by Qdrant + the embeddings you already compute. Full reasoning in §14.5.
 
 ## 14. AI model selection, RAG & fine-tuning
 
-All choices favor open-source, GPU-efficient models with genuine Bangla support,
-and are **100% self-hosted — no external/paid LLM API anywhere**. **Small models do
-the bulk work; the LLM is selective.** The input is a post + its comment thread,
-heavily **Banglish** (romanized Bangla mixed with English, e.g. "Green garden e vat
-25 taka baire 10 taka"). Every choice is judged on **bn + en + code-mixed
-Banglish**.
+All small-model choices favor open-source, GPU-efficient models with genuine
+Bangla support and run **self-hosted**. The Stage-2 LLM runs behind a **pluggable
+backend with two interchangeable providers — `local` (self-hosted vLLM) and `groq`
+(Groq Cloud API) — switchable at runtime** (see §14.2); default is `local` (no
+per-token bill, no data egress), `groq` is an opt-in switch for fastest inference
+and zero GPU ops. **Small models do the bulk work; the LLM is selective.** The
+input is a post + its comment thread, heavily **Banglish** (romanized Bangla mixed
+with English, e.g. "Green garden e vat 25 taka baire 10 taka"). Every choice is
+judged on **bn + en + code-mixed Banglish**.
 
 ### 14.1 Model recommendations per task
 
@@ -608,8 +661,8 @@ Banglish**.
 | **Toxicity / hate / offensive**     | `XLM-R`/`mBERT` fine-tuned; Detoxify (en) + Bangla hate datasets          | ✅     | ✅      | Bangla hate-speech corpora exist (e.g. Bengali Hate Speech); fine-tune |
 | **NER (person/org/location/brand)** | `GLiNER` (multilingual, zero/few-shot), `spaCy` (en), BanglaBERT-NER (bn) | ✅     | ✅      | GLiNER gives flexible entity types without per-type models             |
 | **Embeddings**                      | `BAAI/bge-m3` (multilingual, incl. Bangla) or `intfloat/multilingual-e5`  | ✅     | ✅      | Powers dedup, comment clustering, semantic search, RAG                 |
-| **Summarization** (thread)          | **Local LLM-A** (small thread) / **LLM-B** (large/clustered) — see §14.2  | ✅     | ✅      | Selective; summary in the post's original language                     |
-| **Insight / report generation**     | **Local LLM-B** + RAG (see §14.5)                                         | ✅     | ✅      | Cluster summaries → corpus-level insight                               |
+| **Summarization** (thread)          | **LLM-A** (small thread) / **LLM-B** (large/clustered), any backend §14.2 | ✅     | ✅      | Selective; summary in the post's original language                     |
+| **Insight / report generation**     | **LLM-B** role + RAG, on the active backend (see §14.5)                   | ✅     | ✅      | Cluster summaries → corpus-level insight                               |
 | **Keyword extraction**              | KeyBERT (on embeddings) / YAKE                                            | ✅     | ✅      | Cheap, no extra GPU model                                              |
 
 **Bangla-specific resources:** BanglaBERT (csebuetnlp), XLM-RoBERTa / mBERT (handle
@@ -623,47 +676,82 @@ multiple lightweight task heads (sentiment, emotion, intent, topic), cutting GPU
 cost vs. a separate full model per task, and handles code-mixed Bangla-English in a
 single model.
 
-### 14.2 The selective LLMs — two local models, no API
+### 14.2 The selective LLMs — two roles, a pluggable backend (local ⇄ Groq)
 
-Both served on **vLLM**, on our own GPUs — no external/paid API, no per-token bill.
+The selective Stage-2 work is split across **two logical roles** — **LLM-A** (fast
+/ high-throughput) and **LLM-B** (large / high-quality). Each role is fulfilled by
+a **pluggable backend, switchable at runtime**:
 
-| Role                               | Model                                                                          | Serves                                                                             | Why                                                                                              |
-| ---------------------------------- | ------------------------------------------------------------------------------ | ---------------------------------------------------------------------------------- | ------------------------------------------------------------------------------------------------ |
-| **LLM-A — fast / high-throughput** | `Qwen2.5-7B-Instruct` (or `Llama-3.1-8B-Instruct`), AWQ/GPTQ quantized         | Per-post selective refinement, hardest classification, short single-post summaries | Strong multilingual incl. Bangla, fits one mid (24 GB) GPU, continuous batching → high post rate |
-| **LLM-B — large / high-quality**   | `Qwen2.5-32B-Instruct` (or `Qwen2.5-14B-Instruct` at smaller scale), quantized | Cluster summarization, corpus insight, grounded report generation (RAG)            | Higher reasoning/quality for the low-volume, quality-critical generation work                    |
+- **`local` (default)** — self-hosted models on **vLLM**, on our own GPUs. Post
+  content never leaves the cluster and there is no per-token bill; capacity grows
+  by adding GPUs. Best for privacy-sensitive data, steady high volume, and
+  predictable cost.
+- **`groq`** — the **Groq Cloud API** (OpenAI-compatible), serving the same open
+  model families (Llama 3.x, Qwen, etc.) on Groq's LPU hardware. Extremely fast
+  inference, **zero GPU/model-serving ops**, elastic burst — billed per token, and
+  prompt content leaves the cluster. Best for bursty load, no/low local GPU, or
+  when you want the lowest latency.
 
-Why two and not one: per-post refinement is high-volume/low-difficulty (favor a
-small fast model); cluster/report generation is low-volume/high-quality (favor a
-larger model). Splitting lets each run on right-sized GPUs and scale independently.
-At MVP scale they can time-slice one GPU, or LLM-B can be dropped and LLM-A used for
-both until volume justifies the second model. Both expose an **OpenAI-compatible
-HTTP API** (vLLM wire protocol — a local server, not a paid service) with structured
-JSON output mode. If LLM-B is saturated the router degrades to LLM-A or returns
-Stage-1-only results; capacity is added by scaling GPUs, never by calling a
-third-party API.
+Because both backends speak the **same OpenAI-compatible API**, the Stage-2 worker
+is backend-agnostic — only the base URL, API key, and model name differ. Switching
+is a config/flag change (env `LLM_BACKEND=local|groq`, or a per-request override —
+see §17), applied **at runtime without a redeploy**. You can even run **hybrid**:
+e.g. `local` LLM-A for per-post volume + `groq` for LLM-B report bursts, or fail
+over local→Groq under load.
+
+| Role                               | `local` backend (vLLM, our GPUs)                                               | `groq` backend (Groq Cloud API)                      | Serves                                                                             |
+| ---------------------------------- | ------------------------------------------------------------------------------ | ---------------------------------------------------- | ---------------------------------------------------------------------------------- |
+| **LLM-A — fast / high-throughput** | `Qwen2.5-7B-Instruct` (or `Llama-3.1-8B-Instruct`), AWQ/GPTQ quantized         | a fast Groq model (e.g. `llama-3.1-8b-instant`)      | Per-post selective refinement, hardest classification, short single-post summaries |
+| **LLM-B — large / high-quality**   | `Qwen2.5-32B-Instruct` (or `Qwen2.5-14B-Instruct` at smaller scale), quantized | a larger Groq model (e.g. `llama-3.3-70b-versatile`) | Cluster summarization, corpus insight, grounded report generation (RAG)            |
+
+Groq model IDs change as their catalog evolves — treat the examples above as
+placeholders and pin the current IDs in config. The prompts and JSON output schema
+are identical across backends, so a switch needs no prompt changes.
+
+Why two roles and not one: per-post refinement is **high-volume, low-difficulty**
+(favor a small fast model); cluster/report generation is **low-volume,
+high-quality** (favor a larger model). Splitting lets each be right-sized and
+scaled independently. On the `local` backend at MVP scale the two can time-slice
+one GPU, or LLM-B can be dropped and LLM-A used for both until volume justifies the
+second model; on the `groq` backend the two roles are just two model IDs with no
+extra infrastructure. Both backends use **structured JSON output mode** to minimize
+tokens. If a backend is saturated or unhealthy the router degrades LLM-B→LLM-A,
+**fails over to the other backend** (when both are configured), or returns
+Stage-1-only results (see §10). Privacy-locked tenants can be pinned to `local` so
+a switch never routes their data to Groq.
 
 ### 14.3 Model serving architecture
 
 ```text
-   NLP fleet (Stage 1)                         LLMs (Stage 2) — both local
- ┌───────────────────────┐                 ┌────────────────────────────┐
- │ Triton / ONNX Runtime │                 │ vLLM: LLM-A (7B/8B, fast)  │
- │  + CTranslate2        │                 │ vLLM: LLM-B (14B/32B, qual)│
- │  dynamic batching     │                 │  continuous batching,      │
- │  many small models    │                 │  quantized, paged-attn KV  │
- └──────────┬────────────┘                 └───────────┬────────────────┘
-            │ gRPC/HTTP                                 │ HTTP (OpenAI-compat, local)
-   Stage-1 worker pulls batch                  Stage-2 worker pulls from LLM
-   from queue, calls Triton                    sub-queue, calls LLM-A or LLM-B
+   NLP fleet (Stage 1)                  LLM roles (Stage 2) — pluggable backend
+ ┌───────────────────────┐          ┌──────────────────────────────────────────┐
+ │ Triton / ONNX Runtime │          │  Stage-2 worker (OpenAI-compatible client) │
+ │  + CTranslate2        │          │      picks role LLM-A / LLM-B by task      │
+ │  dynamic batching     │          └───────────────┬────────────────┬───────────┘
+ │  many small models    │            LLM_BACKEND=local│        =groq │
+ └──────────┬────────────┘          ┌─────────────────▼──┐   ┌───────▼──────────┐
+            │ gRPC/HTTP             │ vLLM (our GPUs):    │   │ Groq Cloud API   │
+   Stage-1 worker pulls batch       │  LLM-A 7B/8B fast   │   │ OpenAI-compatible│
+   from queue, calls Triton         │  LLM-B 14B/32B qual │   │ Llama/Qwen on LPU│
+                                     │  quantized, paged KV│   │ per-token, no GPU│
+                                     └─────────────────────┘   └──────────────────┘
 ```
 
 - **NLP models** → **Triton Inference Server** (or ONNX Runtime / CTranslate2) with
-  dynamic batching and INT8/FP16 quantization; multiple models share GPUs.
-- **LLMs** → **two vLLM deployments** (paged attention + continuous batching), each
-  exposing a local OpenAI-compatible API; quantized weights (AWQ/GPTQ). The Stage-2
-  worker picks A or B by task. No external API endpoint is configured.
-- **Versioning:** every result records `model_versions` so re-runs after a model
-  upgrade are auditable and reproducible (replay from Kafka).
+  dynamic batching and INT8/FP16 quantization; multiple models share GPUs. (NLP is
+  always self-hosted — only the Stage-2 LLM has a Groq option.)
+- **LLM (Stage 2)** → one **OpenAI-compatible Stage-2 worker** that targets the
+  configured backend:
+  - `local`: **two vLLM deployments** (paged attention + continuous batching),
+    LLM-A (fast) and LLM-B (large), quantized (AWQ/GPTQ) to fit GPU and raise
+    throughput.
+  - `groq`: the **Groq Cloud endpoint**, with role→model-ID mapping in config; no
+    GPU, no model loading, just outbound HTTPS.
+  The worker picks the **role** (A or B) by task; the **backend** is selected by
+  config/flag and switchable at runtime.
+- **Versioning:** every result records `processing.llm_backend` + `llm_model` +
+  `model_versions` so re-runs (and a backend switch) are auditable and reproducible
+  (replay from Kafka).
 
 ### 14.4 Fine-tuning strategy (Bangla + English)
 
@@ -672,8 +760,12 @@ third-party API.
 2. **Collect & label.** Use the platform's own low-confidence/router-flagged posts
    as an active-learning pool. Build a held-out eval set per task and per language.
 3. **Parameter-efficient fine-tuning (LoRA/QLoRA).** Fine-tune the shared XLM-R
-   encoder + task heads, and optionally LLM-A (the 7B/8B local model). Cheap, fast,
-   versionable. Fine-tuned weights stay in-house.
+   encoder + task heads, and optionally LLM-A (the 7B/8B model) on the **`local`
+   backend**. Cheap, fast, versionable; fine-tuned weights stay in-house. This is a
+   **local-backend advantage**: the `groq` backend runs Groq's hosted models, which
+   we can steer only via prompting/few-shot, not custom fine-tunes — so tasks that
+   need fine-tuned LLM behavior should stay on `local` (the NLP fleet is fine-tuned
+   regardless of which LLM backend is active).
 4. **Code-mixed focus.** Explicitly include Banglish (Bangla in Latin script, mixed
    sentences) in training data — where off-the-shelf models fail most.
 5. **Distillation (later).** Distill LLM judgments on the hardest tasks into the
@@ -693,7 +785,10 @@ cluster summarization with citations. **Benefits:** grounded, citation-able answ
 without stuffing the whole corpus into context; reuses embeddings you already
 compute. **Drawbacks:** retrieval-quality dependent; mitigate with good chunking,
 metadata filters, showing source posts. **Stack:** Qdrant + bge-m3/multilingual-e5
-embeddings + the local LLM-B for generation — fully local end to end.
+embeddings + the **LLM-B role** for generation on whichever Stage-2 backend is
+active — `local` for fully in-cluster RAG, or `groq` for faster report generation
+when the retrieved context may leave the cluster. Retrieval and embeddings stay
+local in both cases; only the final generation call follows the chosen backend.
 
 ---
 
@@ -708,28 +803,44 @@ hundreds of short texts — Stage-1 throughput is better measured in **texts
 - **Stage-1 NLP** (shared XLM-R encoder + heads + embedding), batched on GPU: order
   of **hundreds–low-thousands of texts/sec** on a single modern GPU. A thread with
   50 comments = ~51 texts.
-- **Stage-2 LLMs** (two local models on vLLM, continuous batching): order of
-  **thousands of output tokens/sec** aggregate; but they only see the **selective
-  slice** (single-digit % of posts) and mostly **cluster-level** calls.
+- **Stage-2 LLMs** (two roles — **LLM-A** 7B/8B for per-post refinement, **LLM-B**
+  14B/32B for cluster/report generation): order of **thousands of output tokens/sec**
+  aggregate; but they only see the **selective slice** (single-digit % of posts) and
+  mostly **cluster-level** calls. This throughput is delivered by the configured
+  backend: `local` (vLLM continuous batching on our GPUs — sized below) or `groq`
+  (Groq LPU — throughput is Groq's to scale, bounded by your rate-limit/quota rather
+  than your GPUs).
 
 The NLP fleet dominates raw text throughput; the LLM dominates _quality_ work on a
-small slice. Size them independently.
+small slice. Size them independently — and note the `groq` backend removes LLM GPU
+sizing from the equation entirely (you size only the NLP fleet).
 
 ### 15.2 GPU requirements by stage
 
-- **MVP — 1,000 posts/batch:** 1 × consumer GPU (RTX 4090/3090, 24 GB) runs the
-  whole show: NLP suite (quantized) + local LLMs via vLLM, time-sliced. Run just
-  **LLM-A** (quantized 7B) for all Stage-2 work; add **LLM-B** when cluster/report
-  quality demands it. CPU-only possible for the smallest NLP models. Docker Compose.
+**Backend choice changes the GPU need.** On the **`local`** backend you size a GPU
+for the Stage-2 LLM (below). On the **`groq`** backend the LLM runs on Groq — **no
+LLM GPU at all** — so the Stage-2 worker pool is CPU-only and you size only the NLP
+fleet (mind Groq rate-limits/quotas as the throughput ceiling instead of GPU count).
+
+- **MVP — 1,000 posts/batch:** on `local`, 1 × consumer GPU (RTX 4090/3090, 24 GB)
+  runs the whole show: NLP suite (quantized) + local LLMs via vLLM, time-sliced —
+  run just **LLM-A** (quantized 7B) for all Stage-2 work; add **LLM-B** when
+  cluster/report quality demands it. On `groq`, the MVP can run NLP on a small GPU
+  or even CPU-only and call Groq for summaries (cheapest way to stand up an MVP
+  without owning a GPU). Docker Compose.
 - **Production — 10,000 posts/batch:** NLP fleet 1–2 GPUs (24 GB consumer or L4/A10)
-  with Triton dynamic batching, autoscaled by queue depth. **LLM-A** (quantized 7B)
-  on an L4/A10 + **LLM-B** (quantized 14B/32B) on a data-center GPU (**L40S / A100
-  40GB**); at lower volume LLM-A can share the NLP GPU. Small K8s cluster, 2–4 GPUs,
-  KEDA.
+  with Triton dynamic batching, autoscaled by queue depth. **LLMs (`local`):**
+  **LLM-A** (quantized 7B) on an L4/A10 + **LLM-B** (quantized 14B/32B) on a
+  data-center GPU (**L40S / A100 40GB**); at lower volume LLM-A can share the NLP
+  GPU. **LLMs (`groq`):** none of the above — the Stage-2 worker pool is CPU-only.
+  Small K8s cluster, 2–4 GPUs on `local` (just the NLP GPUs on `groq`), KEDA.
 - **Enterprise — 100,000 posts/batch:** NLP fleet several data-center GPUs (A10 /
-  L4 / L40S), autoscaled. **LLMs:** multiple **A100/H100** (or several L40S) behind
-  vLLM serving both local models, multi-replica with tensor parallelism for LLM-B;
-  scale out by adding GPU replicas (never an external API). Multi-node K8s, GPU node
+  L4 / L40S), autoscaled. **LLMs (`local`):** multiple **A100/H100** (or several
+  L40S) behind vLLM serving both models, multi-replica with tensor parallelism for
+  LLM-B; scale out by adding GPU replicas. **LLMs (`groq`):** no LLM GPU pool —
+  scale the stateless Stage-2 workers and negotiate a Groq quota that covers peak. A
+  **hybrid** is common at this scale: own GPUs for the steady base, burst overflow
+  to Groq during spikes instead of over-provisioning GPUs. Multi-node K8s, GPU node
   pools per stage, aggressive caching + clustering.
 
 | Class                              | Examples                                                  | Best for                                 | Tradeoff                                                          |
@@ -761,8 +872,12 @@ interruptions (re-queue from Kafka).
 ```
 
 - **Prometheus** — queue depth/lag, posts/sec per stage, GPU utilization (DCGM
-  exporter), LLM-routing rate, cache hit rate, error rate, p50/p95/p99 latency, DLQ
-  size.
+  exporter, `local` backend), LLM-routing rate, cache hit rate, error rate,
+  p50/p95/p99 latency, DLQ size. **Per-backend LLM metrics:** calls and latency
+  split by `backend` (local/groq); on `groq` also **tokens in/out + estimated cost**,
+  HTTP 429 rate-limit hits, and Groq API error rate; on `local` also vLLM
+  queue/KV-cache utilization. A **backend label** on every LLM metric makes a
+  runtime switch visible on the dashboards.
 - **Grafana** — dashboards (throughput, cost-per-batch, LLM slice %) + alerting
   (Alertmanager): queue lag, DLQ growth, GPU saturation, error-rate spikes.
 - **Loki** — centralized structured logs, correlated to traces by trace_id.
@@ -772,17 +887,19 @@ interruptions (re-queue from Kafka).
   (LLM) → assembler → store.
 
 **Key product metrics:** % of posts that hit the LLM, cache hit rates
-(dedup/embedding/LLM), cost per 1k posts, per-language accuracy drift.
+(dedup/embedding/LLM), cost per 1k posts (GPU-amortized on `local`, token-billed on
+`groq`), the active **LLM backend mix** (local vs groq share), and per-language
+accuracy drift.
 
 ### 15.4 Caching strategy
 
-| Cache                          | Key                           | Purpose                                   | TTL                  |
-| ------------------------------ | ----------------------------- | ----------------------------------------- | -------------------- |
-| **Dedup set** (Redis)          | `content_hash`                | Skip re-analysis of exact dupes/reshares  | long / per-retention |
-| **Embedding cache** (Redis)    | `content_hash`                | Avoid recomputing vectors                 | long                 |
-| **LLM response cache** (Redis) | `(model, task, content_hash)` | Free repeats of LLM calls                 | medium–long          |
-| **Query cache** (Redis)        | normalized query              | Fast dashboard aggregations               | short (secs–mins)    |
-| **CDN**                        | URL                           | Flutter web assets, static report exports | long, versioned      |
+| Cache                          | Key                                    | Purpose                                   | TTL                  |
+| ------------------------------ | -------------------------------------- | ----------------------------------------- | -------------------- |
+| **Dedup set** (Redis)          | `content_hash`                         | Skip re-analysis of exact dupes/reshares  | long / per-retention |
+| **Embedding cache** (Redis)    | `content_hash`                         | Avoid recomputing vectors                 | long                 |
+| **LLM response cache** (Redis) | `(backend, model, task, content_hash)` | Free repeats of LLM calls                 | medium–long          |
+| **Query cache** (Redis)        | normalized query                       | Fast dashboard aggregations               | short (secs–mins)    |
+| **CDN**                        | URL                                    | Flutter web assets, static report exports | long, versioned      |
 
 On real social feeds these caches remove a large fraction of total work — a primary
 cost lever, not an afterthought.
@@ -810,23 +927,32 @@ cost lever, not an afterthought.
 
 > **Planning-grade order-of-magnitude estimates, not quotes.** Cloud GPU prices
 > change frequently and vary by region, commitment, and provider. Treat the
-> _ratios and the dominant cost drivers_ as the durable insight. **There is no LLM
-> API line at all** — both LLMs are self-hosted, so cost is GPU + storage +
-> networking only, with no per-token charges. The headline number is **cost per
-> 1,000 threads analyzed**, which the hybrid pipeline drives down by keeping the LLM
-> to one cluster-level summary per thread.
+> _ratios and the dominant cost drivers_ as the durable insight. **The LLM cost
+> shape depends on the selected backend** (see §14.2): on the **`local`** backend
+> there is no API line — cost is GPU + storage + networking, no per-token charge;
+> on the **`groq`** backend the LLM becomes a **per-token API line** but the LLM
+> GPU line disappears. Either way the hybrid design's whole point is to keep the
+> LLM slice small — that caps both the GPU bill and the token bill. The headline
+> number is **cost per 1,000 threads analyzed**, which the hybrid pipeline drives
+> down by keeping the LLM to one cluster-level summary per thread.
 
 ### 16.1 What drives cost
 
-| Driver      | Without hybrid (LLM-per-post)                 | With hybrid (this design)                                             |
-| ----------- | --------------------------------------------- | --------------------------------------------------------------------- |
-| LLM tokens  | **Dominant, runaway** — every post = LLM call | Small — only the selective slice + cluster-level calls                |
-| GPU compute | Moderate                                      | **Now the main line**, but cheap & predictable (batched small models) |
-| Storage     | Small                                         | Small                                                                 |
-| Networking  | Small–moderate                                | Small–moderate                                                        |
+| Driver          | Without hybrid (LLM-per-post)                 | With hybrid (this design)                                           |
+| --------------- | --------------------------------------------- | ------------------------------------------------------------------- |
+| LLM tokens      | **Dominant, runaway** — every post = LLM call | Small — only the selective slice + cluster-level calls              |
+| LLM GPU (local) | Moderate                                      | Fixed GPU line (only on the `local` backend)                        |
+| LLM API (groq)  | **Dominant, runaway**                         | Small per-token line (only on the `groq` backend)                   |
+| NLP GPU compute | Moderate                                      | **The main fixed line**, cheap & predictable (batched small models) |
+| Storage         | Small                                         | Small                                                               |
+| Networking      | Small–moderate                                | Small–moderate (+ egress to Groq on the `groq` backend)             |
 
-The hybrid architecture + self-hosting both LLMs converts an unbounded per-token
-bill into a **bounded, mostly-fixed GPU bill**.
+The hybrid architecture keeps the LLM slice tiny, which caps cost under either
+backend: on `local` it converts an unbounded per-token bill into a **bounded,
+mostly-fixed GPU bill**; on `groq` it keeps the **per-token bill small and
+proportional to the few calls that actually reach the LLM**, with no LLM GPU to
+own. The operator can switch backends as volume, GPU availability, and data policy
+change.
 
 ### 16.2 MVP — ~1,000 posts/batch
 
@@ -837,23 +963,32 @@ Single host, one 24 GB consumer GPU, Docker Compose. Self-hosted everything.
 | Compute (1 GPU host, on-prem amortized **or** 1 cloud GPU part-time) | $150 – $700         | On-prem 4090 amortized at low end; cloud L4/A10 on-demand part-time at high end |
 | Storage (Postgres + ClickHouse + Qdrant + object, modest)            | $10 – $40           | Tens of GB                                                                      |
 | Networking                                                           | $5 – $30            | Mostly egress for dashboard/API                                                 |
-| LLM (both local models, time-sliced on the same GPU)                 | ~$0 incremental     | LLM-A + LLM-B share the GPU; selective + cached                                 |
+| LLM — **`local`** (both roles time-sliced on the same GPU)           | ~$0 incremental     | LLM-A + LLM-B share the GPU; selective + cached                                 |
+| LLM — **`groq`** alternative (per-token, ~1k batches)                | ~$5 – $50           | Replaces the LLM GPU; only the selective slice is billed; tiny at MVP volume    |
 | Monitoring (self-hosted Prometheus/Grafana/Loki)                     | ~$0 – $20           | Runs on the same box                                                            |
 | **Total**                                                            | **~$170 – $800/mo** | Dominated by the single GPU                                                     |
+
+Two ways to run Stage-2 at MVP scale: **`local`** (default) time-slices the one GPU
+across both roles (no API line; capacity grows by adding GPUs), or **`groq`** drops
+the LLM off the GPU and calls Groq per token — at ~1k batches the selective slice
+is tiny, so the token bill is a few dollars and you may not need a GPU at all if NLP
+runs CPU-only (trade: prompt data leaves the box). Switchable at runtime, so you can
+start on Groq and move to `local` as volume grows, or vice-versa.
 
 ### 16.3 Production — ~10,000 posts/batch
 
 Small K8s cluster, 2–4 GPUs, KEDA autoscaling, spot for batch surges.
 
-| Line                                                       | Estimate (USD/mo)       | Notes                           |
-| ---------------------------------------------------------- | ----------------------- | ------------------------------- |
-| Compute — NLP fleet (1–2 GPUs, autoscaled, partly spot)    | $400 – $1,500           | Scales with daily volume        |
-| Compute — LLM GPUs (LLM-A on L4/A10 + LLM-B on L40S/A100)  | $900 – $3,200           | Both local; reserved/spot lower |
-| Compute — CPU services (API, ingestion, assembler, DBs)    | $200 – $600             | Several small nodes             |
-| Storage (Postgres + ClickHouse + Qdrant + object, growing) | $50 – $250              | Hundreds of GB → TB             |
-| Networking / egress                                        | $50 – $300              | Dashboard, exports, inter-AZ    |
-| Monitoring                                                 | $30 – $150              | Self-hosted or small managed    |
-| **Total**                                                  | **~$1,600 – $6,000/mo** | LLM + NLP GPUs dominate; no API |
+| Line                                                                | Estimate (USD/mo)       | Notes                                                      |
+| ------------------------------------------------------------------- | ----------------------- | ---------------------------------------------------------- |
+| Compute — NLP fleet (1–2 GPUs, autoscaled, partly spot)             | $400 – $1,500           | Scales with daily volume                                   |
+| Compute — Stage-2 LLM, **`local`** (LLM-A L4/A10 + LLM-B L40S/A100) | $900 – $3,200           | GPU line; reserved/spot lower                              |
+| — **or** Stage-2 LLM, **`groq`** (per-token, ~10k batches)          | $150 – $1,500           | Replaces the LLM GPU line; scales with the selective slice |
+| Compute — CPU services (API, ingestion, assembler, DBs)             | $200 – $600             | Several small nodes                                        |
+| Storage (Postgres + ClickHouse + Qdrant + object, growing)          | $50 – $250              | Hundreds of GB → TB                                        |
+| Networking / egress                                                 | $50 – $300              | Dashboard, exports, inter-AZ (+Groq egress on `groq`)      |
+| Monitoring                                                          | $30 – $150              | Self-hosted or small managed                               |
+| **Total**                                                           | **~$1,600 – $6,000/mo** | LLM + NLP GPUs dominate on `local`                         |
 
 ### 16.4 Enterprise — ~100,000 posts/batch
 
@@ -862,12 +997,20 @@ Multi-node K8s, GPU node pools per stage, several A100/H100 or many L40S.
 | Line                                                                   | Estimate (USD/mo)         | Notes                                                   |
 | ---------------------------------------------------------------------- | ------------------------- | ------------------------------------------------------- |
 | Compute — NLP fleet (several data-center GPUs, autoscaled, spot-heavy) | $3,000 – $12,000          | Horizontal scale; spot saves 50–70%                     |
-| Compute — LLM-A + LLM-B (multiple A100/H100 or many L40S, vLLM)        | $5,000 – $25,000          | Biggest line; both local; reserved/spot critical        |
+| Compute — Stage-2 LLM `local` (A100/H100 or many L40S, vLLM)           | $5,000 – $25,000          | Biggest line on `local`; reserved/spot critical         |
+| — **or** Stage-2 LLM `groq` (per-token, ~100k batches)                 | $1,500 – $15,000          | No LLM GPUs; cost tracks the selective slice + caching  |
 | Compute — CPU services + DB nodes                                      | $1,000 – $4,000           | HA Postgres, ClickHouse cluster, Qdrant shards          |
 | Storage (TBs across stores + object + backups)                         | $300 – $2,000             | Grows with retention                                    |
 | Networking / egress                                                    | $300 – $2,000             | Significant at this scale                               |
 | Monitoring / observability                                             | $150 – $600               |                                                         |
 | **Total**                                                              | **~$10,000 – $48,000/mo** | LLM GPUs dominate; caching/clustering decide the spread |
+
+At this scale the **single biggest lever is keeping the LLM slice small** — every
+percentage point that doesn't need the LLM, and every cache hit, directly cuts the
+largest line under **either** backend (it shrinks both the GPU line on `local` and
+the token line on `groq`). A common enterprise pattern is **hybrid**: own LLM GPUs
+for the steady base (`local`) and burst overflow to `groq` during spikes instead of
+over-provisioning GPUs.
 
 ### 16.5 Levers ranked by impact
 
@@ -877,9 +1020,12 @@ Multi-node K8s, GPU node pools per stage, several A100/H100 or many L40S.
 4. **Quantization + batching** — maximize GPU utilization (vLLM/Triton).
 5. **Spot/reserved GPUs** — batch tolerates preemption (Kafka replay); reserve the
    steady base.
-6. **Both LLMs local, no API** — zero per-token pricing and no data egress; scale by
-   adding GPUs. Right-size: cheap LLM-A for per-post, larger LLM-B only for
-   low-volume cluster/report work.
+6. **Right-size the backend.** `local` (vLLM) — zero per-token pricing, no data
+   egress, scale by adding GPUs; best for steady volume. `groq` — no LLM GPUs to own
+   or reserve, pay only for the selective slice; best for bursty/low volume or
+   no-GPU MVPs. Either way, right-size the roles: cheap LLM-A for per-post, larger
+   LLM-B only for low-volume cluster/report work. The backend is switchable at
+   runtime, so re-evaluate it as volume and GPU prices change.
 
 ---
 
@@ -929,13 +1075,26 @@ nested; the service flattens it but preserves `parent_id`.
       "meta": { "page_id": "p_99", "lang_hint": "bn" }
     }
   ],
-  "options": { "tasks": ["all"], "want_summary": true, "summary_lang": "auto" }
+  "options": {
+    "tasks": ["all"],
+    "want_summary": true,
+    "summary_lang": "auto",
+    "llm_backend": "auto"
+  }
 }
 ```
 
 `comments` is optional (a bare post is valid). `summary_lang: "auto"` keeps the
 summary in the post's detected language; pass `"bn"`/`"en"` to force it. Banglish
 comments are handled natively.
+
+`llm_backend` selects the Stage-2 LLM provider for this request: `"local"`
+(self-hosted vLLM), `"groq"` (Groq Cloud API), or `"auto"` (default — use the
+server's configured backend and failover policy). A per-request override lets
+callers pin sensitive data to `"local"` or send burst traffic to `"groq"` without
+changing server config. **Tenant policy wins:** a tenant pinned to `local` for
+data-residency cannot be overridden to `groq` by a request (the override is
+rejected with `forbidden`). See §14.2.
 
 **Request (large file):**
 
@@ -977,13 +1136,17 @@ reprocessing after a model upgrade.
     "tasks": ["sentiment", "emotion", "topics", "ner", "toxicity"],
     "want_summary": true,
     "want_cluster_summary": true,
-    "model_profile": "default"
+    "model_profile": "default",
+    "llm_backend": "auto"
   }
 }
 ```
 
 `selector` may instead be `{ "post_ids": [...] }` or
 `{ "filter": { "platform": "instagram", "from": "...", "to": "..." } }`.
+`llm_backend` (`auto` | `local` | `groq`) overrides the Stage-2 provider for this
+run — handy to reprocess a batch on a different backend (e.g. compare local vs Groq
+output, or rerun on `groq` while LLM GPUs are down), subject to tenant policy.
 
 **Response — `202 Accepted`:**
 
@@ -1073,7 +1236,9 @@ transparency feature tied to the hybrid design.
         "unit": "post+thread",
         "stage1_ms": 58,
         "llm_used": true,
-        "llm_model": "LLM-A"
+        "llm_role": "LLM-A",
+        "llm_backend": "local",
+        "llm_model": "Qwen2.5-7B-Instruct"
       },
       "created_at": "2026-06-01T10:00:00Z"
     }
@@ -1146,13 +1311,13 @@ cluster insights). Reports are LLM-generated at the _cluster/corpus_ level.
 
 ### 17.5 Supporting endpoints
 
-| Endpoint                           | Purpose                                                           |
-| ---------------------------------- | ----------------------------------------------------------------- |
-| `POST /v1/auth/token`              | Exchange credentials/API key for a JWT                            |
-| `GET /v1/health` / `GET /v1/ready` | Liveness / readiness probes                                       |
-| `GET /v1/usage`                    | Per-tenant usage + cost metering (posts, LLM calls)               |
-| `GET /v1/search?q=&semantic=true`  | Semantic/keyword search over analyzed posts (Qdrant + ClickHouse) |
-| `DELETE /v1/posts/{id}`            | Data deletion (retention / GDPR-style)                            |
+| Endpoint                           | Purpose                                                                                |
+| ---------------------------------- | -------------------------------------------------------------------------------------- |
+| `POST /v1/auth/token`              | Exchange credentials/API key for a JWT                                                 |
+| `GET /v1/health` / `GET /v1/ready` | Liveness / readiness probes                                                            |
+| `GET /v1/usage`                    | Per-tenant usage + cost metering (posts, LLM calls, by backend incl. Groq tokens/cost) |
+| `GET /v1/search?q=&semantic=true`  | Semantic/keyword search over analyzed posts (Qdrant + ClickHouse)                      |
+| `DELETE /v1/posts/{id}`            | Data deletion (retention / GDPR-style)                                                 |
 
 ### 17.6 Error envelope
 
@@ -1167,8 +1332,12 @@ cluster insights). Reports are LLM-generated at the _cluster/corpus_ level.
 }
 ```
 
-Standard codes: `unauthorized`, `forbidden`, `validation_error`, `rate_limited`
-(with `Retry-After`), `not_found`, `conflict` (idempotency), `internal`.
+Standard codes: `unauthorized`, `forbidden` (incl. an `llm_backend` override that
+violates tenant data-residency policy), `validation_error`, `rate_limited` (with
+`Retry-After` — also surfaced when the `groq` backend returns HTTP 429),
+`not_found`, `conflict` (idempotency), `internal`. The service handles a saturated
+or failed backend internally (failover/degrade per §10) rather than surfacing a raw
+upstream error where possible.
 
 ---
 
@@ -1288,7 +1457,9 @@ thread of mostly Banglish comments agreeing and calling for a boycott.
     "unit": "post+thread",
     "stage1_ms": 61,
     "llm_used": true,
-    "llm_model": "LLM-A"
+    "llm_role": "LLM-A",
+    "llm_backend": "local",
+    "llm_model": "Qwen2.5-7B-Instruct"
   },
   "created_at": "2026-06-01T09:00:00Z"
 }
@@ -1437,7 +1608,9 @@ replies. Summary requested in English.
     "unit": "post+thread",
     "stage1_ms": 240,
     "llm_used": true,
-    "llm_model": "LLM-B"
+    "llm_role": "LLM-B",
+    "llm_backend": "groq",
+    "llm_model": "llama-3.3-70b-versatile"
   },
   "created_at": "2026-05-28T08:00:00Z"
 }
@@ -1446,9 +1619,12 @@ replies. Summary requested in English.
 **What did the work:** with 2,000 comments, the router does **not** send every
 comment to the LLM. Stage-1 NLP classifies each comment's language, sentiment, and
 intent cheaply; comments are **clustered by embedding**, and only cluster
-representatives + the post go to **LLM-B** for the English `post_summary` and
-`themes`. This keeps a 2,000-comment thread to a single cluster-level LLM call
-instead of thousands.
+representatives + the post go to the **LLM-B** role for the English `post_summary`
+and `themes`. This keeps a 2,000-comment thread to a single cluster-level LLM call
+instead of thousands. Note `processing.llm_backend` here is **`groq`**: this thread
+was summarized via the Groq Cloud API (Example 1 used the `local` vLLM backend) —
+the same prompts and output schema, just a different Stage-2 backend, chosen at
+runtime. The `llm_backend` field records which one served each result.
 
 ### 18.3 How these map to the owner's request
 
@@ -1492,7 +1668,8 @@ services:
   gateway        (NGINX)            → TLS, routing, rate limit
   api            (FastAPI)          → auth + ingestion + reporting (combined for MVP)
   worker-nlp     (Python)           → Stage-1 small-model suite (GPU)
-  worker-llm     (Python + vLLM)    → Stage-2 local LLMs A+B (share GPU, no API)
+  worker-llm     (Python)           → Stage-2 worker; LLM_BACKEND=local|groq
+  vllm           (vLLM, optional)   → local backend only: LLM-A (+LLM-B) on GPU
   redis          (cache/queue)      → Redis Streams = bus + cache + dedup
   postgres       (ops + jobs)
   clickhouse     (analytics)
@@ -1503,8 +1680,12 @@ services:
 
 - Queue = **Redis Streams** (no separate Kafka yet).
 - API services can be one process for the MVP; split later.
-- GPU shared between NLP and the local LLM(s) via time-slicing (run LLM-A only at
-  MVP scale; both LLM-A and LLM-B are self-hosted — no external API).
+- **Stage-2 backend is a config switch** on `worker-llm`:
+  - `LLM_BACKEND=local` → it talks to the `vllm` service; GPU is shared between NLP
+    and the local LLM(s) via time-slicing (run LLM-A only at MVP scale).
+  - `LLM_BACKEND=groq` → drop the `vllm` service entirely and set `GROQ_API_KEY` +
+    role→model IDs; the worker calls Groq over HTTPS and needs **no GPU**. Flip the
+    env var to switch at any time (no image rebuild).
 - Goal: prove the hybrid pipeline end-to-end on 1k post+comment-thread batches.
 
 ### 19.3 Production architecture (Kubernetes)
@@ -1534,9 +1715,11 @@ services:
    │ KEDA-scaled  │      │ KEDA-scaled   │
    └──────┬───────┘      └─────┬─────────┘
           │ Triton svc          │ vLLM svc
-   ┌──────▼───────┐      ┌──────▼────────┐
-   │ triton (GPU) │      │ vllm A + B    │   model servers (2 local LLMs, no API)
-   └──────────────┘      └───────────────┘
+   ┌──────▼───────┐      ┌──────▼────────────────────┐
+   │ triton (GPU) │      │ Stage-2 backend:          │   LLM_BACKEND switch:
+   └──────────────┘      │  vllm A+B (GPU)  ⇄  Groq  │   local (in-cluster GPU)
+                         │                    (API)  │   or groq (egress HTTPS)
+                         └───────────────────────────┘
           │ writes (assembler Deployment) │
    ┌──────▼───────┬──────────┬────────────▼──────┬───────────┐
    │ postgres     │clickhouse│ qdrant            │ minio/S3  │  StatefulSets / managed
@@ -1558,9 +1741,15 @@ services:
 - **Workers** (nlp, llm) → `Deployment` on **GPU node pools** (nodeSelector +
   tolerations + `nvidia.com/gpu` resource requests), scaled by **KEDA** on Kafka
   consumer lag.
-- **Model servers** (Triton + two vLLM deployments, LLM-A and LLM-B) →
-  `Deployment`/`StatefulSet` on GPU pool, `Service` each for in-cluster gRPC/HTTP.
-  Both LLMs are local; no egress to an external API.
+- **Model servers** → Triton (NLP) always on the GPU pool. The **Stage-2 LLM
+  backend is selected per environment** via `LLM_BACKEND`:
+  - `local`: two vLLM `Deployment`s (LLM-A, LLM-B) on the GPU pool, a `Service` each
+    for in-cluster HTTP; no egress.
+  - `groq`: no vLLM deployments — the Stage-2 worker (a stateless `Deployment`,
+    HPA/KEDA on queue depth, **no GPU**) calls Groq over HTTPS. Allow egress to Groq
+    in `NetworkPolicy`/egress rules and mount `GROQ_API_KEY` from a Secret.
+  Both are valid simultaneously for **hybrid/failover**; the worker picks per
+  request/policy. Switching backends is a config rollout, not a rebuild.
 - **Stateful infra** (Kafka, PostgreSQL, ClickHouse, Qdrant) → operators or
   `StatefulSet` + `PersistentVolumeClaim`; or managed equivalents.
 - **Object storage** → MinIO operator or cloud S3.
@@ -1576,9 +1765,13 @@ services:
 
 **Networking & security:** Ingress controller (NGINX) terminates TLS; cert-manager
 for certs. NetworkPolicies (only ingress reaches services; only services reach
-data; model servers reachable only by workers). Optional **Linkerd** mesh for mTLS +
-retries + canary. Secrets via Kubernetes Secrets + Vault/External Secrets. Private
-node pools for `data` and `models`; only ingress is internet-facing.
+data; model servers reachable only by workers). On the `groq` backend, allow
+**egress from the Stage-2 worker to the Groq API only** (default-deny egress
+elsewhere); on `local` the workers need no internet egress at all. Optional
+**Linkerd** mesh for mTLS + retries + canary. Secrets via Kubernetes Secrets +
+Vault/External Secrets — including the **`GROQ_API_KEY`**, mounted only into the
+Stage-2 worker when the `groq` backend is enabled. Private node pools for `data`
+and `models`; only ingress is internet-facing.
 
 **Reliability:** Multi-AZ node pools; PodDisruptionBudgets; replicas ≥ 2 for
 stateless. DLQ topic in Kafka; alert on DLQ growth. Rolling updates with readiness
@@ -1603,7 +1796,11 @@ Phased build from MVP (1k) → Production (10k) → Enterprise (100k).
   These two contracts are the heart of the microservice; lock them early.
 - Stand up local Docker Compose skeleton: Postgres, Redis, Qdrant, ClickHouse,
   MinIO, a stub API, Prometheus/Grafana.
-- Pick and pin model versions (§14); download weights to object storage.
+- Pick and pin model versions (§14); download local weights to object storage.
+  Define the **Stage-2 LLM backend interface** (OpenAI-compatible) and wire both
+  providers behind it — `local` (vLLM) and `groq` — selected by `LLM_BACKEND`
+  config with a per-request override and per-tenant policy. Pin the Groq
+  role→model IDs and store `GROQ_API_KEY` as a secret.
 - Build a small **labeled eval set** per task and per language (bn / en / Banglish).
 
 **Exit criterion:** a single post flows API → Redis Stream → stub worker → Postgres
@@ -1623,9 +1820,12 @@ Goal: prove the hybrid pipeline and output quality end-to-end, cheaply.
   embedding (bge-m3) → keywords. Aggregate per-comment sentiment into the thread
   `sentiment_breakdown`. Micro-batched. Emit confidence per field.
 - **Router/Triage:** confidence gates + task flags; decide LLM routing.
-- **Stage-2 LLM worker:** vLLM serving **LLM-A** (quantized 7B) for selective
-  summarization/insight — local only, no API; **LLM response cache** in Redis.
-  (LLM-B is added in Phase 2 for cluster/report quality.)
+- **Stage-2 LLM worker:** a backend-agnostic worker for selective
+  summarization/insight, running either backend — `local` (vLLM serving **LLM-A**,
+  quantized 7B) or `groq` (call Groq's fast model). Ship both adapters in the MVP so
+  the switch is exercised early; **LLM response cache** in Redis keyed by
+  `(backend, model, task, content_hash)`. (LLM-B is added in Phase 2 for
+  cluster/report quality.)
 - **Result assembler:** merge + JSON-schema validate + write to Postgres, ClickHouse,
   Qdrant, MinIO.
 - **APIs:** `/posts/upload`, `/analysis/run`, `/analysis/{id}`, `/reports` (basic),
@@ -1647,11 +1847,12 @@ Goal: scale, reliability, and the move to Kubernetes.
 - **Kubernetes** (§19): namespaces, GPU node pools, **KEDA** autoscaling on Kafka
   lag, HPA on API tier, NetworkPolicies, secrets, ingress + cert-manager.
 - **Model serving upgrade:** Triton for the NLP fleet (dynamic batching), and add
-  **LLM-B** — a quantized 14B/32B on a data-center GPU (L40S/A100) via vLLM —
-  alongside LLM-A. Both local.
+  the **LLM-B** role — on `local`, a quantized 14B/32B on a data-center GPU
+  (L40S/A100) via vLLM alongside LLM-A; on `groq`, just a larger model ID.
 - **Reliability:** retries + backoff everywhere, idempotent assembler, circuit
-  breakers around each LLM; if LLM-B is saturated, degrade to LLM-A or Stage-1-only
-  (no external API fallback), PDBs, multi-replica.
+  breakers around each LLM backend; if a backend is saturated, degrade LLM-B→LLM-A,
+  **fail over local↔Groq** (where policy allows), or fall back to Stage-1-only;
+  PDBs, multi-replica.
 - **Cluster summarization:** k-means/HDBSCAN over embeddings → LLM summarizes
   clusters, not posts (key cost lever at 10k).
 - **Reporting:** trend analysis, brand-mention tracking, political analysis on
@@ -1674,8 +1875,10 @@ Goal: horizontal scale, cost efficiency, resilience at volume.
 - **Data layer scale-out:** Postgres read replicas; ClickHouse cluster
   (shards+replicas); Qdrant sharded by tenant; possibly Milvus if vectors reach
   billions (§13.5).
-- **LLM scale:** multiple vLLM replicas for both local models (tensor parallelism
-  for LLM-B); absorb spikes by adding GPU replicas, not by calling an external API.
+- **LLM scale:** on `local`, multiple vLLM replicas for both models (tensor
+  parallelism for LLM-B), absorbing spikes by adding GPU replicas; on `groq`, no GPU
+  scaling — negotiate quota for peak. **Hybrid** is the typical enterprise pattern:
+  own GPUs for the steady base, burst overflow to Groq during spikes.
 - **Aggressive caching + dedup** tuning — the dominant cost lever at this scale.
 - **Service mesh** (Linkerd) for mTLS + canary; GitOps (ArgoCD).
 - **Continuous fine-tuning loop** + distillation to shrink the LLM slice further.
@@ -1717,15 +1920,17 @@ Production; graceful degradation under failure proven (chaos test).
 
 ## 22. Risk register
 
-| Risk                                 | Mitigation                                                             |
-| ------------------------------------ | ---------------------------------------------------------------------- |
-| Bangla / Banglish accuracy below bar | Multilingual encoder + Bangla fine-tune + Banglish-heavy eval set      |
-| LLM slice creeps up → cost spikes    | Confidence-gate tuning, caching, clustering, alert on LLM-share metric |
-| GPU cost overrun                     | Spot for batch, reserved base, quantization, right-sizing              |
-| Queue/worker overload                | KEDA on lag, bounded queues, backpressure, DLQ                         |
-| Data privacy / PII                   | Encryption at rest/in transit, retention/deletion APIs, access audit   |
-| Prompt injection via post text       | Treat post text as untrusted; never let it alter system instructions   |
-| Model regression on upgrade          | Eval-set gate before ship; Kafka replay to compare                     |
+| Risk                                    | Mitigation                                                                                                    |
+| --------------------------------------- | ------------------------------------------------------------------------------------------------------------- |
+| Bangla / Banglish accuracy below bar    | Multilingual encoder + Bangla fine-tune + Banglish-heavy eval set                                             |
+| LLM slice creeps up → cost spikes       | Confidence-gate tuning, caching, clustering, alert on LLM-share metric                                        |
+| GPU cost overrun                        | Spot for batch, reserved base, quantization, right-sizing                                                     |
+| Queue/worker overload                   | KEDA on lag, bounded queues, backpressure, DLQ                                                                |
+| Data privacy / PII                      | Encryption at rest/in transit, retention/deletion APIs, access audit                                          |
+| Prompt injection via post text          | Treat post text as untrusted; never let it alter system instructions                                          |
+| Model regression on upgrade             | Eval-set gate before ship; Kafka replay to compare                                                            |
+| Groq backend leaks PII (data egress)    | Default `local`; pin sensitive tenants to `local`; reject policy-violating overrides; audit `llm_backend`     |
+| Groq outage / rate-limit / price change | Failover to `local` (or degrade to Stage-1-only); retry on 429; alert on Groq error/cost; cap per-call tokens |
 
 ```
 

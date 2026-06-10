@@ -19,11 +19,17 @@ a **smart, self-contained microservice** — a "thinking layer" — that:
   language, sentiment, topics, intents, entities, brand mentions, comment
   analysis — see §6) that downstream projects consume directly.
 
-Hard product constraints from the owner: **fast**, **cost-effective with no
-external/paid API** (two local open-source LLMs only — see [models.md](models.md)
-§2), **efficient**, and **accurate on Bangla and Banglish** (with fine-tuning
-hooks for when accuracy must improve). It must **scale** horizontally to handle
-batches of 1k → 10k → 100k threads.
+Hard product constraints from the owner: **fast**, **cost-effective**,
+**efficient**, and **accurate on Bangla and Banglish** (with fine-tuning hooks
+for when accuracy must improve). It must **scale** horizontally to handle batches
+of 1k → 10k → 100k threads.
+
+The Stage-2 LLM is a **pluggable backend with two interchangeable providers —
+`local` (self-hosted vLLM) and `groq` (Groq Cloud API) — switchable at runtime**
+(see [models.md](models.md) §2). The default backend is **local** (no per-token
+bill, no data egress); **Groq** is an opt-in switch for fastest inference and
+zero GPU ops. The choice is config- and request-level, so the operator can flip
+between them at any time without redeploying.
 
 ---
 
@@ -85,10 +91,10 @@ batches of 1k → 10k → 100k threads.
                                 └─────┬───────┬─────┘
                           done│             │needs LLM (selective)
                               │       ┌─────▼──────────┐
-                              │       │ STAGE 2 — LLM   │  2 local vLLM models
-                              │       │ workers         │  LLM-A fast / LLM-B qual
-                              │       │ summarize·insight│  (no external API)
-                              │       │ ·report·hard NER │
+                              │       │ STAGE 2 — LLM   │  pluggable backend:
+                              │       │ workers         │  local vLLM ⇄ Groq API
+                              │       │ summarize·insight│  roles LLM-A / LLM-B
+                              │       │ ·report·hard NER │  (switchable runtime)
                               │       └─────┬───────────┘
                               └─────────────┤
                                 ┌───────────▼───────────┐
@@ -138,12 +144,16 @@ strategy — see §5.
      compact, token-minimized prompt (post + a representative/clustered subset of
      comments, truncated). This selectivity is what keeps the service fast and
      cheap.
-6. **Stage 2 — LLM (selective).** Two self-hosted local models on vLLM produce
-   summaries, insights, refined labels — **LLM-A** (fast 7B/8B) for per-post
-   refinement and short summaries, **LLM-B** (large 14B/32B) for cluster
-   summarization, insight, and report generation. No external/paid API is used.
-   Responses are cached by `(model, task, content_hash)` in Redis so repeats are
-   free.
+6. **Stage 2 — LLM (selective).** The Stage-2 worker produces summaries,
+   insights, and refined labels through two **logical roles** — **LLM-A** (fast
+   7B/8B) for per-post refinement and short summaries, **LLM-B** (large 14B/32B)
+   for cluster summarization, insight, and report generation. Each role is served
+   by a **pluggable backend, switchable at runtime**: `local` (self-hosted vLLM
+   on our own GPUs — no per-token bill, no data egress) or `groq` (Groq Cloud
+   API — fastest inference, zero GPU ops, per-token cost). Both speak an
+   OpenAI-compatible API, so the worker code is backend-agnostic; switching is a
+   config/flag change, not a redeploy. Responses are cached by
+   `(backend, model, task, content_hash)` in Redis so repeats are free.
 7. **Assemble + validate.** The Result Assembler merges Stage 1 + Stage 2 into
    the canonical JSON (see §6), validates against the JSON Schema, and sets
    `confidence` = aggregate.
@@ -166,13 +176,18 @@ strategy — see §5.
 | **Ingestion Service**       | Validate, normalize, dedup, create job, enqueue                    | FastAPI (async)                                        | stateless replicas  |
 | **Stage-1 NLP Workers**     | Run small-model suite, micro-batched, emit features + confidence   | Python (Ray/Celery consumer) + Triton/ONNX/CTranslate2 | GPU/CPU worker pool |
 | **Router/Triage**           | Apply confidence gates + task flags; decide LLM routing            | lightweight Python service or in-worker rule module    | stateless           |
-| **Stage-2 LLM Workers**     | Selective summarization / insight / report / hard cases            | 2 local vLLM servers (LLM-A + LLM-B) + thin worker     | GPU worker pool     |
+| **Stage-2 LLM Workers**     | Selective summarization / insight / report / hard cases            | Thin worker → local vLLM (LLM-A+LLM-B) **or** Groq API | GPU pool, stateless |
 | **Result Assembler**        | Merge, JSON-schema validate, compute aggregate confidence          | Python consumer                                        | stateless replicas  |
 | **Reporting/Query Service** | Read APIs, report generation, exports                              | FastAPI + ClickHouse + PostgreSQL                      | stateless replicas  |
 | **User Management**         | Tenants, users, roles, billing/usage metering                      | FastAPI + PostgreSQL                                   | stateless replicas  |
 
 Workers are split into **separate pools per stage** so the expensive LLM GPUs
-scale independently from the cheap NLP fleet.
+scale independently from the cheap NLP fleet. The Stage-2 worker itself is a thin
+client that calls the configured **LLM backend**: with the `local` backend it
+talks to in-cluster vLLM servers (GPU-bound); with the `groq` backend it makes
+outbound HTTPS calls to Groq and needs no GPU at all (a stateless pool that
+scales on CPU/queue depth). The backend is selected by config and can be flipped
+at runtime per the routing rules in §5.
 
 ---
 
@@ -204,11 +219,14 @@ Levers that keep token usage and cost low:
   generation" from one LLM call per cluster, not per post.
 - **Token minimization.** Send only truncated, cleaned text and only the fields
   the LLM must produce. Use structured/JSON-mode output to avoid wasted tokens.
-- **Two local LLMs, no API.** Both Stage-2 models run on owned/cloud GPUs via
-  vLLM with continuous batching — there is no per-token API bill and no data
-  egress. The cheap LLM-A absorbs per-post work; the larger LLM-B is reserved for
-  low-volume cluster/report generation.
-- **LLM response cache** keyed by `(model, task, content_hash)`.
+- **Two LLM roles, pluggable backend.** LLM-A (fast) absorbs per-post work; the
+  larger LLM-B is reserved for low-volume cluster/report generation. Each role is
+  served by the configured backend: `local` (vLLM, continuous batching — no
+  per-token bill, no data egress) or `groq` (Groq Cloud — fastest inference, no
+  GPU to run, billed per token). The backend is switchable at runtime, so the
+  operator can run fully local for cost/privacy, burst to Groq under load, or mix
+  (e.g. local LLM-A + Groq for LLM-B reports).
+- **LLM response cache** keyed by `(backend, model, task, content_hash)`.
 
 Expected outcome: LLM touches a single-digit-to-low-double-digit percentage of
 posts, and the per-batch LLM bill is dominated by _cluster-level_ generation,
@@ -259,10 +277,18 @@ normalized to the dominant language for the summary.
   "comment_analysis": {
     "analyzed": 12,
     "sentiment_breakdown": { "positive": 1, "negative": 9, "neutral": 2 },
-    "themes": ["prices far above market", "same quality cheaper outside", "calls to boycott"],
+    "themes": [
+      "prices far above market",
+      "same quality cheaper outside",
+      "calls to boycott"
+    ],
     "representative_comments": [
-      { "author": "Anonymous participant 558", "lang": "bn", "sentiment": "negative",
-        "text": "নুনুর গার্ডেনে এক প্লেট ভাতের দাম ২০ টাকা, বাইরে ৫ টাকা" }
+      {
+        "author": "Anonymous participant 558",
+        "lang": "bn",
+        "sentiment": "negative",
+        "text": "নুনুর গার্ডেনে এক প্লেট ভাতের দাম ২০ টাকা, বাইরে ৫ টাকা"
+      }
     ]
   },
   "post_summary_source": "llm",
@@ -271,7 +297,9 @@ normalized to the dominant language for the summary.
     "unit": "post+thread",
     "stage1_ms": 58,
     "llm_used": true,
-    "llm_model": "LLM-A",
+    "llm_role": "LLM-A",
+    "llm_backend": "local",
+    "llm_model": "Qwen2.5-7B-Instruct",
     "model_versions": {}
   },
   "created_at": "2026-06-01T10:00:00Z"
@@ -286,35 +314,36 @@ Notes:
 - `post_summary` + `post_summary_lang` capture "summary in the original language."
 - `post_type`, `intents`, `brand_mentions`, and `comment_analysis.themes` are the
   "and something like that" fields — useful structured signal for downstream use.
-- `post_summary_source` and `processing.llm_used`/`llm_model` make the hybrid
-  behavior auditable (did we call an LLM, which one, was it worth it).
+- `post_summary_source` and `processing.llm_used`/`llm_role`/`llm_backend`/`llm_model`
+  make the hybrid behavior auditable (did we call an LLM, which role, on which
+  backend — `local` or `groq` — which concrete model, was it worth it).
 - All fields except `post_summary`, `comment_analysis.themes`, and
   `representative_comments` come from cheap Stage-1 NLP; the LLM fills only the
   generative fields when the router asks for them.
 - The flat schema the owner sketched (`post_id, platform, language, sentiment,
-  emotion, topics, entities, keywords, toxicity_score, summary, confidence,
-  created_at`) is preserved as a subset of this richer object (`sentiment` →
+emotion, topics, entities, keywords, toxicity_score, summary, confidence,
+created_at`) is preserved as a subset of this richer object (`sentiment` →
   `overall_sentiment`, `summary` → `post_summary`).
 
 ---
 
 ## 7. Technology stack (recommended)
 
-| Layer          | Choice                                                        | Why                                                                      |
-| -------------- | ------------------------------------------------------------- | ------------------------------------------------------------------------ |
-| API services   | **Python + FastAPI** (async)                                  | Matches team skills; great for I/O-bound APIs and ML glue                |
-| Workers        | **Python**, Celery or Ray for orchestration                   | Native ML ecosystem; Ray scales to multi-node cleanly                    |
-| Model serving  | **Triton / ONNX / CTranslate2** (NLP) + **vLLM x2 local**     | High GPU utilization, dynamic batching; all local, no API                |
-| Message bus    | **Kafka** (prod), **Redis Streams** (MVP)                     | Durable, partitioned, replayable at scale; simple to start               |
-| Operational DB | **PostgreSQL**                                                | ACID jobs/state, JSONB flexibility, mature                               |
-| Analytics DB   | **ClickHouse**                                                | Columnar, billions of rows, sub-second aggregations for trends           |
-| Vector DB      | **Qdrant**                                                    | Fast, open-source, easy ops, good filtering; for dedup/search/clustering |
-| Cache          | **Redis**                                                     | LLM/embedding/query cache, dedup set, rate limits                        |
-| Object storage | **S3 / MinIO**                                                | Raw payloads, reports, model artifacts                                   |
-| Orchestration  | **Kubernetes** (prod), **Docker Compose** (MVP)               | Autoscaling + HA vs simplicity                                           |
-| Autoscaling    | **KEDA** (scale on queue depth) + HPA                         | Workers track backlog, not just CPU                                      |
-| Observability  | **Prometheus + Grafana + Loki + OpenTelemetry + Jaeger**      | Metrics, logs, traces — see [infrastructure.md](infrastructure.md)       |
-| Frontend       | **Flutter**                                                   | Matches team skills; one codebase for web/mobile dashboard               |
+| Layer          | Choice                                                       | Why                                                                      |
+| -------------- | ------------------------------------------------------------ | ------------------------------------------------------------------------ |
+| API services   | **Python + FastAPI** (async)                                 | Matches team skills; great for I/O-bound APIs and ML glue                |
+| Workers        | **Python**, Celery or Ray for orchestration                  | Native ML ecosystem; Ray scales to multi-node cleanly                    |
+| Model serving  | **Triton/ONNX/CTranslate2** (NLP); Stage-2 **vLLM**⇄**Groq** | High GPU utilization for NLP; Stage-2 LLM backend switchable local↔Groq  |
+| Message bus    | **Kafka** (prod), **Redis Streams** (MVP)                    | Durable, partitioned, replayable at scale; simple to start               |
+| Operational DB | **PostgreSQL**                                               | ACID jobs/state, JSONB flexibility, mature                               |
+| Analytics DB   | **ClickHouse**                                               | Columnar, billions of rows, sub-second aggregations for trends           |
+| Vector DB      | **Qdrant**                                                   | Fast, open-source, easy ops, good filtering; for dedup/search/clustering |
+| Cache          | **Redis**                                                    | LLM/embedding/query cache, dedup set, rate limits                        |
+| Object storage | **S3 / MinIO**                                               | Raw payloads, reports, model artifacts                                   |
+| Orchestration  | **Kubernetes** (prod), **Docker Compose** (MVP)              | Autoscaling + HA vs simplicity                                           |
+| Autoscaling    | **KEDA** (scale on queue depth) + HPA                        | Workers track backlog, not just CPU                                      |
+| Observability  | **Prometheus + Grafana + Loki + OpenTelemetry + Jaeger**     | Metrics, logs, traces — see [infrastructure.md](infrastructure.md)       |
+| Frontend       | **Flutter**                                                  | Matches team skills; one codebase for web/mobile dashboard               |
 
 Rationale for each data-layer pick and the alternatives rejected is in
 [possible_architecture.md](possible_architecture.md).
@@ -324,18 +353,23 @@ Rationale for each data-layer pick and the alternatives rejected is in
 ## 8. Reliability & fault tolerance
 
 - **Retries with backoff** at every worker; transient failures (OOM, GPU hiccup,
-  local vLLM 5xx) retried up to N times.
+  local vLLM 5xx, or Groq 429/5xx) retried up to N times. Groq rate-limit (429)
+  responses honor `Retry-After` and back off per-key.
 - **Dead-letter queue (DLQ).** Messages that exhaust retries go to a DLQ topic
   with the error context for inspection/replay.
 - **Idempotency.** Content hash + job id make reprocessing safe; assembler
   upserts.
 - **At-least-once delivery** from the bus + idempotent writes = no lost or
   double-counted posts.
-- **Graceful degradation (all local).** If the LLMs are saturated, the router can
-  (a) queue, (b) degrade LLM-B work to LLM-A (lower quality, still local), or
-  (c) return Stage-1-only results flagged `summary_source: "skipped"` — never
-  block the whole batch and never fall out to a third-party API.
-- **Health/readiness probes** on every service; circuit breakers around each LLM.
+- **Graceful degradation + backend failover.** If the active backend is saturated
+  or unhealthy, the router can (a) queue, (b) degrade LLM-B work to LLM-A (lower
+  quality), (c) **fail over to the other backend** — local↔Groq — when both are
+  configured, or (d) return Stage-1-only results flagged
+  `summary_source: "skipped"`. Failover is policy-driven: a privacy-locked tenant
+  can be pinned to `local` and will never spill to Groq even under load (it
+  degrades to Stage-1-only instead). Never block the whole batch.
+- **Health/readiness probes** on every service; circuit breakers around each LLM
+  backend (per local vLLM server and around the Groq endpoint).
 
 ---
 
@@ -353,7 +387,15 @@ Rationale for each data-layer pick and the alternatives rejected is in
 - **PII handling:** social content contains personal data. Encrypt at rest
   (DB + object storage), encrypt in transit, support per-tenant data retention /
   deletion (GDPR-style), and access logging.
-- **Secrets:** Kubernetes Secrets / Vault; no secrets in images or env files.
+- **LLM backend data residency.** The `local` backend keeps all post/comment text
+  inside the cluster (no egress). The `groq` backend **sends prompt content to a
+  third party (Groq)** over TLS — a deliberate trade for speed/elasticity. Make it
+  an explicit, audited choice: default to `local`, allow `groq` per-tenant/per-job
+  only where the data classification permits it, and **pin privacy-sensitive
+  tenants to `local`** so a runtime switch can never route their PII to Groq.
+  Record the backend used on every result (`processing.llm_backend`) for audit.
+- **Secrets:** Kubernetes Secrets / Vault; no secrets in images or env files —
+  including the **Groq API key**, which is mounted only into Stage-2 workers.
 - **Network:** private subnets for DBs and model servers; only the gateway is
   internet-facing. NetworkPolicies in K8s.
 - **Audit logging** of admin and data-access actions.

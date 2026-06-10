@@ -6,9 +6,11 @@ revisit a decision if constraints change.
 
 Context for every choice below: the service is a **self-hosted microservice** that
 ingests scraped **post + comment threads** (Bangla/English/Banglish) and emits
-structured JSON, under hard constraints — **no external/paid API**, fast, cheap,
-Bangla-accurate. That rules out anything that forces data egress or per-token
-billing, and favors operationally simple, horizontally scalable components.
+structured JSON, under hard constraints — fast, cheap, Bangla-accurate. The data
+stores and NLP fleet are self-hosted (no data egress there). The **Stage-2 LLM is
+the one pluggable piece**: a switchable backend, `local` (self-hosted vLLM,
+default — no egress, no per-token bill) ⇄ `groq` (Groq Cloud API — fastest, no
+GPU, per-token). See §8.
 
 ---
 
@@ -139,8 +141,9 @@ All of these are used; they are complementary, not alternatives:
   counters, hot query results. Central and essential.
 - **Embedding cache** — keyed by `content_hash`; avoids recomputing vectors for
   duplicates/reshares.
-- **LLM response cache** — keyed by `(model, task, content_hash)`; repeats are
-  free.
+- **LLM response cache** — keyed by `(backend, model, task, content_hash)`;
+  repeats are free (the `backend` segment keeps `local` and `groq` results
+  distinct).
 - **Query cache** — short-TTL cache of expensive ClickHouse aggregations powering
   the dashboard.
 - **CDN** — fronts the Flutter web assets and any public/static report exports;
@@ -170,30 +173,38 @@ All of these are used; they are complementary, not alternatives:
 
 ---
 
-## 8. LLM serving: self-host vs API, and why two local models
+## 8. LLM serving: a pluggable backend (local ⇄ Groq), and two LLM roles
 
-**Hard constraint: no external/paid LLM API.** Every model in this design,
-including both Stage-2 LLMs, runs on our own GPUs. The table below records why,
-and why we run _two_ local models rather than one.
+**The Stage-2 LLM runs behind a pluggable backend, switchable at runtime.** Two
+interchangeable providers fulfill the same two LLM roles; the operator picks one
+(or mixes them) by config/flag without redeploying. The NLP fleet and all data
+stores remain self-hosted regardless.
 
-| Option                            | Pros                                                                         | Cons                                                                          | Verdict                                 |
-| --------------------------------- | ---------------------------------------------------------------------------- | ----------------------------------------------------------------------------- | --------------------------------------- |
-| **External API**                  | Zero ops; frontier quality; elastic                                          | Per-token cost; data leaves the cluster; rate limits                          | **Rejected** — violates the no-API rule |
-| **Single self-hosted LLM**        | One model to run; simplest                                                   | Either overpay (big model per post) or under-deliver (small model on reports) | Workable for the MVP only               |
-| **Two self-hosted LLMs (CHOSEN)** | Right-sized per job; data in-house; no per-token bill; scale each separately | Two model deployments to run                                                  | **Chosen** for Production/Enterprise    |
+| Backend option                 | Pros                                                                  | Cons                                                               | Verdict                                             |
+| ------------------------------ | --------------------------------------------------------------------- | ------------------------------------------------------------------ | --------------------------------------------------- |
+| **`local` — self-hosted vLLM** | No per-token bill; data stays in-cluster; fine-tunable; no rate limit | Needs GPUs + serving ops; capacity = GPUs you run                  | **Default.** Privacy/cost-sensitive, steady volume  |
+| **`groq` — Groq Cloud API**    | Fastest inference (LPU); zero GPU/model ops; elastic burst; tiny MVP  | Per-token cost; prompt data leaves the cluster; rate limits/quotas | **Opt-in switch.** Bursty load, no GPU, low latency |
+| **Both (hybrid / failover)**   | Local for steady/private work, Groq for burst or report spikes        | Two integrations to keep configured; per-tenant policy needed      | **Recommended** where data policy allows            |
 
-Why two local models (see [models.md](models.md) §2):
+Rejected: a **single LLM** (either overpay running a big model per post, or
+under-deliver running a small model on reports) — so we keep **two roles** instead.
 
-- **LLM-A** — a fast 7B/8B (AWQ/GPTQ) for the **high-volume, low-difficulty**
-  per-post refinement and short summaries the router sends from Stage 1.
+Why two roles (see [models.md](models.md) §2):
+
+- **LLM-A** — a fast 7B/8B for the **high-volume, low-difficulty** per-post
+  refinement and short summaries the router sends from Stage 1.
 - **LLM-B** — a larger 14B/32B for the **low-volume, high-quality** cluster
   summarization, corpus insight, and grounded report generation (RAG).
 
-This pairs with the router in [architecture.md](architecture.md) §5: per-post
-selective work hits the cheap LLM-A; cluster/report generation hits LLM-B. If
-LLM-B is saturated the router degrades to LLM-A or returns Stage-1-only results —
-it never calls out to a third-party API. At MVP scale the two can time-slice one
-GPU, or run LLM-A alone until volume justifies LLM-B.
+Each role maps to a `local` model (vLLM) or a `groq` model ID — same prompts, same
+JSON schema, so a backend switch needs no code or prompt changes. This pairs with
+the router in [architecture.md](architecture.md) §5: per-post selective work hits
+LLM-A; cluster/report generation hits LLM-B. If a backend is saturated the router
+degrades LLM-B→LLM-A, **fails over to the other backend** (when both configured),
+or returns Stage-1-only results. On `local` at MVP scale the two roles time-slice
+one GPU (or run LLM-A alone until volume justifies LLM-B); on `groq` they are just
+two model IDs with no infrastructure. **Privacy note:** pin sensitive tenants to
+`local` so a runtime switch can never send their data to Groq.
 
 ---
 

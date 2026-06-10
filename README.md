@@ -9,10 +9,12 @@ threads per batch.
 
 It is built around a **smart routing layer** ("thinking layer") that decides, per
 thread, how much intelligence each one needs: cheap NLP models do ~90–95% of the
-work, and **two local open-source LLMs (no external/paid API)** handle only the
-selective summarization/insight work. The hard goals: **fast, cost-effective,
-efficient, and accurate on Bangla/Banglish** (with fine-tuning hooks the owner
-can drive).
+work, and a selective LLM handles only the summarization/insight work. That LLM
+runs behind a **pluggable, runtime-switchable backend — `local` (self-hosted
+vLLM) or `groq` (Groq Cloud API)** — so the operator can choose no-egress/no-bill
+local serving or fastest/zero-GPU Groq, and switch anytime. The hard goals:
+**fast, cost-effective, efficient, and accurate on Bangla/Banglish** (with
+fine-tuning hooks the owner can drive).
 
 This folder answers the system-design request described by the owner in
 [what.txt](what.txt) — a scraper feeds 1,000+ real-time Bangla/English/Banglish
@@ -54,10 +56,14 @@ is the original system-design request. It has been reconciled with
   ~90–95% of the work. An LLM is invoked **selectively** only for the
   original-language summary, insight, and low-confidence/ambiguous cases. This is
   the central cost-control idea.
-- **Two local LLMs, no external/paid API.** The selective stage runs entirely on
-  self-hosted models: **LLM-A** (fast 7B/8B) for per-post refinement and
+- **Two LLM roles, a pluggable backend (local ⇄ Groq), switchable at runtime.**
+  The selective stage uses **LLM-A** (fast 7B/8B) for per-post refinement and
   **LLM-B** (larger 14B/32B) for cluster summarization, insight, and grounded
-  reports. Everything stays on our own GPUs — no per-token bill, no data egress.
+  reports. Each role is served by the chosen backend: **`local`** (self-hosted
+  vLLM — no per-token bill, no data egress; the default) or **`groq`** (Groq Cloud
+  API — fastest inference, zero GPU ops, per-token cost). Both speak an
+  OpenAI-compatible API, so switching is a config/flag change, and you can run
+  hybrid/failover. Pin privacy-sensitive tenants to `local`.
 - **Queue-based, horizontally scalable.** API → ingestion → message bus →
   stateless GPU/CPU workers → result store. Workers scale independently per
   stage.

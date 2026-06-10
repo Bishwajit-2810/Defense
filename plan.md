@@ -16,8 +16,11 @@ posts efficiently. Read alongside [architecture.md](architecture.md).
   consumes) are the heart of the microservice; lock them early.
 - Stand up local Docker Compose skeleton: Postgres, Redis, Qdrant, ClickHouse,
   MinIO, a stub API, Prometheus/Grafana.
-- Pick and pin model versions ([models.md](models.md)); download weights to
-  object storage.
+- Pick and pin model versions ([models.md](models.md)); download local weights to
+  object storage. Define the **Stage-2 LLM backend interface** (OpenAI-compatible)
+  and wire both providers behind it — `local` (vLLM) and `groq` — selected by
+  `LLM_BACKEND` config with a per-request override and per-tenant policy. Pin the
+  Groq role→model IDs and store `GROQ_API_KEY` as a secret.
 - Build a small **labeled eval set** per task and per language (bn / en /
   Banglish) — needed to tune confidence thresholds and judge fine-tuning later.
 
@@ -40,9 +43,12 @@ Goal: prove the hybrid pipeline and output quality end-to-end, cheaply.
   embedding (bge-m3) → keywords. Aggregate per-comment sentiment into the thread
   `sentiment_breakdown`. Micro-batched. Emit confidence per field.
 - **Router/Triage:** confidence gates + task flags; decide LLM routing.
-- **Stage-2 LLM worker:** vLLM serving **LLM-A** (quantized 7B) for selective
-  summarization/insight — local only, no API; **LLM response cache** in Redis.
-  (LLM-B is added in Phase 2 for cluster/report quality.)
+- **Stage-2 LLM worker:** a backend-agnostic worker for selective
+  summarization/insight, running either backend — `local` (vLLM serving **LLM-A**,
+  quantized 7B) or `groq` (call Groq's fast model). Ship both adapters in the MVP
+  so the switch is exercised early; **LLM response cache** in Redis keyed by
+  `(backend, model, task, content_hash)`. (LLM-B is added in Phase 2 for
+  cluster/report quality.)
 - **Result assembler:** merge + JSON-schema validate + write to Postgres,
   ClickHouse, Qdrant, MinIO.
 - **APIs:** `/posts/upload`, `/analysis/run`, `/analysis/{id}`, `/reports`
@@ -68,11 +74,12 @@ Goal: scale, reliability, and the move to Kubernetes.
   **KEDA** autoscaling on Kafka lag, HPA on API tier, NetworkPolicies, secrets,
   ingress + cert-manager.
 - **Model serving upgrade:** Triton for the NLP fleet (dynamic batching), and add
-  **LLM-B** — a quantized 14B/32B on a data-center GPU (L40S/A100) via vLLM —
-  alongside LLM-A. Both local.
+  the **LLM-B** role — on `local`, a quantized 14B/32B on a data-center GPU
+  (L40S/A100) via vLLM alongside LLM-A; on `groq`, just a larger model ID.
 - **Reliability:** retries + backoff everywhere, idempotent assembler, circuit
-  breakers around each LLM; if LLM-B is saturated, degrade to LLM-A or
-  Stage-1-only (no external API fallback), PDBs, multi-replica.
+  breakers around each LLM backend; if a backend is saturated, degrade
+  LLM-B→LLM-A, **fail over local↔Groq** (where policy allows), or fall back to
+  Stage-1-only; PDBs, multi-replica.
 - **Cluster summarization:** k-means/HDBSCAN over embeddings → LLM summarizes
   clusters, not posts (key cost lever at 10k).
 - **Reporting:** trend analysis, brand-mention tracking, political analysis on
@@ -97,8 +104,10 @@ Goal: horizontal scale, cost efficiency, resilience at volume.
 - **Data layer scale-out:** Postgres read replicas; ClickHouse cluster
   (shards+replicas); Qdrant sharded by tenant; possibly Milvus if vectors reach
   billions ([possible_architecture.md](possible_architecture.md) §5).
-- **LLM scale:** multiple vLLM replicas for both local models (tensor parallelism
-  for LLM-B); absorb spikes by adding GPU replicas, not by calling an external API.
+- **LLM scale:** on `local`, multiple vLLM replicas for both models (tensor
+  parallelism for LLM-B), absorbing spikes by adding GPU replicas; on `groq`, no
+  GPU scaling — negotiate quota for peak. **Hybrid** is the typical enterprise
+  pattern: own GPUs for the steady base, burst overflow to Groq during spikes.
 - **Aggressive caching + dedup** tuning — the dominant cost lever at this scale.
 - **Service mesh** (Linkerd) for mTLS + canary; GitOps (ArgoCD).
 - **Continuous fine-tuning loop** + distillation to shrink the LLM slice further.
@@ -142,12 +151,14 @@ Production; graceful degradation under failure proven (chaos test).
 
 ## Risk register (top items)
 
-| Risk                                 | Mitigation                                                             |
-| ------------------------------------ | ---------------------------------------------------------------------- |
-| Bangla / Banglish accuracy below bar | Multilingual encoder + Bangla fine-tune + Banglish-heavy eval set      |
-| LLM slice creeps up → cost spikes    | Confidence-gate tuning, caching, clustering, alert on LLM-share metric |
-| GPU cost overrun                     | Spot for batch, reserved base, quantization, right-sizing              |
-| Queue/worker overload                | KEDA on lag, bounded queues, backpressure, DLQ                         |
-| Data privacy / PII                   | Encryption at rest/in transit, retention/deletion APIs, access audit   |
-| Prompt injection via post text       | Treat post text as untrusted; never let it alter system instructions   |
-| Model regression on upgrade          | Eval-set gate before ship; Kafka replay to compare                     |
+| Risk                                    | Mitigation                                                                                                    |
+| --------------------------------------- | ------------------------------------------------------------------------------------------------------------- |
+| Bangla / Banglish accuracy below bar    | Multilingual encoder + Bangla fine-tune + Banglish-heavy eval set                                             |
+| LLM slice creeps up → cost spikes       | Confidence-gate tuning, caching, clustering, alert on LLM-share metric                                        |
+| GPU cost overrun                        | Spot for batch, reserved base, quantization, right-sizing                                                     |
+| Queue/worker overload                   | KEDA on lag, bounded queues, backpressure, DLQ                                                                |
+| Data privacy / PII                      | Encryption at rest/in transit, retention/deletion APIs, access audit                                          |
+| Prompt injection via post text          | Treat post text as untrusted; never let it alter system instructions                                          |
+| Model regression on upgrade             | Eval-set gate before ship; Kafka replay to compare                                                            |
+| Groq backend leaks PII (data egress)    | Default `local`; pin sensitive tenants to `local`; reject policy-violating overrides; audit `llm_backend`     |
+| Groq outage / rate-limit / price change | Failover to `local` (or degrade to Stage-1-only); retry on 429; alert on Groq error/cost; cap per-call tokens |

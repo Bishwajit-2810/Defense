@@ -61,13 +61,26 @@ Idempotency-Key: 7d3c...-batch-001
       "meta": { "page_id": "p_99", "lang_hint": "bn" }
     }
   ],
-  "options": { "tasks": ["all"], "want_summary": true, "summary_lang": "auto" }
+  "options": {
+    "tasks": ["all"],
+    "want_summary": true,
+    "summary_lang": "auto",
+    "llm_backend": "auto"
+  }
 }
 ```
 
 `comments` is optional (a bare post with no thread is valid). `summary_lang:
 "auto"` keeps the summary in the post's detected language; pass `"bn"`/`"en"` to
 force it. Banglish comments (romanized Bangla, as above) are handled natively.
+
+`llm_backend` selects the Stage-2 LLM provider for this request: `"local"`
+(self-hosted vLLM), `"groq"` (Groq Cloud API), or `"auto"` (default — use the
+server's configured backend and failover policy). A per-request override lets
+callers pin sensitive data to `"local"` or send burst traffic to `"groq"` without
+changing server config. **Tenant policy wins:** a tenant pinned to `local` for
+data-residency cannot be overridden to `groq` by a request (the override is
+rejected with `forbidden`). See [models.md](models.md) §2.
 
 ### Request (large file)
 
@@ -113,13 +126,17 @@ batch with specific options — useful for reprocessing after a model upgrade.
     "tasks": ["sentiment", "emotion", "topics", "ner", "toxicity"],
     "want_summary": true,
     "want_cluster_summary": true,
-    "model_profile": "default"
+    "model_profile": "default",
+    "llm_backend": "auto"
   }
 }
 ```
 
 `selector` may instead be `{ "post_ids": [...] }` or
 `{ "filter": { "platform": "instagram", "from": "...", "to": "..." } }`.
+`llm_backend` (`auto` | `local` | `groq`) overrides the Stage-2 provider for this
+run — handy to reprocess a batch on a different backend (e.g. compare local vs
+Groq output, or rerun on `groq` while LLM GPUs are down), subject to tenant policy.
 
 ### Response — `202 Accepted`
 
@@ -203,7 +220,7 @@ Poll job/analysis status and fetch results. `{id}` is a `job_id` or `analysis_id
       },
       "post_summary_source": "llm",
       "confidence": 0.92,
-      "processing": { "unit": "post+thread", "stage1_ms": 58, "llm_used": true, "llm_model": "LLM-A" },
+      "processing": { "unit": "post+thread", "stage1_ms": 58, "llm_used": true, "llm_role": "LLM-A", "llm_backend": "local", "llm_model": "Qwen2.5-7B-Instruct" },
       "created_at": "2026-06-01T10:00:00Z"
     }
   ],
@@ -283,13 +300,13 @@ cluster insights). Reports are LLM-generated at the _cluster/corpus_ level.
 
 ## 5. Supporting endpoints
 
-| Endpoint                           | Purpose                                                           |
-| ---------------------------------- | ----------------------------------------------------------------- |
-| `POST /v1/auth/token`              | Exchange credentials/API key for a JWT                            |
-| `GET /v1/health` / `GET /v1/ready` | Liveness / readiness probes                                       |
-| `GET /v1/usage`                    | Per-tenant usage + cost metering (posts, LLM calls)               |
-| `GET /v1/search?q=&semantic=true`  | Semantic/keyword search over analyzed posts (Qdrant + ClickHouse) |
-| `DELETE /v1/posts/{id}`            | Data deletion (retention / GDPR-style)                            |
+| Endpoint                           | Purpose                                                                                |
+| ---------------------------------- | -------------------------------------------------------------------------------------- |
+| `POST /v1/auth/token`              | Exchange credentials/API key for a JWT                                                 |
+| `GET /v1/health` / `GET /v1/ready` | Liveness / readiness probes                                                            |
+| `GET /v1/usage`                    | Per-tenant usage + cost metering (posts, LLM calls, by backend incl. Groq tokens/cost) |
+| `GET /v1/search?q=&semantic=true`  | Semantic/keyword search over analyzed posts (Qdrant + ClickHouse)                      |
+| `DELETE /v1/posts/{id}`            | Data deletion (retention / GDPR-style)                                                 |
 
 ---
 
@@ -306,5 +323,10 @@ cluster insights). Reports are LLM-generated at the _cluster/corpus_ level.
 }
 ```
 
-Standard codes: `unauthorized`, `forbidden`, `validation_error`, `rate_limited`
-(with `Retry-After`), `not_found`, `conflict` (idempotency), `internal`.
+Standard codes: `unauthorized`, `forbidden` (incl. an `llm_backend` override that
+violates tenant data-residency policy), `validation_error`, `rate_limited` (with
+`Retry-After` — also surfaced when the `groq` backend returns HTTP 429),
+`not_found`, `conflict` (idempotency), `internal`. The service handles a saturated
+or failed backend internally (failover/degrade per
+[architecture.md](architecture.md) §8) rather than surfacing a raw upstream error
+where possible.
