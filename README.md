@@ -75,6 +75,7 @@ concrete input→output, see [examples.md](examples.md).
 | [deployment.md](deployment.md)                       | Docker Compose vs Kubernetes, full K8s deployment plan                                                                                                                            |
 | [evaluation.md](evaluation.md)                       | **Evaluation plan** — how we score each task, the summary, the agents, and system properties; gold sets, gates, drift                                                             |
 | [plan.md](plan.md)                                   | Phased implementation roadmap and milestones                                                                                                                                      |
+| [HOWTO.md](HOWTO.md)                                 | **Build guide for coding agents** — golden rules, ordered tasks with definition-of-done, repo layout; how to actually implement this design                                       |
 
 Background: [social_media_llm_architecture_prompt.md](social_media_llm_architecture_prompt.md)
 is the original system-design request. It has been reconciled with
