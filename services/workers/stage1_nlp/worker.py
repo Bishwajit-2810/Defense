@@ -21,7 +21,6 @@ from __future__ import annotations
 
 import asyncio
 import json
-import logging
 import os
 import sys
 import time
@@ -53,11 +52,9 @@ from .vision_analyzer import analyze_image  # noqa: E402
 # Logging
 # ---------------------------------------------------------------------------
 
-structlog.configure(
-    wrapper_class=structlog.make_filtering_bound_logger(
-        getattr(logging, os.getenv("LOG_LEVEL", "INFO").upper(), logging.INFO)
-    ),
-)
+from common.logging import setup_logging  # noqa: E402
+
+setup_logging("stage1")
 log = structlog.get_logger(__name__)
 
 # ---------------------------------------------------------------------------

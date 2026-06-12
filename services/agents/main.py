@@ -19,7 +19,6 @@ Architecture constraints (Architecture.md §11):
 from __future__ import annotations
 
 import asyncio
-import logging
 import os
 import time
 from typing import Any, Optional
@@ -39,21 +38,9 @@ from .store import AgentRunStore
 # Structured logging
 # ---------------------------------------------------------------------------
 
-structlog.configure(
-    processors=[
-        structlog.contextvars.merge_contextvars,
-        structlog.stdlib.add_log_level,
-        structlog.processors.TimeStamper(fmt="iso"),
-        structlog.processors.StackInfoRenderer(),
-        structlog.processors.format_exc_info,
-        structlog.processors.JSONRenderer(),
-    ],
-    wrapper_class=structlog.make_filtering_bound_logger(logging.INFO),
-    context_class=dict,
-    logger_factory=structlog.PrintLoggerFactory(),
-    cache_logger_on_first_use=True,
-)
+from libs.common.logging import setup_logging  # noqa: E402
 
+setup_logging("agents")
 log = structlog.get_logger("agents-service")
 
 # ---------------------------------------------------------------------------

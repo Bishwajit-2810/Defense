@@ -43,16 +43,9 @@ from .normalizer import normalize_post
 # Logging
 # ---------------------------------------------------------------------------
 
-structlog.configure(
-    processors=[
-        structlog.stdlib.add_log_level,
-        structlog.processors.TimeStamper(fmt="iso"),
-        structlog.processors.StackInfoRenderer(),
-        structlog.processors.format_exc_info,
-        structlog.processors.JSONRenderer(),
-    ]
-)
+from libs.common.logging import setup_logging  # noqa: E402
 
+setup_logging("ingestion")
 log = structlog.get_logger(__name__)
 
 # ---------------------------------------------------------------------------

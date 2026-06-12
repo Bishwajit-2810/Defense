@@ -23,7 +23,7 @@ from schemas.validator import assert_valid_output
 # ---------------------------------------------------------------------------
 # Schema version — bump when the output schema changes
 # ---------------------------------------------------------------------------
-SCHEMA_VERSION = "1.0"
+SCHEMA_VERSION = "1.1"  # 1.1: per-comment emotion label + comment_analysis.emotion_breakdown
 
 
 def build_canonical_result(
@@ -71,6 +71,13 @@ def build_canonical_result(
     # Null-caption (image-only) posts may yield no detected language; the
     # schema requires a string, so fall back to "und" (undetermined).
     language: str = stage1_result.get("language") or "und"
+
+    # ------------------------------------------------------------------
+    # Original post content (caption) — from normalized_post, surfaced on the
+    # canonical result so the dashboard detail view can show the source text
+    # next to the LLM summary. None for image-only posts with no caption.
+    # ------------------------------------------------------------------
+    post_text: str | None = normalized_post.get("caption") or None
 
     # ------------------------------------------------------------------
     # Semantic post_type — Stage 2 wins when available, else Stage 1
@@ -211,6 +218,7 @@ def build_canonical_result(
         "platform_post_id": platform_post_id,
         "media_type": media_type,
         "language": language,
+        "post_text": post_text,
         "post_type": post_type,
         "post_summary": post_summary,
         "post_summary_lang": post_summary_lang,

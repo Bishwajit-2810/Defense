@@ -203,6 +203,51 @@ def _clickhouse_insert_sync(result: dict, ch_client) -> None:
         [row],
     )
 
+    # Per-comment rows go in on the SAME connection, sequentially. clickhouse-driver
+    # forbids concurrent queries on one Client ("Simultaneous queries on single
+    # connection detected"), so this must not run as a parallel executor job.
+    _clickhouse_insert_comments_sync(result, ch_client)
+
+
+def _clickhouse_insert_comments_sync(result: dict, ch_client) -> int:
+    """Bulk-insert one row per analysed comment into ``comment_sentiments``.
+
+    Returns the number of rows inserted (0 when the post has no embedded
+    comments). Called via executor since clickhouse-driver is synchronous.
+    """
+    comment_analysis = result.get("comment_analysis", {})
+    comments = comment_analysis.get("comments") or []
+    if not comments:
+        return 0
+
+    post_id: str = result["post_id"]
+    campaign_id: str = result["campaign_id"]
+    platform: str = result["platform"]
+
+    rows = [
+        {
+            "comment_id": str(c.get("id") or ""),
+            "post_id": post_id,
+            "campaign_id": campaign_id,
+            "platform": platform,
+            "sentiment": c.get("sentiment") or "neutral",
+            "sentiment_score": float(c.get("sentiment_score") or 0.0),
+            "emotion": c.get("emotion") or "neutral",
+            "method": c.get("method") or "fast",
+            "likes": int(c.get("likes") or 0),
+            "author": c.get("author"),
+        }
+        for c in comments
+    ]
+
+    ch_client.execute(
+        "INSERT INTO comment_sentiments "
+        "(comment_id, post_id, campaign_id, platform, sentiment, sentiment_score, "
+        "emotion, method, likes, author) VALUES",
+        rows,
+    )
+    return len(rows)
+
 
 async def persist_clickhouse(result: dict, ch_client) -> None:
     """Insert an analytics row into ClickHouse.

@@ -147,20 +147,36 @@ function showTab(tabName) {
   refreshTab(tabName);
 }
 
-/** Load (or reload) the data behind a tab. */
-function refreshTab(tabName) {
+/** Load (or reload) the data behind a tab.
+ * background=true marks an automatic (timer-driven) refresh: loaders skip the
+ * loading spinner and preserve in-place state so the view doesn't flash. */
+function refreshTab(tabName, background) {
   if (tabName === 'overview') {
-    loadOverview();
+    loadOverview(background);
   } else if (tabName === 'posts') {
-    loadAnalysisResults();
+    loadAnalysisResults(background);
   } else if (tabName === 'jobs') {
-    loadJobs();
+    loadJobs(background);
   } else if (tabName === 'reports') {
-    loadReports();
+    loadReports(background);
   } else if (tabName === 'agents') {
-    loadAgentRuns();
+    loadAgentRuns(background);
   }
   // 'search' is on-demand only.
+}
+
+/** Skip an automatic refresh while the user is actively engaged, so a timer
+ * tick never yanks the page out from under them. Covers: an open detail modal,
+ * an expanded inline row, a focused input/select, an open dropdown menu, and a
+ * backgrounded browser tab (Page Visibility API). */
+function shouldSkipAutoRefresh() {
+  if (document.hidden) return true;
+  var overlay = document.getElementById('modal-overlay');
+  if (overlay && !overlay.classList.contains('hidden')) return true;
+  if (document.querySelector('tr.expanded')) return true;
+  var ae = document.activeElement;
+  if (ae && (ae.tagName === 'INPUT' || ae.tagName === 'TEXTAREA' || ae.tagName === 'SELECT')) return true;
+  return false;
 }
 
 function markRefreshed() {
@@ -197,17 +213,16 @@ async function loadOverview() {
     updateStatusText('overview-updated', 'Live counters — refreshed ' + new Date().toLocaleTimeString());
   }
 
-  // Corpus-derived charts from the latest results
-  var results = [];
+  // All corpus aggregates are computed server-side; the frontend only renders.
+  var overview = null;
   try {
-    var data = await apiCall('/v1/analysis/latest?limit=500', { method: 'GET' });
-    results = (data && data.results) || [];
+    overview = await apiCall('/v1/analysis/overview', { method: 'GET' });
   } catch (err) {
     // charts simply stay empty
   }
 
-  renderOverviewCharts(results);
-  renderLlmPanel(usage, results);
+  renderOverviewCharts(overview);
+  renderLlmPanel(overview);
   markRefreshed();
 }
 
@@ -223,77 +238,69 @@ function pct(v) {
   return Math.round((Number(v) || 0) * 100) + '%';
 }
 
-function renderOverviewCharts(results) {
+// All distributions below come pre-aggregated from GET /v1/analysis/overview —
+// the frontend does no counting, it only paints the server's numbers.
+function renderOverviewCharts(overview) {
+  overview = overview || {};
+  var sent = overview.sentiment_distribution || {};
+
   // ---- Sentiment donut ----
-  var sentCounts = { positive: 0, negative: 0, neutral: 0, mixed: 0 };
-  var langCounts = {};
-  var topicCounts = {};
-
-  results.forEach(function(r) {
-    var s = r.overall_sentiment || 'neutral';
-    sentCounts[s] = (sentCounts[s] || 0) + 1;
-    var lang = r.language || 'und';
-    langCounts[lang] = (langCounts[lang] || 0) + 1;
-    (r.topics || []).forEach(function(t) {
-      topicCounts[t] = (topicCounts[t] || 0) + 1;
-    });
-  });
-
   var pieCanvas = document.getElementById('overview-sentiment-pie');
   if (pieCanvas) {
     renderSentimentPie(pieCanvas, {
-      positive: sentCounts.positive,
-      negative: sentCounts.negative,
-      neutral:  sentCounts.neutral + (sentCounts.mixed || 0)
+      positive: sent.positive || 0,
+      negative: sent.negative || 0,
+      neutral:  (sent.neutral || 0) + (sent.mixed || 0)
     });
   }
   var legendEl = document.getElementById('overview-sentiment-legend');
   if (legendEl) {
     legendEl.innerHTML =
-        makeLegendItem('Positive', sentCounts.positive, 'var(--color-positive)')
-      + makeLegendItem('Negative', sentCounts.negative, 'var(--color-negative)')
-      + makeLegendItem('Neutral',  sentCounts.neutral,  'var(--color-neutral)')
-      + (sentCounts.mixed ? makeLegendItem('Mixed', sentCounts.mixed, 'var(--color-mixed)') : '');
+        makeLegendItem('Positive', sent.positive || 0, 'var(--color-positive)')
+      + makeLegendItem('Negative', sent.negative || 0, 'var(--color-negative)')
+      + makeLegendItem('Neutral',  sent.neutral  || 0, 'var(--color-neutral)')
+      + (sent.mixed ? makeLegendItem('Mixed', sent.mixed, 'var(--color-mixed)') : '');
   }
 
   // ---- Language bar chart ----
   var langCanvas = document.getElementById('overview-lang-chart');
   if (langCanvas) {
-    var langData = Object.keys(langCounts).map(function(k) {
-      return { label: k, value: langCounts[k], color: '#6366f1' };
-    }).sort(function(a, b) { return b.value - a.value; }).slice(0, 6);
-    renderBarChart(langCanvas, langData);
+    renderBarChart(langCanvas, (overview.language_distribution || []).map(function(d) {
+      return { label: d.label, value: d.count, color: '#6366f1' };
+    }));
   }
 
   // ---- Top topics bar chart ----
   var topicsCanvas = document.getElementById('overview-topics-chart');
   if (topicsCanvas) {
-    var topicData = Object.keys(topicCounts).map(function(k) {
-      return { label: k, value: topicCounts[k], color: '#8b5cf6' };
-    }).sort(function(a, b) { return b.value - a.value; }).slice(0, 8);
-    renderBarChart(topicsCanvas, topicData, 110);
+    renderBarChart(topicsCanvas, (overview.top_topics || []).map(function(d) {
+      return { label: d.label, value: d.count, color: '#8b5cf6' };
+    }), 110);
+  }
+
+  // ---- Comment emotion distribution (corpus-wide) ----
+  var emoCanvas = document.getElementById('overview-emotion-chart');
+  if (emoCanvas) {
+    renderBarChart(emoCanvas, (overview.comment_emotion_distribution || []).map(function(d) {
+      var m = EMOTION_META[d.label] || EMOTION_META.neutral;
+      return { label: m.emoji + ' ' + d.label, value: d.count, color: m.color };
+    }), 90);
   }
 }
 
-function renderLlmPanel(usage, results) {
+function renderLlmPanel(overview) {
   var el = document.getElementById('overview-llm-panel');
   if (!el) return;
 
-  var withSummary = 0, vlmGrounded = 0, llmUsed = 0;
-  var backends = {};
-  results.forEach(function(r) {
-    if (r.post_summary) withSummary++;
-    if (r.processing && r.processing.llm_used) llmUsed++;
-    var be = r.processing && r.processing.llm_backend;
-    if (be) backends[be] = (backends[be] || 0) + 1;
-  });
+  var panel = (overview && overview.llm_panel) || {};
+  var backends = panel.backends_seen || [];
 
   var html = '<div class="meta-grid">'
     + makeMetaField('Active backend', llmConfig ? llmBackendLabel(llmConfig.backend) : '—')
-    + makeMetaField('Posts with LLM output', llmUsed + ' / ' + results.length)
-    + makeMetaField('Posts with summaries', withSummary)
-    + makeMetaField('Backends seen', Object.keys(backends).map(function(k) {
-        return k + ' (' + backends[k] + ')';
+    + makeMetaField('Posts with LLM output', (panel.posts_with_llm || 0) + ' / ' + (panel.total_posts || 0))
+    + makeMetaField('Posts with summaries', panel.posts_with_summaries || 0)
+    + makeMetaField('Backends seen', backends.map(function(b) {
+        return b.label + ' (' + b.count + ')';
       }).join(', ') || '—')
     + '</div>'
     + '<div style="margin-top:12px">'
@@ -380,11 +387,16 @@ async function uploadPosts(file) {
 /* ============================================================
    Posts tab — results
    ============================================================ */
-async function loadAnalysisResults() {
+async function loadAnalysisResults(background) {
   var container = document.getElementById('results-table-body');
   if (!container) return;
 
-  container.innerHTML = '<tr><td colspan="9" class="table-empty"><div class="loading-overlay"><div class="spinner spinner-dark"></div> Loading results...</div></td></tr>';
+  // Only show the loading spinner on a foreground load (initial / manual /
+  // tab-switch). A background timer refresh repaints in place, so the table
+  // never flashes empty while you're reading it.
+  if (!background || analysisResultsCache.length === 0) {
+    container.innerHTML = '<tr><td colspan="10" class="table-empty"><div class="loading-overlay"><div class="spinner spinner-dark"></div> Loading results...</div></td></tr>';
+  }
 
   var campaignEl = document.getElementById('posts-campaign-filter');
   var campaign = campaignEl ? campaignEl.value.trim() : '';
@@ -407,7 +419,13 @@ async function loadAnalysisResults() {
     markRefreshed();
 
   } catch (err) {
-    container.innerHTML = '<tr><td colspan="9" class="table-empty">'
+    // On a background refresh, keep the data already on screen rather than
+    // replacing it with an error — a transient blip shouldn't blank the table.
+    if (background && analysisResultsCache.length > 0) {
+      updateStatusText('results-count', 'refresh failed — showing last data');
+      return;
+    }
+    container.innerHTML = '<tr><td colspan="10" class="table-empty">'
       + '<div class="alert alert-error" style="display:inline-block">Could not load results: ' + escHtml(err.message) + '</div>'
       + '</td></tr>';
   }
@@ -418,7 +436,7 @@ function renderResultsTable(results) {
   if (!tbody) return;
 
   if (!results || results.length === 0) {
-    tbody.innerHTML = '<tr><td colspan="9" class="table-empty">No results found. Upload posts to get started.</td></tr>';
+    tbody.innerHTML = '<tr><td colspan="10" class="table-empty">No results found. Upload posts to get started.</td></tr>';
     return;
   }
 
@@ -426,7 +444,7 @@ function renderResultsTable(results) {
   results.forEach(function(r, i) {
     var sentiment = r.overall_sentiment || 'neutral';
     var toxScore  = typeof r.toxicity_score === 'number' ? r.toxicity_score : null;
-    var coverage  = buildCoverageText(r.comment_analysis, r.engagement);
+    var coverage  = (r.comment_analysis && r.comment_analysis.coverage_label) || '—';
     var dateStr   = r.created_at ? formatDate(r.created_at) : '—';
     var langStr   = r.language || '—';
     if (r.language_mix && r.language_mix.length > 1) {
@@ -438,6 +456,7 @@ function renderResultsTable(results) {
       : '<span class="text-muted">—</span>';
 
     html += '<tr data-post-id="' + escAttr(r.post_id) + '" data-idx="' + i + '" onclick="toggleRowDetail(this)">'
+      + '<td class="post-number">' + (i + 1) + '</td>'
       + '<td class="monospace truncate" style="max-width:140px;" title="' + escAttr(r.post_id) + '">' + escHtml(shortenId(r.post_id)) + '</td>'
       + '<td>' + escHtml(r.platform || '—') + '</td>'
       + '<td>' + langStr + '</td>'
@@ -451,15 +470,6 @@ function renderResultsTable(results) {
   });
 
   tbody.innerHTML = html;
-}
-
-function buildCoverageText(commentAnalysis, engagement) {
-  if (!commentAnalysis) return '—';
-  var analyzed = commentAnalysis.analyzed || 0;
-  var total = (engagement && engagement.comment_count) || 0;
-  if (!total) return analyzed + ' analyzed';
-  var p = total > 0 ? Math.round(analyzed / total * 100) : 0;
-  return p + '% (' + analyzed + '/' + total + ')';
 }
 
 function renderToxicityBar(score) {
@@ -479,14 +489,17 @@ function toggleRowDetail(row) {
   if (existingDetail) {
     existingDetail.parentNode.removeChild(existingDetail);
     row.classList.remove('expanded');
+    delete commentCtx['row' + idx];
     return;
   }
 
   // Collapse other expanded rows
   document.querySelectorAll('tr.expanded').forEach(function(r) {
     r.classList.remove('expanded');
-    var oldDetail = document.getElementById('row-detail-' + r.getAttribute('data-idx'));
+    var oldIdx = r.getAttribute('data-idx');
+    var oldDetail = document.getElementById('row-detail-' + oldIdx);
     if (oldDetail) oldDetail.parentNode.removeChild(oldDetail);
+    delete commentCtx['row' + oldIdx];
   });
 
   row.classList.add('expanded');
@@ -503,7 +516,7 @@ function toggleRowDetail(row) {
     ['campaign_id',       r.campaign_id],
     ['platform_post_id',  r.platform_post_id],
     ['media_type',        r.media_type],
-    ['emotion',           r.emotion && typeof r.emotion === 'object' ? topEmotion(r.emotion) : r.emotion],
+    ['emotion',           r.emotion && typeof r.emotion === 'object' ? r.emotion.primary : r.emotion],
     ['sentiment_score',   typeof r.sentiment_score === 'number' ? r.sentiment_score.toFixed(3) : null],
     ['toxicity_score',    typeof r.toxicity_score  === 'number' ? r.toxicity_score.toFixed(3)  : null],
     ['hate_speech_score', typeof r.hate_speech_score === 'number' ? r.hate_speech_score.toFixed(3) : null],
@@ -524,6 +537,15 @@ function toggleRowDetail(row) {
     + '</div>';
   }).join('');
 
+  // Original post content (full width) — the source text next to the summary.
+  var originalHtml = '';
+  if (r.post_text) {
+    originalHtml = '<div class="detail-field" style="grid-column:1/-1">'
+      + '<span class="detail-field-label">Original Post</span>'
+      + '<span class="detail-field-value" style="font-family:var(--font-sans);white-space:pre-wrap">' + escHtml(r.post_text) + '</span>'
+    + '</div>';
+  }
+
   // Summary preview
   var captionHtml = '';
   if (r.post_summary) {
@@ -534,19 +556,22 @@ function toggleRowDetail(row) {
     + '</div>';
   }
 
-  var tdContent = '<div class="row-detail-content">' + fieldsHtml + captionHtml + '</div>';
+  var tdContent = '<div class="row-detail-content">' + fieldsHtml + originalHtml + captionHtml + '</div>';
 
-  detailRow.innerHTML = '<td colspan="9">' + tdContent + '</td>';
+  // Full per-post comment-sentiment section, inline on the page (no modal).
+  // Same renderer the detail modal uses, scoped to this row by index.
+  var prefix = 'row' + idx;
+  var hasComments = r.comment_analysis
+    && ((r.comment_analysis.analyzed || 0) > 0
+        || ((r.engagement || {}).stored_comments || 0) > 0);
+  if (hasComments) {
+    tdContent += '<div class="row-comment-insights">' + commentInsightsHtml(prefix, r) + '</div>';
+  }
+
+  detailRow.innerHTML = '<td colspan="10">' + tdContent + '</td>';
   row.parentNode.insertBefore(detailRow, row.nextSibling);
-}
 
-function topEmotion(emotionObj) {
-  var best = null, bestV = -1;
-  Object.keys(emotionObj).forEach(function(k) {
-    var v = Number(emotionObj[k]);
-    if (v > bestV) { bestV = v; best = k; }
-  });
-  return best ? best + ' (' + bestV.toFixed(2) + ')' : null;
+  if (hasComments) mountCommentInsights(prefix, r);
 }
 
 /* ============================================================
@@ -597,6 +622,34 @@ function renderPostModal(r) {
 
   var html = '';
 
+  // ---- Header chip strip (quick-scan key signals) ----
+  var emo = (r.emotion && typeof r.emotion === 'object') ? r.emotion : null;
+  var conf = r.confidence || {};
+  var chips = [];
+  chips.push(makeChip('sentiment',
+    (r.overall_sentiment || 'neutral') + (typeof r.sentiment_score === 'number' ? ' ' + r.sentiment_score.toFixed(2) : ''),
+    sentColorVar(r.overall_sentiment)));
+  if (r.post_type) chips.push(makeChip('type', r.post_type, 'var(--color-primary, #6366f1)'));
+  var langChip = (r.language || 'und') + (r.script ? '/' + r.script : '') + (r.is_banglish ? ' ·banglish' : '');
+  chips.push(makeChip('language', langChip, '#6366f1'));
+  if (emo && emo.primary) chips.push(makeChip('emotion', emo.primary, '#8b5cf6'));
+  if (typeof r.toxicity_score === 'number') chips.push(makeChip('toxicity', pct(r.toxicity_score), sevColor(r.toxicity_score)));
+  if (typeof r.hate_speech_score === 'number') chips.push(makeChip('hate', pct(r.hate_speech_score), sevColor(r.hate_speech_score)));
+  if (typeof conf.overall === 'number') chips.push(makeChip('confidence', pct(conf.overall), '#0ea5e9'));
+  var eg = r.engagement || {};
+  chips.push(makeChip('♥ reactions', formatNumber(eg.total_reactions || eg.reactions || 0), '#64748b'));
+  chips.push(makeChip('💬 comments', formatNumber(eg.comment_count || 0), '#64748b'));
+  chips.push(makeChip('↗ shares', formatNumber(eg.share_count || 0), '#64748b'));
+  html += '<div class="chip-strip">' + chips.join('') + '</div>';
+
+  // ---- Original post content ----
+  if (r.post_text) {
+    html += '<div class="modal-section">'
+      + '<div class="modal-section-title">Original Post</div>'
+      + '<div class="original-post-box">' + escHtml(r.post_text) + '</div>'
+    + '</div>';
+  }
+
   // ---- Summary ----
   if (r.post_summary) {
     var srcBadge = '';
@@ -625,8 +678,46 @@ function renderPostModal(r) {
     + makeSentimentItem('Text', textSent.label || '—', textSent.score)
     + makeSentimentItem('Image', imageSent ? (imageSent.label || '—') : 'N/A', imageSent ? imageSent.score : null)
     + makeSentimentItem('Overall', overall, r.sentiment_score)
+    + (r.baseline_sentiment != null
+        ? makeSentimentItem('Baseline (upstream)',
+            (Number(r.baseline_sentiment) > 0.1 ? 'positive' : Number(r.baseline_sentiment) < -0.1 ? 'negative' : 'neutral'),
+            Number(r.baseline_sentiment))
+        : '')
     + '</div>'
   + '</div>';
+
+  // ---- Emotion + Confidence + Safety (three-up detail row) ----
+  var emoScores = emo && emo.scores ? emo.scores : null;
+  html += '<div class="modal-section"><div class="modal-section-title">Signals</div>'
+    + '<div class="detail-3col">';
+
+  // Emotion column (bar chart)
+  html += '<div><p class="chart-title">Emotion'
+    + (emo && emo.primary ? ' · <span style="color:var(--color-mixed)">' + escHtml(emo.primary) + '</span>' : '')
+    + '</p>'
+    + (emoScores ? '<canvas id="emotion-chart" height="150"></canvas>' : '<div class="text-muted">—</div>')
+    + '</div>';
+
+  // Confidence column (DOM bars)
+  html += '<div><p class="chart-title">Confidence</p>'
+    + makeBar('Overall',   conf.overall,   '#0ea5e9')
+    + makeBar('Sentiment', conf.sentiment, '#0ea5e9')
+    + makeBar('Language',  conf.language,  '#0ea5e9')
+    + makeBar('Topics',    conf.topics,    '#0ea5e9')
+    + '</div>';
+
+  // Safety column (DOM bars)
+  html += '<div><p class="chart-title">Safety</p>'
+    + makeBar('Toxicity',    r.toxicity_score,    sevColor(r.toxicity_score || 0))
+    + makeBar('Hate speech', r.hate_speech_score, sevColor(r.hate_speech_score || 0))
+    + (r.intents && r.intents.length
+        ? '<p class="chart-title" style="margin-top:10px">Intents</p><div class="tag-list">'
+          + r.intents.map(function(t){ return '<span class="tag tag-sm">' + escHtml(t) + '</span>'; }).join('')
+          + '</div>'
+        : '')
+    + '</div>';
+
+  html += '</div></div>';
 
   // ---- Image analysis ----
   if (r.image_analysis && (r.image_analysis.ocr_text || r.image_analysis.description || (r.image_analysis.images || []).length)) {
@@ -651,55 +742,10 @@ function renderPostModal(r) {
     + '</div>';
   }
 
-  // ---- Comment analysis ----
+  // ---- Comment analysis (unified renderer — same section used inline in the
+  //      Posts results row). Charts + AI summary + per-comment list. ----
   if (r.comment_analysis) {
-    var ca = r.comment_analysis;
-    var coverage = ca.coverage || (ca.analyzed + ' analyzed');
-    var sb = ca.sentiment_breakdown || {};
-
-    html += '<div class="modal-section">'
-      + '<div class="modal-section-title">Comment Analysis</div>'
-      + '<div class="charts-row">'
-      + '<div>'
-      + '<p class="chart-title">Coverage: ' + escHtml(coverage) + '</p>'
-      + '<div style="display:flex;gap:20px;align-items:center">'
-      + '<canvas id="sentiment-pie" width="160" height="160"></canvas>'
-      + '<div style="flex:1">'
-      + makeLegendItem('Positive', sb.positive || 0, 'var(--color-positive)')
-      + makeLegendItem('Negative', sb.negative || 0, 'var(--color-negative)')
-      + makeLegendItem('Neutral',  sb.neutral  || 0, 'var(--color-neutral)')
-      + '</div>'
-      + '</div>'
-      + '</div>';
-
-    if (ca.themes && ca.themes.length > 0) {
-      html += '<div>'
-        + '<p class="chart-title">Top Themes</p>'
-        + '<ul class="theme-list">'
-        + ca.themes.map(function(t) { return '<li>' + escHtml(t) + '</li>'; }).join('')
-        + '</ul>'
-      + '</div>';
-    }
-
-    html += '</div>';
-
-    // Representative comments
-    if (ca.representative_comments && ca.representative_comments.length > 0) {
-      html += '<p class="chart-title" style="margin-top:12px">Representative Comments</p>';
-      ca.representative_comments.forEach(function(c) {
-        var cObj = (typeof c === 'string') ? { text: c } : (c || {});
-        html += '<div class="rep-comment">'
-          + '<div class="rep-comment-meta">'
-          + (cObj.sentiment ? '<span class="badge badge-' + escAttr(cObj.sentiment) + '">' + escHtml(cObj.sentiment) + '</span>' : '')
-          + (cObj.lang ? '<span class="text-muted">' + escHtml(cObj.lang) + '</span>' : '')
-          + (cObj.likes != null ? '<span class="text-muted">♥ ' + cObj.likes + '</span>' : '')
-          + '</div>'
-          + '<div class="rep-comment-text">' + escHtml(cObj.text || '') + '</div>'
-        + '</div>';
-      });
-    }
-
-    html += '</div>';
+    html += '<div class="modal-section">' + commentInsightsHtml('modal', r) + '</div>';
   }
 
   // ---- Engagement metrics ----
@@ -790,12 +836,292 @@ function renderPostModal(r) {
     }, 50);
   }
 
-  if (r.comment_analysis && r.comment_analysis.sentiment_breakdown) {
+  // Emotion bar chart
+  if (emoScores) {
     setTimeout(function() {
-      var canvas = document.getElementById('sentiment-pie');
-      if (canvas) renderSentimentPie(canvas, r.comment_analysis.sentiment_breakdown);
+      var canvas = document.getElementById('emotion-chart');
+      if (!canvas) return;
+      var emoColors = { joy:'#22c55e', sadness:'#3b82f6', anger:'#ef4444', fear:'#a855f7',
+                        surprise:'#f59e0b', disgust:'#84cc16', neutral:'#94a3b8' };
+      var data = Object.keys(emoScores).map(function(k){
+        return { label: k, value: Number(emoScores[k]) || 0, color: emoColors[k] || '#6366f1' };
+      }).sort(function(a,b){ return b.value - a.value; });
+      renderBarChart(canvas, data, 76);
     }, 50);
   }
+
+  // Mount the comment-insights charts + lazy-load the per-comment list.
+  if (r.comment_analysis && (r.post_id || currentPostId)) {
+    mountCommentInsights('modal', r);
+  }
+}
+
+// ---- Per-comment sentiment + emotion (full coverage) ---------------------
+// One context per rendered comment-insights instance, keyed by a DOM id prefix
+// ('modal' for the detail modal, 'rowN' for an expanded results row). This lets
+// the same renderer drive several instances at once without id collisions.
+var commentCtx = {};   // prefix -> { prefix, postId, sentiment, offset, limit }
+
+// Shared emotion taxonomy → colour + emoji (matches the post emotion chart and
+// the backend libs/schemas/output_schema.json taxonomy).
+var EMOTION_META = {
+  anger:    { color: '#ef4444', emoji: '😠' },
+  sadness:  { color: '#3b82f6', emoji: '😢' },
+  joy:      { color: '#22c55e', emoji: '😊' },
+  fear:     { color: '#a855f7', emoji: '😨' },
+  disgust:  { color: '#84cc16', emoji: '🤢' },
+  surprise: { color: '#f59e0b', emoji: '😮' },
+  neutral:  { color: '#94a3b8', emoji: '😐' }
+};
+
+function emotionTag(emo) {
+  if (!emo) return '';
+  var m = EMOTION_META[emo] || EMOTION_META.neutral;
+  return '<span class="tag tag-sm" style="border-color:' + m.color + ';color:' + m.color + '" title="emotion">'
+    + m.emoji + ' ' + escHtml(emo) + '</span>';
+}
+
+// AI-written summary of the comment mood (empty string when none yet).
+function commentSummaryBox(summary) {
+  if (!summary) return '';
+  return '<div class="comment-summary-box">'
+    + '<span class="comment-summary-tag">AI summary</span>'
+    + '<span class="comment-summary-text">' + escHtml(summary) + '</span>'
+  + '</div>';
+}
+
+// Emotion distribution as a horizontal bar chart (every comment), coloured by
+// the shared EMOTION_META taxonomy. Replaces the old tag-list with a real chart.
+function renderEmotionChart(canvas, emotionBreakdown) {
+  var order = ['anger', 'sadness', 'joy', 'fear', 'disgust', 'surprise', 'neutral'];
+  var eb = emotionBreakdown || {};
+  var data = order.filter(function(k){ return eb[k]; }).map(function(k){
+    var m = EMOTION_META[k] || EMOTION_META.neutral;
+    return { label: m.emoji + ' ' + k, value: eb[k], color: m.color };
+  });
+  renderBarChart(canvas, data, 92);
+}
+
+/* Build the full comment-insights section (AI summary + stance donut + emotion
+ * chart + themes + representative + analytics + paginated per-comment list).
+ * Every id is scoped by `prefix` so the modal and any number of expanded rows
+ * can coexist. Static parts render from the cached result `r`; the analytics /
+ * per-comment list are filled by mountCommentInsights's fetch. */
+function commentInsightsHtml(prefix, r) {
+  var ca = (r && r.comment_analysis) || {};
+  var coverage = ca.coverage_label || '—';
+  var sb = ca.sentiment_breakdown || {};
+
+  var html = '<div class="comment-insights">'
+    + '<div class="modal-section-title">Comment Sentiment <span class="text-muted">(' + escHtml(coverage) + ')</span></div>'
+    + '<div id="cs-summary-' + prefix + '">' + commentSummaryBox(ca.summary) + '</div>'
+    + '<div class="charts-row" style="margin-top:12px">'
+    + '<div>'
+    + '<p class="chart-title">Stance toward post</p>'
+    + '<div style="display:flex;gap:20px;align-items:center">'
+    + '<canvas id="cs-pie-' + prefix + '" width="160" height="160"></canvas>'
+    + '<div style="flex:1">'
+    + makeLegendItem('Positive', sb.positive || 0, 'var(--color-positive)')
+    + makeLegendItem('Negative', sb.negative || 0, 'var(--color-negative)')
+    + makeLegendItem('Neutral',  sb.neutral  || 0, 'var(--color-neutral)')
+    + '</div></div>'
+    + '</div>'
+    + '<div>'
+    + '<p class="chart-title">Emotion mix <span class="text-muted">(every comment)</span></p>'
+    + '<canvas id="cs-emotion-' + prefix + '" height="120"></canvas>'
+    + '</div>'
+    + '</div>';
+
+  if (ca.themes && ca.themes.length > 0) {
+    html += '<p class="chart-title" style="margin-top:12px">Top Themes</p>'
+      + '<ul class="theme-list">'
+      + ca.themes.map(function(t){ return '<li>' + escHtml(t) + '</li>'; }).join('')
+      + '</ul>';
+  }
+
+  if (ca.representative_comments && ca.representative_comments.length > 0) {
+    html += '<p class="chart-title" style="margin-top:12px">Representative Comments</p>';
+    ca.representative_comments.forEach(function(c) {
+      var cObj = (typeof c === 'string') ? { text: c } : (c || {});
+      html += '<div class="rep-comment">'
+        + '<div class="rep-comment-meta">'
+        + (cObj.sentiment ? '<span class="badge badge-' + escAttr(cObj.sentiment) + '">' + escHtml(cObj.sentiment) + '</span>' : '')
+        + (cObj.likes != null ? '<span class="text-muted">♥ ' + cObj.likes + '</span>' : '')
+        + '</div>'
+        + '<div class="rep-comment-text">' + escHtml(cObj.text || '') + '</div>'
+      + '</div>';
+    });
+  }
+
+  html += '<div id="cs-analytics-' + prefix + '"></div>'
+    + '<p class="chart-title" style="margin-top:16px">Every comment <span class="text-muted">(stance toward post · full coverage)</span></p>'
+    + '<div id="cs-controls-' + prefix + '" style="display:flex;gap:8px;align-items:center;flex-wrap:wrap;margin-bottom:8px"></div>'
+    + '<div id="cs-list-' + prefix + '"><div class="text-muted" style="padding:8px 0">Loading comments…</div></div>'
+  + '</div>';
+
+  return html;
+}
+
+// Paint the charts that need no fetch, then lazy-load the analytics + comments.
+function mountCommentInsights(prefix, r) {
+  var ca = (r && r.comment_analysis) || {};
+  setTimeout(function() {
+    var pie = document.getElementById('cs-pie-' + prefix);
+    if (pie) renderSentimentPie(pie, ca.sentiment_breakdown || {});
+    var emo = document.getElementById('cs-emotion-' + prefix);
+    if (emo) renderEmotionChart(emo, ca.emotion_breakdown || {});
+  }, 50);
+
+  commentCtx[prefix] = {
+    prefix: prefix,
+    postId: (r && r.post_id) || currentPostId,
+    sentiment: 'all',
+    offset: 0,
+    limit: 100
+  };
+  loadComments(prefix);
+}
+
+async function loadComments(prefix) {
+  var st = commentCtx[prefix];
+  if (!st) return;
+  var listEl = document.getElementById('cs-list-' + prefix);
+  if (listEl) listEl.innerHTML = '<div class="text-muted" style="padding:8px 0">Loading comments…</div>';
+  try {
+    var qs = '?limit=' + st.limit + '&offset=' + st.offset + '&sentiment=' + encodeURIComponent(st.sentiment);
+    var data = await apiCall('/v1/analysis/post/' + encodeURIComponent(st.postId) + '/comments' + qs, { method: 'GET' });
+    renderComments(prefix, data);
+  } catch (err) {
+    if (listEl) listEl.innerHTML = '<div class="alert alert-error">Could not load comments: ' + escHtml(err.message) + '</div>';
+  }
+}
+
+function setCommentFilter(prefix, sentiment) {
+  var st = commentCtx[prefix];
+  if (!st) return;
+  st.sentiment = sentiment;
+  st.offset = 0;
+  loadComments(prefix);
+}
+
+function pageComments(prefix, delta) {
+  var st = commentCtx[prefix];
+  if (!st) return;
+  st.offset = Math.max(0, st.offset + delta * st.limit);
+  loadComments(prefix);
+}
+
+function renderComments(prefix, data) {
+  var st = commentCtx[prefix];
+  if (!st) return;
+  var controls = document.getElementById('cs-controls-' + prefix);
+  var listEl = document.getElementById('cs-list-' + prefix);
+  if (!listEl) return;
+
+  // The detail fetch is the authoritative source for the AI summary and the
+  // full-coverage emotion mix — refresh both if they arrived with it.
+  var sumEl = document.getElementById('cs-summary-' + prefix);
+  if (sumEl && data.summary) sumEl.innerHTML = commentSummaryBox(data.summary);
+  var emoCanvas = document.getElementById('cs-emotion-' + prefix);
+  if (emoCanvas && data.emotion_breakdown) renderEmotionChart(emoCanvas, data.emotion_breakdown);
+
+  if (controls) {
+    var filters = ['all', 'positive', 'negative', 'neutral'];
+    controls.innerHTML = filters.map(function(f) {
+      var active = (st.sentiment === f) ? ' btn-secondary' : '';
+      return '<button class="btn btn-sm' + active + '" onclick="setCommentFilter(\'' + prefix + '\',\'' + f + '\')">' + f + '</button>';
+    }).join('')
+      + '<span class="text-muted" style="margin-left:auto">' + data.filtered_total + ' / ' + data.total + ' comments</span>';
+  }
+
+  // ---- Full-set comment analytics (constant across pages/filters) ----
+  var an = document.getElementById('cs-analytics-' + prefix);
+  if (an) {
+    var mb = data.method_breakdown || {};
+    var mbTotal = Object.keys(mb).reduce(function(s, k){ return s + (mb[k] || 0); }, 0);
+    var analyticsHtml = '<div class="detail-3col" style="margin-top:8px">';
+
+    // Score distribution histogram
+    analyticsHtml += '<div><p class="chart-title">Sentiment-score distribution'
+      + (typeof data.avg_sentiment_score === 'number' ? ' <span class="text-muted">(avg ' + data.avg_sentiment_score.toFixed(2) + ')</span>' : '')
+      + '</p><canvas id="cs-hist-' + prefix + '" height="130"></canvas></div>';
+
+    // Top authors
+    var ta = (data.top_authors || []).filter(function(a){ return a.author && a.author !== '—'; });
+    analyticsHtml += '<div><p class="chart-title">Top authors <span class="text-muted">(by likes)</span></p>';
+    if (ta.length) {
+      analyticsHtml += '<div class="mini-list">' + ta.slice(0, 6).map(function(a){
+        return '<div class="mini-row"><span class="mini-name" title="' + escAttr(a.author) + '">' + escHtml(a.author) + '</span>'
+          + '<span class="text-muted">' + a.count + '× · ♥ ' + formatNumber(a.likes) + '</span></div>';
+      }).join('') + '</div>';
+    } else { analyticsHtml += '<div class="text-muted">—</div>'; }
+    // Engine mix (llm = context-aware stance; fast/model = standalone fallback)
+    if (mbTotal > 0) {
+      var llmPct = Math.round((mb.llm || 0) / mbTotal * 100);
+      var mixParts = Object.keys(mb).filter(function(k){ return mb[k]; })
+        .map(function(k){ return k + ' ' + mb[k]; });
+      analyticsHtml += '<p class="chart-title" style="margin-top:10px">Engine mix '
+        + '<span class="text-muted">(' + llmPct + '% LLM-stance)</span></p>'
+        + '<div class="split-bar"><span class="split-fast" style="width:' + llmPct + '%"></span></div>'
+        + '<div class="text-muted" style="font-size:.72rem;margin-top:2px">' + escHtml(mixParts.join(' · ')) + '</div>';
+    }
+    analyticsHtml += '</div>';
+
+    // Most-liked comments
+    var tl = (data.top_liked || []).filter(function(c){ return (c.likes || 0) > 0; });
+    analyticsHtml += '<div><p class="chart-title">Most-liked comments</p>';
+    if (tl.length) {
+      analyticsHtml += tl.slice(0, 4).map(function(c){
+        return '<div class="rep-comment" style="margin-bottom:6px">'
+          + '<div class="rep-comment-meta">'
+          + '<span class="badge badge-' + escAttr(c.sentiment || 'neutral') + '">' + escHtml(c.sentiment || 'neutral') + '</span>'
+          + '<span class="text-muted">♥ ' + formatNumber(c.likes || 0) + '</span></div>'
+          + '<div class="rep-comment-text">' + escHtml(truncate(c.text || '', 90)) + '</div></div>';
+      }).join('');
+    } else { analyticsHtml += '<div class="text-muted">—</div>'; }
+    analyticsHtml += '</div></div>';
+
+    an.innerHTML = analyticsHtml;
+    setTimeout(function(){
+      var hc = document.getElementById('cs-hist-' + prefix);
+      if (hc) renderHistogram(hc, data.score_histogram || []);
+    }, 30);
+  }
+
+  var comments = data.comments || [];
+  if (comments.length === 0) {
+    listEl.innerHTML = '<div class="text-muted" style="padding:8px 0">No comments for this filter.</div>';
+    return;
+  }
+
+  var rows = comments.map(function(c) {
+    var sent = c.sentiment || 'neutral';
+    var scoreStr = (typeof c.sentiment_score === 'number') ? c.sentiment_score.toFixed(2) : '';
+    return '<div class="rep-comment"' + (c.id ? ' title="comment ' + escAttr(String(c.id)) + '"' : '') + '>'
+      + '<div class="rep-comment-meta">'
+      + '<span class="badge badge-' + escAttr(sent) + '">' + escHtml(sent) + '</span>'
+      + emotionTag(c.emotion)
+      + (scoreStr ? '<span class="text-muted">' + escHtml(scoreStr) + '</span>' : '')
+      + (c.method ? '<span class="tag tag-sm">' + escHtml(c.method) + '</span>' : '')
+      + (c.parent_id ? '<span class="tag tag-sm" title="reply to ' + escAttr(String(c.parent_id)) + '">↳ reply</span>' : '')
+      + (c.author ? '<span class="text-muted">' + escHtml(c.author) + '</span>' : '')
+      + (c.likes != null ? '<span class="text-muted">♥ ' + c.likes + '</span>' : '')
+      + '</div>'
+      + '<div class="rep-comment-text">' + escHtml(c.text || '') + '</div>'
+    + '</div>';
+  }).join('');
+
+  var from = data.offset + 1;
+  var to = data.offset + data.returned;
+  var hasPrev = data.offset > 0;
+  var hasNext = (data.offset + data.returned) < data.filtered_total;
+  var pager = '<div style="display:flex;gap:8px;align-items:center;margin-top:10px">'
+    + '<button class="btn btn-sm"' + (hasPrev ? '' : ' disabled') + ' onclick="pageComments(\'' + prefix + '\',-1)">‹ Prev</button>'
+    + '<span class="text-muted">' + from + '–' + to + '</span>'
+    + '<button class="btn btn-sm"' + (hasNext ? '' : ' disabled') + ' onclick="pageComments(\'' + prefix + '\',1)">Next ›</button>'
+    + '</div>';
+
+  listEl.innerHTML = rows + pager;
 }
 
 function makeSentimentItem(label, value, score) {
@@ -826,6 +1152,77 @@ function makeMetaField(key, value) {
     + '<div class="meta-field-key">' + escHtml(key) + '</div>'
     + '<div class="meta-field-val">' + escHtml(String(value)) + '</div>'
   + '</div>';
+}
+
+/* ---- Detail UI helpers (chips, bars, colors, histogram) ---- */
+function sentColorVar(label) {
+  if (label === 'positive') return 'var(--color-positive)';
+  if (label === 'negative') return 'var(--color-negative)';
+  if (label === 'mixed')    return 'var(--color-mixed)';
+  return 'var(--color-neutral)';
+}
+
+function sevColor(v) {
+  v = Number(v) || 0;
+  return v < 0.33 ? 'var(--color-positive)' : v < 0.66 ? 'var(--color-mixed)' : 'var(--color-negative)';
+}
+
+function makeChip(label, value, color) {
+  return '<span class="chip"><span class="chip-dot" style="background:' + (color || '#64748b') + '"></span>'
+    + '<span class="chip-label">' + escHtml(label) + '</span>'
+    + '<span class="chip-val">' + escHtml(String(value)) + '</span></span>';
+}
+
+function makeBar(label, frac, color) {
+  if (typeof frac !== 'number' || isNaN(frac)) frac = 0;
+  var p = Math.max(0, Math.min(100, Math.round(frac * 100)));
+  return '<div class="dbar">'
+    + '<span class="dbar-label">' + escHtml(label) + '</span>'
+    + '<span class="dbar-track"><span class="dbar-fill" style="width:' + p + '%;background:' + (color || '#6366f1') + '"></span></span>'
+    + '<span class="dbar-val">' + p + '%</span>'
+  + '</div>';
+}
+
+function renderHistogram(canvas, buckets) {
+  var ctx = canvas.getContext('2d');
+  var dpr = window.devicePixelRatio || 1;
+  var width = canvas.parentNode.offsetWidth || 300;
+  var height = 130;
+  canvas.width = width * dpr; canvas.height = height * dpr;
+  canvas.style.width = width + 'px'; canvas.style.height = height + 'px';
+  ctx.scale(dpr, dpr);
+  ctx.clearRect(0, 0, width, height);
+  if (!buckets || !buckets.length) return;
+  var maxV = Math.max.apply(null, buckets) || 1;
+  var n = buckets.length;
+  var padB = 16, padT = 6;
+  var gap = 3;
+  var bw = (width - gap * (n - 1)) / n;
+  var css = getComputedStyle(document.documentElement);
+  var neg = css.getPropertyValue('--color-negative').trim() || '#ef4444';
+  var neu = css.getPropertyValue('--color-neutral').trim() || '#94a3b8';
+  var pos = css.getPropertyValue('--color-positive').trim() || '#22c55e';
+  for (var i = 0; i < n; i++) {
+    var h = (buckets[i] / maxV) * (height - padB - padT);
+    var x = i * (bw + gap);
+    var y = height - padB - h;
+    // bucket i maps to score range; left=negative, mid=neutral, right=positive
+    var frac = i / (n - 1);
+    ctx.fillStyle = frac < 0.4 ? neg : frac > 0.6 ? pos : neu;
+    roundRect(ctx, x, y, bw, h, 2);
+    ctx.fill();
+    if (buckets[i] > 0) {
+      ctx.fillStyle = neu;
+      ctx.font = '9px system-ui, sans-serif';
+      ctx.textAlign = 'center';
+      ctx.fillText(String(buckets[i]), x + bw / 2, y - 2);
+    }
+  }
+  // axis labels
+  ctx.fillStyle = neu; ctx.font = '9px system-ui, sans-serif';
+  ctx.textAlign = 'left';  ctx.fillText('−1', 0, height - 4);
+  ctx.textAlign = 'center'; ctx.fillText('0', width / 2, height - 4);
+  ctx.textAlign = 'right'; ctx.fillText('+1', width, height - 4);
 }
 
 function closeModal() {
@@ -1013,11 +1410,13 @@ function roundRect(ctx, x, y, w, h, r) {
    ============================================================ */
 var jobsCache = [];
 
-async function loadJobs() {
+async function loadJobs(background) {
   var container = document.getElementById('jobs-table-body');
   if (!container) return;
 
-  container.innerHTML = '<tr><td colspan="6" class="table-empty"><div class="loading-overlay"><div class="spinner spinner-dark"></div> Loading jobs...</div></td></tr>';
+  if (!background || jobsCache.length === 0) {
+    container.innerHTML = '<tr><td colspan="6" class="table-empty"><div class="loading-overlay"><div class="spinner spinner-dark"></div> Loading jobs...</div></td></tr>';
+  }
 
   try {
     var data = await apiCall('/v1/analysis?limit=25', { method: 'GET' });
@@ -1305,11 +1704,13 @@ async function refreshJobStatus(jobId) {
 /* ============================================================
    Reports tab
    ============================================================ */
-async function loadReports() {
+async function loadReports(background) {
   var container = document.getElementById('reports-list');
   if (!container) return;
 
-  container.innerHTML = '<div class="loading-overlay"><div class="spinner spinner-dark"></div> Loading reports...</div>';
+  if (!background) {
+    container.innerHTML = '<div class="loading-overlay"><div class="spinner spinner-dark"></div> Loading reports...</div>';
+  }
 
   try {
     var data = await apiCall('/v1/reports?limit=20', { method: 'GET' });
@@ -2178,10 +2579,11 @@ function init() {
     }
   });
 
-  // Auto-refresh the active tab
+  // Auto-refresh the active tab — quietly, in the background, and never while
+  // the user is interacting (modal open, row expanded, typing, tab hidden).
   setInterval(function() {
-    if (autoRefreshEnabled) {
-      refreshTab(currentTab);
+    if (autoRefreshEnabled && !shouldSkipAutoRefresh()) {
+      refreshTab(currentTab, true);
     }
   }, AUTO_REFRESH_MS);
 

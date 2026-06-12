@@ -139,10 +139,18 @@ class EngagementResult(BaseModel):
 class CommentAnalysisResult(BaseModel):
     analyzed: int
     coverage: float
+    coverage_label: Optional[str] = None  # server-rendered coverage string
+    summary: Optional[str] = None  # LLM-written natural-language mood of the comments
+    summary_source: Optional[str] = None  # "llm" | None
     sentiment_breakdown: Dict[str, int]
+    emotion_breakdown: Dict[str, int] = {}  # per-comment emotion counts (schema v1.1)
+    method_breakdown: Dict[str, int] = {}
     themes: List[str] = []
     top_keywords: List[str] = []
     representative_comments: List[Any] = []
+    # Per-comment sentiment for every embedded comment. Only populated on the
+    # single-result detail path; stripped from list responses to bound payload.
+    comments: List[Any] = []
 
 
 class ConfidenceResult(BaseModel):
@@ -171,6 +179,7 @@ class AnalysisResultResponse(BaseModel):
     platform_post_id: str
     media_type: str
     language: str
+    post_text: Optional[str] = None  # original post caption/text
     post_type: Optional[str] = None
     post_summary: Optional[str] = None
     post_summary_lang: Optional[str] = None
@@ -209,6 +218,44 @@ class AnalysisDetailResponse(BaseModel):
     progress: Optional[Dict[str, Any]] = Field(
         None, description="Per-job progress: {total, completed, failed}"
     )
+
+
+# ---------------------------------------------------------------------------
+# Overview (corpus-level aggregates — all computed server-side)
+# ---------------------------------------------------------------------------
+
+
+class LabelCount(BaseModel):
+    """A label and its count, used for distribution lists."""
+
+    label: str
+    count: int
+
+
+class LlmPanel(BaseModel):
+    total_posts: int = 0
+    posts_with_llm: int = 0
+    posts_with_summaries: int = 0
+    backends_seen: List[LabelCount] = []
+
+
+class OverviewResponse(BaseModel):
+    """Everything the Overview tab renders — fully aggregated server-side so the
+    dashboard only fetches and displays it (no client-side counting)."""
+
+    total_posts: int = 0
+    campaign_id: Optional[str] = None
+    # Sentiment is a fixed taxonomy so the donut always has stable keys.
+    sentiment_distribution: Dict[str, int] = Field(
+        default_factory=lambda: {"positive": 0, "negative": 0, "neutral": 0, "mixed": 0}
+    )
+    language_distribution: List[LabelCount] = []
+    top_topics: List[LabelCount] = []
+    # Post-level dominant emotion across the corpus.
+    emotion_distribution: List[LabelCount] = []
+    # Per-comment emotion summed across all posts (from comment_analysis.emotion_breakdown).
+    comment_emotion_distribution: List[LabelCount] = []
+    llm_panel: LlmPanel = LlmPanel()
 
 
 # ---------------------------------------------------------------------------

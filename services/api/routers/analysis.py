@@ -29,6 +29,9 @@ from models import (
     AnalysisResultResponse,
     AnalysisRunRequest,
     AnalysisRunResponse,
+    LabelCount,
+    LlmPanel,
+    OverviewResponse,
 )
 
 log = structlog.get_logger(__name__)
@@ -250,6 +253,133 @@ async def list_analysis_jobs(
 
 
 @router.get(
+    "/overview",
+    response_model=OverviewResponse,
+    summary="Corpus-level aggregates for the Overview tab (all computed server-side)",
+)
+async def analysis_overview(
+    campaign_id: str | None = Query(None, description="Optional campaign filter"),
+    top: int = Query(8, ge=1, le=50, description="Max entries in the topic/language/emotion lists"),
+    db: AsyncSession = Depends(get_db),
+    current_user: dict = Depends(get_current_user),
+) -> OverviewResponse:
+    """Aggregate the whole corpus in SQL so the dashboard only renders.
+
+    Everything is derived from ``analysis_results`` JSONB (same source the
+    Posts tab reads), so no client-side counting is needed. Declared before
+    ``/{analysis_id}`` so the literal ``/overview`` path wins.
+    """
+    where = ""
+    params: dict[str, Any] = {"top": top}
+    if campaign_id:
+        where = "WHERE campaign_id = :campaign_id"
+        params["campaign_id"] = campaign_id
+
+    async def rows(sql: str) -> list:
+        return (await db.execute(text(sql), params)).mappings().all()
+
+    # --- Totals + LLM panel (one pass) --------------------------------------
+    panel_row = (
+        await db.execute(
+            text(
+                f"""
+                SELECT
+                    COUNT(*) AS total,
+                    SUM(CASE WHEN result->'processing'->>'llm_used' = 'true'
+                             OR result->>'llm_used' = 'true' THEN 1 ELSE 0 END) AS llm_used,
+                    SUM(CASE WHEN COALESCE(result->>'post_summary', '') <> '' THEN 1 ELSE 0 END) AS with_summary
+                FROM analysis_results
+                {where}
+                """
+            ),
+            params,
+        )
+    ).mappings().first()
+    total_posts = int(panel_row["total"] or 0)
+
+    # --- Sentiment distribution (fixed taxonomy) ----------------------------
+    sentiment_distribution = {"positive": 0, "negative": 0, "neutral": 0, "mixed": 0}
+    for r in await rows(
+        f"SELECT result->>'overall_sentiment' AS k, COUNT(*) AS c "
+        f"FROM analysis_results {where} GROUP BY k"
+    ):
+        key = r["k"] or "neutral"
+        if key in sentiment_distribution:
+            sentiment_distribution[key] += int(r["c"])
+
+    # --- Language distribution ----------------------------------------------
+    language_distribution = [
+        LabelCount(label=r["k"] or "und", count=int(r["c"]))
+        for r in await rows(
+            f"SELECT result->>'language' AS k, COUNT(*) AS c "
+            f"FROM analysis_results {where} GROUP BY k ORDER BY c DESC LIMIT :top"
+        )
+    ]
+
+    # --- Top topics (unnest the topics array) -------------------------------
+    # The comma-join puts analysis_results first, so the campaign filter must be
+    # a fresh WHERE clause here (not appended to the scalar `where`).
+    topic_filter = "WHERE campaign_id = :campaign_id" if campaign_id else ""
+    top_topics = [
+        LabelCount(label=r["k"], count=int(r["c"]))
+        for r in await rows(
+            f"SELECT topic AS k, COUNT(*) AS c "
+            f"FROM analysis_results, jsonb_array_elements_text(result->'topics') AS topic "
+            f"{topic_filter} GROUP BY topic ORDER BY c DESC LIMIT :top"
+        )
+    ]
+
+    # --- Post-level dominant emotion ----------------------------------------
+    emotion_distribution = [
+        LabelCount(label=r["k"], count=int(r["c"]))
+        for r in await rows(
+            f"SELECT result->'emotion'->>'primary' AS k, COUNT(*) AS c "
+            f"FROM analysis_results {where} "
+            f"{'AND' if where else 'WHERE'} result->'emotion'->>'primary' IS NOT NULL "
+            f"GROUP BY k ORDER BY c DESC LIMIT :top"
+        )
+    ]
+
+    # --- Per-comment emotion summed across posts (new emotion_breakdown) -----
+    comment_emotion_distribution = [
+        LabelCount(label=r["k"], count=int(r["c"]))
+        for r in await rows(
+            f"SELECT key AS k, SUM(value::int) AS c "
+            f"FROM analysis_results, "
+            f"jsonb_each_text(result->'comment_analysis'->'emotion_breakdown') "
+            f"{topic_filter} GROUP BY key ORDER BY c DESC"
+        )
+    ]
+
+    # --- Backends seen ------------------------------------------------------
+    backends_seen = [
+        LabelCount(label=r["k"], count=int(r["c"]))
+        for r in await rows(
+            f"SELECT result->'processing'->>'llm_backend' AS k, COUNT(*) AS c "
+            f"FROM analysis_results {where} "
+            f"{'AND' if where else 'WHERE'} result->'processing'->>'llm_backend' IS NOT NULL "
+            f"GROUP BY k ORDER BY c DESC"
+        )
+    ]
+
+    return OverviewResponse(
+        total_posts=total_posts,
+        campaign_id=campaign_id,
+        sentiment_distribution=sentiment_distribution,
+        language_distribution=language_distribution,
+        top_topics=top_topics,
+        emotion_distribution=emotion_distribution,
+        comment_emotion_distribution=comment_emotion_distribution,
+        llm_panel=LlmPanel(
+            total_posts=total_posts,
+            posts_with_llm=int(panel_row["llm_used"] or 0),
+            posts_with_summaries=int(panel_row["with_summary"] or 0),
+            backends_seen=backends_seen,
+        ),
+    )
+
+
+@router.get(
     "/latest",
     response_model=AnalysisDetailResponse,
     summary="List the most recent analysis results across all jobs",
@@ -403,6 +533,127 @@ async def get_analysis(
     )
 
 
+@router.get(
+    "/post/{post_id}/comments",
+    summary="Paginated per-comment sentiment for one post (full coverage)",
+)
+async def get_post_comments(
+    post_id: str,
+    limit: int = Query(200, ge=1, le=2000),
+    offset: int = Query(0, ge=0),
+    sentiment: str = Query("all", description="all | positive | negative | neutral"),
+    emotion: str = Query("all", description="all | anger | sadness | joy | fear | disgust | surprise | neutral"),
+    db: AsyncSession = Depends(get_db),
+    current_user: dict = Depends(get_current_user),
+) -> dict:
+    """Return every analysed comment for a post, paginated.
+
+    Reads the per-comment list from the canonical result (analysis_results JSONB)
+    so no extra datastore is needed. ``sentiment`` and ``emotion`` filter the
+    returned slice; the breakdown counts always reflect the full set.
+    """
+    row = (
+        await db.execute(
+            text("SELECT result FROM analysis_results WHERE post_id = :pid"),
+            {"pid": post_id},
+        )
+    ).mappings().first()
+
+    if row is None:
+        raise HTTPException(
+            status_code=status.HTTP_404_NOT_FOUND,
+            detail=f"No analysis result for post '{post_id}'",
+        )
+
+    ca: dict = (row["result"] or {}).get("comment_analysis") or {}
+    all_comments: list[dict] = ca.get("comments") or []
+
+    filtered = all_comments
+    if sentiment != "all":
+        filtered = [c for c in filtered if (c.get("sentiment") or "neutral") == sentiment]
+    if emotion != "all":
+        filtered = [c for c in filtered if (c.get("emotion") or "neutral") == emotion]
+
+    page = filtered[offset : offset + limit]
+
+    # ---- Aggregates over the FULL comment set (not just the page) ----------
+    # 10 buckets across the sentiment-score range [-1, 1].
+    histogram = [0] * 10
+    author_stats: dict[str, dict] = {}
+    score_sum = 0.0
+    for c in all_comments:
+        score = float(c.get("sentiment_score") or 0.0)
+        score_sum += score
+        idx = min(9, max(0, int((score + 1.0) / 2.0 * 10)))
+        histogram[idx] += 1
+        author = c.get("author") or "—"
+        a = author_stats.setdefault(author, {"author": author, "likes": 0, "count": 0})
+        a["likes"] += int(c.get("likes") or 0)
+        a["count"] += 1
+
+    top_authors = sorted(
+        author_stats.values(), key=lambda a: (-a["likes"], -a["count"])
+    )[:8]
+    top_liked = sorted(
+        all_comments, key=lambda c: int(c.get("likes") or 0), reverse=True
+    )[:6]
+    avg_score = round(score_sum / len(all_comments), 3) if all_comments else 0.0
+
+    return {
+        "post_id": post_id,
+        "total": len(all_comments),
+        "filtered_total": len(filtered),
+        "offset": offset,
+        "returned": len(page),
+        "summary": ca.get("summary"),
+        "summary_source": ca.get("summary_source"),
+        "sentiment_breakdown": ca.get("sentiment_breakdown", {}),
+        "emotion_breakdown": ca.get("emotion_breakdown", {}),
+        "method_breakdown": ca.get("method_breakdown", {}),
+        "coverage": ca.get("coverage", 0.0),
+        "coverage_label": _coverage_label(ca, (row["result"] or {}).get("engagement") or {}),
+        "avg_sentiment_score": avg_score,
+        "score_histogram": histogram,
+        "top_authors": top_authors,
+        "top_liked": top_liked,
+        "comments": page,
+    }
+
+
+def _coverage_label(ca: dict, engagement: dict) -> str:
+    """Human-readable comment-coverage string, computed server-side.
+
+    Mirrors what the dashboard used to build in JS: every stored comment is
+    classified, so "✓ all" means we analysed everything the upstream shipped;
+    the "% of N" tail is the honest fraction of the platform's reported total
+    that we ever received.
+    """
+    analyzed = int(ca.get("analyzed") or 0)
+    stored = int((engagement or {}).get("stored_comments") or 0)
+    total = int((engagement or {}).get("comment_count") or 0)
+    if not analyzed and not stored and not total:
+        return "—"
+    full = analyzed >= stored if stored > 0 else True
+    head = ("✓ all " if full else "") + f"{analyzed} analyzed"
+    if total > 0 and total > analyzed:
+        head += f" · {round(analyzed / total * 100)}% of {total}"
+    return head
+
+
+def _comment_analysis_summary(r: dict) -> dict:
+    """comment_analysis for list/detail responses: drop the bulky per-comment
+    list and attach the server-computed coverage_label."""
+    ca = dict(
+        r.get(
+            "comment_analysis",
+            {"analyzed": 0, "coverage": 0.0, "sentiment_breakdown": {}},
+        )
+    )
+    ca.pop("comments", None)
+    ca["coverage_label"] = _coverage_label(ca, r.get("engagement") or {})
+    return ca
+
+
 def _row_to_result(row: Any) -> AnalysisResultResponse:
     """Map a DB row (with embedded JSONB result) to AnalysisResultResponse."""
     r: dict = row["result"]
@@ -414,6 +665,7 @@ def _row_to_result(row: Any) -> AnalysisResultResponse:
         platform_post_id=r.get("platform_post_id", ""),
         media_type=r.get("media_type", "TEXT"),
         language=r.get("language", ""),
+        post_text=r.get("post_text"),
         post_type=r.get("post_type"),
         post_summary=r.get("post_summary"),
         post_summary_lang=r.get("post_summary_lang"),
@@ -433,10 +685,11 @@ def _row_to_result(row: Any) -> AnalysisResultResponse:
         engagement=r.get("engagement", {}),
         reaction_breakdown=r.get("reaction_breakdown"),
         image_analysis=r.get("image_analysis"),
-        comment_analysis=r.get(
-            "comment_analysis",
-            {"analyzed": 0, "coverage": 0.0, "sentiment_breakdown": {}},
-        ),
+        # Strip the (potentially large) per-comment list here — list and job
+        # responses stay lean. The Details modal lazy-loads the full per-comment
+        # sentiment via GET /v1/analysis/post/{post_id}/comments. coverage_label
+        # is computed server-side so the frontend just displays it.
+        comment_analysis=_comment_analysis_summary(r),
         confidence=r.get(
             "confidence",
             {"overall": 0.0, "sentiment": 0.0, "language": 0.0, "topics": 0.0},

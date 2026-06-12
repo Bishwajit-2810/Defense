@@ -17,7 +17,9 @@ import redis.asyncio as aioredis
 import structlog
 
 from .rules import get_task_flags, should_use_llm
+from libs.common.logging import setup_logging
 
+setup_logging("router")
 logger = structlog.get_logger(__name__)
 
 REDIS_URL: str = os.environ.get("REDIS_URL", "redis://localhost:6379/0")
@@ -142,7 +144,14 @@ async def run() -> None:
         except asyncio.CancelledError:
             break
         except Exception as exc:
-            logger.error("router_read_error", error=str(exc))
+            msg = str(exc)
+            # An idle BLOCK window with no new messages surfaces as a redis
+            # TimeoutError — that's normal when the queue is empty, not an error.
+            # Re-block quietly instead of spamming ERROR every few seconds.
+            if isinstance(exc, asyncio.TimeoutError) or "Timeout" in msg:
+                logger.debug("router_read_idle")
+                continue
+            logger.error("router_read_error", error=msg)
             if "NOGROUP" in str(exc):
                 # Stream/group wiped at runtime (e.g. FLUSHALL) — re-create
                 # the group instead of error-looping forever.

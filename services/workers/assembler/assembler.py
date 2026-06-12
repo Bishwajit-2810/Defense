@@ -21,7 +21,6 @@ from __future__ import annotations
 
 import asyncio
 import json
-import logging
 import os
 import sys
 import time
@@ -42,13 +41,11 @@ from persistence import (
 )
 
 # ---------------------------------------------------------------------------
-# Structured logging
+# Logging — everything funnels into loguru (see libs/common/logging.py)
 # ---------------------------------------------------------------------------
-structlog.configure(
-    wrapper_class=structlog.make_filtering_bound_logger(
-        logging.getLevelName(os.environ.get("LOG_LEVEL", "INFO"))
-    ),
-)
+from common.logging import setup_logging  # noqa: E402
+
+setup_logging("assembler")
 log: structlog.BoundLogger = structlog.get_logger(__name__)
 
 # ---------------------------------------------------------------------------
@@ -265,6 +262,9 @@ async def _process_message(
     try:
         await asyncio.gather(
             persist_postgres(result, engine, embedding=stage1_embedding),
+            # persist_clickhouse writes both the analytics row AND the per-comment
+            # rows on its single connection (sequentially) — they must NOT be
+            # separate gather tasks or clickhouse-driver rejects the concurrent use.
             persist_clickhouse(result, ch_client),
             persist_minio(result, s3_client, bucket),
         )
@@ -370,7 +370,13 @@ async def run_assembler(
             log.info("assembler_cancelled")
             break
         except Exception as exc:
-            log.error("xreadgroup_error", error=str(exc))
+            msg = str(exc)
+            # An idle BLOCK window with no new messages surfaces as a redis
+            # TimeoutError — normal when upstream is quiet, not an error.
+            if isinstance(exc, asyncio.TimeoutError) or "Timeout" in msg:
+                log.debug("xreadgroup_idle")
+                continue
+            log.error("xreadgroup_error", error=msg)
             if "NOGROUP" in str(exc):
                 # Stream/group wiped at runtime (e.g. FLUSHALL) — re-create
                 # the group instead of error-looping forever.

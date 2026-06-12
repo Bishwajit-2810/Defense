@@ -77,6 +77,15 @@ def make_stub_stage1(normalized_post: dict) -> dict:
                 "negative": 0,
                 "neutral": n_comments,
             },
+            "emotion_breakdown": {
+                "anger": 0,
+                "sadness": 0,
+                "joy": 0,
+                "fear": 0,
+                "disgust": 0,
+                "surprise": 0,
+                "neutral": n_comments,
+            },
             "themes": [],
             "top_keywords": [],
             "representative_comments": [],
@@ -327,8 +336,8 @@ class TestRouterRules:
         )
         assert flags["want_summary"] is True
 
-    def test_get_task_flags_no_summary_by_default(self):
-        """get_task_flags returns want_summary=False when nothing triggers it."""
+    def test_get_task_flags_summary_on_by_default(self):
+        """Every post gets a summary now — want_summary defaults to True."""
         flags = get_task_flags(
             {
                 "overall_confidence": 0.9,
@@ -338,6 +347,14 @@ class TestRouterRules:
                 "image_sentiment": "neutral",
             },
             {},
+        )
+        assert flags["want_summary"] is True
+
+    def test_get_task_flags_summary_can_be_disabled(self):
+        """An explicit want_summary=False is still honoured."""
+        flags = get_task_flags(
+            {"overall_confidence": 0.9, "post_type": "news", "topics": ["a", "b"]},
+            {"want_summary": False},
         )
         assert flags["want_summary"] is False
 
@@ -394,6 +411,11 @@ class TestBuilderEndToEnd:
         assert "positive" in sb
         assert "negative" in sb
         assert "neutral" in sb
+        # Per-comment emotion aggregate (schema v1.1)
+        assert "emotion_breakdown" in ca
+        eb = ca["emotion_breakdown"]
+        for label in ("anger", "sadness", "joy", "fear", "disgust", "surprise", "neutral"):
+            assert label in eb
 
     def test_text_only_image_null(self):
         """TEXT post produces image_analysis=None and image_sentiment=None."""

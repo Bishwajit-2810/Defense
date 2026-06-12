@@ -381,6 +381,30 @@ def _real_embedding(text: str, embed_model: object) -> list[float]:
 # Public entry-point
 # ---------------------------------------------------------------------------
 
+async def analyze_sentiment(text: str | None, registry: ModelRegistry) -> tuple[str, float, float]:
+    """Sentiment-only classification for a single string — (label, score, confidence).
+
+    A lightweight cousin of :func:`analyze_text` used for per-comment scoring.
+    It deliberately skips the expensive embedding / NER / keyword stages so the
+    hybrid comment classifier can score thousands of comments per post without
+    generating a dense vector for each one. Uses the real XLM-R sentiment model
+    when available (``MODEL_STUB_MODE=false``), otherwise the deterministic stub.
+    """
+    if not text or not text.strip():
+        return "neutral", 0.0, 0.0
+
+    text = text.strip()
+
+    if registry.stub_mode:
+        return _stub_sentiment(text)
+
+    sent_pair = registry.get_sentiment_model()
+    if sent_pair is not None:
+        tokenizer, sent_model = sent_pair
+        return _real_sentiment(text, tokenizer, sent_model)
+    return _stub_sentiment(text)
+
+
 async def analyze_text(text: str | None, registry: ModelRegistry) -> dict:
     """Run the full text NLP pipeline on a single text string.
 

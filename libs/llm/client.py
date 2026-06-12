@@ -14,9 +14,11 @@ Usage:
 
 import json
 import os
+import time
 from typing import Any, Optional, Type, TypeVar
 
 import openai
+from loguru import logger as log
 from openai import AsyncOpenAI
 from tenacity import (
     retry,
@@ -197,26 +199,59 @@ class LLMClient:
         )
 
         model_id = self._resolve_model(role, effective_backend)
-        client = self._get_client(effective_backend)
 
-        completion = await self._call_api(
-            client=client,
-            model=model_id,
-            messages=messages,
-            response_format=response_format,
-            max_tokens=max_tokens,
-            temperature=temperature,
-        )
+        t0 = time.perf_counter()
+        try:
+            completion = await self._call_api(
+                client=self._get_client(effective_backend),
+                model=model_id,
+                messages=messages,
+                response_format=response_format,
+                max_tokens=max_tokens,
+                temperature=temperature,
+            )
+        except Exception as exc:
+            # A Groq failure (bad/expired key, connection, rate limit) must never
+            # take down analysis — fall back to the local Ollama backend, which is
+            # always available and privacy-safe. Local failures still propagate.
+            if effective_backend == "groq":
+                log.warning(
+                    "llm_groq_failed_falling_back_to_local role={} model={} error={}",
+                    role, model_id, exc,
+                )
+                effective_backend = "local"
+                model_id = self._resolve_model(role, "local")
+                completion = await self._call_api(
+                    client=self._get_client("local"),
+                    model=model_id,
+                    messages=messages,
+                    response_format=response_format,
+                    max_tokens=max_tokens,
+                    temperature=temperature,
+                )
+            else:
+                log.error(
+                    "llm_call_failed backend={} role={} model={} error={}",
+                    effective_backend, role, model_id, exc,
+                )
+                raise
 
         choice = completion.choices[0]
         usage = completion.usage
+        total_tokens = usage.total_tokens if usage else 0
+        latency_ms = round((time.perf_counter() - t0) * 1000.0, 1)
+
+        log.info(
+            "llm_call backend={} role={} model={} tokens={} latency_ms={}",
+            effective_backend, role, completion.model, total_tokens, latency_ms,
+        )
 
         return {
             "content": choice.message.content or "",
             "usage": {
                 "prompt_tokens": usage.prompt_tokens if usage else 0,
                 "completion_tokens": usage.completion_tokens if usage else 0,
-                "total_tokens": usage.total_tokens if usage else 0,
+                "total_tokens": total_tokens,
             },
             "model": completion.model,
             "backend": effective_backend,

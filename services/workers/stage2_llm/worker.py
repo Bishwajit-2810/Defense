@@ -31,11 +31,40 @@ from libs.llm import LLMClient  # noqa: E402
 
 from .cache import get_cached, set_cached  # noqa: E402
 from .prompts import (  # noqa: E402
+    build_comment_stance_messages,
+    build_comment_summary_messages,
     build_insight_messages,
     build_post_type_messages,
     build_summary_messages,
 )
 
+# Context-aware comment stance (post + comments → per-comment stance via LLM).
+# Comment stance runs on the lighter llm_b model slot (e.g. gemma3:4b) — set
+# LLM_B_LOCAL_MODEL to control it. Summaries/post-type stay on llm_a (qwen2.5:7b).
+_STANCE_ENABLED = os.environ.get("COMMENT_STANCE", "true").lower() == "true"
+_STANCE_ROLE = os.environ.get("COMMENT_STANCE_ROLE", "llm_b")
+_STANCE_BATCH = int(os.environ.get("COMMENT_STANCE_BATCH", "40"))
+_STANCE_MAX_TEXT = 140
+# Cap how many comments per post get the (slow) context-aware LLM stance: the
+# top-N by likes. The rest keep their instant Stage-1 heuristic label, so EVERY
+# comment is still analysed (full coverage) — the cap only bounds the premium LLM
+# pass so a post with thousands of comments doesn't stall the pipeline.
+#   COMMENT_STANCE_MAX_PER_POST=0  → LLM-label every comment (full LLM coverage;
+#   only practical on Groq / a GPU — on local CPU Ollama this takes ages).
+_STANCE_MAX_PER_POST = int(os.environ.get("COMMENT_STANCE_MAX_PER_POST", "40"))
+# Natural-language summary of the comment reactions (one short LLM call per post
+# that has comments). Set COMMENT_SUMMARY=false to disable.
+_COMMENT_SUMMARY_ENABLED = os.environ.get("COMMENT_SUMMARY", "true").lower() == "true"
+_STANCE_LABELS = {"positive", "negative", "neutral"}
+_STANCE_SCORE = {"positive": 0.6, "negative": -0.6, "neutral": 0.0}
+# Emotion taxonomy must match libs/schemas/output_schema.json and the Stage-1
+# heuristic (comment_analyzer._EMOTIONS).
+_EMOTION_LABELS = {"anger", "sadness", "joy", "fear", "disgust", "surprise", "neutral"}
+_EMOTION_KEYS = ("anger", "sadness", "joy", "fear", "disgust", "surprise", "neutral")
+
+from libs.common.logging import setup_logging  # noqa: E402
+
+setup_logging("stage2")
 logger = structlog.get_logger(__name__)
 
 REDIS_URL: str = os.environ.get("REDIS_URL", "redis://localhost:6379/0")
@@ -179,35 +208,44 @@ async def _run_summary(
         image_urls=image_urls,
     )
 
-    try:
-        response = await llm.chat(
-            role=role,
-            messages=messages,
-            backend_override=backend_override,
-            max_tokens=512,
-            temperature=0.2,
-        )
-    except Exception as exc:
-        if not grounded_on_image:
-            raise
-        logger.warning("vlm_summary_failed_falling_back_to_text", error=str(exc))
-        grounded_on_image = False
-        messages = build_summary_messages(
-            caption=partial_result.get("caption") or "",
-            ocr_text=partial_result.get("ocr_text") or "",
-            image_description=partial_result.get("image_description") or "",
-            language=partial_result.get("language") or "unknown",
-            target_lang=target_lang,
-        )
-        response = await llm.chat(
-            role="llm_a",
-            messages=messages,
+    text_only_messages = build_summary_messages(
+        caption=partial_result.get("caption") or "",
+        ocr_text=partial_result.get("ocr_text") or "",
+        image_description=partial_result.get("image_description") or "",
+        language=partial_result.get("language") or "unknown",
+        target_lang=target_lang,
+    )
+
+    async def _chat(chat_role: str, msgs: list[dict]) -> dict:
+        return await llm.chat(
+            role=chat_role,
+            messages=msgs,
             backend_override=backend_override,
             max_tokens=512,
             temperature=0.2,
         )
 
+    try:
+        response = await _chat(role, messages)
+    except Exception as exc:
+        if not grounded_on_image:
+            raise
+        logger.warning("vlm_summary_failed_falling_back_to_text", error=str(exc))
+        grounded_on_image = False
+        response = await _chat("llm_a", text_only_messages)
+
+    # Local VLMs (qwen3-vl) frequently return EMPTY content for image-grounded
+    # prompts without raising — that left every image post with a blank summary.
+    # Treat an empty grounded response exactly like a failure: redo text-only so
+    # the caption + OCR still produce a summary.
+    if grounded_on_image and not (response.get("content") or "").strip():
+        logger.warning("vlm_summary_empty_falling_back_to_text", post_id=partial_result.get("post_id"))
+        grounded_on_image = False
+        response = await _chat("llm_a", text_only_messages)
+
     await _track_usage(redis, response)
+
+    summary_text = (response.get("content") or "").strip()
 
     grounding_parts = []
     if partial_result.get("caption"):
@@ -220,7 +258,7 @@ async def _run_summary(
         grounding_parts.append("image_description")
 
     result = {
-        "post_summary": response["content"].strip(),
+        "post_summary": summary_text,
         "post_summary_lang": target_lang,
         # Golden rule 10: "vlm" only when the image actually grounded it.
         "post_summary_source": "vlm" if grounded_on_image else "llm",
@@ -229,7 +267,10 @@ async def _run_summary(
         "_llm_backend": response.get("backend", backend),
     }
 
-    await set_cached(redis, backend, model_label, task, content_hash, result)
+    # Never cache an empty summary — otherwise the blank result is served back on
+    # every retry for the same content and the post can never recover.
+    if summary_text:
+        await set_cached(redis, backend, model_label, task, content_hash, result)
     return result
 
 
@@ -340,6 +381,188 @@ async def _run_insight(
     return result
 
 
+def _normalize_stance(parsed: Any, n: int) -> list:
+    """Map an LLM response to a list[n] of {"s","e"} dicts (or None per slot).
+
+    Each slot carries the stance ("s") and emotion ("e") the LLM returned for
+    that comment number. Either field may be None when the model omits it or
+    returns an out-of-taxonomy value, so the caller keeps the Stage-1 fallback.
+    """
+    out: list = [None] * n
+    labels = parsed.get("labels") if isinstance(parsed, dict) else parsed
+    if not isinstance(labels, list):
+        return out
+    for item in labels:
+        if not isinstance(item, dict):
+            continue
+        idx = item.get("i", item.get("index"))
+        s = str(item.get("s", item.get("sentiment", ""))).lower().strip()
+        e = str(item.get("e", item.get("emotion", ""))).lower().strip()
+        try:
+            idx = int(idx)
+        except (TypeError, ValueError):
+            continue
+        if not (1 <= idx <= n):
+            continue
+        out[idx - 1] = {
+            "s": s if s in _STANCE_LABELS else None,
+            "e": e if e in _EMOTION_LABELS else None,
+        }
+    return out
+
+
+async def _run_comment_stance(
+    llm: LLMClient,
+    redis,
+    stage1_result: dict,
+    post_context: str,
+    backend_override: str | None,
+) -> int:
+    """Re-label every embedded comment with its STANCE TOWARD THE POST via the LLM.
+
+    Batches comments, sends each batch (with the post as context) to the LLM,
+    and overwrites each comment's ``sentiment`` (+ score, method="llm"). Mutates
+    ``stage1_result["comment_analysis"]`` in place — including a recomputed
+    sentiment_breakdown / method_breakdown — so the assembler persists the
+    context-aware labels to Postgres + ClickHouse. Returns #comments re-labelled.
+    """
+    ca = stage1_result.get("comment_analysis") or {}
+    comments = ca.get("comments") or []
+    if not comments:
+        return 0
+
+    backend = backend_override or os.environ.get("LLM_BACKEND", "local")
+    labeled = 0
+
+    # Only the most-engaged comments get the premium context-aware LLM stance;
+    # the rest keep their instant Stage-1 label (coverage stays 100%). These are
+    # the same dict objects as in ``comments``, so mutating them updates the list.
+    if 0 < _STANCE_MAX_PER_POST < len(comments):
+        targets = sorted(comments, key=lambda c: int(c.get("likes") or 0), reverse=True)[:_STANCE_MAX_PER_POST]
+    else:
+        targets = comments
+
+    for start in range(0, len(targets), _STANCE_BATCH):
+        batch = targets[start : start + _STANCE_BATCH]
+        raw_key = post_context[:1500] + "||" + "|".join(
+            (c.get("text") or "")[:_STANCE_MAX_TEXT] for c in batch
+        )
+        content_hash = hashlib.sha256(raw_key.encode("utf-8")).hexdigest()
+
+        cached = await get_cached(redis, backend, _STANCE_ROLE, "comment_stance", content_hash)
+        if cached is not None and isinstance(cached.get("labels"), list) and len(cached["labels"]) == len(batch):
+            results = cached["labels"]
+            await _track_usage(redis, cache_hit=True)
+        else:
+            messages = build_comment_stance_messages(post_context, batch, _STANCE_MAX_TEXT)
+            try:
+                resp = await llm.chat(
+                    role=_STANCE_ROLE,
+                    messages=messages,
+                    backend_override=backend_override,
+                    response_format={"type": "json_object"},
+                    # ~56 tokens/comment covers {"i":N,"s":"...","e":"..."}.
+                    max_tokens=min(4096, 56 * len(batch) + 64),
+                    temperature=0.0,
+                )
+                await _track_usage(redis, resp)
+                results = _normalize_stance(_safe_json_parse(resp["content"], {}), len(batch))
+                await set_cached(redis, backend, _STANCE_ROLE, "comment_stance", content_hash, {"labels": results})
+            except Exception as exc:
+                logger.warning("comment_stance_batch_failed", start=start, error=str(exc))
+                results = [None] * len(batch)
+
+        for c, label in zip(batch, results):
+            if not isinstance(label, dict):
+                continue
+            stance = label.get("s")
+            emotion = label.get("e")
+            if stance in _STANCE_LABELS:
+                c["sentiment"] = stance
+                c["sentiment_score"] = _STANCE_SCORE[stance]
+                c["method"] = "llm"
+                labeled += 1
+            if emotion in _EMOTION_LABELS:
+                # Context-aware emotion overwrites the Stage-1 heuristic guess.
+                c["emotion"] = emotion
+            # else: keep the Stage-1 standalone values as a fallback
+
+    # Recompute aggregates from the (mutated) per-comment list.
+    sb = {"positive": 0, "negative": 0, "neutral": 0}
+    eb = {k: 0 for k in _EMOTION_KEYS}
+    mb: dict = {}
+    for c in comments:
+        s = c.get("sentiment") or "neutral"
+        if s not in sb:
+            s = "neutral"
+        sb[s] += 1
+        e = c.get("emotion") or "neutral"
+        if e not in eb:
+            e = "neutral"
+        eb[e] += 1
+        m = c.get("method") or "fast"
+        mb[m] = mb.get(m, 0) + 1
+    ca["sentiment_breakdown"] = sb
+    ca["emotion_breakdown"] = eb
+    ca["method_breakdown"] = mb
+    return labeled
+
+
+async def _run_comment_summary(
+    llm: LLMClient,
+    redis,
+    stage1_result: dict,
+    post_context: str,
+    target_lang: str,
+    backend_override: str | None,
+) -> str | None:
+    """Write a short natural-language summary of how commenters reacted.
+
+    Grounded on the (context-aware) sentiment/emotion breakdowns and a few
+    representative comments — so it must run AFTER _run_comment_stance, whose
+    recomputed aggregates it reads. Returns the summary text (or None).
+    """
+    ca = stage1_result.get("comment_analysis") or {}
+    if not ca.get("comments"):
+        return None
+
+    backend = backend_override or os.environ.get("LLM_BACKEND", "local")
+    sb = ca.get("sentiment_breakdown") or {}
+    eb = ca.get("emotion_breakdown") or {}
+    reps = ca.get("representative_comments") or []
+
+    raw_key = (
+        post_context[:500]
+        + "||" + json.dumps(sb, sort_keys=True)
+        + "||" + json.dumps(eb, sort_keys=True)
+        + "||" + "|".join((c.get("text") or "")[:120] for c in reps[:4])
+        + "||" + (target_lang or "")
+    )
+    content_hash = hashlib.sha256(raw_key.encode("utf-8")).hexdigest()
+
+    cached = await get_cached(redis, backend, _STANCE_ROLE, "comment_summary", content_hash)
+    if cached is not None:
+        await _track_usage(redis, cache_hit=True)
+        return cached.get("summary")
+
+    messages = build_comment_summary_messages(post_context, sb, eb, reps, target_lang)
+    resp = await llm.chat(
+        role=_STANCE_ROLE,
+        messages=messages,
+        backend_override=backend_override,
+        max_tokens=256,
+        temperature=0.3,
+    )
+    await _track_usage(redis, resp)
+
+    summary = (resp.get("content") or "").strip()
+    if summary:
+        await set_cached(
+            redis, backend, _STANCE_ROLE, "comment_summary", content_hash, {"summary": summary}
+        )
+    return summary or None
+
+
 # ---------------------------------------------------------------------------
 # Core message processing
 # ---------------------------------------------------------------------------
@@ -392,9 +615,13 @@ async def _process_message(
         "photo_urls": normalized_post.get("photo_urls") or [],
     }
 
-    # Choose role: VLM for image posts (photo_urls present), LLM-A otherwise
+    # Choose role: VLM for image posts (photo_urls present), LLM-A otherwise.
+    # Set VLM_SUMMARY=false to skip image grounding entirely — useful when the
+    # local VLM is weak/unavailable (e.g. returns empty), so every post still gets
+    # a text+OCR-grounded summary without burning a wasted VLM call first.
     has_photos = bool(normalized_post.get("photo_urls"))
-    role = "vlm" if has_photos else "llm_a"
+    vlm_enabled = os.environ.get("VLM_SUMMARY", "true").lower() == "true"
+    role = "vlm" if (has_photos and vlm_enabled) else "llm_a"
 
     stage2_result: dict = {}
     llm_backend: str | None = None
@@ -443,6 +670,44 @@ async def _process_message(
             llm_model = llm_model or insight_data.get("_llm_model")
         except Exception as exc:
             log.error("stage2_insight_error", error=str(exc))
+
+    # ---- Comment stance (context-aware: each comment vs THE POST) ----
+    # Re-labels every embedded comment by its stance toward the post via the LLM
+    # (batched). Mutates stage1_result["comment_analysis"] in place so the
+    # assembler persists these context-aware labels to Postgres + ClickHouse.
+    if _STANCE_ENABLED:
+        ca = (stage1_result.get("comment_analysis") or {})
+        if ca.get("comments"):
+            post_context = (normalized_post.get("caption") or "").strip()
+            if not post_context:
+                post_context = (stage2_result.get("post_summary")
+                                or partial_result.get("ocr_text") or "")
+            try:
+                n_labeled = await _run_comment_stance(
+                    llm, redis, stage1_result, post_context, backend_override
+                )
+                log.info("stage2_comment_stance", labeled=n_labeled,
+                         total=len(ca.get("comments") or []))
+                llm_backend = llm_backend or (backend_override or os.environ.get("LLM_BACKEND", "local"))
+            except Exception as exc:
+                log.error("stage2_comment_stance_error", error=str(exc))
+
+            # ---- Comment summary (natural-language mood of the comment section) ----
+            # Runs after stance so it reads the context-aware breakdowns. Writes
+            # into comment_analysis in place → assembler persists it.
+            if _COMMENT_SUMMARY_ENABLED:
+                try:
+                    summary_lang = (task_flags.get("target_lang")
+                                    or stage1_result.get("language") or "English")
+                    comment_summary = await _run_comment_summary(
+                        llm, redis, stage1_result, post_context, summary_lang, backend_override
+                    )
+                    if comment_summary:
+                        ca["summary"] = comment_summary
+                        ca["summary_source"] = "llm"
+                        log.info("stage2_comment_summary", chars=len(comment_summary))
+                except Exception as exc:
+                    log.error("stage2_comment_summary_error", error=str(exc))
 
     elapsed_ms = int((time.monotonic() - t0) * 1000)
     stage2_result["processing"] = {
@@ -506,7 +771,12 @@ async def run() -> None:
         except asyncio.CancelledError:
             break
         except Exception as exc:
-            logger.error("stage2_read_error", error=str(exc))
+            msg = str(exc)
+            # Idle BLOCK window with no new messages → redis TimeoutError; normal.
+            if isinstance(exc, asyncio.TimeoutError) or "Timeout" in msg:
+                logger.debug("stage2_read_idle")
+                continue
+            logger.error("stage2_read_error", error=msg)
             if "NOGROUP" in str(exc):
                 # Stream/group wiped at runtime (e.g. FLUSHALL) — re-create
                 # the group instead of error-looping forever.

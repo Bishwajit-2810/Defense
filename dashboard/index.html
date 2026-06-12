@@ -5,7 +5,7 @@
   <meta name="viewport" content="width=device-width, initial-scale=1.0" />
   <title>Defense Analysis Dashboard</title>
   <link rel="icon" href="data:image/svg+xml,%3Csvg xmlns='http://www.w3.org/2000/svg' viewBox='0 0 16 16'%3E%3Crect width='16' height='16' rx='3' fill='%236366f1'/%3E%3C/svg%3E" />
-  <link rel="stylesheet" href="styles.css" />
+  <link rel="stylesheet" href="styles.css?v=5" />
   <!-- API the dashboard talks to. Change this for other deployments
        (e.g. 'http://localhost:8000' for Mode B). -->
   <script>window.API_BASE = 'http://127.0.0.1:8001';</script>
@@ -120,6 +120,13 @@
         </div>
       </div>
 
+      <div class="charts-2col">
+        <div class="card">
+          <div class="card-header"><div class="card-title">Comment Emotions <span class="text-muted">(all comments)</span></div></div>
+          <div class="chart-container"><canvas id="overview-emotion-chart" height="200"></canvas></div>
+        </div>
+      </div>
+
     </section><!-- /tab-overview -->
 
     <!-- =========================================================
@@ -180,6 +187,7 @@
           <table>
             <thead>
               <tr>
+                <th title="Sequential display number — not a database id">#</th>
                 <th>Post ID</th>
                 <th>Platform</th>
                 <th>Language</th>
@@ -579,6 +587,6 @@
 
 </div><!-- /app -->
 
-<script src="app.js?v=4"></script>
+<script src="app.js?v=11"></script>
 </body>
 </html>

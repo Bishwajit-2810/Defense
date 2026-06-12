@@ -2,8 +2,6 @@
 
 from __future__ import annotations
 
-import logging
-
 import structlog
 from fastapi import FastAPI
 from fastapi.middleware.cors import CORSMiddleware
@@ -14,24 +12,11 @@ from routers.agents import router as agents_router
 from routers.usage import router as usage_router
 
 # ---------------------------------------------------------------------------
-# Structured logging
+# Logging — everything funnels into loguru (see libs/common/logging.py)
 # ---------------------------------------------------------------------------
+from libs.common.logging import setup_logging
 
-structlog.configure(
-    processors=[
-        structlog.contextvars.merge_contextvars,
-        structlog.stdlib.add_log_level,
-        structlog.processors.TimeStamper(fmt="iso"),
-        structlog.processors.StackInfoRenderer(),
-        structlog.processors.format_exc_info,
-        structlog.processors.JSONRenderer(),
-    ],
-    wrapper_class=structlog.make_filtering_bound_logger(logging.INFO),
-    context_class=dict,
-    logger_factory=structlog.PrintLoggerFactory(),
-    cache_logger_on_first_use=True,
-)
-
+setup_logging("api")
 log = structlog.get_logger(__name__)
 
 # ---------------------------------------------------------------------------

@@ -84,16 +84,10 @@ def get_task_flags(partial_result: dict, options: dict) -> dict:
         want_insight   – Refine topics/intents and produce a one-line insight.
         target_lang    – Language code for the summary (None = auto).
     """
-    want_summary: bool = bool(options.get("want_summary", False))
-
-    # Also generate a summary when image posts lack one or confidence is low
-    overall_confidence = partial_result.get("overall_confidence")
-    if not want_summary:
-        photo_urls = partial_result.get("photo_urls") or []
-        if photo_urls and partial_result.get("image_sentiment") is None:
-            want_summary = True
-        elif overall_confidence is not None and overall_confidence < 0.65:
-            want_summary = True
+    # Every post gets a summary: the product requirement is a summary +
+    # sentiment for every post, not only image / low-confidence ones. Callers
+    # can still pass want_summary explicitly, but the default is now True.
+    want_summary: bool = options.get("want_summary", True)
 
     # Need post_type when it is absent or explicitly requested
     want_post_type: bool = (

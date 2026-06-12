@@ -6,6 +6,7 @@ Run it with uv (recommended):
     uv run run_all.py                 # core pipeline + dashboard, load the 50 posts
     uv run run_all.py --with-agents   # also start the agents + 3 MCP servers
     uv run run_all.py --reset         # wipe prior data, then load the 50 posts fresh
+    uv run run_all.py --fast          # run LLM work on Groq Cloud (needs GROQ_API_KEY) — much faster
     uv run run_all.py --no-load       # don't push the sample posts
     uv run run_all.py --no-dashboard  # skip serving the web UI
     uv run run_all.py --down          # on exit, also `docker compose down`
@@ -23,8 +24,10 @@ import json
 import os
 import shutil
 import signal
+import socket
 import subprocess
 import sys
+import threading
 import time
 import urllib.request
 from pathlib import Path
@@ -39,6 +42,48 @@ OLLAMA_URL = "http://localhost:11434"
 _C = {"cyan": "\033[36m", "yellow": "\033[33m", "red": "\033[31m", "green": "\033[32m", "off": "\033[0m"}
 _procs: list[tuple[str, subprocess.Popen]] = []
 _started_ollama = False
+
+# Live log streaming to the console (enabled by --logs). When on, each service's
+# stdout/stderr is teed to /tmp/<name>.log AND printed here with a coloured,
+# service-prefixed line so the whole pipeline can be watched in one terminal.
+_STREAM = False
+_LOG_LEVEL = "INFO"
+# Only print lines matching this substring filter when set (e.g. "llm" to watch
+# just LLM activity). None = print every line.
+_LOG_FILTER: str | None = None
+_STREAM_COLORS = ["\033[36m", "\033[32m", "\033[33m", "\033[35m", "\033[34m",
+                  "\033[91m", "\033[92m", "\033[93m", "\033[95m", "\033[96m"]
+_color_idx = 0
+
+
+def _uvicorn_level() -> str:
+    """uvicorn's own log level — verbose when streaming, quiet otherwise."""
+    return _LOG_LEVEL.lower() if _STREAM else "warning"
+
+
+def _pump(name: str, stream, logf, color: str) -> None:
+    """Read a child's combined stdout/stderr line-by-line: tee to its log file
+    and echo to the console with a coloured ``<service> |`` prefix."""
+    prefix = f"{color}{name:>13}{_C['off']} | "
+    try:
+        for raw in iter(stream.readline, b""):
+            try:
+                logf.write(raw)
+                logf.flush()
+            except Exception:
+                pass
+            line = raw.decode("utf-8", "replace").rstrip("\n")
+            if _LOG_FILTER and _LOG_FILTER.lower() not in line.lower():
+                continue
+            sys.stdout.write(prefix + line + "\n")
+            sys.stdout.flush()
+    except Exception:
+        pass
+    finally:
+        try:
+            logf.close()
+        except Exception:
+            pass
 
 
 def log(m): print(f"{_C['cyan']}[run_all]{_C['off']} {m}", flush=True)
@@ -139,9 +184,20 @@ def reap_stale() -> None:
 
 
 def start(name: str, cmd: list[str], env: dict, cwd: Path | None = None) -> subprocess.Popen:
+    global _color_idx
     logf = open(f"/tmp/{name}.log", "ab")
-    p = subprocess.Popen(cmd, cwd=str(cwd) if cwd else None, env=env,
-                         stdout=logf, stderr=subprocess.STDOUT, start_new_session=True)
+    if _STREAM:
+        # Pipe the child's output through a reader thread that tees it to the log
+        # file and the console. The thread owns/closes logf when the pipe ends.
+        p = subprocess.Popen(cmd, cwd=str(cwd) if cwd else None, env=env,
+                             stdout=subprocess.PIPE, stderr=subprocess.STDOUT,
+                             start_new_session=True, bufsize=1)
+        color = _STREAM_COLORS[_color_idx % len(_STREAM_COLORS)]
+        _color_idx += 1
+        threading.Thread(target=_pump, args=(name, p.stdout, logf, color), daemon=True).start()
+    else:
+        p = subprocess.Popen(cmd, cwd=str(cwd) if cwd else None, env=env,
+                             stdout=logf, stderr=subprocess.STDOUT, start_new_session=True)
     _procs.append((name, p))
     log(f"started {name} (pid {p.pid}) → /tmp/{name}.log")
     return p
@@ -249,11 +305,22 @@ def build_env() -> dict:
         "LOCAL_LLM_BASE_URL": f"{OLLAMA_URL}/v1",
         "LOCAL_LLM_API_KEY": "ollama",
         "LLM_A_LOCAL_MODEL": "qwen2.5:7b",
-        "LLM_B_LOCAL_MODEL": "qwen2.5:7b",
+        # llm_b is the lighter slot used for per-comment stance — a small, fast,
+        # multilingual, NON-reasoning model keeps full-coverage comment labelling
+        # tractable on CPU and returns direct JSON (gemma4:e4b is a reasoning model
+        # that emits empty content here, so it is unsuitable for batch labelling).
+        "LLM_B_LOCAL_MODEL": os.environ.get("LLM_B_LOCAL_MODEL", "gemma3:4b"),
         "VLM_LOCAL_MODEL": "qwen3-vl:4b",
+        # Per-post context-aware comment labelling. Every comment is ALWAYS
+        # analysed by the instant Stage-1 heuristic (full coverage); this only
+        # bounds the slow premium LLM pass to the top-N most-liked comments so a
+        # post with thousands of comments can't stall Stage-2. Set 0 to LLM-label
+        # EVERY comment (only practical on Groq / a GPU — slow on local CPU).
+        "COMMENT_STANCE_MAX_PER_POST": os.environ.get("COMMENT_STANCE_MAX_PER_POST", "40"),
+        "COMMENT_STANCE_BATCH": os.environ.get("COMMENT_STANCE_BATCH", "40"),
         "MODEL_STUB_MODE": "true",
         "JWT_SECRET": "demo",
-        "LOG_LEVEL": "INFO",
+        "LOG_LEVEL": _LOG_LEVEL,
         "PYTHONPATH": str(REPO),
         # The API proxies /v1/agents/* to the agents service; its default
         # (http://agents:8010) is the compose hostname, which doesn't resolve
@@ -263,6 +330,51 @@ def build_env() -> dict:
     return env
 
 
+def _dotenv_value(key: str) -> str:
+    """Read a single KEY=value from the repo-root .env (best-effort).
+
+    The LLM client reads GROQ_API_KEY straight from os.environ, but .env is only
+    loaded by the services' settings layer — so for --fast we pull the key here
+    and inject it into the child env explicitly.
+    """
+    f = REPO / ".env"
+    if not f.exists():
+        return ""
+    for line in f.read_text().splitlines():
+        s = line.strip()
+        if s.startswith(f"{key}=") and not s.startswith("#"):
+            return s.split("=", 1)[1].strip().strip('"').strip("'")
+    return ""
+
+
+def apply_fast_preset(env: dict) -> None:
+    """--fast: route Stage-2 + agents through Groq Cloud instead of local Ollama.
+
+    Groq is dramatically faster than CPU Ollama, so this is the recommended way
+    to get quick, high-quality summaries + comment stance. Requires GROQ_API_KEY
+    (exported, or in .env). Combine with COMMENT_STANCE_MAX_PER_POST=0 to LLM-label
+    every comment (now tractable on Groq).
+    """
+    key = env.get("GROQ_API_KEY") or os.environ.get("GROQ_API_KEY") or _dotenv_value("GROQ_API_KEY")
+    if not key:
+        die("--fast needs GROQ_API_KEY — set it in .env or export it, then retry")
+    env.update({
+        "LLM_BACKEND": "groq",
+        "GROQ_API_KEY": key,
+        # Fast Groq models per role; override any of these via env to taste.
+        "LLM_A_GROQ_MODEL": os.environ.get("LLM_A_GROQ_MODEL", "llama-3.3-70b-versatile"),
+        "LLM_B_GROQ_MODEL": os.environ.get("LLM_B_GROQ_MODEL", "llama-3.1-8b-instant"),
+        "VLM_GROQ_MODEL": os.environ.get("VLM_GROQ_MODEL", "meta-llama/llama-4-scout-17b-16e-instruct"),
+    })
+    # The dashboard LLM toggle persists a runtime backend override in Redis that
+    # Stage-2 reads BEFORE the env default — pin it to groq so --fast always wins,
+    # even if a prior run left it on local. (Runs after reset_data's FLUSHALL.)
+    subprocess.run(["docker", "exec", "deploy-redis-1", "redis-cli", "SET",
+                    "config:llm_backend", "groq"], capture_output=True)
+    ok(f"--fast: Stage-2/agents → Groq  (llm_a={env['LLM_A_GROQ_MODEL']}, "
+       f"llm_b={env['LLM_B_GROQ_MODEL']})")
+
+
 def start_pipeline(py: str, env: dict) -> None:
     start("stage1", [py, "-m", "services.workers.stage1_nlp"], env, REPO)
     start("router", [py, "-m", "services.workers.router"], env, REPO)
@@ -270,7 +382,7 @@ def start_pipeline(py: str, env: dict) -> None:
     start("assembler", [py, "__main__.py"], env, REPO / "services/workers/assembler")
     start("ingestion", [py, "-m", "services.ingestion"], env, REPO)
     start("api", [py, "-m", "uvicorn", "main:app", "--host", "127.0.0.1",
-                  "--port", str(API_PORT), "--log-level", "warning"], env, REPO / "services/api")
+                  "--port", str(API_PORT), "--log-level", _uvicorn_level()], env, REPO / "services/api")
 
     log("waiting for the API to answer …")
     for _ in range(30):
@@ -292,7 +404,7 @@ def start_agents(py: str, env: dict) -> None:
         "CLICKHOUSE_DB": "defense", "CLICKHOUSE_USER": "defense", "CLICKHOUSE_PASSWORD": "defense",
         "ANALYTICS_MCP_STUB": "true", "RETRIEVAL_MCP_STUB": "true",
     })
-    uvi = [py, "-m", "uvicorn", "--host", "127.0.0.1", "--log-level", "warning"]
+    uvi = [py, "-m", "uvicorn", "--host", "127.0.0.1", "--log-level", _uvicorn_level()]
     # analytics_mcp + agents use package-relative imports → module path from repo
     # root; retrieval/ingest use cwd-relative imports → run from their own dir.
     start("analytics_mcp", uvi + ["mcp.analytics_mcp.server:app", "--port", "8110"], a, REPO)
@@ -302,20 +414,43 @@ def start_agents(py: str, env: dict) -> None:
     ok("agent layer started (analytics :8110, retrieval :8101, ingest :8102, agents :8010)")
 
 
-def serve_dashboard(py: str, env: dict) -> None:
+def _free_port(start_port: int, tries: int = 10) -> int:
+    """Return the first free TCP port at/after start_port (probes 127.0.0.1)."""
+    for cand in range(start_port, start_port + tries):
+        with socket.socket(socket.AF_INET, socket.SOCK_STREAM) as s:
+            if s.connect_ex(("127.0.0.1", cand)) != 0:  # nothing listening → free
+                return cand
+    return start_port
+
+
+def serve_dashboard(py: str, env: dict) -> int:
     # The dashboard defaults to the dev API on :8001 (dashboard/app.js), so we
-    # just serve the static files — no patching needed.
-    start("dashboard", [py, "-m", "http.server", str(DASH_PORT)], env, REPO / "dashboard")
+    # just serve the static files — no patching needed. If 8080 is held by a
+    # stale process / another run, fall back to the next free port instead of
+    # crashing with "Address already in use".
+    port = _free_port(DASH_PORT)
+    if port != DASH_PORT:
+        warn(f"port {DASH_PORT} is in use — serving the dashboard on {port} instead")
+    start("dashboard", [py, "-m", "http.server", str(port)], env, REPO / "dashboard")
+    return port
 
 
 def reset_data() -> None:
     # Must run BEFORE the workers start: FLUSHALL destroys the Redis consumer
     # groups the workers create at startup (workers also self-heal on NOGROUP,
     # but a pre-start reset avoids the error churn entirely).
-    log("resetting data (Redis FLUSHALL + truncate) …")
+    log("resetting data (Redis FLUSHALL + Postgres/ClickHouse truncate) …")
     subprocess.run(["docker", "exec", "deploy-redis-1", "redis-cli", "FLUSHALL"], capture_output=True)
     subprocess.run(["docker", "exec", "deploy-postgres-1", "psql", "-U", "defense", "-d", "defense",
                     "-c", "TRUNCATE analysis_results, posts, jobs CASCADE;"], capture_output=True)
+    # ClickHouse is append-only analytics; clear it too so a reset is a true reset
+    # (otherwise analysis_events and comment_sentiments accumulate stale rows from
+    # prior runs — the per-comment table dedups on merge, but the events table does
+    # not). TRUNCATE is a no-op when the tables don't exist yet (first run).
+    subprocess.run(["docker", "exec", "deploy-clickhouse-1", "clickhouse-client",
+                    "--user", "defense", "--password", "defense", "--database", "defense",
+                    "-q", "TRUNCATE TABLE IF EXISTS analysis_events; TRUNCATE TABLE IF EXISTS comment_sentiments;"],
+                   capture_output=True)
 
 
 def load_posts(skip_if_loaded: bool) -> None:
@@ -347,16 +482,20 @@ def load_posts(skip_if_loaded: bool) -> None:
     warn("fewer than 50 results so far — check the worker logs in /tmp/*.log")
 
 
-def banner(with_agents: bool, dashboard: bool) -> None:
+def banner(with_agents: bool, dash_port: int | None) -> None:
     print()
     ok("════════════════════════════════════════════════════════════")
     ok("  Smart Layer is up.")
     print(f"   • API        →  http://127.0.0.1:{API_PORT}/v1/health")
-    if dashboard:
-        print(f"   • Dashboard  →  http://127.0.0.1:{DASH_PORT}   (log in with API key: demo)")
+    if dash_port:
+        print(f"   • Dashboard  →  http://127.0.0.1:{dash_port}   (log in with API key: demo)")
     if with_agents:
         print("   • Agents     →  POST http://127.0.0.1:%d/v1/agents/query" % API_PORT)
-    print("   • Logs       →  /tmp/<service>.log")
+    if _STREAM:
+        flt = f" (filtered: '{_LOG_FILTER}')" if _LOG_FILTER else ""
+        print(f"   • Logs       →  streaming live below{flt}  +  /tmp/<service>.log")
+    else:
+        print("   • Logs       →  /tmp/<service>.log   (add --logs to stream them here live)")
     ok("  Press Ctrl-C to stop everything this script started.")
     ok("════════════════════════════════════════════════════════════")
     print()
@@ -372,7 +511,20 @@ def main() -> None:
     ap.add_argument("--no-load", action="store_true", help="don't push the 50 sample posts")
     ap.add_argument("--reset", action="store_true", help="wipe prior data before loading posts")
     ap.add_argument("--down", action="store_true", help="on exit, also `docker compose down`")
+    ap.add_argument("--fast", action="store_true",
+                    help="route Stage-2 + agents through Groq Cloud (much faster than local Ollama; needs GROQ_API_KEY)")
+    ap.add_argument("--logs", "-l", action="store_true",
+                    help="stream every service's logs live to this terminal (still tee'd to /tmp/*.log)")
+    ap.add_argument("--log-level", default="INFO",
+                    help="log level for all services (DEBUG/INFO/WARNING/ERROR); default INFO")
+    ap.add_argument("--log-filter", metavar="STR",
+                    help="with --logs, only print lines containing STR (e.g. 'llm' to watch LLM activity)")
     args = ap.parse_args()
+
+    global _STREAM, _LOG_LEVEL, _LOG_FILTER
+    _STREAM = args.logs or bool(args.log_filter)
+    _LOG_LEVEL = args.log_level.upper()
+    _LOG_FILTER = args.log_filter
 
     py = ensure_deps()
     reap_stale()
@@ -381,15 +533,18 @@ def main() -> None:
     env = build_env()
     if args.reset:
         reset_data()
+    if args.fast:
+        apply_fast_preset(env)
     start_pipeline(py, env)
     if args.with_agents:
         start_agents(py, env)
     if not args.no_load:
         load_posts(skip_if_loaded=not args.reset)
+    dash_port = None
     if not args.no_dashboard:
-        serve_dashboard(py, env)
+        dash_port = serve_dashboard(py, env)
 
-    banner(args.with_agents, not args.no_dashboard)
+    banner(args.with_agents, dash_port)
 
     stop = {"flag": False}
     signal.signal(signal.SIGINT, lambda *_: stop.__setitem__("flag", True))

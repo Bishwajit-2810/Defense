@@ -856,6 +856,57 @@ canvas {
   line-height: 1.6;
 }
 
+/* ---- Original post content box ---- */
+.original-post-box {
+  background: var(--bg-table-row);
+  border: 1px solid var(--border-color);
+  border-left: 3px solid var(--text-muted);
+  border-radius: var(--border-radius);
+  padding: 14px 16px;
+  font-size: 0.875rem;
+  color: var(--text-primary);
+  line-height: 1.6;
+  white-space: pre-wrap;
+  word-break: break-word;
+}
+
+/* ---- Comment-insights section (inline expanded row + detail modal) ---- */
+.row-comment-insights {
+  margin-top: 16px;
+  padding-top: 16px;
+  border-top: 2px solid var(--border-color);
+}
+
+.comment-summary-box {
+  display: flex;
+  align-items: flex-start;
+  gap: 10px;
+  background: var(--accent-light);
+  border: 1px solid rgba(99,102,241,0.2);
+  border-left: 3px solid var(--accent, #6366f1);
+  border-radius: var(--border-radius);
+  padding: 12px 14px;
+}
+
+.comment-summary-tag {
+  flex-shrink: 0;
+  font-size: 0.65rem;
+  font-weight: 700;
+  text-transform: uppercase;
+  letter-spacing: 0.06em;
+  color: #fff;
+  background: var(--accent, #6366f1);
+  border-radius: 999px;
+  padding: 2px 8px;
+  margin-top: 1px;
+}
+
+.comment-summary-text {
+  font-size: 0.875rem;
+  color: var(--text-primary);
+  line-height: 1.6;
+}
+
 /* ---- Comment themes list ---- */
 .theme-list {
   list-style: none;
@@ -1600,4 +1651,93 @@ canvas {
 .rep-comment-text {
   font-size: 0.82rem;
   color: var(--text-primary);
+}
+
+/* ============================================================
+   Detail-view enhancements (chips, bars, analytics grids)
+   ============================================================ */
+.chip-strip {
+  display: flex;
+  flex-wrap: wrap;
+  gap: 6px;
+  margin-bottom: 16px;
+}
+.chip {
+  display: inline-flex;
+  align-items: center;
+  gap: 6px;
+  padding: 4px 10px;
+  background: var(--bg-table-row);
+  border: 1px solid var(--border-color);
+  border-radius: 999px;
+  font-size: 0.75rem;
+  line-height: 1;
+}
+.chip-dot { width: 8px; height: 8px; border-radius: 50%; flex-shrink: 0; }
+.chip-label { color: var(--text-secondary); }
+.chip-val { color: var(--text-primary); font-weight: 600; }
+
+/* Three-column detail grid (collapses on narrow modals) */
+.detail-3col {
+  display: grid;
+  grid-template-columns: repeat(3, 1fr);
+  gap: 20px;
+}
+@media (max-width: 720px) {
+  .detail-3col { grid-template-columns: 1fr; }
+}
+
+/* Labeled horizontal bars (confidence / safety) */
+.dbar {
+  display: grid;
+  grid-template-columns: 78px 1fr 38px;
+  align-items: center;
+  gap: 8px;
+  margin-bottom: 7px;
+}
+.dbar-label { font-size: 0.75rem; color: var(--text-secondary); }
+.dbar-track {
+  height: 8px;
+  background: var(--bg-table-row);
+  border-radius: 4px;
+  overflow: hidden;
+}
+.dbar-fill { display: block; height: 100%; border-radius: 4px; transition: width .3s ease; }
+.dbar-val { font-size: 0.72rem; color: var(--text-muted); text-align: right; }
+
+/* Mini lists (top authors) */
+.mini-list { display: flex; flex-direction: column; gap: 4px; }
+.mini-row {
+  display: flex;
+  justify-content: space-between;
+  gap: 8px;
+  font-size: 0.76rem;
+  padding: 3px 0;
+  border-bottom: 1px dashed var(--border-color);
+}
+.mini-name {
+  color: var(--text-primary);
+  font-weight: 500;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+  max-width: 120px;
+}
+
+/* Two-tone split bar (classifier mix) */
+.split-bar {
+  height: 8px;
+  background: var(--color-neutral);
+  border-radius: 4px;
+  overflow: hidden;
+}
+.split-fast { display: block; height: 100%; background: var(--color-mixed); }
+
+/* Sequential display ordinal in the Analysis Results table (not a DB id) */
+.post-number {
+  color: var(--text-muted);
+  font-variant-numeric: tabular-nums;
+  text-align: right;
+  width: 44px;
+  font-size: 0.8rem;
 }

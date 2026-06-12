@@ -10,6 +10,7 @@
     "platform_post_id": {"type":"string"},
     "media_type": {"type":"string","enum":["TEXT","PHOTO","PHOTO_TEXT"]},
     "language": {"type":"string"},
+    "post_text": {"type":["string","null"],"description":"Original post caption/text as ingested."},
     "post_type": {"type":["string","null"]},
     "post_summary": {"type":["string","null"]},
     "post_summary_lang": {"type":["string","null"]},
@@ -72,6 +73,8 @@
       "properties": {
         "analyzed":{"type":"integer"},
         "coverage":{"type":"number"},
+        "summary":{"type":["string","null"],"description":"LLM-written natural-language summary of the comment reactions."},
+        "summary_source":{"type":["string","null"],"description":"How the comment summary was produced (e.g. 'llm')."},
         "sentiment_breakdown": {
           "type":"object",
           "properties": {
@@ -80,9 +83,47 @@
             "neutral":{"type":"integer"}
           }
         },
+        "emotion_breakdown": {
+          "type":"object",
+          "description":"Count of comments per emotion label (full coverage).",
+          "properties": {
+            "anger":{"type":"integer"},
+            "sadness":{"type":"integer"},
+            "joy":{"type":"integer"},
+            "fear":{"type":"integer"},
+            "disgust":{"type":"integer"},
+            "surprise":{"type":"integer"},
+            "neutral":{"type":"integer"}
+          }
+        },
+        "method_breakdown": {
+          "type":"object",
+          "properties": {
+            "fast":{"type":"integer"},
+            "model":{"type":"integer"},
+            "llm":{"type":"integer"}
+          }
+        },
         "themes":{"type":"array","items":{"type":"string"}},
         "top_keywords":{"type":"array","items":{"type":"string"}},
-        "representative_comments":{"type":"array"}
+        "representative_comments":{"type":"array"},
+        "comments":{
+          "type":"array",
+          "items":{
+            "type":"object",
+            "properties":{
+              "id":{"type":"string"},
+              "text":{"type":"string"},
+              "likes":{"type":"integer"},
+              "author":{"type":["string","null"]},
+              "parent_id":{"type":["string","null"]},
+              "sentiment":{"type":"string","enum":["positive","negative","neutral"]},
+              "sentiment_score":{"type":"number"},
+              "emotion":{"type":"string","enum":["anger","sadness","joy","fear","disgust","surprise","neutral"]},
+              "method":{"type":"string","enum":["fast","model","llm"]}
+            }
+          }
+        }
       }
     },
     "confidence": {
