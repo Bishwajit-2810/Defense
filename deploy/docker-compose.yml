@@ -1,0 +1,360 @@
+networks:
+  defense_net:
+    driver: bridge
+
+volumes:
+  postgres_data:
+  redis_data:
+  clickhouse_data:
+  minio_data:
+  grafana_data:
+
+services:
+
+  # ---------------------------------------------------------------------------
+  # Infrastructure
+  # ---------------------------------------------------------------------------
+
+  postgres:
+    # pgvector/pgvector ships Postgres with the `vector` extension preinstalled
+    # (used for semantic search — replaces the standalone Qdrant service).
+    image: pgvector/pgvector:pg16
+    restart: unless-stopped
+    environment:
+      POSTGRES_DB: defense
+      POSTGRES_USER: defense
+      POSTGRES_PASSWORD: defense
+    volumes:
+      - postgres_data:/var/lib/postgresql/data
+      - ./init-db.sql:/docker-entrypoint-initdb.d/init.sql
+    # Host port publishing disabled for local verification (host already runs
+    # services on 5432/9000). Reach infra via the compose network instead.
+    # ports:
+    #   - "5432:5432"
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U defense -d defense"]
+      interval: 10s
+      timeout: 5s
+      retries: 5
+      start_period: 20s
+    networks:
+      - defense_net
+
+  redis:
+    image: redis:7-alpine
+    restart: unless-stopped
+    ports:
+      - "6379:6379"
+    volumes:
+      - redis_data:/data
+    healthcheck:
+      test: ["CMD", "redis-cli", "ping"]
+      interval: 10s
+      timeout: 5s
+      retries: 5
+      start_period: 10s
+    networks:
+      - defense_net
+
+  clickhouse:
+    image: clickhouse/clickhouse-server:latest
+    restart: unless-stopped
+    environment:
+      CLICKHOUSE_DB: defense
+      CLICKHOUSE_USER: defense
+      CLICKHOUSE_PASSWORD: defense
+    # Host port publishing disabled for local verification (host already uses
+    # 9000). Reach ClickHouse via the compose network instead.
+    # ports:
+    #   - "8123:8123"
+    #   - "9000:9000"
+    volumes:
+      - clickhouse_data:/var/lib/clickhouse
+    healthcheck:
+      test: ["CMD-SHELL", "wget -qO- http://localhost:8123/ping || exit 1"]
+      interval: 15s
+      timeout: 5s
+      retries: 5
+      start_period: 30s
+    networks:
+      - defense_net
+
+  minio:
+    image: minio/minio:latest
+    restart: unless-stopped
+    command: server /data --console-address ":9001"
+    environment:
+      MINIO_ROOT_USER: minioadmin
+      MINIO_ROOT_PASSWORD: minioadmin
+    ports:
+      - "9002:9000"
+      - "9001:9001"
+    volumes:
+      - minio_data:/data
+    healthcheck:
+      test: ["CMD-SHELL", "curl -sf http://localhost:9000/minio/health/live || exit 1"]
+      interval: 15s
+      timeout: 5s
+      retries: 5
+      start_period: 20s
+    networks:
+      - defense_net
+
+  # ---------------------------------------------------------------------------
+  # Application services
+  # ---------------------------------------------------------------------------
+
+  # All app images build with the REPO ROOT as context so Dockerfiles can
+  # COPY libs/ and the services/ packages (COPY paths outside the build
+  # context are forbidden by Docker).
+
+  api:
+    build:
+      context: ..
+      dockerfile: services/api/Dockerfile
+    restart: unless-stopped
+    ports:
+      - "8000:8000"
+    env_file:
+      - .env
+    environment:
+      - AGENTS_SERVICE_URL=http://agents:8010
+    depends_on:
+      postgres:
+        condition: service_healthy
+      redis:
+        condition: service_healthy
+      clickhouse:
+        condition: service_healthy
+      minio:
+        condition: service_healthy
+    healthcheck:
+      # python:3.11-slim has no curl/wget; the API health route lives at /v1/health
+      test: ["CMD-SHELL", "python -c \"import urllib.request; urllib.request.urlopen('http://localhost:8000/v1/health')\" || exit 1"]
+      interval: 15s
+      timeout: 5s
+      retries: 5
+      start_period: 30s
+    networks:
+      - defense_net
+
+  ingestion:
+    build:
+      context: ..
+      dockerfile: services/ingestion/Dockerfile
+    restart: unless-stopped
+    env_file:
+      - .env
+    depends_on:
+      postgres:
+        condition: service_healthy
+      redis:
+        condition: service_healthy
+    networks:
+      - defense_net
+
+  worker_stage1:
+    build:
+      context: ..
+      dockerfile: services/workers/stage1_nlp/Dockerfile
+    restart: unless-stopped
+    env_file:
+      - .env
+    environment:
+      # The default image only installs requirements-stub.txt — keep stub mode
+      # on. Real ML needs the full requirements.txt baked into the image.
+      MODEL_STUB_MODE: "true"
+    depends_on:
+      postgres:
+        condition: service_healthy
+      redis:
+        condition: service_healthy
+    networks:
+      - defense_net
+
+  worker_router:
+    build:
+      context: ..
+      dockerfile: services/workers/router/Dockerfile
+    restart: unless-stopped
+    env_file:
+      - .env
+    depends_on:
+      redis:
+        condition: service_healthy
+    networks:
+      - defense_net
+
+  worker_stage2:
+    build:
+      context: ..
+      dockerfile: services/workers/stage2_llm/Dockerfile
+    restart: unless-stopped
+    env_file:
+      - .env
+    # Containers reach the host's Ollama (LOCAL_LLM_BASE_URL in .env) via
+    # host.docker.internal; on Linux that name needs an explicit host-gateway
+    # mapping.
+    extra_hosts:
+      - "host.docker.internal:host-gateway"
+    depends_on:
+      redis:
+        condition: service_healthy
+    networks:
+      - defense_net
+
+  worker_assembler:
+    build:
+      context: ..
+      dockerfile: services/workers/assembler/Dockerfile
+    restart: unless-stopped
+    env_file:
+      - .env
+    depends_on:
+      postgres:
+        condition: service_healthy
+      redis:
+        condition: service_healthy
+      clickhouse:
+        condition: service_healthy
+      minio:
+        condition: service_healthy
+    networks:
+      - defense_net
+
+  # ---------------------------------------------------------------------------
+  # Phase 2 — MCP services
+  # ---------------------------------------------------------------------------
+
+  analytics-mcp:
+    build:
+      context: ..
+      dockerfile: mcp/analytics_mcp/Dockerfile
+    restart: unless-stopped
+    ports:
+      # Host 8110 (8100 is commonly taken on dev hosts); compose-internal stays 8100.
+      - "8110:8100"
+    env_file:
+      - .env
+    environment:
+      # analytics-mcp reads CLICKHOUSE_HOST/PORT/... (not CLICKHOUSE_URL)
+      CLICKHOUSE_HOST: clickhouse
+      CLICKHOUSE_PORT: "9000"
+      CLICKHOUSE_DB: defense
+      CLICKHOUSE_USER: defense
+      CLICKHOUSE_PASSWORD: defense
+    depends_on:
+      postgres:
+        condition: service_healthy
+      clickhouse:
+        condition: service_healthy
+    networks:
+      - defense_net
+
+  retrieval-mcp:
+    build:
+      context: ..
+      dockerfile: mcp/retrieval_mcp/Dockerfile
+    restart: unless-stopped
+    ports:
+      - "8101:8101"
+    env_file:
+      - .env
+    environment:
+      # Real vector search needs sentence-transformers (not in the slim image);
+      # stub mode returns rows by recency instead.
+      RETRIEVAL_MCP_STUB: "true"
+    depends_on:
+      postgres:
+        condition: service_healthy
+    networks:
+      - defense_net
+
+  ingest-mcp:
+    build:
+      context: ..
+      dockerfile: mcp/ingest_mcp/Dockerfile
+    restart: unless-stopped
+    ports:
+      - "8102:8102"
+    env_file:
+      - .env
+    depends_on:
+      postgres:
+        condition: service_healthy
+      redis:
+        condition: service_healthy
+    networks:
+      - defense_net
+
+  # ---------------------------------------------------------------------------
+  # Phase 2 — Agents service
+  # ---------------------------------------------------------------------------
+
+  agents:
+    build:
+      context: ..
+      dockerfile: services/agents/Dockerfile
+    restart: unless-stopped
+    ports:
+      - "8010:8010"
+    env_file:
+      - .env
+    environment:
+      - ANALYTICS_MCP_URL=http://analytics-mcp:8100
+      - RETRIEVAL_MCP_URL=http://retrieval-mcp:8101
+      - INGEST_MCP_URL=http://ingest-mcp:8102
+    # Agents run the LLM loop against the host's Ollama (see .env) — Linux
+    # needs the explicit host-gateway mapping for host.docker.internal.
+    extra_hosts:
+      - "host.docker.internal:host-gateway"
+    depends_on:
+      redis:
+        condition: service_healthy
+      analytics-mcp:
+        condition: service_started
+      retrieval-mcp:
+        condition: service_started
+      ingest-mcp:
+        condition: service_started
+    networks:
+      - defense_net
+
+  # ---------------------------------------------------------------------------
+  # Observability
+  # ---------------------------------------------------------------------------
+
+  prometheus:
+    image: prom/prometheus:latest
+    restart: unless-stopped
+    ports:
+      - "9090:9090"
+    volumes:
+      - ./prometheus.yml:/etc/prometheus/prometheus.yml:ro
+    healthcheck:
+      test: ["CMD-SHELL", "wget -qO- http://localhost:9090/-/healthy || exit 1"]
+      interval: 15s
+      timeout: 5s
+      retries: 5
+      start_period: 20s
+    networks:
+      - defense_net
+
+  grafana:
+    image: grafana/grafana:latest
+    restart: unless-stopped
+    ports:
+      - "3001:3000"
+    volumes:
+      - grafana_data:/var/lib/grafana
+    depends_on:
+      prometheus:
+        condition: service_healthy
+    healthcheck:
+      test: ["CMD-SHELL", "curl -sf http://localhost:3000/api/health || exit 1"]
+      interval: 15s
+      timeout: 5s
+      retries: 5
+      start_period: 30s
+    networks:
+      - defense_net

@@ -492,7 +492,7 @@ egresses to Groq.
 | `POST /v1/auth/token`              | Exchange credentials/API key for a JWT                                                 |
 | `GET /v1/health` / `GET /v1/ready` | Liveness / readiness probes                                                            |
 | `GET /v1/usage`                    | Per-tenant usage + cost metering (posts, LLM calls, by backend incl. Groq tokens/cost) |
-| `GET /v1/search?q=&semantic=true`  | Semantic/keyword search over analyzed posts (Qdrant + ClickHouse)                      |
+| `GET /v1/search?q=&semantic=true`  | Semantic/keyword search over analyzed posts (pgvector + ClickHouse)                    |
 | `GET /v1/agents/{id}`              | Poll an agent run (analyst query / report) — status, answer, citations, usage          |
 | `DELETE /v1/posts/{id}`            | Data deletion (retention / GDPR-style)                                                 |
 

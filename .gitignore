@@ -1,0 +1,15 @@
+# Secrets / local config — never commit the root .env (real keys live there).
+# deploy/.env stays tracked: it's the compose env template with dev defaults.
+/.env
+
+# Python
+__pycache__/
+*.py[cod]
+.venv/
+.pytest_cache/
+.ruff_cache/
+*.egg-info/
+
+# Logs / scratch
+*.log
+.DS_Store

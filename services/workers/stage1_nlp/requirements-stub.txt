@@ -1,0 +1,15 @@
+# Stage-1 NLP worker — STUB-MODE dependencies only (MODEL_STUB_MODE=true).
+# This is what the default Docker image installs: every ML import in this
+# worker (torch, transformers, fasttext, keybert, sklearn, Pillow, ...) is
+# lazy and only executed when MODEL_STUB_MODE=false, so the multi-GB ML stack
+# is not needed for the stub pipeline. For real-ML mode, install the full
+# requirements.txt instead (and add libgomp1 + tesseract-ocr system packages).
+httpx>=0.28.0
+redis[hiredis]>=5.2.0
+sqlalchemy[asyncio]>=2.0.0
+asyncpg>=0.30.0
+pydantic>=2.10.0
+pydantic-settings>=2.7.0
+numpy>=2.0.0
+python-dotenv>=1.0.0
+structlog>=24.0.0

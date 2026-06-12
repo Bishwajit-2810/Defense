@@ -1,0 +1,584 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="UTF-8" />
+  <meta name="viewport" content="width=device-width, initial-scale=1.0" />
+  <title>Defense Analysis Dashboard</title>
+  <link rel="icon" href="data:image/svg+xml,%3Csvg xmlns='http://www.w3.org/2000/svg' viewBox='0 0 16 16'%3E%3Crect width='16' height='16' rx='3' fill='%236366f1'/%3E%3C/svg%3E" />
+  <link rel="stylesheet" href="styles.css" />
+  <!-- API the dashboard talks to. Change this for other deployments
+       (e.g. 'http://localhost:8000' for Mode B). -->
+  <script>window.API_BASE = 'http://127.0.0.1:8001';</script>
+</head>
+<body>
+<div id="app">
+
+  <!-- ============================================================
+       Header
+       ============================================================ -->
+  <header class="header">
+    <div class="header-logo" title="Defense Analysis">&#9632;</div>
+    <div>
+      <div class="header-title">Defense Analysis Dashboard</div>
+      <div class="header-subtitle">Social Media Intelligence Platform</div>
+    </div>
+    <div class="header-spacer"></div>
+    <div class="header-auth">
+      <label class="refresh-toggle" title="Automatically refresh the active tab every 15 seconds">
+        <span class="toggle-input">
+          <input type="checkbox" id="auto-refresh-toggle" checked />
+          <span class="toggle-slider"></span>
+        </span>
+        <span class="refresh-toggle-label">Auto-refresh</span>
+      </label>
+      <button id="llm-chip" class="llm-chip hidden" type="button" title="LLM backend — click to open settings">LLM: ...</button>
+      <span id="header-auth-status" class="auth-status disconnected">Not authenticated</span>
+      <button id="header-login-btn" class="btn btn-secondary btn-sm">Login / API Key</button>
+    </div>
+  </header>
+
+  <!-- ============================================================
+       Navigation tabs
+       ============================================================ -->
+  <nav class="nav-tabs" role="tablist">
+    <button class="nav-tab active" data-tab="overview" role="tab" aria-controls="tab-overview">
+      <svg class="nav-tab-icon" viewBox="0 0 20 20" fill="currentColor"><path d="M2 11a1 1 0 011-1h2a1 1 0 011 1v5a1 1 0 01-1 1H3a1 1 0 01-1-1v-5zM8 7a1 1 0 011-1h2a1 1 0 011 1v9a1 1 0 01-1 1H9a1 1 0 01-1-1V7zM14 4a1 1 0 011-1h2a1 1 0 011 1v12a1 1 0 01-1 1h-2a1 1 0 01-1-1V4z"/></svg>
+      Overview
+    </button>
+    <button class="nav-tab" data-tab="posts" role="tab" aria-controls="tab-posts">
+      <svg class="nav-tab-icon" viewBox="0 0 20 20" fill="currentColor"><path d="M2 4a2 2 0 012-2h12a2 2 0 012 2v12a2 2 0 01-2 2H4a2 2 0 01-2-2V4zm2 0v12h12V4H4zm2 3h8v1H6V7zm0 3h8v1H6v-1zm0 3h4v1H6v-1z"/></svg>
+      Posts
+    </button>
+    <button class="nav-tab" data-tab="jobs" role="tab" aria-controls="tab-jobs">
+      <svg class="nav-tab-icon" viewBox="0 0 20 20" fill="currentColor"><path d="M10 2a8 8 0 100 16A8 8 0 0010 2zm0 14A6 6 0 1110 4a6 6 0 010 12zm.75-9.25a.75.75 0 00-1.5 0v4.5l2.875 2.875a.75.75 0 001.06-1.06L10.75 10.44V6.75z"/></svg>
+      Analysis Jobs
+    </button>
+    <button class="nav-tab" data-tab="reports" role="tab" aria-controls="tab-reports">
+      <svg class="nav-tab-icon" viewBox="0 0 20 20" fill="currentColor"><path d="M4 3a1 1 0 000 2h12a1 1 0 100-2H4zm0 4a1 1 0 000 2h12a1 1 0 100-2H4zm0 4a1 1 0 000 2h7a1 1 0 100-2H4zm0 4a1 1 0 000 2h5a1 1 0 100-2H4z"/></svg>
+      Reports
+    </button>
+    <button class="nav-tab" data-tab="search" role="tab" aria-controls="tab-search">
+      <svg class="nav-tab-icon" viewBox="0 0 20 20" fill="currentColor"><path fill-rule="evenodd" d="M8 4a4 4 0 100 8 4 4 0 000-8zM2 8a6 6 0 1110.89 3.476l4.817 4.817a1 1 0 01-1.414 1.414l-4.816-4.816A6 6 0 012 8z" clip-rule="evenodd"/></svg>
+      Search
+    </button>
+    <button class="nav-tab" data-tab="agents" role="tab" aria-controls="tab-agents">
+      <svg class="nav-tab-icon" viewBox="0 0 20 20" fill="currentColor"><path d="M10 2a4 4 0 014 4v1h1a2 2 0 012 2v6a2 2 0 01-2 2H5a2 2 0 01-2-2V9a2 2 0 012-2h1V6a4 4 0 014-4zm0 2a2 2 0 00-2 2v1h4V6a2 2 0 00-2-2zM7.5 11a1 1 0 100 2 1 1 0 000-2zm5 0a1 1 0 100 2 1 1 0 000-2z"/></svg>
+      Agents
+    </button>
+  </nav>
+
+  <!-- ============================================================
+       Main content area
+       ============================================================ -->
+  <main class="main-content">
+
+    <!-- =========================================================
+         OVERVIEW TAB
+         ========================================================= -->
+    <section id="tab-overview" class="tab-panel active" role="tabpanel">
+
+      <div class="card">
+        <div class="card-header">
+          <div>
+            <div class="card-title">Corpus &amp; LLM Usage</div>
+            <div class="card-description" id="overview-updated">Live counters from /v1/usage and the analysis corpus</div>
+          </div>
+          <button class="btn btn-secondary btn-sm" onclick="loadOverview()">
+            <svg width="13" height="13" viewBox="0 0 20 20" fill="currentColor"><path fill-rule="evenodd" d="M4 2a1 1 0 011 1v2.101a7.002 7.002 0 0111.601 2.566 1 1 0 11-1.885.666A5.002 5.002 0 005.999 7H9a1 1 0 010 2H4a1 1 0 01-1-1V3a1 1 0 011-1zm.008 9.057a1 1 0 011.276.61A5.002 5.002 0 0014.001 13H11a1 1 0 110-2h5a1 1 0 011 1v5a1 1 0 11-2 0v-2.101a7.002 7.002 0 01-11.601-2.566 1 1 0 01.61-1.276z" clip-rule="evenodd"/></svg>
+            Refresh
+          </button>
+        </div>
+        <div id="overview-stats" class="stat-grid">
+          <div class="loading-overlay"><div class="spinner spinner-dark"></div> Loading usage...</div>
+        </div>
+      </div>
+
+      <div class="charts-2col">
+        <div class="card">
+          <div class="card-header"><div class="card-title">Sentiment Distribution</div></div>
+          <div class="overview-chart-wrap">
+            <canvas id="overview-sentiment-pie" width="170" height="170"></canvas>
+            <div id="overview-sentiment-legend"></div>
+          </div>
+        </div>
+        <div class="card">
+          <div class="card-header"><div class="card-title">Languages</div></div>
+          <div class="chart-container"><canvas id="overview-lang-chart" height="170"></canvas></div>
+        </div>
+      </div>
+
+      <div class="charts-2col">
+        <div class="card">
+          <div class="card-header"><div class="card-title">Top Topics</div></div>
+          <div class="chart-container"><canvas id="overview-topics-chart" height="200"></canvas></div>
+        </div>
+        <div class="card">
+          <div class="card-header"><div class="card-title">Pipeline / LLM</div></div>
+          <div id="overview-llm-panel">
+            <div class="loading-overlay"><div class="spinner spinner-dark"></div> Loading...</div>
+          </div>
+        </div>
+      </div>
+
+    </section><!-- /tab-overview -->
+
+    <!-- =========================================================
+         POSTS TAB
+         ========================================================= -->
+    <section id="tab-posts" class="tab-panel" role="tabpanel">
+
+      <!-- Upload card -->
+      <div class="card">
+        <div class="card-header">
+          <div>
+            <div class="card-title">Upload Posts</div>
+            <div class="card-description">Upload a JSON file containing post-with-details records for analysis</div>
+          </div>
+        </div>
+
+        <div id="upload-area" class="upload-area" title="Click or drag a .json file here">
+          <input type="file" id="file-input" accept=".json,application/json" />
+          <div class="upload-area-icon">&#128196;</div>
+          <div class="upload-area-text">Click to select or drag &amp; drop a <strong>.json</strong> file</div>
+          <div class="upload-area-hint">Supports inline post-with-details arrays or single records</div>
+        </div>
+
+        <div style="margin-top:12px;display:flex;align-items:center;gap:12px;flex-wrap:wrap;">
+          <span id="upload-filename" style="font-size:0.8125rem;color:var(--text-secondary);flex:1"></span>
+          <label class="toggle-label" for="upload-want-summary" title="Route every uploaded post through Stage-2 for an LLM summary">
+            <span class="toggle-input">
+              <input type="checkbox" id="upload-want-summary" checked />
+              <span class="toggle-slider"></span>
+            </span>
+            LLM summaries
+          </label>
+          <button id="upload-btn" class="btn btn-primary">
+            <svg width="14" height="14" viewBox="0 0 20 20" fill="currentColor"><path d="M10 2a1 1 0 01.707.293l4 4a1 1 0 01-1.414 1.414L11 5.414V13a1 1 0 11-2 0V5.414L6.707 7.707A1 1 0 115.293 6.293l4-4A1 1 0 0110 2z"/><path d="M3 15a1 1 0 011-1h12a1 1 0 110 2H4a1 1 0 01-1-1z"/></svg>
+            Upload Posts
+          </button>
+        </div>
+        <div id="upload-progress" class="hidden" style="margin-top:12px"></div>
+      </div>
+
+      <!-- Results table card -->
+      <div class="card">
+        <div class="card-header">
+          <div>
+            <div class="card-title">Analysis Results</div>
+            <div class="card-description" id="results-count">Click a row to expand inline details, or use the Details button for the full modal.</div>
+          </div>
+          <div style="display:flex;gap:8px;align-items:center">
+            <input type="text" id="posts-campaign-filter" class="form-input form-input-sm" placeholder="Filter: campaign id" autocomplete="off" spellcheck="false" style="width:200px" />
+            <button class="btn btn-secondary btn-sm" onclick="loadAnalysisResults()">
+              <svg width="13" height="13" viewBox="0 0 20 20" fill="currentColor"><path fill-rule="evenodd" d="M4 2a1 1 0 011 1v2.101a7.002 7.002 0 0111.601 2.566 1 1 0 11-1.885.666A5.002 5.002 0 005.999 7H9a1 1 0 010 2H4a1 1 0 01-1-1V3a1 1 0 011-1zm.008 9.057a1 1 0 011.276.61A5.002 5.002 0 0014.001 13H11a1 1 0 110-2h5a1 1 0 011 1v5a1 1 0 11-2 0v-2.101a7.002 7.002 0 01-11.601-2.566 1 1 0 01.61-1.276z" clip-rule="evenodd"/></svg>
+              Refresh
+            </button>
+          </div>
+        </div>
+
+        <div class="table-wrapper">
+          <table>
+            <thead>
+              <tr>
+                <th>Post ID</th>
+                <th>Platform</th>
+                <th>Language</th>
+                <th>Sentiment</th>
+                <th>Toxicity</th>
+                <th>Summary</th>
+                <th>Comment Coverage</th>
+                <th>Created At</th>
+                <th>Actions</th>
+              </tr>
+            </thead>
+            <tbody id="results-table-body">
+              <tr>
+                <td colspan="9" class="table-empty">Loading results...</td>
+              </tr>
+            </tbody>
+          </table>
+        </div>
+      </div>
+
+    </section><!-- /tab-posts -->
+
+    <!-- =========================================================
+         ANALYSIS JOBS TAB
+         ========================================================= -->
+    <section id="tab-jobs" class="tab-panel" role="tabpanel">
+
+      <div class="card">
+        <div class="card-header">
+          <div>
+            <div class="card-title">Run Analysis</div>
+            <div class="card-description">Trigger (re-)analysis for already-ingested posts by campaign — progress streams live below</div>
+          </div>
+        </div>
+
+        <div class="form-row">
+          <div class="form-group">
+            <label class="form-label" for="campaign-id-input">Campaign ID</label>
+            <input
+              type="text"
+              id="campaign-id-input"
+              class="form-input"
+              placeholder="e.g. cmoldmxzr02d8fu22vhvrg23c"
+              autocomplete="off"
+              spellcheck="false"
+            />
+          </div>
+          <label class="toggle-label" for="run-want-summary" style="margin-bottom:6px" title="Route every post through Stage-2 for an LLM summary">
+            <span class="toggle-input">
+              <input type="checkbox" id="run-want-summary" checked />
+              <span class="toggle-slider"></span>
+            </span>
+            LLM summaries
+          </label>
+          <button id="run-analysis-btn" class="btn btn-primary" style="margin-bottom:0">
+            <svg width="14" height="14" viewBox="0 0 20 20" fill="currentColor"><path fill-rule="evenodd" d="M10 18a8 8 0 100-16 8 8 0 000 16zM9.555 7.168A1 1 0 008 8v4a1 1 0 001.555.832l3-2a1 1 0 000-1.664l-3-2z" clip-rule="evenodd"/></svg>
+            Run Analysis
+          </button>
+        </div>
+
+        <div id="live-progress" class="hidden" style="margin-top:14px"></div>
+      </div>
+
+      <div class="card">
+        <div class="card-header">
+          <div>
+            <div class="card-title">Jobs</div>
+            <div class="card-description">Track running and completed ingest/analysis jobs</div>
+          </div>
+          <button class="btn btn-secondary btn-sm" onclick="loadJobs()">
+            <svg width="13" height="13" viewBox="0 0 20 20" fill="currentColor"><path fill-rule="evenodd" d="M4 2a1 1 0 011 1v2.101a7.002 7.002 0 0111.601 2.566 1 1 0 11-1.885.666A5.002 5.002 0 005.999 7H9a1 1 0 010 2H4a1 1 0 01-1-1V3a1 1 0 011-1zm.008 9.057a1 1 0 011.276.61A5.002 5.002 0 0014.001 13H11a1 1 0 110-2h5a1 1 0 011 1v5a1 1 0 11-2 0v-2.101a7.002 7.002 0 01-11.601-2.566 1 1 0 01.61-1.276z" clip-rule="evenodd"/></svg>
+            Refresh
+          </button>
+        </div>
+
+        <div class="table-wrapper">
+          <table>
+            <thead>
+              <tr>
+                <th>Job ID</th>
+                <th>Type</th>
+                <th>Status</th>
+                <th>Progress</th>
+                <th>Created At</th>
+                <th>Actions</th>
+              </tr>
+            </thead>
+            <tbody id="jobs-table-body">
+              <tr>
+                <td colspan="6" class="table-empty">No jobs loaded yet.</td>
+              </tr>
+            </tbody>
+          </table>
+        </div>
+      </div>
+
+    </section><!-- /tab-jobs -->
+
+    <!-- =========================================================
+         REPORTS TAB
+         ========================================================= -->
+    <section id="tab-reports" class="tab-panel" role="tabpanel">
+
+      <div class="card">
+        <div class="card-header">
+          <div>
+            <div class="card-title">Generate Report</div>
+            <div class="card-description">Aggregates the analyzed corpus; "Grounded" adds an LLM-written executive summary</div>
+          </div>
+        </div>
+
+        <div class="form-row">
+          <div class="form-group">
+            <label class="form-label" for="report-type">Report Type</label>
+            <select id="report-type" class="form-select">
+              <option value="trend">Trend Digest</option>
+              <option value="brand_mentions">Brand Mentions</option>
+              <option value="political">Political Analysis</option>
+              <option value="sentiment_summary">Sentiment Summary</option>
+            </select>
+          </div>
+          <div class="form-group">
+            <label class="form-label" for="report-campaign">Campaign (optional)</label>
+            <input type="text" id="report-campaign" class="form-input" placeholder="all campaigns" autocomplete="off" spellcheck="false" />
+          </div>
+          <label class="toggle-label" for="report-grounded" style="margin-bottom:6px" title="Use LLM-B to write the executive summary">
+            <span class="toggle-input">
+              <input type="checkbox" id="report-grounded" checked />
+              <span class="toggle-slider"></span>
+            </span>
+            Grounded (LLM)
+          </label>
+          <button id="generate-report-btn" class="btn btn-primary">
+            <svg width="14" height="14" viewBox="0 0 20 20" fill="currentColor"><path d="M9 2a1 1 0 000 2h2a1 1 0 100-2H9z"/><path fill-rule="evenodd" d="M4 5a2 2 0 012-2 3 3 0 003 3h2a3 3 0 003-3 2 2 0 012 2v11a2 2 0 01-2 2H6a2 2 0 01-2-2V5zm3 4a1 1 0 000 2h.01a1 1 0 100-2H7zm3 0a1 1 0 000 2h3a1 1 0 100-2h-3zm-3 4a1 1 0 100 2h.01a1 1 0 100-2H7zm3 0a1 1 0 100 2h3a1 1 0 100-2h-3z" clip-rule="evenodd"/></svg>
+            Generate Report
+          </button>
+        </div>
+      </div>
+
+      <div class="card">
+        <div class="card-header">
+          <div>
+            <div class="card-title">Existing Reports</div>
+            <div class="card-description">Click View to read a report's full content</div>
+          </div>
+          <button class="btn btn-secondary btn-sm" onclick="loadReports()">
+            <svg width="13" height="13" viewBox="0 0 20 20" fill="currentColor"><path fill-rule="evenodd" d="M4 2a1 1 0 011 1v2.101a7.002 7.002 0 0111.601 2.566 1 1 0 11-1.885.666A5.002 5.002 0 005.999 7H9a1 1 0 010 2H4a1 1 0 01-1-1V3a1 1 0 011-1zm.008 9.057a1 1 0 011.276.61A5.002 5.002 0 0014.001 13H11a1 1 0 110-2h5a1 1 0 011 1v5a1 1 0 11-2 0v-2.101a7.002 7.002 0 01-11.601-2.566 1 1 0 01.61-1.276z" clip-rule="evenodd"/></svg>
+            Refresh
+          </button>
+        </div>
+
+        <div id="reports-list">
+          <div class="loading-overlay">
+            <div class="spinner spinner-dark"></div> Loading reports...
+          </div>
+        </div>
+      </div>
+
+      <!-- Report detail (hidden until a report is opened) -->
+      <div id="report-detail" class="report-detail hidden"></div>
+
+    </section><!-- /tab-reports -->
+
+    <!-- =========================================================
+         SEARCH TAB
+         ========================================================= -->
+    <section id="tab-search" class="tab-panel" role="tabpanel">
+
+      <div class="card">
+        <div class="card-header">
+          <div>
+            <div class="card-title">Search Posts</div>
+            <div class="card-description">Keyword or semantic search over analyzed posts (pgvector + ClickHouse)</div>
+          </div>
+        </div>
+
+        <div class="search-bar">
+          <input
+            type="search"
+            id="search-input"
+            class="form-input"
+            placeholder="Search by keyword, topic, entity, or phrase..."
+            autocomplete="off"
+          />
+          <input type="text" id="search-campaign" class="form-input" placeholder="campaign (optional)" autocomplete="off" spellcheck="false" style="max-width:200px" />
+          <button id="search-btn" class="btn btn-primary">
+            <svg width="14" height="14" viewBox="0 0 20 20" fill="currentColor"><path fill-rule="evenodd" d="M8 4a4 4 0 100 8 4 4 0 000-8zM2 8a6 6 0 1110.89 3.476l4.817 4.817a1 1 0 01-1.414 1.414l-4.816-4.816A6 6 0 012 8z" clip-rule="evenodd"/></svg>
+            Search
+          </button>
+        </div>
+
+        <div class="search-options">
+          <label class="toggle-label" for="semantic-toggle">
+            <span class="toggle-input">
+              <input type="checkbox" id="semantic-toggle" />
+              <span class="toggle-slider"></span>
+            </span>
+            Semantic search (vector-based, pgvector)
+          </label>
+          <span style="font-size:0.75rem;color:var(--text-muted);margin-left:8px">
+            Off = keyword / full-text; On = vector similarity via pgvector &mdash; works after posts are analyzed
+          </span>
+        </div>
+      </div>
+
+      <div id="search-results">
+        <div class="alert alert-info">Enter a query and press Search.</div>
+      </div>
+
+    </section><!-- /tab-search -->
+
+    <!-- =========================================================
+         AGENTS TAB
+         ========================================================= -->
+    <section id="tab-agents" class="tab-panel" role="tabpanel">
+
+      <div class="card">
+        <div class="card-header">
+          <div>
+            <div class="card-title">Ask an Agent</div>
+            <div class="card-description">Natural-language Q&amp;A over the analyzed corpus (requires the agent layer: <code>run_all.py --with-agents</code>)</div>
+          </div>
+        </div>
+
+        <div class="form-row">
+          <div class="form-group" style="flex:0 0 170px">
+            <label class="form-label" for="agent-type">Agent</label>
+            <select id="agent-type" class="form-select">
+              <option value="analyst">Analyst</option>
+              <option value="coverage">Coverage</option>
+              <option value="alerting">Alerting</option>
+            </select>
+          </div>
+          <div class="form-group">
+            <label class="form-label" for="agent-question">Question</label>
+            <input
+              type="text"
+              id="agent-question"
+              class="form-input"
+              placeholder="e.g. What are people saying about fuel prices this week?"
+              autocomplete="off"
+            />
+          </div>
+          <div class="form-group" style="flex:0 0 200px">
+            <label class="form-label" for="agent-campaign">Campaign (optional)</label>
+            <input type="text" id="agent-campaign" class="form-input" placeholder="all" autocomplete="off" spellcheck="false" />
+          </div>
+          <button id="agent-ask-btn" class="btn btn-primary" style="margin-bottom:0">Ask</button>
+        </div>
+
+        <div id="agent-answer" class="hidden" style="margin-top:14px"></div>
+      </div>
+
+      <div class="card">
+        <div class="card-header">
+          <div>
+            <div class="card-title">Recent Agent Runs</div>
+            <div class="card-description">Click a run to see its full answer, citations and tool calls</div>
+          </div>
+          <button class="btn btn-secondary btn-sm" onclick="loadAgentRuns()">
+            <svg width="13" height="13" viewBox="0 0 20 20" fill="currentColor"><path fill-rule="evenodd" d="M4 2a1 1 0 011 1v2.101a7.002 7.002 0 0111.601 2.566 1 1 0 11-1.885.666A5.002 5.002 0 005.999 7H9a1 1 0 010 2H4a1 1 0 01-1-1V3a1 1 0 011-1zm.008 9.057a1 1 0 011.276.61A5.002 5.002 0 0014.001 13H11a1 1 0 110-2h5a1 1 0 011 1v5a1 1 0 11-2 0v-2.101a7.002 7.002 0 01-11.601-2.566 1 1 0 01.61-1.276z" clip-rule="evenodd"/></svg>
+            Refresh
+          </button>
+        </div>
+        <div id="agent-runs-list">
+          <div class="alert alert-info">No runs loaded yet.</div>
+        </div>
+      </div>
+
+    </section><!-- /tab-agents -->
+
+  </main><!-- /main-content -->
+
+  <!-- ============================================================
+       Status bar
+       ============================================================ -->
+  <div class="status-bar" role="status">
+    <span class="status-item">
+      <span class="status-dot yellow" id="api-status-dot"></span>
+      <span id="api-status-label">Connecting...</span>
+    </span>
+    <span class="status-item">
+      API: <span id="status-api-base">http://localhost:8000</span>
+    </span>
+    <span class="status-item" id="status-last-refresh"></span>
+    <span class="status-bar-spacer"></span>
+    <span class="status-item text-muted">Defense Analysis v1</span>
+  </div>
+
+  <!-- ============================================================
+       Post detail modal
+       ============================================================ -->
+  <div id="modal-overlay" class="modal-overlay hidden" role="dialog" aria-modal="true" aria-labelledby="modal-post-id">
+
+    <div class="modal" id="post-modal">
+      <div class="modal-header">
+        <div>
+          <div class="modal-title" id="modal-post-id">Post Detail</div>
+          <div class="modal-subtitle" id="modal-platform"></div>
+        </div>
+        <button class="modal-close" id="modal-close-btn" aria-label="Close">&times;</button>
+      </div>
+      <div class="modal-body" id="modal-body">
+        <div class="loading-overlay">
+          <div class="spinner spinner-dark"></div> Loading...
+        </div>
+      </div>
+    </div>
+
+  </div>
+
+  <!-- ============================================================
+       Login overlay
+       ============================================================ -->
+  <div id="login-overlay" class="login-overlay hidden" role="dialog" aria-modal="true" aria-labelledby="login-title">
+    <div class="login-card">
+      <div class="login-title" id="login-title">Sign In</div>
+      <div class="login-subtitle">Enter your credentials or API key to connect to the API.</div>
+
+      <form id="login-form" autocomplete="off">
+        <div class="form-group">
+          <label class="form-label" for="login-apikey">API Key <span style="color:var(--text-muted);font-weight:400">(preferred)</span></label>
+          <input
+            type="password"
+            id="login-apikey"
+            class="form-input"
+            placeholder="demo"
+            autocomplete="new-password"
+            autofocus
+          />
+          <div style="font-size:0.75rem;color:var(--text-muted);margin-top:4px">Dev mode: any non-empty key works (e.g. demo)</div>
+        </div>
+
+        <div class="divider"></div>
+        <p style="font-size:0.75rem;color:var(--text-muted);margin-bottom:12px;text-align:center">— or log in with username &amp; password —</p>
+
+        <div class="form-group">
+          <label class="form-label" for="login-username">Username</label>
+          <input
+            type="text"
+            id="login-username"
+            class="form-input"
+            placeholder="username"
+            autocomplete="username"
+          />
+        </div>
+        <div class="form-group">
+          <label class="form-label" for="login-password">Password</label>
+          <input
+            type="password"
+            id="login-password"
+            class="form-input"
+            placeholder="••••••••"
+            autocomplete="current-password"
+          />
+        </div>
+
+        <div id="login-error" style="color:var(--danger);font-size:0.8125rem;margin-bottom:10px;min-height:18px"></div>
+
+        <button type="submit" id="login-submit-btn" class="btn btn-primary" style="width:100%;justify-content:center">
+          Connect
+        </button>
+
+        <div class="login-footer">
+          Credentials are stored in localStorage for this browser session only.
+          <br />
+          <button type="button" class="btn btn-sm" style="background:none;border:none;color:var(--accent);cursor:pointer;padding:4px 0;text-decoration:underline;font-size:0.75rem" onclick="hideLoginModal()">
+            Skip (try without auth)
+          </button>
+        </div>
+      </form>
+    </div>
+  </div>
+
+  <!-- ============================================================
+       LLM backend settings modal
+       ============================================================ -->
+  <div id="llm-settings-overlay" class="modal-overlay hidden" role="dialog" aria-modal="true" aria-labelledby="llm-settings-title">
+    <div class="modal" style="max-width:560px">
+      <div class="modal-header">
+        <div>
+          <div class="modal-title" id="llm-settings-title">LLM Backend Settings</div>
+          <div class="modal-subtitle">Choose which LLM backend new analysis runs use</div>
+        </div>
+        <button class="modal-close" id="llm-settings-close-btn" aria-label="Close">&times;</button>
+      </div>
+      <div class="modal-body" id="llm-settings-body">
+        <div class="loading-overlay">
+          <div class="spinner spinner-dark"></div> Loading LLM configuration...
+        </div>
+      </div>
+    </div>
+  </div>
+
+  <!-- Toast container -->
+  <div id="toast-container" aria-live="polite"></div>
+
+</div><!-- /app -->
+
+<script src="app.js?v=4"></script>
+</body>
+</html>

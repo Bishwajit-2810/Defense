@@ -50,7 +50,9 @@ The Stage-2 LLM is a **pluggable backend with two interchangeable providers —
 `local` (self-hosted vLLM) and `groq` (Groq Cloud API) — switchable at runtime**
 (see [models.md](models.md) §2). The default backend is **local** (no per-token
 bill, no data egress); **Groq** is an opt-in switch for fastest inference and
-zero GPU ops. The choice is config- and request-level, so the operator can flip
+zero GPU ops. The `local` backend is any OpenAI-compatible server: vLLM in
+production, **Ollama** for local dev (the runbooks use Ollama with
+`qwen2.5:7b` / `qwen3-vl:4b` — see [run.md](run.md) §3). The choice is config- and request-level, so the operator can flip
 between them at any time without redeploying.
 
 ---
@@ -67,8 +69,9 @@ between them at any time without redeploying.
    come for free.
 3. **Scale by partition, not by bigger machines.** Throughput grows by adding
    workers and queue partitions, not vertical scaling.
-4. **Storage by access pattern.** No single database is good at OLTP +
-   aggregation + vector search. Use the right store per job.
+4. **Storage by access pattern.** Use the right store per job — OLTP and vector
+   search co-locate in Postgres (the `pgvector` extension), while heavy
+   aggregation lives in a columnar store.
 5. **Idempotent + observable.** Every post has a stable hash; reprocessing is
    safe. Every stage emits metrics, logs, and traces.
 
@@ -133,11 +136,13 @@ between them at any time without redeploying.
                                 │  + JSON schema validate│
                                 └───────────┬───────────┘
                                             │ fan-out writes
-        ┌───────────────┬───────────────────┼───────────────────┬───────────────┐
-   ┌────▼─────┐   ┌─────▼──────┐      ┌──────▼──────┐     ┌──────▼──────┐  ┌─────▼─────┐
-   │PostgreSQL│   │ ClickHouse │      │   Qdrant    │     │   Redis     │  │  Object   │
-   │ ops+jobs │   │ analytics  │      │  vectors    │     │ cache/dedup │  │  storage  │
-   └──────────┘   └────────────┘      └─────────────┘     └─────────────┘  └───────────┘
+            ┌───────────────────┬───────────┼───────────────────┬───────────────┐
+       ┌────▼─────┐       ┌──────▼─────┐     ┌──────▼──────┐  ┌─────▼─────┐
+       │PostgreSQL│       │ ClickHouse │     │   Redis     │  │  Object   │
+       │ ops+jobs │       │ analytics  │     │ cache/dedup │  │  storage  │
+       │+pgvector │       └────────────┘     └─────────────┘  └───────────┘
+       │ vectors  │
+       └──────────┘
 ```
 
 The **Router/Triage** between Stage 1 and Stage 2 is the heart of the cost
@@ -162,9 +167,10 @@ Q&A, grounded reports, and targeted deep-dives (never per post) — see §11.
    `storedCommentRows` of `commentCount` — record coverage), and computes a content
    hash over the post + comments. A pushed batch (`POST /v1/posts/upload`) is also
    accepted for external/replay sources, but the upstream pull is the primary path.
-2. **Dedup gate.** Hash is checked against Redis (recent) and Qdrant/Postgres
+2. **Dedup gate.** Hash is checked against Redis (recent) and Postgres
    (historical). Exact duplicates short-circuit to the cached result; near
-   duplicates (cosine > threshold on embedding) can reuse prior analysis. This
+   duplicates (cosine > threshold on the `analysis_results.embedding` vector)
+   can reuse prior analysis. This
    alone removes a large fraction of LLM/NLP work on real social feeds.
 3. **Enqueue.** A `job` row is created in PostgreSQL (`status=queued`). One
    message per post is produced to the bus, partitioned by `post_id` hash so a
@@ -216,10 +222,12 @@ Q&A, grounded reports, and targeted deep-dives (never per post) — see §11.
 7. **Assemble + validate.** The Result Assembler merges Stage 1 + Stage 2 into
    the canonical JSON (see §6), validates against the JSON Schema, and sets
    `confidence` = aggregate.
-8. **Persist (fan-out).**
-   - PostgreSQL: job status, per-post status, the canonical result row.
+8. **Persist (fan-out to 3 backends).**
+   - PostgreSQL (+ pgvector): job status, per-post status, the canonical result
+     row, **and** the `analysis_results.embedding` `vector(768)` column for
+     semantic search, clustering, and dedup — an idempotent upsert keyed by
+     `post_id`.
    - ClickHouse: a denormalized analytics row for fast aggregations/trends.
-   - Qdrant: the embedding + key metadata for semantic search, clustering, dedup.
    - Object storage: raw payload + any generated reports.
 9. **Serve.** `GET /analysis/{id}`, `GET /reports`, and dashboard queries read
    from PostgreSQL (point lookups) and ClickHouse (aggregations).
@@ -239,7 +247,7 @@ Q&A, grounded reports, and targeted deep-dives (never per post) — see §11.
 | **Result Assembler**             | Merge, JSON-schema validate, compute aggregate confidence                                                                                                                                  | Python consumer                                                                            | stateless replicas  |
 | **Reporting/Query Service**      | Read APIs, report generation, exports                                                                                                                                                      | FastAPI + ClickHouse + PostgreSQL                                                          | stateless replicas  |
 | **Agent Orchestrator**           | Runs the **selective AI agents** (insight/analyst, coverage deep-dive, alerting) — corpus/report tier only, never per-post (§11)                                                           | FastAPI + agent loop → pluggable LLM-B/VLM backend + MCP tools                             | stateless replicas  |
-| **MCP Servers**                  | Standardized tool/resource interfaces the agents call: `analytics-mcp` (ClickHouse/Postgres), `retrieval-mcp` (Qdrant + fetch), `ingest-mcp` (trigger upstream pull / fetch more comments) | FastAPI + MCP SDK (stdio/HTTP)                                                             | stateless replicas  |
+| **MCP Servers**                  | Standardized tool/resource interfaces the agents call: `analytics-mcp` (ClickHouse/Postgres), `retrieval-mcp` (Postgres + pgvector + fetch), `ingest-mcp` (trigger upstream pull / fetch more comments) | FastAPI + MCP SDK (stdio/HTTP)                                                             | stateless replicas  |
 | **User Management**              | Tenants, users, roles, billing/usage metering                                                                                                                                              | FastAPI + PostgreSQL                                                                       | stateless replicas  |
 
 Workers are split into **separate pools per stage** so the expensive LLM GPUs
@@ -275,7 +283,7 @@ Levers that keep token usage and cost low:
 - **Exact + near-duplicate caching.** Social feeds are highly repetitive
   (reshares, copypasta, viral captions). Hash + embedding dedup avoids reanalysis.
 - **Batch & cluster summarization.** Don't summarize 10,000 posts individually.
-  Cluster embeddings (Qdrant + k-means/HDBSCAN), then have the LLM summarize a
+  Cluster embeddings (pgvector + k-means/HDBSCAN), then have the LLM summarize a
   _cluster_ or representative samples → "cluster summarization" and "insight
   generation" from one LLM call per cluster, not per post.
 - **Token minimization.** Send only truncated, cleaned text and only the fields
@@ -475,9 +483,8 @@ created_at`) is preserved as a subset of this richer object (`sentiment` →
 | Model serving  | **Triton/ONNX/CTranslate2** (NLP); **SigLIP/CLIP + VLM** (vision); Stage-2 **vLLM**⇄**Groq**             | High GPU utilization for NLP; cheap visual sentiment + a VLM for image-grounded summaries; Stage-2 backend switchable local↔Groq                                                |
 | Agents + tools | **Agent orchestrator** (FastAPI) on the pluggable LLM-B/VLM backend; **MCP servers** (FastAPI + MCP SDK) | Tool-using agents for corpus-level insight; MCP gives a standardized tool/resource interface over our stores + upstream (§11). Backend models (Qwen/Llama) support tool calling |
 | Message bus    | **Kafka** (prod), **Redis Streams** (MVP)                                                                | Durable, partitioned, replayable at scale; simple to start                                                                                                                      |
-| Operational DB | **PostgreSQL**                                                                                           | ACID jobs/state, JSONB flexibility, mature                                                                                                                                      |
+| Operational DB | **PostgreSQL + pgvector**                                                                                | ACID jobs/state, JSONB flexibility, mature; the `pgvector` extension adds the `analysis_results.embedding` `vector(768)` column for dedup/search/clustering — one store, no separate vector service |
 | Analytics DB   | **ClickHouse**                                                                                           | Columnar, billions of rows, sub-second aggregations for trends                                                                                                                  |
-| Vector DB      | **Qdrant**                                                                                               | Fast, open-source, easy ops, good filtering; for dedup/search/clustering                                                                                                        |
 | Cache          | **Redis**                                                                                                | LLM/embedding/query cache, dedup set, rate limits                                                                                                                               |
 | Object storage | **S3 / MinIO**                                                                                           | Raw payloads, reports, model artifacts                                                                                                                                          |
 | Orchestration  | **Kubernetes** (prod), **Docker Compose** (MVP)                                                          | Autoscaling + HA vs simplicity                                                                                                                                                  |
@@ -582,7 +589,7 @@ glue:
 | MCP server      | Tools it exposes                                                                 | Backed by                      |
 | --------------- | -------------------------------------------------------------------------------- | ------------------------------ |
 | `analytics-mcp` | `trend_query`, `sentiment_over_time`, `top_posts`, `reaction_mix`, point lookups | ClickHouse + PostgreSQL        |
-| `retrieval-mcp` | `semantic_search`, `get_post`, `get_thread`, `representative_comments`           | Qdrant + PostgreSQL            |
+| `retrieval-mcp` | `semantic_search`, `get_post`, `get_thread`, `representative_comments`           | Postgres + pgvector            |
 | `ingest-mcp`    | `pull_campaign`, `fetch_more_comments` (raise coverage), `refresh_post`          | upstream post-with-details API |
 
 MCP servers are **read-mostly** and respect the same auth/tenant scoping as the

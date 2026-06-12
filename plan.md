@@ -23,8 +23,9 @@ posts efficiently. Read alongside [architecture.md](architecture.md).
   `sentiment`/`viralPotential` as `baseline_*`, **run OCR on `photoUrls`** (no OCR
   is shipped), record comment **coverage** (`storedCommentRows`/`commentCount`),
   upsert into **our own database**.
-- Stand up local Docker Compose skeleton: Postgres, Redis, Qdrant, ClickHouse,
-  MinIO, a stub API, Prometheus/Grafana.
+- Stand up local Docker Compose skeleton: Postgres (`pgvector/pgvector:pg16`,
+  with the pgvector extension for vector search), Redis, ClickHouse, MinIO, a stub
+  API, Prometheus/Grafana.
 - Pick and pin model versions ([models.md](models.md)), **including the vision
   models** (image-sentiment: SigLIP/CLIP; image-description/summary VLM:
   Qwen2.5-VL); download local weights to object storage. Define the **Stage-2 LLM
@@ -83,8 +84,9 @@ Goal: prove the hybrid pipeline and output quality end-to-end, cheaply.
   photo posts. Ship both adapters in the MVP so the switch is exercised early;
   **LLM response cache** in Redis keyed by `(backend, model, task, content_hash)`.
   (LLM-B is added in Phase 2 for cluster/report quality.)
-- **Result assembler:** merge + JSON-schema validate + write to Postgres,
-  ClickHouse, Qdrant, MinIO.
+- **Result assembler:** merge + JSON-schema validate + write to Postgres
+  (including the `analysis_results.embedding` `vector(768)` column via pgvector),
+  ClickHouse, MinIO.
 - **APIs:** `/posts/upload`, `/analysis/run`, `/analysis/{id}`, `/reports`
   (basic), auth (API key + JWT).
 - **Web dashboard (v1) — plain HTML/CSS/JS** (vanilla, no framework): job status,
@@ -119,7 +121,7 @@ Goal: scale, reliability, and the move to Kubernetes.
 - **Cluster summarization:** k-means/HDBSCAN over embeddings → LLM summarizes
   clusters, not posts (key cost lever at 10k).
 - **Reporting:** trend analysis, brand-mention tracking, political analysis on
-  ClickHouse; grounded report generation via RAG (Qdrant + LLM).
+  ClickHouse; grounded report generation via RAG (Postgres + pgvector + LLM).
 - **Agentic insight layer ([architecture.md](architecture.md) §11):** stand up the
   **MCP servers** (`analytics-mcp`, `retrieval-mcp`, `ingest-mcp` — FastAPI + MCP
   SDK) and the **agent orchestrator**; ship the **Insight/Analyst agent**
@@ -144,9 +146,10 @@ Goal: horizontal scale, cost efficiency, resilience at volume.
 
 - **GPU node pools per stage**, spot/preemptible for batch surges (Kafka replay
   makes preemption safe); reserved capacity for steady base.
-- **Data layer scale-out:** Postgres read replicas; ClickHouse cluster
-  (shards+replicas); Qdrant sharded by tenant; possibly Milvus if vectors reach
-  billions ([possible_architecture.md](possible_architecture.md) §5).
+- **Data layer scale-out:** Postgres read replicas (the pgvector index scales with
+  them); ClickHouse cluster (shards+replicas); partition/replicate the pgvector
+  embeddings by tenant; possibly a dedicated vector engine (e.g. Milvus) if vectors
+  reach billions ([possible_architecture.md](possible_architecture.md) §5).
 - **LLM scale:** on `local`, multiple vLLM replicas for both models (tensor
   parallelism for LLM-B), absorbing spikes by adding GPU replicas; on `groq`, no
   GPU scaling — negotiate quota for peak. **Hybrid** is the typical enterprise

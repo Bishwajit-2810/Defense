@@ -210,7 +210,7 @@ own text, not retrieval. Adding RAG there would only add latency and cost.
 **Reporting / insight / analyst Q&A: YES, valuable.** RAG shines for:
 
 - "What are people saying about _Brand X_ this week?" — retrieve relevant posts
-  from Qdrant, feed to the LLM grounded.
+  via pgvector (Postgres extension), feed to the LLM grounded.
 - Grounded **report generation** and **insight generation** across the corpus.
 - **Cluster summarization** — retrieve cluster members, summarize with citations.
 
@@ -220,13 +220,15 @@ whole corpus into context; reuses embeddings you already compute.
 if retrieval is poor — mitigate with good chunking, metadata filters, and
 showing source posts.
 
-**Recommended stack:** **Qdrant** vector DB + **bge-m3 / multilingual-e5**
-embeddings (Bangla-capable) + **LLM-B** (the large role) for generation, on
-whichever Stage-2 backend is active — `local` for fully in-cluster RAG, or `groq`
-for faster report generation when the retrieved context may leave the cluster.
-This reuses the same Qdrant + embeddings already in the core pipeline, so RAG is
-nearly free to add at the reporting layer; retrieval/embeddings stay local in
-both cases — only the final generation call follows the chosen backend.
+**Recommended stack:** **Postgres + pgvector** (the `analysis_results.embedding`
+`vector(768)` column, cosine distance via the `<=>` operator) + **bge-m3 /
+multilingual-e5** embeddings (Bangla-capable) + **LLM-B** (the large role) for
+generation, on whichever Stage-2 backend is active — `local` for fully in-cluster
+RAG, or `groq` for faster report generation when the retrieved context may leave
+the cluster. This reuses the same pgvector embeddings already stored in the core
+pipeline, so RAG is nearly free to add at the reporting layer; retrieval/embeddings
+stay local in both cases — only the final generation call follows the chosen
+backend.
 
 ### Delivered as an agentic loop over MCP tools
 
@@ -234,7 +236,7 @@ In practice RAG here is driven by the **Insight/Analyst agent**
 ([architecture.md](architecture.md) §11), not a single retrieve→generate call. The
 agent runs on **LLM-B** (Qwen/Llama — both support tool/function calling, which MCP
 builds on) and plans over **MCP tools**: `retrieval-mcp.semantic_search` /
-`get_thread` (Qdrant + Postgres) for grounding, `analytics-mcp.trend_query` /
+`get_thread` (Postgres + pgvector) for grounding, `analytics-mcp.trend_query` /
 `reaction_mix` (ClickHouse) for the numbers, and a **VLM** step when an answer needs
 the images. This keeps reports **grounded and cited**, lets the agent decide _how
 much_ to retrieve, and stays on the chosen backend (`local` for in-cluster, `groq`

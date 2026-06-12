@@ -38,9 +38,8 @@ services:
   agent-orch     (FastAPI)          → AI agents (insight/analyst, deep-dive, alerting) → LLM-B + MCP   [Phase 2]
   mcp-servers    (FastAPI + MCP)    → analytics-mcp · retrieval-mcp · ingest-mcp (internal tools)        [Phase 2]
   redis          (cache/queue)      → Redis Streams = bus + cache + dedup
-  postgres       (ops + jobs)
+  postgres       (ops + jobs + vectors via pgvector)
   clickhouse     (analytics)
-  qdrant         (vectors)
   minio          (object storage)
   prometheus + grafana + loki       → monitoring
 ```
@@ -92,10 +91,11 @@ services:
                          │                    (API)  │   or groq (egress HTTPS)
                          └───────────────────────────┘
           │ writes (assembler Deployment) │
-   ┌──────▼───────┬──────────┬────────────▼──────┬───────────┐
-   │ postgres     │clickhouse│ qdrant            │ minio/S3  │  StatefulSets / managed
-   │ (HA, replica)│(cluster) │ (sharded)         │           │
-   └──────────────┴──────────┴───────────────────┴───────────┘
+   ┌──────▼──────────────┬───────────┬──────────▼┐
+   │ postgres + pgvector │clickhouse │ minio/S3  │  StatefulSets / managed
+   │ (HA, replica;       │(cluster)  │           │
+   │  vectors)           │           │           │
+   └─────────────────────┴───────────┴───────────┘
         observability namespace: prometheus, grafana, loki, jaeger, otel-collector
 ```
 
@@ -128,8 +128,10 @@ services:
     Groq in `NetworkPolicy`/egress rules and mount `GROQ_API_KEY` from a Secret.
     Both are valid simultaneously for **hybrid/failover**; the worker picks per
     request/policy. Switching backends is a config rollout, not a rebuild.
-- **Stateful infra** (Kafka, PostgreSQL, ClickHouse, Qdrant) → operators or
-  `StatefulSet` + `PersistentVolumeClaim`; or managed equivalents to cut ops.
+- **Stateful infra** (Kafka, PostgreSQL + pgvector, ClickHouse) → operators or
+  `StatefulSet` + `PersistentVolumeClaim`; or managed equivalents to cut ops. The
+  vector index lives in Postgres (the `pgvector` extension), so it scales with the
+  Postgres StatefulSet — no separate vector-store workload.
 - **Object storage** → MinIO operator or cloud S3.
 
 ### Autoscaling
@@ -160,7 +162,7 @@ services:
 - Multi-AZ node pools; PodDisruptionBudgets; replicas ≥ 2 for stateless.
 - DLQ topic in Kafka; alert on DLQ growth (see [infrastructure.md](infrastructure.md)).
 - Rolling updates with readiness gates; canary via mesh or two Deployments.
-- Backups: Postgres PITR, ClickHouse + Qdrant snapshots to object storage.
+- Backups: Postgres PITR (covers the pgvector embeddings), ClickHouse snapshots to object storage.
 
 ### CI/CD
 

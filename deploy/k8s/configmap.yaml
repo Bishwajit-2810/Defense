@@ -1,0 +1,19 @@
+apiVersion: v1
+kind: ConfigMap
+metadata:
+  name: defense-config
+  namespace: defense
+  labels:
+    app.kubernetes.io/part-of: defense
+data:
+  REDIS_URL: "redis://redis.defense.svc.cluster.local:6379"
+  CLICKHOUSE_URL: "http://clickhouse.defense.svc.cluster.local:8123"
+  MINIO_ENDPOINT: "http://minio.defense.svc.cluster.local:9000"
+  MINIO_BUCKET: "defense-data"
+  LLM_BACKEND: "groq"
+  LOG_LEVEL: "INFO"
+  MODEL_STUB_MODE: "false"
+  ANALYTICS_MCP_URL: "http://analytics-mcp.defense.svc.cluster.local:8100"
+  RETRIEVAL_MCP_URL: "http://retrieval-mcp.defense.svc.cluster.local:8101"
+  INGEST_MCP_URL: "http://ingest-mcp.defense.svc.cluster.local:8102"
+  AGENTS_SERVICE_URL: "http://agents.defense.svc.cluster.local:8010"

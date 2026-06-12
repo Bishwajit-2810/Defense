@@ -1,0 +1,65 @@
+[project]
+name = "defense"
+version = "0.1.0"
+description = "Smart Layer — social-media analysis pipeline (ingest → NLP → router → LLM → assembler)"
+requires-python = ">=3.11"
+
+# Core runtime — everything needed for the default, verified stub-mode run
+# (Mode A in run.md): API + 5 workers + assembler + agents + MCP servers.
+# No GPU / ML weights required. See run.md §1.
+dependencies = [
+    "fastapi>=0.115.0",
+    "starlette>=0.40,<0.51",                      # FastAPI 0.128 needs starlette<0.51
+    "uvicorn[standard]>=0.32.0",
+    "sqlalchemy[asyncio]>=2.0.0",
+    "asyncpg>=0.30.0",
+    "psycopg2-binary>=2.9.0",
+    "redis[hiredis]>=5.2.0",
+    "clickhouse-driver>=0.2.9",
+    "boto3>=1.35.0",
+    "jsonschema>=4.23.0",
+    "pydantic>=2.10.0",
+    "pydantic-settings>=2.7.0",
+    "python-dotenv>=1.0.0",
+    "structlog>=24.0.0",
+    "tenacity>=9.0.0",
+    "openai>=1.58.0",
+    "httpx>=0.28.0",
+    "numpy>=2.0.0",
+    "python-jose[cryptography]>=3.3.0",
+    "passlib[bcrypt]>=1.7.4",
+    "python-multipart>=0.0.12",
+    "prometheus-fastapi-instrumentator>=7.0.0,<8",  # 8.x pulls an incompatible starlette
+]
+
+[project.optional-dependencies]
+# Real NLP/vision models — only needed with MODEL_STUB_MODE=false (needs a GPU
+# for reasonable throughput). Install with: uv sync --extra ml
+ml = [
+    "torch>=2.5.0",
+    "transformers>=4.47.0",
+    "sentence-transformers>=3.0.0",
+    "fasttext-wheel>=0.9.2",
+    "keybert>=0.8.0",
+    "scikit-learn>=1.6.0",
+    "Pillow>=11.0.0",
+]
+# Test + lint tooling. Install with: uv sync --extra dev
+dev = [
+    "pytest>=8.0.0",
+    "ruff>=0.6.0",
+]
+
+[tool.uv]
+# The code runs via PYTHONPATH (libs/, services/, mcp/ are not an installed
+# package and there is no build backend) — manage dependencies only, don't try
+# to build/install this project itself.
+package = false
+
+[tool.pytest.ini_options]
+testpaths = ["tests"]
+pythonpath = ["."]
+
+[tool.ruff]
+line-length = 100
+target-version = "py311"

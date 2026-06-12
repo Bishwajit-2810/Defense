@@ -1,0 +1,544 @@
+"""Analysis endpoints — run analysis jobs and stream progress."""
+
+from __future__ import annotations
+
+import asyncio
+import json
+import os
+import sys
+import uuid
+from datetime import datetime, timezone
+from typing import Any, AsyncGenerator
+
+# Repo root on path so `services.ingestion.normalizer` imports when the API
+# runs from services/api (no-op when PYTHONPATH already provides it).
+_REPO_ROOT = os.path.abspath(os.path.join(os.path.dirname(__file__), "..", "..", ".."))
+if _REPO_ROOT not in sys.path:
+    sys.path.insert(0, _REPO_ROOT)
+
+import structlog
+from fastapi import APIRouter, Depends, HTTPException, Query, Request, status
+from fastapi.responses import StreamingResponse
+from sqlalchemy import text
+from sqlalchemy.ext.asyncio import AsyncSession
+
+import redis.asyncio as aioredis
+from deps import check_llm_backend_policy, get_current_user, get_db, get_redis
+from models import (
+    AnalysisDetailResponse,
+    AnalysisResultResponse,
+    AnalysisRunRequest,
+    AnalysisRunResponse,
+)
+
+log = structlog.get_logger(__name__)
+
+router = APIRouter(prefix="/v1/analysis", tags=["analysis"])
+
+# Re-analysis jobs feed the same Stage-1 stream the ingestion service uses —
+# there is no separate analysis worker; the normal pipeline does the work and
+# the assembler flips the job to done via job_id.
+_NLP_STAGE1_STREAM = "nlp:stage1:queue"
+
+
+async def _create_analysis_job(
+    db: AsyncSession,
+    analysis_id: str,
+    selector: dict,
+) -> None:
+    now = datetime.now(tz=timezone.utc)
+    await db.execute(
+        text(
+            """
+            INSERT INTO jobs (id, type, status, selector, options, created_at, updated_at)
+            VALUES (:id, :type, :status, CAST(:selector AS jsonb), CAST(:options AS jsonb), :created_at, :updated_at)
+            ON CONFLICT (id) DO NOTHING
+            """
+        ),
+        {
+            "id": analysis_id,
+            "type": "analysis_run",
+            "status": "queued",
+            "selector": json.dumps(selector, default=str),
+            "options": json.dumps({}),
+            "created_at": now,
+            "updated_at": now,
+        },
+    )
+
+
+# ---------------------------------------------------------------------------
+# POST /v1/analysis/run
+# ---------------------------------------------------------------------------
+
+
+@router.post(
+    "/run",
+    status_code=status.HTTP_202_ACCEPTED,
+    response_model=AnalysisRunResponse,
+    summary="Enqueue an analysis job",
+)
+async def analysis_run(
+    body: AnalysisRunRequest,
+    request: Request,
+    db: AsyncSession = Depends(get_db),
+    redis: aioredis.Redis = Depends(get_redis),
+    current_user: dict = Depends(get_current_user),
+) -> AnalysisRunResponse:
+    """Enqueue NLP/LLM (re-)analysis for the specified posts or campaign.
+
+    Matched posts are re-normalized from their stored ``raw_payload`` and fed
+    back into the Stage-1 stream with this job's id; the assembler marks the
+    job done as results land. Poll ``GET /v1/analysis/{id}`` or connect to the
+    SSE stream at ``GET /v1/analysis/{id}/stream`` for progress.
+    """
+    if not body.post_ids and not body.campaign_id:
+        raise HTTPException(
+            status_code=status.HTTP_422_UNPROCESSABLE_ENTITY,
+            detail="Provide at least one of 'post_ids' or 'campaign_id'",
+        )
+
+    options: dict[str, Any] = body.options or {}
+    # Privacy-locked tenants may not override the backend to groq (403).
+    await check_llm_backend_policy(db, current_user, options)
+
+    analysis_id = str(uuid.uuid4())
+
+    selector: dict[str, Any] = {}
+    if body.campaign_id:
+        selector["campaign_id"] = body.campaign_id
+    if body.post_ids:
+        selector["post_ids"] = body.post_ids
+    if body.filter:
+        selector["filter"] = body.filter.model_dump(exclude_none=True)
+
+    # --- Find the posts to (re-)analyze -------------------------------------
+    where, params = [], {}
+    if body.campaign_id:
+        where.append("campaign_id = :campaign_id")
+        params["campaign_id"] = body.campaign_id
+    if body.post_ids:
+        where.append("id = ANY(:post_ids)")
+        params["post_ids"] = body.post_ids
+    rows = (
+        await db.execute(
+            text(f"SELECT id, raw_payload FROM posts WHERE {' AND '.join(where)}"),
+            params,
+        )
+    ).mappings().all()
+
+    if not rows:
+        raise HTTPException(
+            status_code=status.HTTP_404_NOT_FOUND,
+            detail="No posts matched the selector — upload posts first",
+        )
+
+    # Re-normalize from the stored raw payload (same path ingestion uses).
+    from services.ingestion.normalizer import normalize_post  # noqa: PLC0415
+
+    try:
+        await _create_analysis_job(db, analysis_id, selector)
+        enqueued = 0
+        for row in rows:
+            raw = row["raw_payload"] or {}
+            try:
+                normalized = normalize_post(raw)
+            except Exception as exc:
+                log.warning("analysis_run_normalize_failed", post_id=row["id"], error=str(exc))
+                continue
+            envelope = {
+                "post_id": normalized["post_id"],
+                "raw_post": raw,
+                "normalized_post": normalized,
+                "options": options,
+                "job_id": analysis_id,
+            }
+            await redis.xadd(
+                _NLP_STAGE1_STREAM,
+                {"data": json.dumps(envelope, ensure_ascii=False, default=str)},
+            )
+            enqueued += 1
+        if enqueued == 0:
+            raise HTTPException(
+                status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,
+                detail="All matched posts failed normalization",
+            )
+    except HTTPException:
+        raise
+    except Exception as exc:
+        log.error("analysis_run_enqueue_failed", analysis_id=analysis_id, error=str(exc))
+        raise HTTPException(
+            status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,
+            detail="Failed to enqueue analysis job",
+        ) from exc
+
+    # Record the expected post count so the assembler can report progress and
+    # mark the job done only when every post has landed.
+    try:
+        await redis.set(f"job:{analysis_id}:total", enqueued, ex=86_400)
+    except Exception as exc:
+        log.warning("analysis_run_total_record_failed", analysis_id=analysis_id, error=str(exc))
+
+    # Estimate the LLM share from the router's observed routing rate; falls
+    # back to the 5% design target before any traffic has been processed.
+    estimated_share = 0.05
+    try:
+        total_stat = int(await redis.get("stats:total_processed") or 0)
+        llm_stat = int(await redis.get("stats:llm_routed") or 0)
+        if total_stat > 0:
+            estimated_share = round(llm_stat / total_stat, 4)
+    except Exception:
+        pass
+    if options.get("want_summary"):
+        estimated_share = 1.0  # summaries force every post through Stage-2
+
+    log.info("analysis_run_enqueued", analysis_id=analysis_id, posts=enqueued)
+    base = str(request.base_url).rstrip("/")
+    return AnalysisRunResponse(
+        analysis_id=analysis_id,
+        status="queued",
+        estimated_llm_share=estimated_share,
+        status_url=f"{base}/v1/analysis/{analysis_id}",
+    )
+
+
+# ---------------------------------------------------------------------------
+# GET /v1/analysis/{id}
+# ---------------------------------------------------------------------------
+
+
+@router.get(
+    "",
+    summary="List recent analysis/ingest jobs",
+)
+async def list_analysis_jobs(
+    limit: int = Query(20, ge=1, le=200),
+    db: AsyncSession = Depends(get_db),
+    current_user: dict = Depends(get_current_user),
+) -> dict:
+    """List recent jobs (newest first), excluding reports. Backs the Jobs tab."""
+    rows = (
+        await db.execute(
+            text(
+                """
+                SELECT id, type, status, selector, created_at, updated_at
+                FROM jobs
+                WHERE type <> 'report'
+                ORDER BY created_at DESC
+                LIMIT :limit
+                """
+            ),
+            {"limit": limit},
+        )
+    ).mappings().all()
+
+    jobs = []
+    for r in rows:
+        selector = r["selector"] or {}
+        post_ids = selector.get("post_ids") or []
+        jobs.append(
+            {
+                "id": r["id"],
+                "type": r["type"],
+                "status": r["status"],
+                "post_count": len(post_ids) or None,
+                "created_at": r["created_at"].isoformat() if r["created_at"] else None,
+                "updated_at": r["updated_at"].isoformat() if r["updated_at"] else None,
+            }
+        )
+    return {"jobs": jobs, "total": len(jobs)}
+
+
+@router.get(
+    "/latest",
+    response_model=AnalysisDetailResponse,
+    summary="List the most recent analysis results across all jobs",
+)
+async def latest_analysis(
+    limit: int = Query(50, ge=1, le=500),
+    campaign_id: str | None = Query(None, description="Optional campaign filter"),
+    db: AsyncSession = Depends(get_db),
+    current_user: dict = Depends(get_current_user),
+) -> AnalysisDetailResponse:
+    """Return the most recent analysis results (newest first). Backs the Posts tab.
+
+    Always embeds results; the dashboard's ``?include=results`` is accepted and
+    ignored. Declared before ``/{analysis_id}`` so the literal ``/latest`` wins.
+    """
+    params: dict[str, Any] = {"limit": limit}
+    where = ""
+    if campaign_id:
+        where = "WHERE ar.campaign_id = :campaign_id"
+        params["campaign_id"] = campaign_id
+
+    rows = (
+        await db.execute(
+            text(
+                f"""
+                SELECT ar.id, ar.post_id, ar.campaign_id, ar.result,
+                       ar.created_at, p.scraped_at
+                FROM analysis_results ar
+                JOIN posts p ON p.id = ar.post_id
+                {where}
+                ORDER BY ar.created_at DESC
+                LIMIT :limit
+                """
+            ),
+            params,
+        )
+    ).mappings().all()
+
+    return AnalysisDetailResponse(
+        analysis_id="latest",
+        status="done",
+        campaign_id=campaign_id,
+        post_ids=[],
+        results=[_row_to_result(r) for r in rows],
+        created_at=rows[0]["created_at"] if rows else None,
+    )
+
+
+@router.get(
+    "/{analysis_id}",
+    response_model=AnalysisDetailResponse,
+    summary="Get analysis job status and results",
+)
+async def get_analysis(
+    analysis_id: str,
+    include: str | None = Query(None, description="Comma-separated includes: results"),
+    limit: int = Query(100, ge=1, le=1000),
+    db: AsyncSession = Depends(get_db),
+    redis: aioredis.Redis = Depends(get_redis),
+    current_user: dict = Depends(get_current_user),
+) -> AnalysisDetailResponse:
+    """Return the status of an analysis job.
+
+    Pass ``?include=results`` to embed analysis result rows in the response.
+    Use ``?limit=N`` to cap the number of result rows returned.
+    """
+    job_row = (
+        await db.execute(
+            text("SELECT id, status, selector, created_at FROM jobs WHERE id = :id"),
+            {"id": analysis_id},
+        )
+    ).mappings().first()
+
+    if job_row is None:
+        raise HTTPException(
+            status_code=status.HTTP_404_NOT_FOUND,
+            detail=f"Analysis job '{analysis_id}' not found",
+        )
+
+    selector: dict = job_row["selector"] or {}
+    campaign_id: str | None = selector.get("campaign_id")
+    post_ids: list[str] = selector.get("post_ids") or []
+
+    # Per-job progress counters maintained by the assembler/ingestion workers.
+    progress: dict[str, Any] | None = None
+    try:
+        raw_total = await redis.get(f"job:{analysis_id}:total")
+        completed = int(await redis.get(f"job:{analysis_id}:completed") or 0)
+        failed = int(await redis.get(f"job:{analysis_id}:failed") or 0)
+        if raw_total is not None or completed or failed:
+            progress = {
+                "total": int(raw_total) if raw_total is not None else None,
+                "completed": completed,
+                "failed": failed,
+            }
+    except Exception as exc:
+        log.warning("job_progress_read_failed", analysis_id=analysis_id, error=str(exc))
+
+    results: list[AnalysisResultResponse] | None = None
+    wants_results = include and "results" in include.split(",")
+
+    if wants_results:
+        # Build a query against analysis_results joined with posts
+        if campaign_id:
+            rows = (
+                await db.execute(
+                    text(
+                        """
+                        SELECT ar.id, ar.post_id, ar.campaign_id, ar.result,
+                               ar.created_at, p.scraped_at
+                        FROM analysis_results ar
+                        JOIN posts p ON p.id = ar.post_id
+                        WHERE ar.campaign_id = :campaign_id
+                        ORDER BY ar.created_at DESC
+                        LIMIT :limit
+                        """
+                    ),
+                    {"campaign_id": campaign_id, "limit": limit},
+                )
+            ).mappings().all()
+        elif post_ids:
+            rows = (
+                await db.execute(
+                    text(
+                        """
+                        SELECT ar.id, ar.post_id, ar.campaign_id, ar.result,
+                               ar.created_at, p.scraped_at
+                        FROM analysis_results ar
+                        JOIN posts p ON p.id = ar.post_id
+                        WHERE ar.post_id = ANY(:post_ids)
+                        ORDER BY ar.created_at DESC
+                        LIMIT :limit
+                        """
+                    ),
+                    {"post_ids": post_ids, "limit": limit},
+                )
+            ).mappings().all()
+        else:
+            rows = []
+
+        results = [_row_to_result(r) for r in rows]
+
+    return AnalysisDetailResponse(
+        analysis_id=analysis_id,
+        status=job_row["status"],
+        campaign_id=campaign_id,
+        post_ids=post_ids,
+        results=results,
+        created_at=job_row["created_at"],
+        progress=progress,
+    )
+
+
+def _row_to_result(row: Any) -> AnalysisResultResponse:
+    """Map a DB row (with embedded JSONB result) to AnalysisResultResponse."""
+    r: dict = row["result"]
+    return AnalysisResultResponse(
+        id=row["id"],
+        post_id=row["post_id"],
+        campaign_id=row["campaign_id"] or r.get("campaign_id", ""),
+        platform=r.get("platform", ""),
+        platform_post_id=r.get("platform_post_id", ""),
+        media_type=r.get("media_type", "TEXT"),
+        language=r.get("language", ""),
+        post_type=r.get("post_type"),
+        post_summary=r.get("post_summary"),
+        post_summary_lang=r.get("post_summary_lang"),
+        post_summary_source=r.get("post_summary_source"),
+        post_summary_grounding=r.get("post_summary_grounding"),
+        overall_sentiment=r.get("overall_sentiment", "neutral"),
+        sentiment_score=r.get("sentiment_score", 0.0),
+        baseline_sentiment=r.get("baseline_sentiment"),
+        emotion=r.get("emotion"),
+        intents=r.get("intents", []),
+        topics=r.get("topics", []),
+        entities=r.get("entities", []),
+        brand_mentions=r.get("brand_mentions", []),
+        keywords=r.get("keywords", []),
+        toxicity_score=r.get("toxicity_score"),
+        hate_speech_score=r.get("hate_speech_score"),
+        engagement=r.get("engagement", {}),
+        reaction_breakdown=r.get("reaction_breakdown"),
+        image_analysis=r.get("image_analysis"),
+        comment_analysis=r.get(
+            "comment_analysis",
+            {"analyzed": 0, "coverage": 0.0, "sentiment_breakdown": {}},
+        ),
+        confidence=r.get(
+            "confidence",
+            {"overall": 0.0, "sentiment": 0.0, "language": 0.0, "topics": 0.0},
+        ),
+        processing=r.get("processing", {"llm_used": False, "schema_version": "1.0"}),
+        created_at=row["created_at"],
+        scraped_at=row.get("scraped_at") or row["created_at"],
+    )
+
+
+# ---------------------------------------------------------------------------
+# GET /v1/analysis/{id}/stream  — SSE
+# ---------------------------------------------------------------------------
+
+
+async def _sse_generator(
+    analysis_id: str,
+    redis: aioredis.Redis,
+) -> AsyncGenerator[str, None]:
+    """Yield Server-Sent Events from the Redis pub/sub channel for the job."""
+    channel = f"analysis:progress:{analysis_id}"
+    pubsub = redis.pubsub()
+    await pubsub.subscribe(channel)
+
+    try:
+        # Send an initial "connected" event so the client knows the stream is live
+        yield f"event: connected\ndata: {json.dumps({'analysis_id': analysis_id})}\n\n"
+
+        timeout_seconds = 300  # 5-minute max stream duration
+        deadline = asyncio.get_event_loop().time() + timeout_seconds
+
+        while True:
+            remaining = deadline - asyncio.get_event_loop().time()
+            if remaining <= 0:
+                yield f"event: timeout\ndata: {json.dumps({'analysis_id': analysis_id})}\n\n"
+                break
+
+            message = await asyncio.wait_for(
+                pubsub.get_message(ignore_subscribe_messages=True, timeout=1.0),
+                timeout=min(2.0, remaining),
+            )
+
+            if message and message.get("type") == "message":
+                raw = message.get("data", "")
+                try:
+                    payload = json.loads(raw)
+                except (json.JSONDecodeError, TypeError):
+                    payload = {"raw": raw}
+
+                event_type = payload.get("event", "progress")
+                yield f"event: {event_type}\ndata: {json.dumps(payload)}\n\n"
+
+                if event_type in ("done", "error"):
+                    break
+            else:
+                # Keepalive comment so the client connection stays open
+                yield ": keepalive\n\n"
+
+    except asyncio.TimeoutError:
+        yield f"event: timeout\ndata: {json.dumps({'analysis_id': analysis_id})}\n\n"
+    finally:
+        await pubsub.unsubscribe(channel)
+        await pubsub.close()
+
+
+@router.get(
+    "/{analysis_id}/stream",
+    summary="Stream analysis progress via SSE",
+    response_class=StreamingResponse,
+)
+async def analysis_stream(
+    analysis_id: str,
+    db: AsyncSession = Depends(get_db),
+    redis: aioredis.Redis = Depends(get_redis),
+    current_user: dict = Depends(get_current_user),
+) -> StreamingResponse:
+    """Subscribe to Server-Sent Events for *analysis_id*.
+
+    Events are published by the worker onto the Redis channel
+    ``analysis:progress:{analysis_id}``.  The stream closes automatically
+    on a ``done`` or ``error`` event, or after 5 minutes.
+    """
+    # Verify job exists before opening the stream
+    job_row = (
+        await db.execute(
+            text("SELECT id FROM jobs WHERE id = :id"),
+            {"id": analysis_id},
+        )
+    ).first()
+
+    if job_row is None:
+        raise HTTPException(
+            status_code=status.HTTP_404_NOT_FOUND,
+            detail=f"Analysis job '{analysis_id}' not found",
+        )
+
+    return StreamingResponse(
+        _sse_generator(analysis_id, redis),
+        media_type="text/event-stream",
+        headers={
+            "Cache-Control": "no-cache",
+            "X-Accel-Buffering": "no",
+            "Connection": "keep-alive",
+        },
+    )

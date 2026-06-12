@@ -75,7 +75,7 @@ The other docs say _what/why_; this says _what to do next_.
 | LLM/VLM      | Stage-2 via **vLLM** (`local`: Qwen2.5-7B/32B-Instruct + Qwen2.5-VL-7B) ⇄ **Groq** (`groq`: Llama text + a vision model). One OpenAI-compatible client. |
 | Serving      | Triton/ONNX/CTranslate2 for the NLP fleet                                                                                                               |
 | Bus          | **Redis Streams** (MVP) → **Kafka** (Prod), partitioned by `hash(post_id)`                                                                              |
-| Stores       | **PostgreSQL** (ops/jobs/results) · **ClickHouse** (analytics) · **Qdrant** (vectors) · **Redis** (cache/dedup) · **S3/MinIO** (raw payloads, reports)  |
+| Stores       | **PostgreSQL + pgvector** (ops/jobs/results + vectors) · **ClickHouse** (analytics) · **Redis** (cache/dedup) · **S3/MinIO** (raw payloads, reports)    |
 | Agents/tools | Agent orchestrator (FastAPI) + **MCP servers** (FastAPI + MCP SDK) — Phase 2                                                                            |
 | Frontend     | **Plain HTML + CSS + JavaScript** served static                                                                                                         |
 | Deploy       | Docker Compose (MVP) → Kubernetes + KEDA (Prod) — see [deployment.md](deployment.md)                                                                    |
@@ -91,7 +91,7 @@ Suggested monorepo layout:
     /stage1_nlp   text suite + vision (image sentiment) + OCR
     /router       confidence gate + task flags
     /stage2_llm   backend-agnostic LLM/VLM worker (summaries/insight)
-    /assembler    merge → JSON-Schema validate → persist (PG/CH/Qdrant/object)
+    /assembler    merge → JSON-Schema validate → persist (PG+pgvector/CH/object)
   /agents         orchestrator + agent definitions (Phase 2)
   /mcp            analytics-mcp, retrieval-mcp, ingest-mcp (Phase 2)
 /libs
@@ -108,9 +108,10 @@ Suggested monorepo layout:
 ## 2. Phase 0 — Foundations (do this first)
 
 **Task 0.1 — Repo skeleton + local stack.** Create the layout above and a
-`docker-compose.yml` (Postgres, Redis, Qdrant, ClickHouse, MinIO, a stub FastAPI,
-Prometheus/Grafana). **DoD:** `docker compose up` brings everything healthy;
-`GET /v1/health` returns 200.
+`docker-compose.yml` (Postgres + pgvector, Redis, ClickHouse, MinIO, a stub FastAPI,
+Prometheus/Grafana). The Postgres image is `pgvector/pgvector:pg16`; `deploy/init-db.sql`
+runs `CREATE EXTENSION vector` to enable the extension. **DoD:** `docker compose up`
+brings everything healthy; `GET /v1/health` returns 200.
 
 **Task 0.2 — Lock the two contracts (`/libs/schemas`).**
 
@@ -185,9 +186,11 @@ language; set `post_summary_grounding`. Cache by
 content; language matches; cache hit on repeat.
 
 **Task 1.5 — Result assembler.** Merge Stage-1 + Stage-2 → canonical JSON →
-**JSON-Schema validate (Task 0.2)** → persist to Postgres (result row), ClickHouse
-(analytics row), Qdrant (embedding+metadata), MinIO (raw). **DoD:** every persisted
-object is schema-valid; analytics row queryable.
+**JSON-Schema validate (Task 0.2)** → fan out to **three backends**: Postgres
+(result row + the `analysis_results.embedding` `vector(768)` column via pgvector),
+ClickHouse (analytics row), MinIO (raw). The embedding upsert is idempotent, keyed by
+`post_id`. **DoD:** every persisted object is schema-valid; analytics row queryable;
+the `embedding` column is populated.
 
 **Task 1.6 — Read APIs (FastAPI).** `POST /v1/ingest/sync`, `POST /v1/posts/upload`,
 `POST /v1/analysis/run`, `GET /v1/analysis/{id}`, `GET /v1/reports` (basic),
@@ -219,7 +222,7 @@ Scale + reliability ([plan.md](plan.md) Phase 2), then the agents.
   **local↔groq failover**; cluster summarization; reporting on ClickHouse.
 - **Agentic insight layer ([architecture.md](architecture.md) §11) — Phase 2, not MVP:**
   - **MCP servers** (FastAPI + MCP SDK, internal `ClusterIP`-only): `analytics-mcp`
-    (ClickHouse/Postgres), `retrieval-mcp` (Qdrant + fetch), `ingest-mcp` (trigger
+    (ClickHouse/Postgres), `retrieval-mcp` (pgvector semantic search + fetch), `ingest-mcp` (trigger
     upstream pull / fetch more comments — writes only to OUR db).
   - **Agent orchestrator** (FastAPI, CPU-only) running on the LLM-B backend:
     **Insight/Analyst** (`POST /v1/agents/query` + report generation),

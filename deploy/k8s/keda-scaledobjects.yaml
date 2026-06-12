@@ -1,0 +1,141 @@
+# KEDA ScaledObjects — one per Redis stream consumer worker.
+# Prerequisites: KEDA operator installed in the cluster (https://keda.sh/docs/deploy/).
+# Each ScaledObject scales its target Deployment based on pendingEntriesCount in the
+# corresponding Redis stream consumer group. When the stream is empty (lag == 0) the
+# deployment can scale down to 0 replicas, saving resources.
+
+---
+# ── ingestion ─────────────────────────────────────────────────────────────────
+apiVersion: keda.sh/v1alpha1
+kind: ScaledObject
+metadata:
+  name: ingestion-scaler
+  namespace: defense
+  labels:
+    app: ingestion
+    app.kubernetes.io/part-of: defense
+spec:
+  scaleTargetRef:
+    apiVersion: apps/v1
+    kind: Deployment
+    name: ingestion
+  pollingInterval: 15       # seconds between lag checks
+  cooldownPeriod: 60        # seconds to wait before scaling down
+  minReplicaCount: 0
+  maxReplicaCount: 5
+  triggers:
+    - type: redis-streams
+      metadata:
+        address: redis.defense.svc.cluster.local:6379
+        stream: ingestion:queue
+        consumerGroup: ingestion-group
+        pendingEntriesCount: "10"
+
+---
+# ── worker-router ─────────────────────────────────────────────────────────────
+apiVersion: keda.sh/v1alpha1
+kind: ScaledObject
+metadata:
+  name: worker-router-scaler
+  namespace: defense
+  labels:
+    app: worker-router
+    app.kubernetes.io/part-of: defense
+spec:
+  scaleTargetRef:
+    apiVersion: apps/v1
+    kind: Deployment
+    name: worker-router
+  pollingInterval: 15
+  cooldownPeriod: 60
+  minReplicaCount: 0
+  maxReplicaCount: 5
+  triggers:
+    - type: redis-streams
+      metadata:
+        address: redis.defense.svc.cluster.local:6379
+        stream: router:queue
+        consumerGroup: router-group
+        pendingEntriesCount: "10"
+
+---
+# ── worker-stage1-nlp ─────────────────────────────────────────────────────────
+# maxReplicaCount is capped at 3 to respect finite GPU node availability.
+apiVersion: keda.sh/v1alpha1
+kind: ScaledObject
+metadata:
+  name: worker-stage1-nlp-scaler
+  namespace: defense
+  labels:
+    app: worker-stage1-nlp
+    app.kubernetes.io/part-of: defense
+spec:
+  scaleTargetRef:
+    apiVersion: apps/v1
+    kind: Deployment
+    name: worker-stage1-nlp
+  pollingInterval: 15
+  cooldownPeriod: 120       # longer cooldown — GPU pods are expensive to restart
+  minReplicaCount: 0
+  maxReplicaCount: 3
+  triggers:
+    - type: redis-streams
+      metadata:
+        address: redis.defense.svc.cluster.local:6379
+        stream: stage1_nlp:queue
+        consumerGroup: stage1-nlp-group
+        pendingEntriesCount: "10"
+
+---
+# ── worker-stage2-llm ─────────────────────────────────────────────────────────
+apiVersion: keda.sh/v1alpha1
+kind: ScaledObject
+metadata:
+  name: worker-stage2-llm-scaler
+  namespace: defense
+  labels:
+    app: worker-stage2-llm
+    app.kubernetes.io/part-of: defense
+spec:
+  scaleTargetRef:
+    apiVersion: apps/v1
+    kind: Deployment
+    name: worker-stage2-llm
+  pollingInterval: 15
+  cooldownPeriod: 60
+  minReplicaCount: 0
+  maxReplicaCount: 5
+  triggers:
+    - type: redis-streams
+      metadata:
+        address: redis.defense.svc.cluster.local:6379
+        stream: stage2_llm:queue
+        consumerGroup: stage2-llm-group
+        pendingEntriesCount: "10"
+
+---
+# ── worker-assembler ──────────────────────────────────────────────────────────
+apiVersion: keda.sh/v1alpha1
+kind: ScaledObject
+metadata:
+  name: worker-assembler-scaler
+  namespace: defense
+  labels:
+    app: worker-assembler
+    app.kubernetes.io/part-of: defense
+spec:
+  scaleTargetRef:
+    apiVersion: apps/v1
+    kind: Deployment
+    name: worker-assembler
+  pollingInterval: 15
+  cooldownPeriod: 60
+  minReplicaCount: 0
+  maxReplicaCount: 5
+  triggers:
+    - type: redis-streams
+      metadata:
+        address: redis.defense.svc.cluster.local:6379
+        stream: assembler:queue
+        consumerGroup: assembler-group
+        pendingEntriesCount: "10"

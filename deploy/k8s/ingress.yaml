@@ -1,0 +1,51 @@
+# Nginx Ingress for the API service.
+# Replace defense.example.com with the real hostname before applying.
+# TLS secret "defense-tls" must be pre-created (e.g. via cert-manager or manual kubectl create secret tls).
+
+apiVersion: networking.k8s.io/v1
+kind: Ingress
+metadata:
+  name: api-ingress
+  namespace: defense
+  labels:
+    app: api
+    app.kubernetes.io/part-of: defense
+  annotations:
+    kubernetes.io/ingress.class: "nginx"
+
+    # Rate limiting — 10 requests/second per source IP, burst of 20
+    nginx.ingress.kubernetes.io/limit-rps: "10"
+    nginx.ingress.kubernetes.io/limit-burst-multiplier: "2"
+    nginx.ingress.kubernetes.io/limit-connections: "20"
+
+    # Proxy timeouts
+    nginx.ingress.kubernetes.io/proxy-connect-timeout: "15"
+    nginx.ingress.kubernetes.io/proxy-send-timeout: "120"
+    nginx.ingress.kubernetes.io/proxy-read-timeout: "120"
+
+    # Body size (adjust for large document uploads)
+    nginx.ingress.kubernetes.io/proxy-body-size: "32m"
+
+    # Force HTTPS redirect
+    nginx.ingress.kubernetes.io/ssl-redirect: "true"
+    nginx.ingress.kubernetes.io/force-ssl-redirect: "true"
+
+    # Enable CORS if needed (disabled by default; uncomment to enable)
+    # nginx.ingress.kubernetes.io/enable-cors: "true"
+    # nginx.ingress.kubernetes.io/cors-allow-origin: "https://defense.example.com"
+spec:
+  tls:
+    - hosts:
+        - defense.example.com
+      secretName: defense-tls
+  rules:
+    - host: defense.example.com
+      http:
+        paths:
+          - path: /
+            pathType: Prefix
+            backend:
+              service:
+                name: api
+                port:
+                  number: 8000

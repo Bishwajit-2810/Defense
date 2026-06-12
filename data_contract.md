@@ -36,8 +36,8 @@ comments — §4.)
   │  EXISTING PLATFORM        │  ──  (post + comments +      ──▶ │  SMART LAYER               │
   │  (upstream, source of     │       engagement + reactions +   │  ingest → analyze →        │
   │   truth: scraping + DB)   │       shares, one payload)       │  OUR OWN DATABASE          │
-  └──────────────────────────┘                                  │  (Postgres/ClickHouse/     │
-                                                                 │   Qdrant/Redis/object)     │
+  └──────────────────────────┘                                  │  (Postgres+pgvector/       │
+                                                                 │   ClickHouse/Redis/object) │
               ▲                                                  └──────────────┬─────────────┘
               │ NO write-back into the upstream DB                              │ serve
               └─────────────────  (read-only consumer)                 ┌────────▼────────┐
@@ -93,7 +93,8 @@ example values are from that sample.
 > `photoOcrTexts`, `caption_embedding`, `search_tsv`, `status`, `aiAnalysisStatus`,
 > `viralMonitoringStatus`, `createdAt`/`updatedAt`, and the snapshot/scheduling
 > flags. Consequences: **OCR is now our job** (run it on `photoUrls` — §4), we
-> compute embeddings ourselves into Qdrant, and we track _our_ analysis status in
+> compute embeddings ourselves into the `analysis_results.embedding` `vector(768)`
+> column (Postgres + pgvector), and we track _our_ analysis status in
 > our own DB (there is no upstream `status` selector anymore — pull by campaign /
 > time / id).
 

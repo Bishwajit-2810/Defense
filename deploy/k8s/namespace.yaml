@@ -1,0 +1,7 @@
+apiVersion: v1
+kind: Namespace
+metadata:
+  name: defense
+  labels:
+    name: defense
+    app.kubernetes.io/managed-by: kubectl

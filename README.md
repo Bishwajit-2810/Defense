@@ -71,6 +71,7 @@ concrete input→output, see [examples.md](examples.md).
 | [infrastructure.md](infrastructure.md)               | GPU sizing, monitoring stack, caching, scaling                                                                                                                                    |
 | [cost_estimation.md](cost_estimation.md)             | Monthly cost estimates for MVP / Production / Enterprise                                                                                                                          |
 | [api_design.md](api_design.md)                       | REST API contracts: ingest the post-with-details payload, get structured JSON                                                                                                     |
+| [endpoints.md](endpoints.md)                         | Hands-on: the output JSON (annotated example) + curl commands to test every endpoint and reshape the JSON                                                                         |
 | [examples.md](examples.md)                           | Real Facebook posts from [posts_with_details.json](posts_with_details.json), with embedded comments analyzed → full output JSON                                                   |
 | [deployment.md](deployment.md)                       | Docker Compose vs Kubernetes, full K8s deployment plan                                                                                                                            |
 | [evaluation.md](evaluation.md)                       | **Evaluation plan** — how we score each task, the summary, the agents, and system properties; gold sets, gates, drift                                                             |
@@ -98,18 +99,20 @@ is the original system-design request. It has been reconciled with
   The selective stage uses **LLM-A** (fast 7B/8B) for per-post refinement and
   **LLM-B** (larger 14B/32B) for cluster summarization, insight, and grounded
   reports. Each role is served by the chosen backend: **`local`** (self-hosted
-  vLLM — no per-token bill, no data egress; the default) or **`groq`** (Groq Cloud
-  API — fastest inference, zero GPU ops, per-token cost). Both speak an
-  OpenAI-compatible API, so switching is a config/flag change, and you can run
-  hybrid/failover. Pin privacy-sensitive tenants to `local`.
+  vLLM in production, Ollama for local dev — no per-token bill, no data egress;
+  the default) or **`groq`** (Groq Cloud API — fastest inference, zero GPU ops,
+  per-token cost). Both speak an OpenAI-compatible API, so switching is a
+  config/flag change, and you can run hybrid/failover. Pin privacy-sensitive
+  tenants to `local`.
 - **Queue-based, horizontally scalable.** API → ingestion → message bus →
   stateless GPU/CPU workers → result store. Workers scale independently per
   stage.
 - **Queue: Kafka for Production/Enterprise, Redis Streams for the MVP.** Start
   simple, migrate when throughput and replay/retention demand it.
-- **Storage split by access pattern:** PostgreSQL (operational + jobs),
-  ClickHouse (analytics/aggregations), Qdrant (vectors/semantic search/dedup),
-  Redis (cache + dedup + rate limits), object storage (raw payloads + reports).
+- **Storage split by access pattern:** PostgreSQL + pgvector (operational + jobs +
+  vectors/semantic search/dedup via the `analysis_results.embedding` `vector(768)`
+  column), ClickHouse (analytics/aggregations), Redis (cache + dedup + rate
+  limits), object storage (raw payloads + reports).
 - **Agentic insight layer (MCP + AI agents).** A selective, corpus-tier agent
   layer (FastAPI orchestrator on LLM-B) reaches data via **MCP servers**
   (`analytics`/`retrieval`/`ingest`) for analyst Q&A, grounded reports, and

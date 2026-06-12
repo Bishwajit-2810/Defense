@@ -1,0 +1,347 @@
+# MCP servers and the agents service.
+# All services are ClusterIP — never exposed outside the cluster.
+# NetworkPolicy (see networkpolicy.yaml) restricts ingress to within-cluster peers only.
+
+---
+# ── analytics-mcp ────────────────────────────────────────────────────────────
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: analytics-mcp
+  namespace: defense
+  labels:
+    app: analytics-mcp
+    app.kubernetes.io/part-of: defense
+    role: mcp
+spec:
+  replicas: 1
+  selector:
+    matchLabels:
+      app: analytics-mcp
+  template:
+    metadata:
+      labels:
+        app: analytics-mcp
+        app.kubernetes.io/part-of: defense
+        role: mcp
+    spec:
+      terminationGracePeriodSeconds: 30
+      containers:
+        - name: analytics-mcp
+          image: defense/analytics-mcp:latest
+          imagePullPolicy: IfNotPresent
+          ports:
+            - name: http
+              containerPort: 8100
+              protocol: TCP
+          envFrom:
+            - configMapRef:
+                name: defense-config
+            - secretRef:
+                name: defense-secrets
+          resources:
+            requests:
+              cpu: "200m"
+              memory: "256Mi"
+            limits:
+              cpu: "1000m"
+              memory: "1Gi"
+          livenessProbe:
+            httpGet:
+              path: /health
+              port: 8100
+            initialDelaySeconds: 10
+            periodSeconds: 20
+            timeoutSeconds: 5
+          readinessProbe:
+            httpGet:
+              path: /health
+              port: 8100
+            initialDelaySeconds: 5
+            periodSeconds: 10
+            timeoutSeconds: 3
+          securityContext:
+            allowPrivilegeEscalation: false
+            readOnlyRootFilesystem: true
+            runAsNonRoot: true
+            runAsUser: 1000
+            capabilities:
+              drop:
+                - ALL
+
+---
+apiVersion: v1
+kind: Service
+metadata:
+  name: analytics-mcp
+  namespace: defense
+  labels:
+    app: analytics-mcp
+    app.kubernetes.io/part-of: defense
+spec:
+  type: ClusterIP
+  selector:
+    app: analytics-mcp
+  ports:
+    - name: http
+      port: 8100
+      targetPort: 8100
+      protocol: TCP
+
+---
+# ── retrieval-mcp ─────────────────────────────────────────────────────────────
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: retrieval-mcp
+  namespace: defense
+  labels:
+    app: retrieval-mcp
+    app.kubernetes.io/part-of: defense
+    role: mcp
+spec:
+  replicas: 1
+  selector:
+    matchLabels:
+      app: retrieval-mcp
+  template:
+    metadata:
+      labels:
+        app: retrieval-mcp
+        app.kubernetes.io/part-of: defense
+        role: mcp
+    spec:
+      terminationGracePeriodSeconds: 30
+      containers:
+        - name: retrieval-mcp
+          image: defense/retrieval-mcp:latest
+          imagePullPolicy: IfNotPresent
+          ports:
+            - name: http
+              containerPort: 8101
+              protocol: TCP
+          envFrom:
+            - configMapRef:
+                name: defense-config
+            - secretRef:
+                name: defense-secrets
+          resources:
+            requests:
+              cpu: "200m"
+              memory: "256Mi"
+            limits:
+              cpu: "1000m"
+              memory: "1Gi"
+          livenessProbe:
+            httpGet:
+              path: /health
+              port: 8101
+            initialDelaySeconds: 10
+            periodSeconds: 20
+            timeoutSeconds: 5
+          readinessProbe:
+            httpGet:
+              path: /health
+              port: 8101
+            initialDelaySeconds: 5
+            periodSeconds: 10
+            timeoutSeconds: 3
+          securityContext:
+            allowPrivilegeEscalation: false
+            readOnlyRootFilesystem: true
+            runAsNonRoot: true
+            runAsUser: 1000
+            capabilities:
+              drop:
+                - ALL
+
+---
+apiVersion: v1
+kind: Service
+metadata:
+  name: retrieval-mcp
+  namespace: defense
+  labels:
+    app: retrieval-mcp
+    app.kubernetes.io/part-of: defense
+spec:
+  type: ClusterIP
+  selector:
+    app: retrieval-mcp
+  ports:
+    - name: http
+      port: 8101
+      targetPort: 8101
+      protocol: TCP
+
+---
+# ── ingest-mcp ────────────────────────────────────────────────────────────────
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: ingest-mcp
+  namespace: defense
+  labels:
+    app: ingest-mcp
+    app.kubernetes.io/part-of: defense
+    role: mcp
+spec:
+  replicas: 1
+  selector:
+    matchLabels:
+      app: ingest-mcp
+  template:
+    metadata:
+      labels:
+        app: ingest-mcp
+        app.kubernetes.io/part-of: defense
+        role: mcp
+    spec:
+      terminationGracePeriodSeconds: 30
+      containers:
+        - name: ingest-mcp
+          image: defense/ingest-mcp:latest
+          imagePullPolicy: IfNotPresent
+          ports:
+            - name: http
+              containerPort: 8102
+              protocol: TCP
+          envFrom:
+            - configMapRef:
+                name: defense-config
+            - secretRef:
+                name: defense-secrets
+          resources:
+            requests:
+              cpu: "200m"
+              memory: "256Mi"
+            limits:
+              cpu: "1000m"
+              memory: "1Gi"
+          livenessProbe:
+            httpGet:
+              path: /health
+              port: 8102
+            initialDelaySeconds: 10
+            periodSeconds: 20
+            timeoutSeconds: 5
+          readinessProbe:
+            httpGet:
+              path: /health
+              port: 8102
+            initialDelaySeconds: 5
+            periodSeconds: 10
+            timeoutSeconds: 3
+          securityContext:
+            allowPrivilegeEscalation: false
+            readOnlyRootFilesystem: true
+            runAsNonRoot: true
+            runAsUser: 1000
+            capabilities:
+              drop:
+                - ALL
+
+---
+apiVersion: v1
+kind: Service
+metadata:
+  name: ingest-mcp
+  namespace: defense
+  labels:
+    app: ingest-mcp
+    app.kubernetes.io/part-of: defense
+spec:
+  type: ClusterIP
+  selector:
+    app: ingest-mcp
+  ports:
+    - name: http
+      port: 8102
+      targetPort: 8102
+      protocol: TCP
+
+---
+# ── agents ────────────────────────────────────────────────────────────────────
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: agents
+  namespace: defense
+  labels:
+    app: agents
+    app.kubernetes.io/part-of: defense
+    role: agents
+spec:
+  replicas: 1
+  selector:
+    matchLabels:
+      app: agents
+  template:
+    metadata:
+      labels:
+        app: agents
+        app.kubernetes.io/part-of: defense
+        role: agents
+    spec:
+      terminationGracePeriodSeconds: 30
+      containers:
+        - name: agents
+          image: defense/agents:latest
+          imagePullPolicy: IfNotPresent
+          ports:
+            - name: http
+              containerPort: 8010
+              protocol: TCP
+          envFrom:
+            - configMapRef:
+                name: defense-config
+            - secretRef:
+                name: defense-secrets
+          resources:
+            requests:
+              cpu: "300m"
+              memory: "512Mi"
+            limits:
+              cpu: "1500m"
+              memory: "2Gi"
+          livenessProbe:
+            httpGet:
+              path: /health
+              port: 8010
+            initialDelaySeconds: 10
+            periodSeconds: 20
+            timeoutSeconds: 5
+          readinessProbe:
+            httpGet:
+              path: /health
+              port: 8010
+            initialDelaySeconds: 5
+            periodSeconds: 10
+            timeoutSeconds: 3
+          securityContext:
+            allowPrivilegeEscalation: false
+            readOnlyRootFilesystem: true
+            runAsNonRoot: true
+            runAsUser: 1000
+            capabilities:
+              drop:
+                - ALL
+
+---
+apiVersion: v1
+kind: Service
+metadata:
+  name: agents
+  namespace: defense
+  labels:
+    app: agents
+    app.kubernetes.io/part-of: defense
+spec:
+  type: ClusterIP
+  selector:
+    app: agents
+  ports:
+    - name: http
+      port: 8010
+      targetPort: 8010
+      protocol: TCP

@@ -1,0 +1,282 @@
+# NetworkPolicies for the defense namespace.
+# Default-deny is established first; subsequent policies selectively open required paths.
+# Assumptions:
+#   - Nginx ingress controller runs in namespace "ingress-nginx" with label
+#     app.kubernetes.io/name: ingress-nginx
+#   - Infrastructure services (Postgres, Redis, ClickHouse, Minio) run in
+#     namespace "defense" (adjust namespaceSelector if they live elsewhere)
+
+---
+# ── Default-deny all ingress and egress within the namespace ──────────────────
+apiVersion: networking.k8s.io/v1
+kind: NetworkPolicy
+metadata:
+  name: default-deny-all
+  namespace: defense
+spec:
+  podSelector: {}
+  policyTypes:
+    - Ingress
+    - Egress
+
+---
+# ── Allow DNS egress for every pod (required for service discovery) ────────────
+apiVersion: networking.k8s.io/v1
+kind: NetworkPolicy
+metadata:
+  name: allow-dns-egress
+  namespace: defense
+spec:
+  podSelector: {}
+  policyTypes:
+    - Egress
+  egress:
+    - ports:
+        - port: 53
+          protocol: UDP
+        - port: 53
+          protocol: TCP
+
+---
+# ── API pod ───────────────────────────────────────────────────────────────────
+# Ingress: from the Nginx ingress controller only.
+# Egress: Postgres (5432, incl. pgvector search), Redis (6379), ClickHouse (8123), agents (8010).
+apiVersion: networking.k8s.io/v1
+kind: NetworkPolicy
+metadata:
+  name: api-network-policy
+  namespace: defense
+  labels:
+    app: api
+spec:
+  podSelector:
+    matchLabels:
+      app: api
+  policyTypes:
+    - Ingress
+    - Egress
+  ingress:
+    - from:
+        - namespaceSelector:
+            matchLabels:
+              kubernetes.io/metadata.name: ingress-nginx
+          podSelector:
+            matchLabels:
+              app.kubernetes.io/name: ingress-nginx
+      ports:
+        - port: 8000
+          protocol: TCP
+  egress:
+    # Postgres
+    - to:
+        - podSelector:
+            matchLabels:
+              app: postgres
+      ports:
+        - port: 5432
+          protocol: TCP
+    # Redis
+    - to:
+        - podSelector:
+            matchLabels:
+              app: redis
+      ports:
+        - port: 6379
+          protocol: TCP
+    # ClickHouse HTTP
+    - to:
+        - podSelector:
+            matchLabels:
+              app: clickhouse
+      ports:
+        - port: 8123
+          protocol: TCP
+    # Agents service
+    - to:
+        - podSelector:
+            matchLabels:
+              app: agents
+      ports:
+        - port: 8010
+          protocol: TCP
+
+---
+# ── MCP pods (analytics-mcp, retrieval-mcp, ingest-mcp) ──────────────────────
+# Ingress: ONLY from the agents service.
+# Egress: Redis (for caching/streaming), Postgres+pgvector (retrieval-mcp semantic search),
+#         ClickHouse (analytics-mcp), Postgres (ingest-mcp), MinIO (ingest-mcp).
+apiVersion: networking.k8s.io/v1
+kind: NetworkPolicy
+metadata:
+  name: mcp-network-policy
+  namespace: defense
+  labels:
+    role: mcp
+spec:
+  podSelector:
+    matchLabels:
+      role: mcp
+  policyTypes:
+    - Ingress
+    - Egress
+  ingress:
+    - from:
+        - podSelector:
+            matchLabels:
+              app: agents
+      ports:
+        - port: 8100
+          protocol: TCP
+        - port: 8101
+          protocol: TCP
+        - port: 8102
+          protocol: TCP
+  egress:
+    # Redis
+    - to:
+        - podSelector:
+            matchLabels:
+              app: redis
+      ports:
+        - port: 6379
+          protocol: TCP
+    # ClickHouse
+    - to:
+        - podSelector:
+            matchLabels:
+              app: clickhouse
+      ports:
+        - port: 8123
+          protocol: TCP
+    # Postgres
+    - to:
+        - podSelector:
+            matchLabels:
+              app: postgres
+      ports:
+        - port: 5432
+          protocol: TCP
+    # MinIO
+    - to:
+        - podSelector:
+            matchLabels:
+              app: minio
+      ports:
+        - port: 9000
+          protocol: TCP
+
+---
+# ── Worker pods (ingestion, router, stage1-nlp, stage2-llm, assembler) ────────
+# Workers are outbound-only consumers — they pull from Redis, write results back to Redis,
+# and may call Postgres (incl. pgvector) / ClickHouse / MinIO.
+# No inbound traffic is needed (no HTTP listener).
+apiVersion: networking.k8s.io/v1
+kind: NetworkPolicy
+metadata:
+  name: worker-network-policy
+  namespace: defense
+  labels:
+    role: worker
+spec:
+  podSelector:
+    matchLabels:
+      role: worker
+  policyTypes:
+    - Ingress
+    - Egress
+  ingress:
+    # Workers have no HTTP listeners; block all ingress.
+    []
+  egress:
+    # Redis — stream consumption and result publishing
+    - to:
+        - podSelector:
+            matchLabels:
+              app: redis
+      ports:
+        - port: 6379
+          protocol: TCP
+    # Postgres
+    - to:
+        - podSelector:
+            matchLabels:
+              app: postgres
+      ports:
+        - port: 5432
+          protocol: TCP
+    # ClickHouse — analytics writes
+    - to:
+        - podSelector:
+            matchLabels:
+              app: clickhouse
+      ports:
+        - port: 8123
+          protocol: TCP
+    # MinIO — object storage (document uploads / model artefacts)
+    - to:
+        - podSelector:
+            matchLabels:
+              app: minio
+      ports:
+        - port: 9000
+          protocol: TCP
+
+---
+# ── agents service ────────────────────────────────────────────────────────────
+# Ingress: from API pod only.
+# Egress: MCP services (8100, 8101, 8102) and Redis.
+apiVersion: networking.k8s.io/v1
+kind: NetworkPolicy
+metadata:
+  name: agents-network-policy
+  namespace: defense
+  labels:
+    app: agents
+spec:
+  podSelector:
+    matchLabels:
+      app: agents
+  policyTypes:
+    - Ingress
+    - Egress
+  ingress:
+    - from:
+        - podSelector:
+            matchLabels:
+              app: api
+      ports:
+        - port: 8010
+          protocol: TCP
+  egress:
+    # analytics-mcp
+    - to:
+        - podSelector:
+            matchLabels:
+              app: analytics-mcp
+      ports:
+        - port: 8100
+          protocol: TCP
+    # retrieval-mcp
+    - to:
+        - podSelector:
+            matchLabels:
+              app: retrieval-mcp
+      ports:
+        - port: 8101
+          protocol: TCP
+    # ingest-mcp
+    - to:
+        - podSelector:
+            matchLabels:
+              app: ingest-mcp
+      ports:
+        - port: 8102
+          protocol: TCP
+    # Redis — session / task state
+    - to:
+        - podSelector:
+            matchLabels:
+              app: redis
+      ports:
+        - port: 6379
+          protocol: TCP

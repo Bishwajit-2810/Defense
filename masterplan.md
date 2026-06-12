@@ -109,8 +109,9 @@ object per thread, reporting comment **coverage** since only a sample is shipped
   stateless GPU/CPU workers → result store. Workers scale independently per stage.
 - **Queue: Kafka for Production/Enterprise, Redis Streams for the MVP.** Start
   simple, migrate when throughput and replay/retention demand it.
-- **Storage split by access pattern:** PostgreSQL (operational + jobs), ClickHouse
-  (analytics/aggregations), Qdrant (vectors/semantic search/dedup), Redis (cache +
+- **Storage split by access pattern:** PostgreSQL + pgvector (operational + jobs +
+  vectors/semantic search/dedup, all in one store), ClickHouse
+  (analytics/aggregations), Redis (cache +
   dedup + rate limits), object storage (raw payloads + reports).
 - **Deployment:** Docker Compose for MVP, Kubernetes (with KEDA autoscaling on
   queue depth) for Production and beyond.
@@ -186,11 +187,12 @@ object per thread, reporting comment **coverage** since only a sample is shipped
                                 │  + JSON schema validate│
                                 └───────────┬───────────┘
                                             │ fan-out writes
-        ┌───────────────┬───────────────────┼───────────────────┬───────────────┐
-   ┌────▼─────┐   ┌─────▼──────┐      ┌──────▼──────┐     ┌──────▼──────┐  ┌─────▼─────┐
-   │PostgreSQL│   │ ClickHouse │      │   Qdrant    │     │   Redis     │  │  Object   │
-   │ ops+jobs │   │ analytics  │      │  vectors    │     │ cache/dedup │  │  storage  │
-   └──────────┘   └────────────┘      └─────────────┘     └─────────────┘  └───────────┘
+        ┌──────────────────┬────────────────┼────────────────┬───────────────┐
+   ┌────▼───────────┐   ┌──▼─────────┐      ┌▼────────────┐  ┌▼──────────┐
+   │PostgreSQL      │   │ ClickHouse │      │   Redis     │  │  Object   │
+   │ ops+jobs+vector│   │ analytics  │      │ cache/dedup │  │  storage  │
+   │ (pgvector)     │   └────────────┘      └─────────────┘  └───────────┘
+   └────────────────┘
 ```
 
 The **Router/Triage** between Stage 1 and Stage 2 is the heart of the cost
@@ -211,9 +213,11 @@ strategy — see §7.
    `storedCommentRows` of `commentCount` — coverage), and computes a content hash
    over the post + comments. A pushed batch (`POST /v1/posts/upload`) is also
    accepted for external/replay sources.
-2. **Dedup gate.** Hash is checked against Redis (recent) and Qdrant/Postgres
-   (historical). Exact duplicates short-circuit to the cached result; near
-   duplicates (cosine > threshold on embedding) can reuse prior analysis. This
+2. **Dedup gate.** Hash is checked against Redis (recent) and Postgres
+   (historical, including a pgvector similarity lookup over
+   `analysis_results.embedding`). Exact duplicates short-circuit to the cached
+   result; near duplicates (cosine `<=>` distance below threshold on embedding) can
+   reuse prior analysis. This
    alone removes a large fraction of LLM/NLP work on real social feeds.
 3. **Enqueue.** A `job` row is created in PostgreSQL (`status=queued`). One message
    per post is produced to the bus, partitioned by `post_id` hash so a post's
@@ -256,10 +260,11 @@ strategy — see §7.
 7. **Assemble + validate.** The Result Assembler merges Stage 1 + Stage 2 into the
    canonical JSON (see §8), validates against the JSON Schema, and sets
    `confidence` = aggregate.
-8. **Persist (fan-out).**
-   - PostgreSQL: job status, per-post status, the canonical result row.
+8. **Persist (fan-out to 3 backends).**
+   - PostgreSQL + pgvector: job status, per-post status, the canonical result row,
+     and the `analysis_results.embedding` `vector(768)` column (cosine `<=>`) for
+     semantic search, clustering, and dedup.
    - ClickHouse: a denormalized analytics row for fast aggregations/trends.
-   - Qdrant: the embedding + key metadata for semantic search, clustering, dedup.
    - Object storage: raw payload + any generated reports.
 9. **Serve.** `GET /analysis/{id}`, `GET /reports`, and dashboard queries read from
    PostgreSQL (point lookups) and ClickHouse (aggregations).
@@ -279,7 +284,7 @@ strategy — see §7.
 | **Result Assembler**             | Merge, JSON-schema validate, compute aggregate confidence                                                                                                                             | Python consumer                                                              | stateless replicas  |
 | **Reporting/Query Service**      | Read APIs, report generation, exports                                                                                                                                                 | FastAPI + ClickHouse + PostgreSQL                                            | stateless replicas  |
 | **Agent Orchestrator**           | Selective **AI agents** (insight/analyst, coverage deep-dive, alerting) — corpus/report tier only, never per-post (§14.6)                                                             | FastAPI + agent loop → LLM-B/VLM backend + MCP tools                         | stateless replicas  |
-| **MCP Servers**                  | Standardized tools for the agents: `analytics-mcp` (ClickHouse/Postgres), `retrieval-mcp` (Qdrant), `ingest-mcp` (upstream pull / more comments)                                      | FastAPI + MCP SDK (internal)                                                 | stateless replicas  |
+| **MCP Servers**                  | Standardized tools for the agents: `analytics-mcp` (ClickHouse/Postgres), `retrieval-mcp` (pgvector), `ingest-mcp` (upstream pull / more comments)                                    | FastAPI + MCP SDK (internal)                                                 | stateless replicas  |
 | **User Management**              | Tenants, users, roles, billing/usage metering                                                                                                                                         | FastAPI + PostgreSQL                                                         | stateless replicas  |
 
 Workers are split into **separate pools per stage** so the expensive LLM GPUs
@@ -315,7 +320,7 @@ Levers that keep token usage and cost low:
 - **Exact + near-duplicate caching.** Social feeds are highly repetitive
   (reshares, copypasta, viral captions). Hash + embedding dedup avoids reanalysis.
 - **Batch & cluster summarization.** Don't summarize 10,000 posts individually.
-  Cluster embeddings (Qdrant + k-means/HDBSCAN), then have the LLM summarize a
+  Cluster embeddings (pgvector + k-means/HDBSCAN), then have the LLM summarize a
   _cluster_ or representative samples → one LLM call per cluster, not per post.
 - **Token minimization.** Send only truncated, cleaned text and only the fields the
   LLM must produce. Use structured/JSON-mode output to avoid wasted tokens.
@@ -498,7 +503,7 @@ created_at`) is preserved as a subset of the above richer object.
 | Message bus    | **Kafka** (prod), **Redis Streams** (MVP)                                                      | Durable, partitioned, replayable at scale; simple to start                                                                                              |
 | Operational DB | **PostgreSQL**                                                                                 | ACID jobs/state, JSONB flexibility, mature                                                                                                              |
 | Analytics DB   | **ClickHouse**                                                                                 | Columnar, billions of rows, sub-second aggregations for trends                                                                                          |
-| Vector DB      | **Qdrant**                                                                                     | Fast, open-source, easy ops, good filtering; for dedup/search/clustering                                                                                |
+| Vector store   | **pgvector (Postgres extension)**                                                              | `analysis_results.embedding vector(768)`, cosine `<=>` — dedup/search/clustering with no extra service; one DB to operate                               |
 | Cache          | **Redis**                                                                                      | LLM/embedding/query cache, dedup set, rate limits                                                                                                       |
 | Object storage | **S3 / MinIO**                                                                                 | Raw payloads, reports, model artifacts                                                                                                                  |
 | Orchestration  | **Kubernetes** (prod), **Docker Compose** (MVP)                                                | Autoscaling + HA vs simplicity                                                                                                                          |
@@ -654,22 +659,26 @@ to ClickHouse, not the operational DB.
 **Decision: ClickHouse** for trend analysis, brand-mention counts, time-series
 aggregations, and dashboard charts — the dominant analytics need (columnar,
 sub-second on billions, high compression). **Optional Elasticsearch/OpenSearch**
-later _only if_ rich full-text search over post text becomes first-class; Qdrant +
+later _only if_ rich full-text search over post text becomes first-class; pgvector +
 ClickHouse cover semantic search and aggregation meanwhile.
 
-### 13.5 Vector database: Qdrant vs Weaviate vs Milvus
+### 13.5 Vector store: pgvector (in Postgres) vs a standalone vector DB
 
-| Criterion        | **Qdrant**                    | **Weaviate**            | **Milvus**               |
-| ---------------- | ----------------------------- | ----------------------- | ------------------------ |
-| Language/perf    | Rust, fast, low memory        | Go, feature-rich        | C++, very scalable       |
-| Filtering        | Excellent payload filters     | Good                    | Good                     |
-| Ops simplicity   | **High**                      | Medium                  | Lower (more components)  |
-| Built-in modules | Lean (BYO embeddings)         | Many (modules, hybrid)  | Lean                     |
-| Scale ceiling    | High                          | High                    | **Very high** (billions) |
-| Best fit         | Pragmatic mid-scale, easy ops | Hybrid search + modules | Massive enterprise scale |
+| Criterion        | **pgvector (in Postgres)**         | **Weaviate**            | **Milvus**               |
+| ---------------- | ---------------------------------- | ----------------------- | ------------------------ |
+| Language/perf    | C, in-Postgres; HNSW/IVFFlat       | Go, feature-rich        | C++, very scalable       |
+| Filtering        | Full SQL `WHERE` + joins on rows   | Good                    | Good                     |
+| Ops simplicity   | **Highest** (no extra service)     | Medium                  | Lower (more components)  |
+| Built-in modules | Lean (BYO embeddings)              | Many (modules, hybrid)  | Lean                     |
+| Scale ceiling    | High (millions–low tens of M)      | High                    | **Very high** (billions) |
+| Best fit         | One-DB simplicity, easy ops        | Hybrid search + modules | Massive enterprise scale |
 
-**Decision: Qdrant** for MVP→Production: easiest to operate, fast, excellent
-metadata filtering (scope vectors by tenant/platform/time). Reassess **Milvus** at
+**Decision: pgvector** for MVP→Production: the embedding lives as the
+`analysis_results.embedding vector(768)` column right alongside the operational
+rows, queried with the cosine `<=>` operator. No separate vector service to run,
+back up, or secure; metadata filtering is just SQL `WHERE`/joins (scope vectors by
+tenant/platform/time), and dedup/search/clustering reuse the same Postgres
+connection pool. Reassess **Milvus** at
 Enterprise/100k scale if vector count reaches billions and you need distributed
 sharding. Weaviate only if you want its built-in hybrid-search/module ecosystem
 over BYO simplicity.
@@ -738,7 +747,7 @@ sensitive tenants to `local` so a runtime switch can never send their data to Gr
 **Not for per-post analysis; yes for the reporting/insight layer.** Per-post
 classification needs no retrieval. RAG becomes valuable for analyst Q&A over the
 corpus, grounded report generation, and "what are people saying about X" queries —
-backed by Qdrant + the embeddings you already compute. Full reasoning in §14.5.
+backed by pgvector + the embeddings you already compute. Full reasoning in §14.5.
 
 ---
 
@@ -888,12 +897,12 @@ a switch never routes their data to Groq.
 
 **Per-post analysis: NO.** Classifying a single post needs the post's own text, not
 retrieval. **Reporting / insight / analyst Q&A: YES.** RAG shines for "what are
-people saying about Brand X this week?" (retrieve relevant posts from Qdrant, feed
+people saying about Brand X this week?" (retrieve relevant posts from pgvector, feed
 to the LLM grounded), grounded report/insight generation across the corpus, and
 cluster summarization with citations. **Benefits:** grounded, citation-able answers
 without stuffing the whole corpus into context; reuses embeddings you already
 compute. **Drawbacks:** retrieval-quality dependent; mitigate with good chunking,
-metadata filters, showing source posts. **Stack:** Qdrant + bge-m3/multilingual-e5
+metadata filters, showing source posts. **Stack:** pgvector + bge-m3/multilingual-e5
 embeddings + the **LLM-B role** for generation on whichever Stage-2 backend is
 active — `local` for fully in-cluster RAG, or `groq` for faster report generation
 when the retrieved context may leave the cluster. Retrieval and embeddings stay
@@ -908,7 +917,7 @@ Q&A, grounded reports, targeted deep-dives. **Agents never run per post.**
 
 - **MCP servers** (Model Context Protocol — standardized tools, small FastAPI
   services): **`analytics-mcp`** (ClickHouse trends/aggregations + Postgres lookups),
-  **`retrieval-mcp`** (Qdrant semantic search + post/thread fetch), **`ingest-mcp`**
+  **`retrieval-mcp`** (pgvector semantic search + post/thread fetch), **`ingest-mcp`**
   (trigger an upstream post-with-details pull / fetch more comments to raise coverage).
   One consistent tool interface, same auth/tenant scoping; read-mostly (`ingest-mcp`
   writes only into our own DB, never upstream).
@@ -1056,8 +1065,9 @@ cost lever, not an afterthought.
 - **Spot for batch.** Use preemptible/spot GPU nodes for batch surges; Kafka replay
   makes interruptions safe.
 - **Backpressure.** Bounded queues + DLQ prevent overload cascades.
-- **DB scaling.** PostgreSQL read replicas; ClickHouse shards/replicas; Qdrant
-  collections sharded by tenant at large scale.
+- **DB scaling.** PostgreSQL read replicas (pgvector queries fan out to replicas);
+  ClickHouse shards/replicas; partition the `analysis_results` vector index by
+  tenant at large scale.
 
 ---
 
@@ -1101,7 +1111,7 @@ Single host, one 24 GB consumer GPU, Docker Compose. Self-hosted everything.
 | Line                                                                 | Estimate (USD/mo)   | Notes                                                                           |
 | -------------------------------------------------------------------- | ------------------- | ------------------------------------------------------------------------------- |
 | Compute (1 GPU host, on-prem amortized **or** 1 cloud GPU part-time) | $150 – $700         | On-prem 4090 amortized at low end; cloud L4/A10 on-demand part-time at high end |
-| Storage (Postgres + ClickHouse + Qdrant + object, modest)            | $10 – $40           | Tens of GB                                                                      |
+| Storage (Postgres + pgvector + ClickHouse + object, modest)          | $10 – $40           | Tens of GB (vectors live in Postgres)                                           |
 | Networking                                                           | $5 – $30            | Mostly egress for dashboard/API                                                 |
 | LLM — **`local`** (both roles time-sliced on the same GPU)           | ~$0 incremental     | LLM-A + LLM-B share the GPU; selective + cached                                 |
 | LLM — **`groq`** alternative (per-token, ~1k batches)                | ~$5 – $50           | Replaces the LLM GPU; only the selective slice is billed; tiny at MVP volume    |
@@ -1125,7 +1135,7 @@ Small K8s cluster, 2–4 GPUs, KEDA autoscaling, spot for batch surges.
 | Compute — Stage-2 LLM, **`local`** (LLM-A L4/A10 + LLM-B L40S/A100) | $900 – $3,200           | GPU line; reserved/spot lower                              |
 | — **or** Stage-2 LLM, **`groq`** (per-token, ~10k batches)          | $150 – $1,500           | Replaces the LLM GPU line; scales with the selective slice |
 | Compute — CPU services (API, ingestion, assembler, DBs)             | $200 – $600             | Several small nodes                                        |
-| Storage (Postgres + ClickHouse + Qdrant + object, growing)          | $50 – $250              | Hundreds of GB → TB                                        |
+| Storage (Postgres + pgvector + ClickHouse + object, growing)        | $50 – $250              | Hundreds of GB → TB (vectors live in Postgres)            |
 | Networking / egress                                                 | $50 – $300              | Dashboard, exports, inter-AZ (+Groq egress on `groq`)      |
 | Monitoring                                                          | $30 – $150              | Self-hosted or small managed                               |
 | **Total**                                                           | **~$1,600 – $6,000/mo** | LLM + NLP GPUs dominate on `local`                         |
@@ -1139,7 +1149,7 @@ Multi-node K8s, GPU node pools per stage, several A100/H100 or many L40S.
 | Compute — NLP fleet (several data-center GPUs, autoscaled, spot-heavy) | $3,000 – $12,000          | Horizontal scale; spot saves 50–70%                     |
 | Compute — Stage-2 LLM `local` (A100/H100 or many L40S, vLLM)           | $5,000 – $25,000          | Biggest line on `local`; reserved/spot critical         |
 | — **or** Stage-2 LLM `groq` (per-token, ~100k batches)                 | $1,500 – $15,000          | No LLM GPUs; cost tracks the selective slice + caching  |
-| Compute — CPU services + DB nodes                                      | $1,000 – $4,000           | HA Postgres, ClickHouse cluster, Qdrant shards          |
+| Compute — CPU services + DB nodes                                      | $1,000 – $4,000           | HA Postgres (with pgvector), ClickHouse cluster         |
 | Storage (TBs across stores + object + backups)                         | $300 – $2,000             | Grows with retention                                    |
 | Networking / egress                                                    | $300 – $2,000             | Significant at this scale                               |
 | Monitoring / observability                                             | $150 – $600               |                                                         |
@@ -1519,7 +1529,7 @@ cluster insights). Reports are LLM-generated at the _cluster/corpus_ level.
 ```
 
 → `202 Accepted` with `report_id` and `status_url`. `grounded: true` uses RAG
-(Qdrant retrieval + LLM) for citation-backed output.
+(pgvector retrieval + LLM) for citation-backed output.
 
 ### 17.5 Supporting endpoints
 
@@ -1528,7 +1538,7 @@ cluster insights). Reports are LLM-generated at the _cluster/corpus_ level.
 | `POST /v1/auth/token`              | Exchange credentials/API key for a JWT                                                 |
 | `GET /v1/health` / `GET /v1/ready` | Liveness / readiness probes                                                            |
 | `GET /v1/usage`                    | Per-tenant usage + cost metering (posts, LLM calls, by backend incl. Groq tokens/cost) |
-| `GET /v1/search?q=&semantic=true`  | Semantic/keyword search over analyzed posts (Qdrant + ClickHouse)                      |
+| `GET /v1/search?q=&semantic=true`  | Semantic/keyword search over analyzed posts (pgvector + ClickHouse)                    |
 | `DELETE /v1/posts/{id}`            | Data deletion (retention / GDPR-style)                                                 |
 
 ### 17.6 Error envelope
@@ -1720,9 +1730,8 @@ services:
   agent-orch     (FastAPI)          → AI agents (insight/deep-dive/alerting) → LLM-B + MCP [Phase 2]
   mcp-servers    (FastAPI + MCP)    → analytics-mcp · retrieval-mcp · ingest-mcp (internal) [Phase 2]
   redis          (cache/queue)      → Redis Streams = bus + cache + dedup
-  postgres       (ops + jobs)
+  postgres       (ops + jobs + vectors) → pgvector/pgvector:pg16 image; analysis_results.embedding vector(768)
   clickhouse     (analytics)
-  qdrant         (vectors)
   minio          (object storage)
   prometheus + grafana + loki       → monitoring
 ```
@@ -1770,10 +1779,10 @@ services:
                          │                    (API)  │   or groq (egress HTTPS)
                          └───────────────────────────┘
           │ writes (assembler Deployment) │
-   ┌──────▼───────┬──────────┬────────────▼──────┬───────────┐
-   │ postgres     │clickhouse│ qdrant            │ minio/S3  │  StatefulSets / managed
-   │ (HA, replica)│(cluster) │ (sharded)         │           │
-   └──────────────┴──────────┴───────────────────┴───────────┘
+   ┌──────▼────────────────┬──────────┬──────────────┬───────────┐
+   │ postgres + pgvector    │clickhouse│              │ minio/S3  │  StatefulSets / managed
+   │ (HA, replica; vectors) │(cluster) │              │           │
+   └────────────────────────┴──────────┴──────────────┴───────────┘
         observability namespace: prometheus, grafana, loki, jaeger, otel-collector
 ```
 
@@ -1801,7 +1810,7 @@ services:
     in `NetworkPolicy`/egress rules and mount `GROQ_API_KEY` from a Secret.
     Both are valid simultaneously for **hybrid/failover**; the worker picks per
     request/policy. Switching backends is a config rollout, not a rebuild.
-- **Stateful infra** (Kafka, PostgreSQL, ClickHouse, Qdrant) → operators or
+- **Stateful infra** (Kafka, PostgreSQL with pgvector, ClickHouse) → operators or
   `StatefulSet` + `PersistentVolumeClaim`; or managed equivalents.
 - **Object storage** → MinIO operator or cloud S3.
 
@@ -1826,8 +1835,8 @@ and `models`; only ingress is internet-facing.
 
 **Reliability:** Multi-AZ node pools; PodDisruptionBudgets; replicas ≥ 2 for
 stateless. DLQ topic in Kafka; alert on DLQ growth. Rolling updates with readiness
-gates; canary via mesh or two Deployments. Backups: Postgres PITR, ClickHouse +
-Qdrant snapshots to object storage.
+gates; canary via mesh or two Deployments. Backups: Postgres PITR (covers the
+pgvector embeddings) + ClickHouse snapshots to object storage.
 
 **CI/CD:** Build → scan images → push to registry → deploy via Helm/Kustomize (+
 ArgoCD for GitOps). Model artifacts versioned in object storage; `model_versions`
@@ -1853,7 +1862,8 @@ Phased build from MVP (1k) → Production (10k) → Enterprise (100k).
   keyed by CUID `id` (comments embedded), derive `platform`, keep upstream
   `sentiment`/`viralPotential` as `baseline_*`, **run OCR on `photoUrls`**, record
   comment **coverage**, upsert into **our own database**.
-- Stand up local Docker Compose skeleton: Postgres, Redis, Qdrant, ClickHouse,
+- Stand up local Docker Compose skeleton: Postgres (`pgvector/pgvector:pg16`, with
+  the `vector` extension enabled), Redis, ClickHouse,
   MinIO, a stub API, Prometheus/Grafana.
 - Pick and pin model versions (§14); download local weights to object storage.
   Define the **Stage-2 LLM backend interface** (OpenAI-compatible) and wire both
@@ -1900,8 +1910,9 @@ Goal: prove the hybrid pipeline and output quality end-to-end, cheaply.
   exercised early; **LLM response cache** in Redis keyed by
   `(backend, model, task, content_hash)`. (LLM-B is added in Phase 2 for
   cluster/report quality.)
-- **Result assembler:** merge + JSON-schema validate + write to Postgres, ClickHouse,
-  Qdrant, MinIO.
+- **Result assembler:** merge + JSON-schema validate + write to the 3 backends —
+  Postgres + pgvector (canonical row + `analysis_results.embedding`), ClickHouse,
+  MinIO.
 - **APIs:** `/posts/upload`, `/analysis/run`, `/analysis/{id}`, `/reports` (basic),
   auth (API key + JWT).
 - **Web dashboard (v1) — plain HTML/CSS/JS** (vanilla, no framework): job status,
@@ -1932,7 +1943,7 @@ Goal: scale, reliability, and the move to Kubernetes.
 - **Cluster summarization:** k-means/HDBSCAN over embeddings → LLM summarizes
   clusters, not posts (key cost lever at 10k).
 - **Reporting:** trend analysis, brand-mention tracking, political analysis on
-  ClickHouse; grounded report generation via RAG (Qdrant + LLM).
+  ClickHouse; grounded report generation via RAG (pgvector + LLM).
 - **Agentic insight layer (§14.6):** stand up the **MCP servers**
   (analytics/retrieval/ingest) + **agent orchestrator**; ship the **Insight/Analyst
   agent** (`POST /v1/agents/query` + agent-generated reports) on LLM-B over those
@@ -1953,8 +1964,9 @@ Goal: horizontal scale, cost efficiency, resilience at volume.
 
 - **GPU node pools per stage**, spot/preemptible for batch surges (Kafka replay
   makes preemption safe); reserved capacity for steady base.
-- **Data layer scale-out:** Postgres read replicas; ClickHouse cluster
-  (shards+replicas); Qdrant sharded by tenant; possibly Milvus if vectors reach
+- **Data layer scale-out:** Postgres read replicas (pgvector queries served from
+  replicas); ClickHouse cluster (shards+replicas); partition the `analysis_results`
+  vector index by tenant; possibly migrate to Milvus if vectors reach
   billions (§13.5).
 - **LLM scale:** on `local`, multiple vLLM replicas for both models (tensor
   parallelism for LLM-B), absorbing spikes by adding GPU replicas; on `groq`, no GPU

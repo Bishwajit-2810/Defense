@@ -113,27 +113,33 @@ philosophies. Heavy aggregation goes to ClickHouse, not the operational DB.
 **Decision: ClickHouse** for trend analysis, brand-mention counts, time-series
 aggregations, and dashboard charts — that's the dominant analytics need.
 **Optional Elasticsearch/OpenSearch** can be added later _only if_ rich
-keyword/full-text search over post text becomes a first-class feature; Qdrant +
-ClickHouse cover semantic search and aggregation in the meantime.
+keyword/full-text search over post text becomes a first-class feature; pgvector
+(Postgres extension) + ClickHouse cover semantic search and aggregation in the
+meantime.
 
 ---
 
-## 5. Vector database: Qdrant vs Weaviate vs Milvus
+## 5. Vector search: pgvector vs Weaviate vs Milvus
 
-| Criterion        | **Qdrant**                    | **Weaviate**            | **Milvus**               |
-| ---------------- | ----------------------------- | ----------------------- | ------------------------ |
-| Language/perf    | Rust, fast, low memory        | Go, feature-rich        | C++, very scalable       |
-| Filtering        | Excellent payload filters     | Good                    | Good                     |
-| Ops simplicity   | **High**                      | Medium                  | Lower (more components)  |
-| Built-in modules | Lean (BYO embeddings)         | Many (modules, hybrid)  | Lean                     |
-| Scale ceiling    | High                          | High                    | **Very high** (billions) |
-| Best fit         | Pragmatic mid-scale, easy ops | Hybrid search + modules | Massive enterprise scale |
+| Criterion        | **pgvector (in Postgres)**       | **Weaviate**            | **Milvus**               |
+| ---------------- | -------------------------------- | ----------------------- | ------------------------ |
+| Language/perf    | C extension, fast, HNSW/IVFFlat  | Go, feature-rich        | C++, very scalable       |
+| Filtering        | Native SQL `WHERE` + indexes     | Good                    | Good                     |
+| Ops simplicity   | **Highest** (no extra service)   | Medium                  | Lower (more components)  |
+| Built-in modules | Lean (BYO embeddings)            | Many (modules, hybrid)  | Lean                     |
+| Scale ceiling    | High (tens of millions)          | High                    | **Very high** (billions) |
+| Best fit         | Co-located vectors, one store    | Hybrid search + modules | Massive enterprise scale |
 
-**Decision: Qdrant** for MVP→Production: easiest to operate, fast, excellent
-metadata filtering (needed to scope vectors by tenant/platform/time). Reassess
-**Milvus** at Enterprise/100k-batch scale if vector count reaches billions and
-you need its distributed sharding. Weaviate is the pick only if you want its
-built-in hybrid-search/module ecosystem over BYO simplicity.
+**Decision: pgvector (the Postgres extension)** for MVP→Production: the embedding
+lives as an `analysis_results.embedding` `vector(768)` column right next to the
+operational rows, so there is **no separate vector service to run** — one fewer
+container, one fewer thing to back up and secure. Queries use cosine distance via
+pgvector's `<=>` operator, and metadata scoping (tenant/platform/time) is plain
+SQL `WHERE` plus the same indexes the operational tables already use. Reassess
+**Milvus** at Enterprise/100k-batch scale if vector count reaches billions and you
+need its distributed sharding; promote to a standalone engine only when the vector
+workload outgrows what Postgres can serve alongside OLTP. Weaviate is the pick only
+if you want its built-in hybrid-search/module ecosystem over BYO simplicity.
 
 ---
 
@@ -234,8 +240,8 @@ Summarized here; full plan in [deployment.md](deployment.md).
 Short answer: **not for per-post analysis; yes for the reporting/insight layer.**
 Full reasoning in [models.md](models.md) §5. Per-post classification needs no
 retrieval. RAG becomes valuable for analyst Q&A over the corpus, grounded report
-generation, and "what are people saying about X" queries — backed by Qdrant +
-the embeddings you already compute.
+generation, and "what are people saying about X" queries — backed by pgvector
+(Postgres extension) + the embeddings you already compute.
 
 ---
 

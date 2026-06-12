@@ -1,0 +1,195 @@
+# Workers: ingestion, router, stage2_llm, assembler
+# These are Redis stream consumers — no HTTP ports exposed.
+# Replica count is intentionally 1; KEDA ScaledObjects handle autoscaling based on stream lag.
+
+---
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: ingestion
+  namespace: defense
+  labels:
+    app: ingestion
+    app.kubernetes.io/part-of: defense
+    role: worker
+spec:
+  replicas: 1
+  selector:
+    matchLabels:
+      app: ingestion
+  template:
+    metadata:
+      labels:
+        app: ingestion
+        app.kubernetes.io/part-of: defense
+        role: worker
+    spec:
+      terminationGracePeriodSeconds: 60
+      containers:
+        - name: ingestion
+          image: defense/ingestion:latest
+          imagePullPolicy: IfNotPresent
+          envFrom:
+            - configMapRef:
+                name: defense-config
+            - secretRef:
+                name: defense-secrets
+          resources:
+            requests:
+              cpu: "500m"
+              memory: "512Mi"
+            limits:
+              cpu: "2000m"
+              memory: "2Gi"
+          securityContext:
+            allowPrivilegeEscalation: false
+            readOnlyRootFilesystem: true
+            runAsNonRoot: true
+            runAsUser: 1000
+            capabilities:
+              drop:
+                - ALL
+
+---
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: worker-router
+  namespace: defense
+  labels:
+    app: worker-router
+    app.kubernetes.io/part-of: defense
+    role: worker
+spec:
+  replicas: 1
+  selector:
+    matchLabels:
+      app: worker-router
+  template:
+    metadata:
+      labels:
+        app: worker-router
+        app.kubernetes.io/part-of: defense
+        role: worker
+    spec:
+      terminationGracePeriodSeconds: 60
+      containers:
+        - name: worker-router
+          image: defense/worker-router:latest
+          imagePullPolicy: IfNotPresent
+          envFrom:
+            - configMapRef:
+                name: defense-config
+            - secretRef:
+                name: defense-secrets
+          resources:
+            requests:
+              cpu: "500m"
+              memory: "512Mi"
+            limits:
+              cpu: "2000m"
+              memory: "2Gi"
+          securityContext:
+            allowPrivilegeEscalation: false
+            readOnlyRootFilesystem: true
+            runAsNonRoot: true
+            runAsUser: 1000
+            capabilities:
+              drop:
+                - ALL
+
+---
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: worker-stage2-llm
+  namespace: defense
+  labels:
+    app: worker-stage2-llm
+    app.kubernetes.io/part-of: defense
+    role: worker
+spec:
+  replicas: 1
+  selector:
+    matchLabels:
+      app: worker-stage2-llm
+  template:
+    metadata:
+      labels:
+        app: worker-stage2-llm
+        app.kubernetes.io/part-of: defense
+        role: worker
+    spec:
+      terminationGracePeriodSeconds: 60
+      containers:
+        - name: worker-stage2-llm
+          image: defense/worker-stage2-llm:latest
+          imagePullPolicy: IfNotPresent
+          envFrom:
+            - configMapRef:
+                name: defense-config
+            - secretRef:
+                name: defense-secrets
+          resources:
+            requests:
+              cpu: "500m"
+              memory: "512Mi"
+            limits:
+              cpu: "2000m"
+              memory: "2Gi"
+          securityContext:
+            allowPrivilegeEscalation: false
+            readOnlyRootFilesystem: true
+            runAsNonRoot: true
+            runAsUser: 1000
+            capabilities:
+              drop:
+                - ALL
+
+---
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: worker-assembler
+  namespace: defense
+  labels:
+    app: worker-assembler
+    app.kubernetes.io/part-of: defense
+    role: worker
+spec:
+  replicas: 1
+  selector:
+    matchLabels:
+      app: worker-assembler
+  template:
+    metadata:
+      labels:
+        app: worker-assembler
+        app.kubernetes.io/part-of: defense
+        role: worker
+    spec:
+      terminationGracePeriodSeconds: 60
+      containers:
+        - name: worker-assembler
+          image: defense/worker-assembler:latest
+          imagePullPolicy: IfNotPresent
+          envFrom:
+            - configMapRef:
+                name: defense-config
+            - secretRef:
+                name: defense-secrets
+          resources:
+            requests:
+              cpu: "500m"
+              memory: "512Mi"
+            limits:
+              cpu: "2000m"
+              memory: "2Gi"
+          securityContext:
+            allowPrivilegeEscalation: false
+            readOnlyRootFilesystem: true
+            runAsNonRoot: true
+            runAsUser: 1000
+            capabilities:
+              drop:
+                - ALL

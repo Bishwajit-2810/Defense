@@ -1,0 +1,75 @@
+{
+  "$schema": "http://json-schema.org/draft-07/schema#",
+  "title": "PostWithDetails",
+  "type": "object",
+  "required": ["id","url","postType","postedAt","scrapedAt","campaignId","platformPostId","engagement","reactionBreakdown","comments"],
+  "properties": {
+    "id": {"type":"string","description":"CUID, our post_id"},
+    "url": {"type":"string","format":"uri"},
+    "caption": {"type":["string","null"]},
+    "isViral": {"type":"boolean"},
+    "isViralCandidate": {"type":"boolean"},
+    "postType": {"type":"string","enum":["PHOTO_TEXT","PHOTO","TEXT"]},
+    "postedAt": {"type":"string","format":"date-time"},
+    "videoUrl": {"type":["string","null"]},
+    "photoUrls": {"type":"array","items":{"type":"string"}},
+    "scrapedAt": {"type":"string","format":"date-time"},
+    "sentiment": {"type":["number","null"]},
+    "viralPotential": {"type":["number","null"]},
+    "campaignId": {"type":"string"},
+    "platformPostId": {"type":"string"},
+    "engagement": {
+      "type":"object",
+      "required":["commentCount","storedCommentRows","totalReactions","shareCount"],
+      "properties": {
+        "commentCount":{"type":"integer"},
+        "storedCommentRows":{"type":"integer"},
+        "totalReactions":{"type":"integer"},
+        "shareCount":{"type":"integer"},
+        "reach":{"type":"integer"},
+        "saves":{"type":"integer"},
+        "impressions":{"type":"integer"},
+        "storedReactionRows":{"type":"integer"}
+      }
+    },
+    "reactionBreakdown": {
+      "type":"object",
+      "properties": {
+        "LIKE":{"type":"integer"},"LOVE":{"type":"integer"},"HAHA":{"type":"integer"},
+        "WOW":{"type":"integer"},"SAD":{"type":"integer"},"ANGRY":{"type":"integer"},"CARE":{"type":"integer"}
+      }
+    },
+    "sampleShares": {
+      "type":"array","maxItems":25,
+      "items": {
+        "type":"object",
+        "properties": {
+          "sharerUrl":{"type":["string","null"]},
+          "sharerUsername":{"type":["string","null"]},
+          "sharedAt":{"type":["string","null"]},
+          "shareText":{"type":["string","null"]}
+        }
+      }
+    },
+    "comments": {
+      "type":"array",
+      "items": {
+        "type":"object",
+        "required":["id","text","likes"],
+        "properties": {
+          "id":{"type":"string"},
+          "text":{"type":["string","null"]},
+          "likes":{"type":"integer"},
+          "category":{"type":"string"},
+          "parentId":{"type":["string","null"]},
+          "postedAt":{"type":["string","null"]},
+          "authorUrl":{"type":["string","null"]},
+          "sentiment":{"type":["number","null"]},
+          "replyCount":{"type":"integer"},
+          "authorUsername":{"type":["string","null"]},
+          "platformCommentId":{"type":["string","null"]}
+        }
+      }
+    }
+  }
+}

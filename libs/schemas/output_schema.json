@@ -1,0 +1,111 @@
+{
+  "$schema": "http://json-schema.org/draft-07/schema#",
+  "title": "AnalysisResult",
+  "type": "object",
+  "required": ["post_id","campaign_id","platform","platform_post_id","media_type","language","overall_sentiment","sentiment_score","baseline_sentiment","engagement","comment_analysis","confidence","processing","created_at","scraped_at"],
+  "properties": {
+    "post_id": {"type":"string"},
+    "campaign_id": {"type":"string"},
+    "platform": {"type":"string"},
+    "platform_post_id": {"type":"string"},
+    "media_type": {"type":"string","enum":["TEXT","PHOTO","PHOTO_TEXT"]},
+    "language": {"type":"string"},
+    "post_type": {"type":["string","null"]},
+    "post_summary": {"type":["string","null"]},
+    "post_summary_lang": {"type":["string","null"]},
+    "post_summary_grounding": {"type":["string","null"]},
+    "post_summary_source": {"type":["string","null"],"enum":["vlm","llm",null]},
+    "overall_sentiment": {"type":"string","enum":["positive","negative","neutral","mixed"]},
+    "sentiment_score": {"type":"number","minimum":-1,"maximum":1},
+    "text_sentiment": {"type":["string","null"]},
+    "image_sentiment": {"type":["string","null"]},
+    "baseline_sentiment": {"type":["number","null"]},
+    "baseline_viral_potential": {"type":["number","null"]},
+    "emotion": {
+      "type":"object",
+      "properties": {
+        "primary":{"type":"string"},
+        "scores":{"type":"object"}
+      }
+    },
+    "intents": {"type":"array","items":{"type":"string"}},
+    "topics": {"type":"array","items":{"type":"string"}},
+    "entities": {
+      "type":"array",
+      "items": {
+        "type":"object",
+        "properties": {
+          "text":{"type":"string"},
+          "label":{"type":"string"},
+          "confidence":{"type":"number"}
+        }
+      }
+    },
+    "brand_mentions": {"type":"array","items":{"type":"string"}},
+    "keywords": {"type":"array","items":{"type":"string"}},
+    "toxicity_score": {"type":"number","minimum":0,"maximum":1},
+    "hate_speech_score": {"type":"number","minimum":0,"maximum":1},
+    "engagement": {
+      "type":"object",
+      "required":["comment_count","stored_comments","total_reactions","share_count"],
+      "properties": {
+        "comment_count":{"type":"integer"},
+        "stored_comments":{"type":"integer"},
+        "total_reactions":{"type":"integer"},
+        "share_count":{"type":"integer"}
+      }
+    },
+    "reaction_breakdown": {"type":"object"},
+    "shares": {"type":"array"},
+    "image_analysis": {
+      "type":["object","null"],
+      "properties": {
+        "ocr_text":{"type":["string","null"]},
+        "image_sentiment":{"type":["string","null"]},
+        "image_sentiment_score":{"type":["number","null"]},
+        "description":{"type":["string","null"]}
+      }
+    },
+    "comment_analysis": {
+      "type":"object",
+      "required":["analyzed","coverage","sentiment_breakdown"],
+      "properties": {
+        "analyzed":{"type":"integer"},
+        "coverage":{"type":"number"},
+        "sentiment_breakdown": {
+          "type":"object",
+          "properties": {
+            "positive":{"type":"integer"},
+            "negative":{"type":"integer"},
+            "neutral":{"type":"integer"}
+          }
+        },
+        "themes":{"type":"array","items":{"type":"string"}},
+        "top_keywords":{"type":"array","items":{"type":"string"}},
+        "representative_comments":{"type":"array"}
+      }
+    },
+    "confidence": {
+      "type":"object",
+      "properties": {
+        "overall":{"type":"number","minimum":0,"maximum":1},
+        "sentiment":{"type":"number","minimum":0,"maximum":1},
+        "language":{"type":"number","minimum":0,"maximum":1},
+        "topics":{"type":"number","minimum":0,"maximum":1}
+      }
+    },
+    "processing": {
+      "type":"object",
+      "properties": {
+        "stage1_ms":{"type":"number"},
+        "stage2_ms":{"type":["number","null"]},
+        "llm_used":{"type":"boolean"},
+        "llm_backend":{"type":["string","null"]},
+        "llm_model":{"type":["string","null"]},
+        "schema_version":{"type":"string"}
+      }
+    },
+    "created_at": {"type":"string","format":"date-time"},
+    "scraped_at": {"type":"string","format":"date-time"}
+  }
+}

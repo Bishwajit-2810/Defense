@@ -183,8 +183,9 @@ are a primary cost lever, not an afterthought.
 - **Spot for batch.** Use preemptible/spot GPU nodes for batch surges; Kafka
   replay makes interruptions safe.
 - **Backpressure.** Bounded queues + DLQ prevent overload cascades.
-- **DB scaling.** PostgreSQL read replicas; ClickHouse shards/replicas; Qdrant
-  collections sharded by tenant at large scale.
+- **DB scaling.** PostgreSQL read replicas (the pgvector `analysis_results.embedding`
+  index rides along on the replicas for semantic-search fan-out); ClickHouse
+  shards/replicas.
 
 See [deployment.md](deployment.md) for the concrete Kubernetes/KEDA setup and
 [plan.md](plan.md) for the order to build it in.

@@ -1,0 +1,64 @@
+# stage1-nlp worker — GPU node required for production inference.
+# Tolerates the gpu:NoSchedule taint and requests 1x nvidia.com/gpu.
+# MODEL_STUB_MODE is explicitly set to "false" to override the ConfigMap default.
+
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: worker-stage1-nlp
+  namespace: defense
+  labels:
+    app: worker-stage1-nlp
+    app.kubernetes.io/part-of: defense
+    role: worker
+spec:
+  replicas: 1
+  selector:
+    matchLabels:
+      app: worker-stage1-nlp
+  template:
+    metadata:
+      labels:
+        app: worker-stage1-nlp
+        app.kubernetes.io/part-of: defense
+        role: worker
+    spec:
+      terminationGracePeriodSeconds: 120
+      # Schedule exclusively on GPU-enabled nodes
+      nodeSelector:
+        kubernetes.io/gpu: "true"
+      tolerations:
+        - key: "nvidia.com/gpu"
+          operator: "Exists"
+          effect: "NoSchedule"
+        - key: "gpu"
+          operator: "Exists"
+          effect: "NoSchedule"
+      containers:
+        - name: worker-stage1-nlp
+          image: defense/worker-stage1-nlp:latest
+          imagePullPolicy: IfNotPresent
+          envFrom:
+            - configMapRef:
+                name: defense-config
+            - secretRef:
+                name: defense-secrets
+          env:
+            # Override the ConfigMap value — production NLP requires real model
+            - name: MODEL_STUB_MODE
+              value: "false"
+          resources:
+            requests:
+              cpu: "2000m"
+              memory: "4Gi"
+              nvidia.com/gpu: "1"
+            limits:
+              memory: "8Gi"
+              nvidia.com/gpu: "1"
+          securityContext:
+            allowPrivilegeEscalation: false
+            runAsNonRoot: true
+            runAsUser: 1000
+            capabilities:
+              drop:
+                - ALL
