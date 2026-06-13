@@ -225,20 +225,30 @@ async def _run_summary(
             temperature=0.2,
         )
 
+    # Only actually drive the VLM when an image was genuinely fetched. A "vlm"
+    # role with no fetchable image — e.g. photo_urls are relative storage paths
+    # ("posts/.../x.jpg") rather than absolute URLs, or the CDN link expired — is
+    # worse than useless: the local VLM is weaker than llm_a at text-only
+    # summarisation and frequently returns empty. So when there's no image to
+    # ground on, summarise on llm_a from caption + OCR directly instead of burning
+    # a doomed VLM call that strands the post with a blank summary.
+    effective_role = role if grounded_on_image else "llm_a"
+    chat_messages = messages if grounded_on_image else text_only_messages
+
     try:
-        response = await _chat(role, messages)
+        response = await _chat(effective_role, chat_messages)
     except Exception as exc:
-        if not grounded_on_image:
+        if effective_role != "vlm":
             raise
         logger.warning("vlm_summary_failed_falling_back_to_text", error=str(exc))
         grounded_on_image = False
         response = await _chat("llm_a", text_only_messages)
 
-    # Local VLMs (qwen3-vl) frequently return EMPTY content for image-grounded
-    # prompts without raising — that left every image post with a blank summary.
-    # Treat an empty grounded response exactly like a failure: redo text-only so
-    # the caption + OCR still produce a summary.
-    if grounded_on_image and not (response.get("content") or "").strip():
+    # Local VLMs (qwen3-vl) frequently return EMPTY content without raising — that
+    # left image posts with a blank summary. Whenever the VLM was actually used
+    # and produced nothing, redo the summary text-only on llm_a so the caption +
+    # OCR still yield a summary.
+    if effective_role == "vlm" and not (response.get("content") or "").strip():
         logger.warning("vlm_summary_empty_falling_back_to_text", post_id=partial_result.get("post_id"))
         grounded_on_image = False
         response = await _chat("llm_a", text_only_messages)
@@ -624,90 +634,116 @@ async def _process_message(
     role = "vlm" if (has_photos and vlm_enabled) else "llm_a"
 
     stage2_result: dict = {}
-    llm_backend: str | None = None
-    llm_model: str | None = None
 
-    # ---- Summary ----
-    if task_flags.get("want_summary", False):
-        try:
-            summary_data = await _run_summary(llm, redis, partial_result, task_flags, role, backend_override)
-            stage2_result["post_summary"] = summary_data.get("post_summary")
-            stage2_result["post_summary_lang"] = summary_data.get("post_summary_lang")
-            # "vlm" when the image grounded the summary, "llm" otherwise
-            # (including VLM→text fallback) — set inside _run_summary.
-            stage2_result["post_summary_source"] = summary_data.get(
-                "post_summary_source", "vlm" if has_photos else "llm"
-            )
-            grounding = summary_data.get("post_summary_grounding")
-            if isinstance(grounding, (list, tuple)):
-                grounding = "+".join(grounding) if grounding else None
-            stage2_result["post_summary_grounding"] = grounding
-            llm_backend = llm_backend or summary_data.get("_llm_backend")
-            llm_model = llm_model or summary_data.get("_llm_model")
-        except Exception as exc:
-            log.error("stage2_summary_error", error=str(exc))
+    # Post context for the comment lane — derived ONLY from the post's own
+    # content (caption → OCR → image description), NEVER from the generated
+    # summary. This decoupling is what lets the comment lane run concurrently
+    # with the summary lane below instead of waiting for the summary first.
+    post_context = (
+        (normalized_post.get("caption") or "").strip()
+        or (partial_result.get("ocr_text") or "").strip()
+        or (partial_result.get("image_description") or "").strip()
+    )
 
-    # ---- Post type ----
-    if task_flags.get("want_post_type", False):
-        try:
-            pt_data = await _run_post_type(llm, redis, partial_result, task_flags, role, backend_override)
-            stage2_result["post_type"] = pt_data.get("post_type")
-            stage2_result["post_type_confidence"] = pt_data.get("post_type_confidence")
-            llm_backend = llm_backend or pt_data.get("_llm_backend")
-            llm_model = llm_model or pt_data.get("_llm_model")
-        except Exception as exc:
-            log.error("stage2_post_type_error", error=str(exc))
+    # ---- Lane A: post-level analysis (summary + post-type + insight) ----
+    # All run on the llm_a / vlm slot, sequentially within the lane.
+    async def _post_level_lane() -> dict:
+        out: dict = {}
+        backend = model = None
 
-    # ---- Insight ----
-    if task_flags.get("want_insight", False):
-        try:
-            insight_data = await _run_insight(llm, redis, partial_result, task_flags, role, backend_override)
-            if insight_data.get("refined_topics"):
-                stage2_result["topics"] = insight_data["refined_topics"]
-            stage2_result["intents"] = insight_data.get("intents") or []
-            stage2_result["insight"] = insight_data.get("insight") or ""
-            llm_backend = llm_backend or insight_data.get("_llm_backend")
-            llm_model = llm_model or insight_data.get("_llm_model")
-        except Exception as exc:
-            log.error("stage2_insight_error", error=str(exc))
-
-    # ---- Comment stance (context-aware: each comment vs THE POST) ----
-    # Re-labels every embedded comment by its stance toward the post via the LLM
-    # (batched). Mutates stage1_result["comment_analysis"] in place so the
-    # assembler persists these context-aware labels to Postgres + ClickHouse.
-    if _STANCE_ENABLED:
-        ca = (stage1_result.get("comment_analysis") or {})
-        if ca.get("comments"):
-            post_context = (normalized_post.get("caption") or "").strip()
-            if not post_context:
-                post_context = (stage2_result.get("post_summary")
-                                or partial_result.get("ocr_text") or "")
+        if task_flags.get("want_summary", False):
             try:
-                n_labeled = await _run_comment_stance(
-                    llm, redis, stage1_result, post_context, backend_override
+                summary_data = await _run_summary(llm, redis, partial_result, task_flags, role, backend_override)
+                out["post_summary"] = summary_data.get("post_summary")
+                out["post_summary_lang"] = summary_data.get("post_summary_lang")
+                # "vlm" when the image grounded the summary, "llm" otherwise
+                # (including VLM→text fallback) — set inside _run_summary.
+                out["post_summary_source"] = summary_data.get(
+                    "post_summary_source", "vlm" if has_photos else "llm"
                 )
-                log.info("stage2_comment_stance", labeled=n_labeled,
-                         total=len(ca.get("comments") or []))
-                llm_backend = llm_backend or (backend_override or os.environ.get("LLM_BACKEND", "local"))
+                grounding = summary_data.get("post_summary_grounding")
+                if isinstance(grounding, (list, tuple)):
+                    grounding = "+".join(grounding) if grounding else None
+                out["post_summary_grounding"] = grounding
+                backend = backend or summary_data.get("_llm_backend")
+                model = model or summary_data.get("_llm_model")
             except Exception as exc:
-                log.error("stage2_comment_stance_error", error=str(exc))
+                log.error("stage2_summary_error", error=str(exc))
 
-            # ---- Comment summary (natural-language mood of the comment section) ----
-            # Runs after stance so it reads the context-aware breakdowns. Writes
-            # into comment_analysis in place → assembler persists it.
-            if _COMMENT_SUMMARY_ENABLED:
-                try:
-                    summary_lang = (task_flags.get("target_lang")
-                                    or stage1_result.get("language") or "English")
-                    comment_summary = await _run_comment_summary(
-                        llm, redis, stage1_result, post_context, summary_lang, backend_override
-                    )
-                    if comment_summary:
-                        ca["summary"] = comment_summary
-                        ca["summary_source"] = "llm"
-                        log.info("stage2_comment_summary", chars=len(comment_summary))
-                except Exception as exc:
-                    log.error("stage2_comment_summary_error", error=str(exc))
+        if task_flags.get("want_post_type", False):
+            try:
+                pt_data = await _run_post_type(llm, redis, partial_result, task_flags, role, backend_override)
+                out["post_type"] = pt_data.get("post_type")
+                out["post_type_confidence"] = pt_data.get("post_type_confidence")
+                backend = backend or pt_data.get("_llm_backend")
+                model = model or pt_data.get("_llm_model")
+            except Exception as exc:
+                log.error("stage2_post_type_error", error=str(exc))
+
+        if task_flags.get("want_insight", False):
+            try:
+                insight_data = await _run_insight(llm, redis, partial_result, task_flags, role, backend_override)
+                if insight_data.get("refined_topics"):
+                    out["topics"] = insight_data["refined_topics"]
+                out["intents"] = insight_data.get("intents") or []
+                out["insight"] = insight_data.get("insight") or ""
+                backend = backend or insight_data.get("_llm_backend")
+                model = model or insight_data.get("_llm_model")
+            except Exception as exc:
+                log.error("stage2_insight_error", error=str(exc))
+
+        out["_llm_backend"] = backend
+        out["_llm_model"] = model
+        return out
+
+    # ---- Lane B: comment analysis (context-aware stance → comment summary) ----
+    # Runs on the llm_b slot. Re-labels every embedded comment by its stance
+    # toward the post (batched) and mutates stage1_result["comment_analysis"] in
+    # place so the assembler persists the context-aware labels. The comment
+    # summary must run AFTER stance (it reads the recomputed breakdowns), so this
+    # lane stays internally sequential — but the whole lane runs concurrently
+    # with Lane A.
+    async def _comment_lane() -> dict:
+        out: dict = {}
+        if not _STANCE_ENABLED:
+            return out
+        ca = stage1_result.get("comment_analysis") or {}
+        if not ca.get("comments"):
+            return out
+
+        try:
+            n_labeled = await _run_comment_stance(
+                llm, redis, stage1_result, post_context, backend_override
+            )
+            log.info("stage2_comment_stance", labeled=n_labeled,
+                     total=len(ca.get("comments") or []))
+            out["_llm_backend"] = backend_override or os.environ.get("LLM_BACKEND", "local")
+        except Exception as exc:
+            log.error("stage2_comment_stance_error", error=str(exc))
+
+        if _COMMENT_SUMMARY_ENABLED:
+            try:
+                summary_lang = (task_flags.get("target_lang")
+                                or stage1_result.get("language") or "English")
+                comment_summary = await _run_comment_summary(
+                    llm, redis, stage1_result, post_context, summary_lang, backend_override
+                )
+                if comment_summary:
+                    ca["summary"] = comment_summary
+                    ca["summary_source"] = "llm"
+                    log.info("stage2_comment_summary", chars=len(comment_summary))
+            except Exception as exc:
+                log.error("stage2_comment_summary_error", error=str(exc))
+        return out
+
+    # Run the two lanes concurrently. Lane A writes only to its returned dict;
+    # Lane B mutates stage1_result["comment_analysis"] in place. They share no
+    # mutable state, so there is no race under asyncio's cooperative scheduling.
+    post_out, comment_out = await asyncio.gather(_post_level_lane(), _comment_lane())
+
+    llm_backend = post_out.pop("_llm_backend", None) or comment_out.pop("_llm_backend", None)
+    llm_model = post_out.pop("_llm_model", None)
+    stage2_result.update(post_out)
 
     elapsed_ms = int((time.monotonic() - t0) * 1000)
     stage2_result["processing"] = {
