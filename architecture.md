@@ -196,6 +196,20 @@ Q&A, grounded reports, and targeted deep-dives (never per post) — see §11.
      `commentCount`). (For a rare comment-less post, the post pass
      runs standalone and `comment_analysis.analyzed = 0`.) Each output carries a
      **confidence** score. Results are written to a partial-result store.
+
+   > **Implementation note — Stage-1 NLP engine (`STAGE1_LLM`).** The Stage-1
+   > field set, fusion, comment coverage, and confidence above are the contract;
+   > _how_ they're computed is pluggable. The default deployment realizes the
+   > "small-model suite" with a **single fast LLM** — the `stage1` role
+   > (`gemma3:4b` on local Ollama by default) — which emits the whole NLP field set
+   > (sentiment/emotion/topic/intent/toxicity/NER/keywords) in one structured-JSON
+   > call per caption and per batched comment group. **Stage 2 runs on a different,
+   > larger model** (the `stage2` role — `qwen2.5:7b`). The embedding still comes
+   > from the SentenceTransformer (or the shared stub), since a chat LLM can't emit
+   > a 768-dim vector. Set `STAGE1_LLM=false` to fall back to the specialized
+   > small-model classifiers (XLM-R/fastText/GLiNER/…) of [models.md](models.md) §1;
+   > any LLM failure also degrades to the deterministic stub, so offline/CI stays
+   > green. See [models.md](models.md) §2 for the role-to-model mapping.
 5. **Router/Triage (the "smart thinking layer").** For each thread the router
    decides:
    - All required fields produced with confidence ≥ threshold, and no LLM-only
@@ -335,42 +349,39 @@ since only a stored sample of comments is shipped.
   "campaign_id": "cmoldmxzr02d8fu22vhvrg23c",
   "platform": "facebook",
   "platform_post_id": "4460219584209360",
-  "url": "https://www.facebook.com/4460219584209360",
-  "author": null,
   "media_type": "PHOTO_TEXT",
   "language": "bn",
-  "language_mix": ["bn"],
-  "language_confidence": 0.98,
+  "post_text": "শাপলা চত্বরের সেই রক্তাক্ত রাতের কথা আজও ভুলিনি।",
   "post_type": "commemoration",
   "post_summary": "শাপলা চত্বরের ঘটনার স্মরণে একটি আবেগঘন বাংলা পোস্ট; ছবিতে সেই রাতের দৃশ্য। পোস্ট ও মন্তব্যে শোক ও আওয়ামী লীগের প্রতি ক্ষোভ প্রবল।",
   "post_summary_lang": "bn",
-  "post_summary_grounding": ["caption", "image"],
+  "post_summary_source": "vlm",
+  "post_summary_grounding": "caption+image",
   "overall_sentiment": "negative",
   "sentiment_score": -0.82,
   "text_sentiment": { "label": "negative", "score": -0.85 },
-  "image_sentiment": {
-    "label": "negative",
-    "score": -0.7,
-    "per_image": [-0.7]
-  },
+  "image_sentiment": { "label": "negative", "score": -0.7 },
   "baseline_sentiment": -0.85,
   "baseline_viral_potential": 0.78,
-  "emotion": "sadness",
+  "emotion": {
+    "primary": "sadness",
+    "scores": { "sadness": 0.62, "anger": 0.21, "fear": 0.06, "neutral": 0.05, "disgust": 0.03, "surprise": 0.02, "joy": 0.01 }
+  },
   "intents": ["commemorate", "express_grievance"],
   "topics": ["shapla chattar", "2013", "politics", "grief"],
   "entities": [
-    { "type": "event", "value": "Shapla Chattar", "confidence": 0.9 },
-    { "type": "organization", "value": "Awami League", "confidence": 0.86 }
+    { "text": "Shapla Chattar", "label": "EVENT", "confidence": 0.9 },
+    { "text": "Awami League", "label": "ORG", "confidence": 0.86 }
   ],
   "brand_mentions": [],
   "keywords": ["শাপলা", "শোক", "আওয়ামী লীগ"],
   "toxicity_score": 0.18,
   "hate_speech_score": 0.12,
   "engagement": {
-    "reactions": 84979,
     "comment_count": 1562,
-    "share_count": 3189,
-    "stored_comments": 112
+    "stored_comments": 112,
+    "total_reactions": 84979,
+    "share_count": 3189
   },
   "reaction_breakdown": {
     "SAD": 65289,
@@ -381,11 +392,11 @@ since only a stored sample of comments is shipped.
     "WOW": 56,
     "ANGRY": 26
   },
-  "shares": { "sample_count": 0, "sample": [] },
+  "shares": [],
   "image_analysis": {
     "image_count": 1,
     "ocr_text": "",
-    "description": "a dark night-time scene of a crowd / security forces (our OCR + caption)",
+    "description": "a dark night-time scene of a crowd / security forces",
     "images": [
       {
         "ref": "photoUrls[0]",
@@ -394,39 +405,35 @@ since only a stored sample of comments is shipped.
         "description": "a dark night-time scene of a crowd / security forces"
       }
     ],
-    "vision_model": "SigLIP (sentiment) + Qwen2.5-VL-7B (description+OCR)"
+    "vision_model": "SigLIP (sentiment) + Qwen2.5-VL (description)"
   },
   "comment_analysis": {
     "analyzed": 112,
-    "coverage": "112/1562 stored",
+    "coverage": 0.0717,
+    "summary": "মন্তব্যের সিংহভাগ শোক ও ক্ষোভে ভরা; অনেকে আওয়ামী লীগের সমালোচনা করেছেন এবং বিচার দাবি করেছেন।",
+    "summary_source": "llm",
     "sentiment_breakdown": { "positive": 6, "negative": 89, "neutral": 17 },
-    "themes": [
-      "grief and remembrance",
-      "anger at Awami League",
-      "calls for justice"
-    ],
+    "emotion_breakdown": { "anger": 38, "sadness": 47, "joy": 3, "fear": 6, "disgust": 8, "surprise": 1, "neutral": 9 },
+    "method_breakdown": { "fast": 60, "model": 0, "llm": 52 },
+    "themes": ["grief and remembrance", "anger at Awami League", "calls for justice"],
+    "top_keywords": ["শাপলা", "শোক", "আওয়ামী"],
     "representative_comments": [
       {
-        "author": "Abdur Rahman Wisdom's",
-        "lang": "bn",
+        "id": "cmco_rep_1",
+        "text": "এই ছবিগুলো প্রমাণ করে যে পুলিশ আমাদের বন্ধু ছিল না কখনো।",
         "sentiment": "negative",
-        "likes": 574,
-        "text": "এই ছবিগুলো প্রমাণ করে যে পুলিশ আমাদের বন্ধু ছিল না কখনো।"
+        "likes": 574
       }
     ]
   },
-  "post_summary_source": "vlm",
-  "confidence": 0.92,
+  "confidence": { "overall": 0.92, "sentiment": 0.95, "language": 0.98, "topics": 0.88 },
   "processing": {
-    "unit": "post+thread",
     "stage1_ms": 58,
+    "stage2_ms": 412,
     "llm_used": true,
-    "llm_role": "LLM-A",
     "llm_backend": "local",
-    "llm_model": "Qwen2.5-7B-Instruct",
-    "vision_used": true,
-    "vision_model": "Qwen2.5-VL-7B-Instruct",
-    "model_versions": {}
+    "llm_model": "qwen2.5:7b",
+    "schema_version": "1.2"
   },
   "created_at": "2026-05-04T18:19:14",
   "scraped_at": "2026-05-05T17:39:44.464"
@@ -459,9 +466,11 @@ Notes:
   is `vlm` when a vision-language model produced it, `llm` for text-only.
 - `post_type`, `intents`, `brand_mentions`, and `comment_analysis.themes` are the
   "and something like that" fields — useful structured signal for downstream use.
-- `post_summary_source` and `processing.llm_used`/`llm_role`/`llm_backend`/`llm_model`
-  make the hybrid behavior auditable (did we call an LLM, which role, on which
-  backend — `local` or `groq` — which concrete model, was it worth it).
+- `post_summary_source` and `processing.llm_used`/`llm_backend`/`llm_model`
+  make the hybrid behavior auditable (did we call Stage-2's LLM, on which
+  backend — `local` or `groq` — which concrete model, was it worth it). The
+  Stage-1 partial result additionally records its own engine/model for
+  reproducibility (`nlp_engine`, `model_versions`).
 - All fields except `post_summary`, `comment_analysis.themes`, and
   `representative_comments` come from cheap Stage-1 NLP; the LLM fills only the
   generative fields when the router asks for them.

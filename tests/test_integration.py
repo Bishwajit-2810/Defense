@@ -49,8 +49,9 @@ def make_stub_stage1(normalized_post: dict) -> dict:
         "language": "bn",
         "overall_sentiment": "neutral",
         "sentiment_score": 0.0,
-        "text_sentiment": "neutral" if caption else None,
-        "image_sentiment": "neutral" if is_photo else None,
+        # Per-component sentiments carry their own {label, score} (schema v1.2).
+        "text_sentiment": {"label": "neutral", "score": 0.0} if caption else None,
+        "image_sentiment": {"label": "neutral", "score": 0.0} if is_photo else None,
         "emotion": {"primary": "neutral", "scores": {"neutral": 0.8}},
         "intents": [],
         "topics": ["politics"],
@@ -443,6 +444,17 @@ class TestBuilderEndToEnd:
         assert result["text_sentiment"] is None, (
             "Null-caption post should have text_sentiment=None"
         )
+
+    def test_component_sentiment_carries_label_and_score(self):
+        """A captioned post's text_sentiment is a {label, score} object (schema v1.2)."""
+        photo_post = self._get_post_by_type("PHOTO_TEXT")
+        _, _, result = self._build_result(photo_post)
+        ts = result["text_sentiment"]
+        assert isinstance(ts, dict), "text_sentiment should be a {label, score} object"
+        assert "label" in ts and "score" in ts, "text_sentiment needs label + score"
+        # Image post → image_sentiment is also a {label, score} object.
+        img = result["image_sentiment"]
+        assert isinstance(img, dict) and "label" in img and "score" in img
 
     def test_processing_metadata_llm_not_used(self):
         """When stage2_result=None, processing.llm_used=False."""

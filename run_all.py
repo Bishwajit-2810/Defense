@@ -304,12 +304,19 @@ def build_env() -> dict:
         "LLM_BACKEND": "local",
         "LOCAL_LLM_BASE_URL": f"{OLLAMA_URL}/v1",
         "LOCAL_LLM_API_KEY": "ollama",
+        # Stage 1 (Fast NLP) and Stage 2 run on DIFFERENT Ollama models:
+        #   stage1 = gemma3:4b (fast/light) carries the high-volume per-post +
+        #            per-comment NLP; stage2 = qwen2.5:7b (quality) does the
+        #            selective summary/insight + context-aware comment stance.
+        "STAGE1_LOCAL_MODEL": os.environ.get("STAGE1_LOCAL_MODEL", "gemma3:4b"),
+        "STAGE2_LOCAL_MODEL": os.environ.get("STAGE2_LOCAL_MODEL", "qwen2.5:7b"),
+        # STAGE1_LLM=true → Stage-1 NLP runs on the stage1 LLM (embeddings stay
+        # stubbed under MODEL_STUB_MODE; any LLM failure falls back to the stub).
+        "STAGE1_LLM": os.environ.get("STAGE1_LLM", "true"),
+        "STAGE1_LLM_COMMENT_MAX": os.environ.get("STAGE1_LLM_COMMENT_MAX", "60"),
+        # llm_a / llm_b = the agents + report roles; kept on the quality model.
         "LLM_A_LOCAL_MODEL": "qwen2.5:7b",
-        # llm_b is the lighter slot used for per-comment stance — a small, fast,
-        # multilingual, NON-reasoning model keeps full-coverage comment labelling
-        # tractable on CPU and returns direct JSON (gemma4:e4b is a reasoning model
-        # that emits empty content here, so it is unsuitable for batch labelling).
-        "LLM_B_LOCAL_MODEL": os.environ.get("LLM_B_LOCAL_MODEL", "gemma3:4b"),
+        "LLM_B_LOCAL_MODEL": os.environ.get("LLM_B_LOCAL_MODEL", "qwen2.5:7b"),
         "VLM_LOCAL_MODEL": "qwen3-vl:4b",
         # Per-post context-aware comment labelling. Every comment is ALWAYS
         # analysed by the instant Stage-1 heuristic (full coverage); this only

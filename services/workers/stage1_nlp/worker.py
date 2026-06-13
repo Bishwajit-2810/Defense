@@ -77,6 +77,10 @@ BATCH_SIZE = int(os.getenv("STAGE1_BATCH_SIZE", "1"))
 # Read fresh per poll; absent/blank => auto-route by detected language.
 SENTIMENT_MODEL_CONFIG_KEY = os.getenv("SENTIMENT_MODEL_CONFIG_KEY", "config:sentiment_model")
 
+# Runtime LLM-backend override (local/groq) shared with Stage 2 + the dashboard
+# (PUT /v1/config/llm). Read per poll when llm_mode is on; absent => LLM_BACKEND.
+LLM_BACKEND_CONFIG_KEY = os.getenv("LLM_BACKEND_KEY", "config:llm_backend")
+
 # Bounded retry before a failed message is dead-lettered to nlp:stage1:queue:dlq.
 STAGE1_MAX_RETRIES = int(os.getenv("STAGE1_MAX_RETRIES", "3"))
 
@@ -111,6 +115,11 @@ def _build_result(
     comment_count = engagement.get("commentCount", 0)
     analyzed_count = comment_analysis.get("analyzed", 0)
     comment_analysis["coverage"] = compute_coverage(analyzed_count, comment_count)
+
+    # Which engine produced the Stage-1 NLP: "llm" (the stage1 LLM), "models"
+    # (small-model suite) or "stub". Drives the processing provenance below.
+    engine = text_result.get("engine")
+    stage1_llm_used = engine == "llm"
 
     # Confidence: average of language + sentiment confidences where available
     lang_conf = text_result.get("language_confidence") or 0.0
@@ -221,15 +230,19 @@ def _build_result(
         "processing": {
             "unit": "post+thread",
             "stage1_ms": round(stage1_ms, 1),
-            "llm_used": False,
-            "llm_role": None,
-            "llm_backend": None,
-            "llm_model": None,
+            # Stage-1-internal LLM provenance: true when the `stage1` LLM (not the
+            # small-model suite / stub) produced the NLP. The canonical
+            # processing.llm_used the assembler emits still tracks Stage-2 only.
+            "nlp_engine": engine,
+            "llm_used": stage1_llm_used,
+            "llm_role": "stage1" if stage1_llm_used else None,
+            "llm_backend": text_result.get("llm_backend"),
+            "llm_model": text_result.get("llm_model"),
             "vision_used": image_result is not None,
             "vision_model": "stub" if os.getenv("MODEL_STUB_MODE", "true").lower() == "true" else "SigLIP",
             "stub_mode": os.getenv("MODEL_STUB_MODE", "true").lower() == "true",
             # Which concrete models produced this result (reproducibility); the
-            # sentiment model is language-routed / runtime-switchable.
+            # sentiment model is the stage1 LLM in llm_mode, else language-routed.
             "model_versions": {
                 "sentiment": text_result.get("sentiment_model"),
                 "sentiment_route": text_result.get("sentiment_route"),
@@ -246,12 +259,15 @@ async def _process_message(
     post: dict,
     registry: ModelRegistry,
     sentiment_override: str | None = None,
+    backend_override: str | None = None,
 ) -> dict:
     """Run the full Stage-1 pipeline on a single post-with-details object.
 
     ``sentiment_override`` is the runtime UI/Redis selection (a key like
     ``"banglabert"``) forcing a specific sentiment model; ``None`` means
     auto-route by detected language (see libs/sentiment_models.py).
+    ``backend_override`` ("local"/"groq") follows the dashboard LLM toggle so
+    the stage1 LLM uses the same backend as Stage 2; ``None`` => LLM_BACKEND.
     """
 
     caption: str | None = post.get("caption")
@@ -259,7 +275,7 @@ async def _process_message(
     comments: list[dict] = post.get("comments") or []
 
     # 1. Text NLP on caption
-    text_result = await analyze_text(caption, registry, sentiment_override)
+    text_result = await analyze_text(caption, registry, sentiment_override, backend_override)
 
     # 2. Image analysis — MVP: only the first image
     image_result: dict | None = None
@@ -267,7 +283,9 @@ async def _process_message(
         image_result = await analyze_image(photo_urls[0], registry)
 
     # 3. Comment analysis
-    comment_analysis = await analyze_comments(comments, registry, sentiment_override)
+    comment_analysis = await analyze_comments(
+        comments, registry, sentiment_override, backend_override
+    )
 
     # 4. Sentiment fusion
     reaction_breakdown = post.get("reactionBreakdown") or {}
@@ -353,6 +371,18 @@ async def run_worker() -> None:
             except Exception:
                 sentiment_override = None
 
+            # Follow the dashboard LLM backend toggle (PUT /v1/config/llm) so the
+            # stage1 LLM uses the same backend as Stage 2. Blank/invalid => None
+            # => LLM_BACKEND default. Only read when llm_mode is on.
+            backend_override = None
+            if registry.llm_mode:
+                try:
+                    raw_backend = await redis.get(LLM_BACKEND_CONFIG_KEY)
+                    if raw_backend in ("local", "groq"):
+                        backend_override = raw_backend
+                except Exception:
+                    backend_override = None
+
             # messages: [(stream_name, [(msg_id, {field: value, ...}), ...])]
             for _stream, entries in messages:
                 for msg_id, fields in entries:
@@ -380,7 +410,9 @@ async def run_worker() -> None:
                             comment_analysis,
                             overall_sentiment,
                             sentiment_score,
-                        ) = await _process_message(post, registry, sentiment_override)
+                        ) = await _process_message(
+                            post, registry, sentiment_override, backend_override
+                        )
 
                         stage1_ms = (time.monotonic() - t0) * 1000.0
 

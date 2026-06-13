@@ -19,6 +19,7 @@ In real mode the pipeline calls:
 
 from __future__ import annotations
 
+import logging
 import re
 import sys
 import os
@@ -33,7 +34,10 @@ from libs.embeddings import fit_dim  # noqa: E402
 from libs.embeddings import stub_embedding as _shared_stub_embedding  # noqa: E402
 from libs.sentiment_models import resolve as _resolve_sentiment  # noqa: E402
 
+from .llm_analyzer import analyze_text_llm  # noqa: E402
 from .models import ModelRegistry  # noqa: E402
+
+logger = logging.getLogger(__name__)
 
 # ---------------------------------------------------------------------------
 # Bengali negative / positive seed words used by the stub heuristic
@@ -143,6 +147,9 @@ def _empty_result() -> dict:
         "embedding": None,
         "sentiment_route": None,
         "sentiment_model": None,
+        "engine": None,
+        "llm_backend": None,
+        "llm_model": None,
     }
 
 
@@ -517,10 +524,64 @@ async def analyze_sentiment(
     return _stub_sentiment(text)
 
 
+async def _analyze_text_llm_path(
+    text: str,
+    registry: ModelRegistry,
+    backend_override: str | None,
+) -> dict | None:
+    """Run Stage-1 NLP via the `stage1` LLM. Returns None on any failure.
+
+    The LLM produces the classification/extraction fields; script/Banglish flags
+    are computed deterministically and the embedding still comes from the
+    SentenceTransformer (or the shared stub), since a chat LLM can't emit one.
+    """
+    llm = registry.get_llm_client()
+    if llm is None:
+        return None
+    try:
+        nlp = await analyze_text_llm(text, llm, backend_override)
+    except Exception as exc:
+        logger.warning("stage1 LLM text analysis failed, falling back to stub: %s", exc)
+        return None
+
+    script = detect_script(text)
+    banglish = is_banglish(text)
+    language = nlp.get("language") or _stub_language(text)[0]
+
+    # Embedding: real model when available (non-stub), else the shared stub.
+    embed_model = registry.get_embedding_model()
+    embedding = _real_embedding(text, embed_model) if embed_model is not None else _stub_embedding(text)
+
+    return {
+        "language": language,
+        "script": script,
+        "is_banglish": banglish,
+        "language_confidence": 0.9 if nlp.get("language") else 0.75,
+        "sentiment": nlp["sentiment"],
+        "sentiment_score": nlp["sentiment_score"],
+        "sentiment_confidence": nlp["sentiment_confidence"],
+        "emotion": nlp["emotion"],
+        "topics": nlp["topics"],
+        "intents": nlp["intents"],
+        "toxicity_score": nlp["toxicity_score"],
+        "hate_speech_score": nlp["hate_speech_score"],
+        "entities": nlp["entities"],
+        "keywords": nlp["keywords"],
+        "embedding": embedding,
+        # The "model" is the stage1 LLM itself; route records that the LLM produced it.
+        "sentiment_route": "llm:stage1",
+        "sentiment_model": nlp.get("_llm_model"),
+        "engine": "llm",
+        "llm_backend": nlp.get("_llm_backend"),
+        "llm_model": nlp.get("_llm_model"),
+    }
+
+
 async def analyze_text(
     text: str | None,
     registry: ModelRegistry,
     sentiment_override: str | None = None,
+    backend_override: str | None = None,
 ) -> dict:
     """Run the full text NLP pipeline on a single text string.
 
@@ -532,6 +593,12 @@ async def analyze_text(
         return _empty_result()
 
     text = text.strip()
+
+    # LLM-backed Stage-1 path (STAGE1_LLM=true). Falls back to stub/real on error.
+    if registry.llm_mode:
+        llm_result = await _analyze_text_llm_path(text, registry, backend_override)
+        if llm_result is not None:
+            return llm_result
 
     if registry.stub_mode:
         language, script, banglish, lang_conf = _stub_language(text)
@@ -548,7 +615,9 @@ async def analyze_text(
         entities = _stub_ner(text)
         keywords = _stub_keywords(text)
         embedding = _stub_embedding(text)
+        engine = "stub"
     else:
+        engine = "models"
         # --- Language ---
         detector = registry.get_lang_detector()
         language, script, banglish, lang_conf = _real_language(text, detector)
@@ -641,4 +710,8 @@ async def analyze_text(
         # Which sentiment model the language router selected for this post.
         "sentiment_route": sent_route,
         "sentiment_model": sent_model_name,
+        # Which engine produced this result: "stub" | "models" | "llm".
+        "engine": engine,
+        "llm_backend": None,
+        "llm_model": None,
     }

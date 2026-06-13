@@ -35,11 +35,15 @@ SENTIMENT_MODEL_KEY = "config:sentiment_model"
 # Mirrors libs/llm/client.py role→model defaults.
 _MODEL_ENVS = {
     "local": {
+        "stage1": ("STAGE1_LOCAL_MODEL", "gemma3:4b"),
+        "stage2": ("STAGE2_LOCAL_MODEL", "qwen2.5:7b"),
         "llm_a": ("LLM_A_LOCAL_MODEL", "qwen2.5:7b"),
         "llm_b": ("LLM_B_LOCAL_MODEL", "qwen2.5:7b"),
         "vlm": ("VLM_LOCAL_MODEL", "qwen3-vl:4b"),
     },
     "groq": {
+        "stage1": ("STAGE1_GROQ_MODEL", "llama-3.1-8b-instant"),
+        "stage2": ("STAGE2_GROQ_MODEL", "llama-3.3-70b-versatile"),
         "llm_a": ("LLM_A_GROQ_MODEL", "llama-3.1-8b-instant"),
         "llm_b": ("LLM_B_GROQ_MODEL", "llama-3.3-70b-versatile"),
         "vlm": ("VLM_GROQ_MODEL", "meta-llama/llama-4-scout-17b-16e-instruct"),

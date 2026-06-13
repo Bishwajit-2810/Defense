@@ -111,6 +111,22 @@ report bursts, or fail over local→Groq under load.
 > placeholders and pin the current IDs in config. The prompts and JSON output
 > schema are identical across backends, so a switch needs no prompt changes.
 
+### Pipeline roles `stage1` / `stage2` (implementation)
+
+The per-post pipeline binds two concrete roles in `libs/llm/client.py`, each with
+its own model id so the **two stages run on different models**:
+
+| Role | env (`local` / `groq`) | default (Ollama / Groq) | Serves |
+| --- | --- | --- | --- |
+| `stage1` | `STAGE1_LOCAL_MODEL` / `STAGE1_GROQ_MODEL` | `gemma3:4b` / `llama-3.1-8b-instant` | **Stage-1 Fast NLP** — sentiment/emotion/topic/intent/toxicity/NER/keywords over caption + comments (`STAGE1_LLM=true`) |
+| `stage2` | `STAGE2_LOCAL_MODEL` / `STAGE2_GROQ_MODEL` | `qwen2.5:7b` / `llama-3.3-70b-versatile` | **Stage-2** — summary, post-type, insight, context-aware comment stance/summary |
+
+`stage1` is the LLM realization of the small-model suite in §1 (a small fast model
+carries the high-volume per-post + per-comment NLP); `stage2` is the larger quality
+model. `llm_a` / `llm_b` remain the architectural fast / quality roles for the
+agents + report layer (§5), and the VLM role is unchanged. On local Ollama all of
+these can be time-sliced on one GPU; on Groq they are just distinct model IDs.
+
 Why two roles and not one: the two jobs have opposite profiles. Per-post refinement
 is **high-volume, low-difficulty** (favor a small fast model); cluster/report
 generation is **low-volume, high-quality** (favor a larger model). Splitting them

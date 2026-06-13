@@ -13,6 +13,13 @@ data:
   LLM_BACKEND: "groq"
   LOG_LEVEL: "INFO"
   MODEL_STUB_MODE: "false"
+  # Stage 1 (Fast NLP) and Stage 2 run on DIFFERENT models. STAGE1_LLM=true →
+  # the Fast-NLP workers compute their NLP on the stage1 model (embeddings use
+  # the real SentenceTransformer since MODEL_STUB_MODE=false).
+  STAGE1_LLM: "true"
+  STAGE1_LLM_COMMENT_MAX: "60"
+  STAGE1_GROQ_MODEL: "llama-3.1-8b-instant"
+  STAGE2_GROQ_MODEL: "llama-3.3-70b-versatile"
   ANALYTICS_MCP_URL: "http://analytics-mcp.defense.svc.cluster.local:8100"
   RETRIEVAL_MCP_URL: "http://retrieval-mcp.defense.svc.cluster.local:8101"
   INGEST_MCP_URL: "http://ingest-mcp.defense.svc.cluster.local:8102"

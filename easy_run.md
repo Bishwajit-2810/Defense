@@ -1,8 +1,10 @@
 # easy_run.md — one-command quickstart (with the dashboard UI)
 
 Run the whole pipeline, load the 50 sample posts, and open the **dashboard in
-your browser** — with a single command. Local dev, stub mode, no GPU. For the
-deep reference (every env var, scaling, full troubleshooting) see [run.md](run.md).
+your browser** — with a single command. Local dev, no GPU: Stage-1 NLP runs on the
+**gemma3:4b** LLM and Stage-2 on **qwen2.5:7b** (both via Ollama); embeddings and
+vision stay stubbed. For the deep reference (every env var, scaling, full
+troubleshooting) see [run.md](run.md).
 
 Pipeline: `API → ingestion → stage1 NLP → router → stage2 LLM → assembler`
 → Postgres (+pgvector) + ClickHouse + MinIO. The **dashboard** is a static web UI
@@ -14,7 +16,7 @@ What ends up running:
 | -------------------------------------------- | --------------------------------- | ----------------------------------------------- |
 | Datastores (Postgres/Redis/ClickHouse/MinIO) | Docker                            | ✅ yes                                          |
 | 5 workers + API                              | host, API on **:8001**            | ✅ yes                                          |
-| Ollama (LLM)                                 | host, **:11434**                  | ✅ yes                                          |
+| Ollama (Stage-1 + Stage-2 LLMs + VLM)        | host, **:11434**                  | ✅ yes                                          |
 | **Dashboard**                                | host, **:8080** → open in browser | ✅ this is the UI                               |
 | Agents + 3 MCP servers                       | host, :8010 / :8110, :8101–8102   | ⛔ optional ([§4](#4-optional-the-agent-layer)) |
 
@@ -24,11 +26,13 @@ What ends up running:
 
 - **Docker** (with `compose`)
 - **[uv](https://docs.astral.sh/uv/)** — `curl -LsSf https://astral.sh/uv/install.sh | sh`
-- **[Ollama](https://ollama.com/)** with the two models pulled:
+- **[Ollama](https://ollama.com/)** with the three models pulled — Stage 1 and
+  Stage 2 run on **different** models:
 
   ```bash
-  ollama pull qwen2.5:7b
-  ollama pull qwen3-vl:4b
+  ollama pull gemma3:4b      # Stage-1 Fast NLP (sentiment/emotion/topics/… + comments)
+  ollama pull qwen2.5:7b     # Stage-2 summary / insight / comment stance
+  ollama pull qwen3-vl:4b    # VLM — image-grounded summaries
   ```
 
 Repo assumed at `/home/bk/code/defense`.
@@ -45,6 +49,12 @@ uv run run_all.py
 That's it. The script brings everything up, waits for it to be healthy, loads the
 50 posts, serves the UI, and prints the URLs. **Leave it running** — press
 **Ctrl-C** when you're done and it stops everything it started.
+
+> First run is slower than you might expect: Stage-1 NLP (`gemma3:4b`) and Stage-2
+> (`qwen2.5:7b`) make real Ollama calls per post **on CPU**, so analysing the 50
+> posts can take several minutes (the model weights also load on first call). The
+> dashboard is usable as soon as the first results land. To go faster, point the
+> LLM backend at Groq from the dashboard, or set `STAGE1_LLM=false` for stub NLP.
 
 <details>
 <summary>What it does, in order</summary>
@@ -88,11 +98,12 @@ submit. (Dev mode accepts any key.) Four tabs:
 
 **Header chips (click to open settings, switch at runtime):**
 
-- **LLM: …** — the Stage-2 LLM backend (`Local (Ollama)` ⇄ `Groq Cloud`).
-- **NLP: …** — the Stage-1 **sentiment model**. `Auto-route` picks by detected
-  language (Bangla→BanglaBERT, Banglish→BanglishBERT, else→XLM-R); you can force
-  one. In stub mode everything resolves to XLM-R and the Bangla/Banglish slots
-  show greyed-out until their `*_SENTIMENT_MODEL` checkpoint is configured.
+- **LLM: …** — the LLM backend for **both** Stage 1 and Stage 2
+  (`Local (Ollama)` ⇄ `Groq Cloud`); the switch applies to both stages at runtime.
+- **NLP: …** — the Stage-1 **sentiment model**, used only when Stage 1 runs the
+  small-model suite (`STAGE1_LLM=false`). `Auto-route` picks by detected language
+  (Bangla→BanglaBERT, Banglish→BanglishBERT, else→XLM-R). By default `STAGE1_LLM=true`,
+  so Stage-1 NLP runs on the **gemma3:4b** LLM and this selector doesn't apply.
 
 ---
 
@@ -124,6 +135,11 @@ The defaults work out of the box; these only matter if you want to tune or go
 beyond stub mode. Set env vars before `uv run run_all.py` (or in the manual §B
 block). Full reference in [run.md](run.md).
 
+- **Stage-1 LLM** (on by default): `STAGE1_LLM=true` makes the Fast-NLP workers
+  compute their NLP on the `stage1` model (`STAGE1_LOCAL_MODEL`, default
+  `gemma3:4b`); Stage 2 uses `STAGE2_LOCAL_MODEL` (default `qwen2.5:7b`). Set
+  `STAGE1_LLM=false` to fall back to the small-model suite (or its stub). Cap the
+  premium per-comment LLM pass with `STAGE1_LLM_COMMENT_MAX` (default 60).
 - **Rate limiting** (on by default, 120 req/min per API key on analysis/report/agent
   calls): `RATE_LIMIT_ENABLED=false` to turn off in dev, or `RATE_LIMIT_PER_MIN=…`.
 - **Near-duplicate reuse** (on by default): a post within cosine `NEAR_DUP_THRESHOLD`
@@ -156,7 +172,8 @@ block). Full reference in [run.md](run.md).
   your browser cached an old `app.js`. **Hard-refresh** (Ctrl-Shift-R). The dashboard
   targets `http://127.0.0.1:8001` by default; confirm `curl http://127.0.0.1:8001/v1/health` works.
 - **Want to start clean** → `uv run run_all.py --reset` (wipes Postgres + Redis, reloads posts).
-- **Ollama missing/empty** → `ollama pull qwen2.5:7b qwen3-vl:4b`; Stage-2 needs it.
+- **Ollama missing/empty** → `ollama pull gemma3:4b qwen2.5:7b qwen3-vl:4b`;
+  Stage-1 NLP (gemma3:4b) and Stage-2 (qwen2.5:7b) both need it.
 
 Full troubleshooting + every knob is in **[run.md](run.md)**.
 
@@ -198,6 +215,8 @@ export CLICKHOUSE_URL="clickhouse://defense:defense@$(ipof clickhouse):9000/defe
 export MINIO_ENDPOINT="http://$(ipof minio):9000"
 export MINIO_ACCESS_KEY=minioadmin MINIO_SECRET_KEY=minioadmin MINIO_BUCKET=defense
 export LLM_BACKEND=local LOCAL_LLM_BASE_URL=http://localhost:11434/v1 LOCAL_LLM_API_KEY=ollama
+# Stage 1 and Stage 2 run on different models; STAGE1_LLM=true puts Stage-1 NLP on the LLM.
+export STAGE1_LLM=true STAGE1_LOCAL_MODEL=gemma3:4b STAGE2_LOCAL_MODEL=qwen2.5:7b
 export LLM_A_LOCAL_MODEL=qwen2.5:7b VLM_LOCAL_MODEL=qwen3-vl:4b
 export MODEL_STUB_MODE=true JWT_SECRET=demo PYTHONPATH=$REPO
 ```

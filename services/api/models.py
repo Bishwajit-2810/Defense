@@ -187,6 +187,10 @@ class AnalysisResultResponse(BaseModel):
     post_summary_grounding: Optional[str] = None  # e.g. "caption+ocr+image"
     overall_sentiment: str
     sentiment_score: float
+    # Per-component sentiments, each its own {label, score} (caption / image).
+    # null for null-caption (text) / text-only (image) posts respectively.
+    text_sentiment: Optional[Dict[str, Any]] = None
+    image_sentiment: Optional[Dict[str, Any]] = None
     baseline_sentiment: Optional[float] = None
     emotion: Optional[Dict[str, Any]] = None
     intents: List[str] = []

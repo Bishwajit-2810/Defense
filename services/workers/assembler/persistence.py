@@ -77,6 +77,20 @@ def _now_utc() -> datetime:
     return datetime.now(timezone.utc)
 
 
+def _sentiment_label(value: object) -> str | None:
+    """Extract the label from a {label, score} component sentiment (or None).
+
+    The canonical JSON carries the {label, score} object, but the ClickHouse
+    analysis_events.text_sentiment/image_sentiment columns are Nullable(String)
+    for fast group-by — so analytics stores just the label.
+    """
+    if isinstance(value, dict):
+        return value.get("label")
+    if isinstance(value, str):
+        return value
+    return None
+
+
 # ---------------------------------------------------------------------------
 # PostgreSQL
 # ---------------------------------------------------------------------------
@@ -176,8 +190,10 @@ def _clickhouse_insert_sync(result: dict, ch_client) -> None:
         "language": language,
         "overall_sentiment": overall_sentiment,
         "sentiment_score": sentiment_score,
-        "text_sentiment": result.get("text_sentiment"),
-        "image_sentiment": result.get("image_sentiment"),
+        # analysis_events.text_sentiment/image_sentiment are Nullable(String) for
+        # aggregation — store just the label from the {label, score} object.
+        "text_sentiment": _sentiment_label(result.get("text_sentiment")),
+        "image_sentiment": _sentiment_label(result.get("image_sentiment")),
         "toxicity_score": toxicity_score,
         "hate_speech_score": hate_speech_score,
         "comment_count": comment_count,

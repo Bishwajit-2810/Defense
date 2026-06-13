@@ -26,6 +26,13 @@ class ModelRegistry:
         self._stub_mode: bool = (
             os.getenv("MODEL_STUB_MODE", "true").lower() == "true"
         )
+        # LLM-backed Stage-1 NLP: when true, the caption + comments are analysed
+        # by the `stage1` LLM (gemma3:4b on local Ollama by default) instead of
+        # the small-model suite / stub. Independent of stub_mode: the LLM can
+        # carry the NLP while embeddings still fall back to the stub. Any LLM
+        # failure degrades to the deterministic stub in the analyzers.
+        self._llm_mode: bool = os.getenv("STAGE1_LLM", "false").lower() == "true"
+        self._llm_client: Any = None
         # Cached model handles (None until first use)
         self._lang_detector: Any = None
         # Sentiment models are cached per HF checkpoint name so the language-aware
@@ -49,6 +56,32 @@ class ModelRegistry:
     def stub_mode(self) -> bool:
         """True when running in stub mode (no GPU / model weights needed)."""
         return self._stub_mode
+
+    @property
+    def llm_mode(self) -> bool:
+        """True when Stage-1 NLP runs on the `stage1` LLM (STAGE1_LLM=true)."""
+        return self._llm_mode
+
+    def get_llm_client(self) -> Any:
+        """Return the shared backend-agnostic LLMClient, or None if disabled.
+
+        Lazily constructed on first use so stub/CI runs never import the OpenAI
+        client. The `stage1` role resolves to STAGE1_LOCAL_MODEL (gemma3:4b).
+        """
+        if not self._llm_mode:
+            return None
+        if self._llm_client is None:
+            try:
+                from libs.llm import LLMClient  # noqa: PLC0415
+
+                self._llm_client = LLMClient()
+                logger.info("Stage-1 LLMClient initialised (STAGE1_LLM=true)")
+            except Exception as exc:
+                logger.error("Failed to init Stage-1 LLMClient: %s", exc)
+                # Disable llm_mode so callers stop retrying and use the stub.
+                self._llm_mode = False
+                return None
+        return self._llm_client
 
     # ------------------------------------------------------------------
     # Language detection

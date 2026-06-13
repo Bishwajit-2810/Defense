@@ -11,16 +11,25 @@ analyze_comments():
 from __future__ import annotations
 
 import logging
+import os
 import re
 from collections import Counter
 from typing import TYPE_CHECKING, Any
 
+from .llm_analyzer import classify_comments_llm
 from .text_analyzer import analyze_sentiment
 
 if TYPE_CHECKING:
     from .models import ModelRegistry
 
 logger = logging.getLogger(__name__)
+
+# LLM-backed Stage-1 comment labelling (STAGE1_LLM=true). Only the most-engaged
+# *substantive* comments get the LLM (batched) so a post with thousands of
+# comments can't stall Stage 1; the rest keep their instant heuristic/stub label,
+# so coverage stays 100%. Mirrors the Stage-2 stance cap (COMMENT_STANCE_*).
+_LLM_COMMENT_MAX = int(os.getenv("STAGE1_LLM_COMMENT_MAX", "60"))
+_LLM_COMMENT_BATCH = int(os.getenv("STAGE1_LLM_COMMENT_BATCH", "40"))
 
 
 # ---------------------------------------------------------------------------
@@ -260,10 +269,58 @@ def _aggregate_top_keywords(analyzed_comments: list[dict]) -> list[str]:
 # Public entry-point
 # ---------------------------------------------------------------------------
 
+async def _llm_upgrade_comments(
+    records: list[dict],
+    registry: Any,
+    backend_override: str | None,
+) -> None:
+    """Re-label the top-N substantive comments via the `stage1` LLM (in place).
+
+    Short/emoji comments (method="fast") keep their free heuristic label; only
+    the most-liked substantive comments are sent to the LLM, batched and capped
+    by STAGE1_LLM_COMMENT_MAX. Each LLM failure leaves that batch on its
+    heuristic/stub label. Mutates ``records`` (sentiment/score/emotion/keywords/
+    method) so coverage stays 100% while the premium pass stays bounded.
+    """
+    llm = registry.get_llm_client()
+    if llm is None:
+        return
+
+    substantive = [r for r in records if r.get("method") != "fast"]
+    if not substantive:
+        return
+    if 0 < _LLM_COMMENT_MAX < len(substantive):
+        targets = sorted(
+            substantive, key=lambda r: int(r.get("likes") or 0), reverse=True
+        )[:_LLM_COMMENT_MAX]
+    else:
+        targets = substantive
+
+    for start in range(0, len(targets), _LLM_COMMENT_BATCH):
+        batch = targets[start : start + _LLM_COMMENT_BATCH]
+        try:
+            labels = await classify_comments_llm(
+                [r["text"] for r in batch], llm, backend_override
+            )
+        except Exception as exc:
+            logger.warning("stage1 LLM comment batch failed (start=%s): %s", start, exc)
+            continue
+        for r, label in zip(batch, labels):
+            if not isinstance(label, dict):
+                continue
+            r["sentiment"] = label["sentiment"]
+            r["sentiment_score"] = label["sentiment_score"]
+            r["emotion"] = label["emotion"]
+            if label.get("keywords"):
+                r["keywords"] = label["keywords"]
+            r["method"] = "llm"
+
+
 async def analyze_comments(
     comments: list[dict],
     registry: Any,  # ModelRegistry — avoid circular import
     sentiment_override: str | None = None,
+    backend_override: str | None = None,
 ) -> dict:
     """Analyse all embedded comments and return a comment_analysis dict.
 
@@ -299,12 +356,9 @@ async def analyze_comments(
             "comments": [],
         }
 
-    analyzed_list: list[dict] = []
-    per_comment: list[dict] = []
-    sentiment_counts: dict[str, int] = {"positive": 0, "negative": 0, "neutral": 0}
-    emotion_counts: dict[str, int] = _empty_emotion_breakdown()
-    method_counts: dict[str, int] = {"fast": 0, "model": 0}
-
+    # 1. Baseline pass — every comment gets an instant heuristic/stub label
+    #    (full coverage), holding all fields in one record per comment.
+    records: list[dict] = []
     for comment in comments:
         text = comment.get("text") or ""
         try:
@@ -318,54 +372,62 @@ async def analyze_comments(
                 "method": "fast",
                 "keywords": [],
             }
-
-        sentiment = nlp.get("sentiment") or "neutral"
-        # Normalise to known keys
-        if sentiment not in sentiment_counts:
-            sentiment = "neutral"
-        sentiment_counts[sentiment] += 1
-        emotion = nlp.get("emotion") or "neutral"
-        if emotion not in emotion_counts:
-            emotion = "neutral"
-        emotion_counts[emotion] += 1
-        method = nlp.get("method", "fast")
-        method_counts[method] = method_counts.get(method, 0) + 1
-
-        likes = comment.get("likes", 0)
-        score = nlp.get("sentiment_score", 0.0)
-        analyzed_list.append(
+        records.append(
             {
                 "id": comment.get("id", ""),
                 "text": text,
-                "likes": likes,
-                "sentiment": sentiment,
-                "sentiment_score": score,
-                "emotion": emotion,
-                "keywords": nlp.get("keywords", []),
-                "topics": nlp.get("topics", []),
-            }
-        )
-        # The persisted per-comment record (one row per comment downstream).
-        per_comment.append(
-            {
-                "id": comment.get("id", ""),
-                "text": text,
-                "likes": likes,
+                "likes": comment.get("likes", 0),
                 "author": comment.get("authorUsername"),
                 "parent_id": comment.get("parentId"),
-                "sentiment": sentiment,
-                "sentiment_score": score,
-                "emotion": emotion,
-                "method": method,
+                "sentiment": nlp.get("sentiment") or "neutral",
+                "sentiment_score": nlp.get("sentiment_score", 0.0),
+                "emotion": nlp.get("emotion") or "neutral",
+                "keywords": nlp.get("keywords", []),
+                "method": nlp.get("method", "fast"),
             }
         )
 
-    themes = _extract_themes(analyzed_list)
-    top_keywords = _aggregate_top_keywords(analyzed_list)
-    representative = _select_representative(analyzed_list)
+    # 2. LLM upgrade pass (STAGE1_LLM=true) — re-label the top-N substantive
+    #    comments via the stage1 LLM so they match the LLM engine. No-op otherwise.
+    if registry.llm_mode:
+        await _llm_upgrade_comments(records, registry, backend_override)
+
+    # 3. Aggregate from the (possibly upgraded) records.
+    sentiment_counts: dict[str, int] = {"positive": 0, "negative": 0, "neutral": 0}
+    emotion_counts: dict[str, int] = _empty_emotion_breakdown()
+    method_counts: dict[str, int] = {"fast": 0, "model": 0}
+    for r in records:
+        s = r["sentiment"] if r["sentiment"] in sentiment_counts else "neutral"
+        r["sentiment"] = s
+        sentiment_counts[s] += 1
+        e = r["emotion"] if r["emotion"] in emotion_counts else "neutral"
+        r["emotion"] = e
+        emotion_counts[e] += 1
+        m = r.get("method", "fast")
+        method_counts[m] = method_counts.get(m, 0) + 1
+
+    themes = _extract_themes(records)
+    top_keywords = _aggregate_top_keywords(records)
+    representative = _select_representative(records)
+
+    # The persisted per-comment records (one row per comment downstream).
+    per_comment = [
+        {
+            "id": r["id"],
+            "text": r["text"],
+            "likes": r["likes"],
+            "author": r["author"],
+            "parent_id": r["parent_id"],
+            "sentiment": r["sentiment"],
+            "sentiment_score": r["sentiment_score"],
+            "emotion": r["emotion"],
+            "method": r["method"],
+        }
+        for r in records
+    ]
 
     return {
-        "analyzed": len(analyzed_list),
+        "analyzed": len(records),
         # coverage is 0.0 here; the worker fills the real value using
         # engagement.commentCount after this function returns.
         "coverage": 0.0,

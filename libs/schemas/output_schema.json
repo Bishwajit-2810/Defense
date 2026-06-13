@@ -18,8 +18,16 @@
     "post_summary_source": {"type":["string","null"],"enum":["vlm","llm",null]},
     "overall_sentiment": {"type":"string","enum":["positive","negative","neutral","mixed"]},
     "sentiment_score": {"type":"number","minimum":-1,"maximum":1},
-    "text_sentiment": {"type":["string","null"]},
-    "image_sentiment": {"type":["string","null"]},
+    "text_sentiment": {
+      "type":["object","null"],
+      "description":"Caption sentiment with its own score; null for null-caption posts.",
+      "properties": {"label":{"type":["string","null"]},"score":{"type":["number","null"]}}
+    },
+    "image_sentiment": {
+      "type":["object","null"],
+      "description":"Aggregate image sentiment with its own score; null for text-only posts.",
+      "properties": {"label":{"type":["string","null"]},"score":{"type":["number","null"]}}
+    },
     "baseline_sentiment": {"type":["number","null"]},
     "baseline_viral_potential": {"type":["number","null"]},
     "emotion": {

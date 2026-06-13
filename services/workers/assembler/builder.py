@@ -23,7 +23,23 @@ from schemas.validator import assert_valid_output
 # ---------------------------------------------------------------------------
 # Schema version — bump when the output schema changes
 # ---------------------------------------------------------------------------
-SCHEMA_VERSION = "1.1"  # 1.1: per-comment emotion label + comment_analysis.emotion_breakdown
+# 1.1: per-comment emotion label + comment_analysis.emotion_breakdown
+# 1.2: text_sentiment / image_sentiment carry their own {label, score} object
+SCHEMA_VERSION = "1.2"
+
+
+def _norm_component_sentiment(value: object) -> dict | None:
+    """Normalise a per-component sentiment to ``{"label", "score"}`` or ``None``.
+
+    Stage 1 emits ``{label, score}``; tolerate a bare label string (→ score
+    ``None``) and pass ``None`` through (null-caption → text_sentiment null;
+    text-only → image_sentiment null).
+    """
+    if isinstance(value, dict):
+        return {"label": value.get("label"), "score": value.get("score")}
+    if isinstance(value, str):
+        return {"label": value, "score": None}
+    return None
 
 
 def build_canonical_result(
@@ -109,12 +125,12 @@ def build_canonical_result(
     # ------------------------------------------------------------------
     overall_sentiment: str = stage1_result["overall_sentiment"]
     sentiment_score: float = stage1_result["sentiment_score"]
-    # Stage-1 may emit either a bare label or a {label, score} dict; the schema
-    # wants the bare label string (the score lives in sentiment_score).
-    _ts = stage1_result.get("text_sentiment")      # null for null-caption posts
-    text_sentiment: str | None = _ts.get("label") if isinstance(_ts, dict) else _ts
-    _is = stage1_result.get("image_sentiment")     # null for text-only posts
-    image_sentiment: str | None = _is.get("label") if isinstance(_is, dict) else _is
+    # Per-component sentiments carry their OWN {label, score} (the caption's and
+    # the image's scores differ from the fused overall_sentiment/sentiment_score).
+    # Normalise to {label, score}: a bare label becomes {label, score:None};
+    # null stays null (null-caption → text_sentiment null; text-only → image null).
+    text_sentiment: dict | None = _norm_component_sentiment(stage1_result.get("text_sentiment"))
+    image_sentiment: dict | None = _norm_component_sentiment(stage1_result.get("image_sentiment"))
 
     # ------------------------------------------------------------------
     # Baseline fields — ALWAYS from normalized_post, NEVER overwritten

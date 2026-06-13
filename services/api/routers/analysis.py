@@ -674,6 +674,8 @@ def _row_to_result(row: Any) -> AnalysisResultResponse:
         post_summary_grounding=r.get("post_summary_grounding"),
         overall_sentiment=r.get("overall_sentiment", "neutral"),
         sentiment_score=r.get("sentiment_score", 0.0),
+        text_sentiment=r.get("text_sentiment"),
+        image_sentiment=r.get("image_sentiment"),
         baseline_sentiment=r.get("baseline_sentiment"),
         emotion=r.get("emotion"),
         intents=r.get("intents", []),

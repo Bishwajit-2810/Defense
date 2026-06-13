@@ -64,7 +64,8 @@ COVERAGE_AGENT = AgentDefinition(
     description="Deep-dive: find low-coverage posts and fetch more comments",
     system_prompt=COVERAGE_SYSTEM_PROMPT,
     tools=["top_posts", "get_post", "fetch_more_comments"],
-    llm_role="llm_a",
+    # architecture.md §11: the corpus/report-tier agents run on the LLM-B role.
+    llm_role="llm_b",
     max_tool_calls=5,
 )
 

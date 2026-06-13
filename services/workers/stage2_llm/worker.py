@@ -39,10 +39,12 @@ from .prompts import (  # noqa: E402
 )
 
 # Context-aware comment stance (post + comments → per-comment stance via LLM).
-# Comment stance runs on the lighter llm_b model slot (e.g. gemma3:4b) — set
-# LLM_B_LOCAL_MODEL to control it. Summaries/post-type stay on llm_a (qwen2.5:7b).
+# All Stage-2 text work — summary, post-type, insight, comment stance/summary —
+# runs on the `stage2` model (qwen2.5:7b by default), a different, larger model
+# than the Stage-1 NLP model (`stage1` = gemma3:4b). Override with
+# STAGE2_LOCAL_MODEL, or per-task via COMMENT_STANCE_ROLE.
 _STANCE_ENABLED = os.environ.get("COMMENT_STANCE", "true").lower() == "true"
-_STANCE_ROLE = os.environ.get("COMMENT_STANCE_ROLE", "llm_b")
+_STANCE_ROLE = os.environ.get("COMMENT_STANCE_ROLE", "stage2")
 _STANCE_BATCH = int(os.environ.get("COMMENT_STANCE_BATCH", "40"))
 _STANCE_MAX_TEXT = 140
 # Cap how many comments per post get the (slow) context-aware LLM stance: the
@@ -232,11 +234,12 @@ async def _run_summary(
     # Only actually drive the VLM when an image was genuinely fetched. A "vlm"
     # role with no fetchable image — e.g. photo_urls are relative storage paths
     # ("posts/.../x.jpg") rather than absolute URLs, or the CDN link expired — is
-    # worse than useless: the local VLM is weaker than llm_a at text-only
+    # worse than useless: the local VLM is weaker than the text model at text-only
     # summarisation and frequently returns empty. So when there's no image to
-    # ground on, summarise on llm_a from caption + OCR directly instead of burning
-    # a doomed VLM call that strands the post with a blank summary.
-    effective_role = role if grounded_on_image else "llm_a"
+    # ground on, summarise on the `stage2` model from caption + OCR directly
+    # instead of burning a doomed VLM call that strands the post with a blank
+    # summary.
+    effective_role = role if grounded_on_image else "stage2"
     chat_messages = messages if grounded_on_image else text_only_messages
 
     try:
@@ -246,16 +249,16 @@ async def _run_summary(
             raise
         logger.warning("vlm_summary_failed_falling_back_to_text", error=str(exc))
         grounded_on_image = False
-        response = await _chat("llm_a", text_only_messages)
+        response = await _chat("stage2", text_only_messages)
 
     # Local VLMs (qwen3-vl) frequently return EMPTY content without raising — that
     # left image posts with a blank summary. Whenever the VLM was actually used
-    # and produced nothing, redo the summary text-only on llm_a so the caption +
-    # OCR still yield a summary.
+    # and produced nothing, redo the summary text-only on the `stage2` model so the
+    # caption + OCR still yield a summary.
     if effective_role == "vlm" and not (response.get("content") or "").strip():
         logger.warning("vlm_summary_empty_falling_back_to_text", post_id=partial_result.get("post_id"))
         grounded_on_image = False
-        response = await _chat("llm_a", text_only_messages)
+        response = await _chat("stage2", text_only_messages)
 
     await _track_usage(redis, response)
 
@@ -629,13 +632,15 @@ async def _process_message(
         "photo_urls": normalized_post.get("photo_urls") or [],
     }
 
-    # Choose role: VLM for image posts (photo_urls present), LLM-A otherwise.
-    # Set VLM_SUMMARY=false to skip image grounding entirely — useful when the
-    # local VLM is weak/unavailable (e.g. returns empty), so every post still gets
-    # a text+OCR-grounded summary without burning a wasted VLM call first.
+    # Choose the summary role: VLM for image posts (photo_urls present), the
+    # text `stage2` model otherwise. Set VLM_SUMMARY=false to skip image grounding
+    # entirely — useful when the local VLM is weak/unavailable (e.g. returns
+    # empty), so every post still gets a text+OCR-grounded summary without burning
+    # a wasted VLM call first. Post-type/insight are text tasks and always use
+    # `stage2` (never the VLM).
     has_photos = bool(normalized_post.get("photo_urls"))
     vlm_enabled = os.environ.get("VLM_SUMMARY", "true").lower() == "true"
-    role = "vlm" if (has_photos and vlm_enabled) else "llm_a"
+    role = "vlm" if (has_photos and vlm_enabled) else "stage2"
 
     stage2_result: dict = {}
 
@@ -650,7 +655,7 @@ async def _process_message(
     )
 
     # ---- Lane A: post-level analysis (summary + post-type + insight) ----
-    # All run on the llm_a / vlm slot, sequentially within the lane.
+    # All run on the stage2 / vlm slot, sequentially within the lane.
     async def _post_level_lane() -> dict:
         out: dict = {}
         backend = model = None
@@ -676,7 +681,7 @@ async def _process_message(
 
         if task_flags.get("want_post_type", False):
             try:
-                pt_data = await _run_post_type(llm, redis, partial_result, task_flags, role, backend_override)
+                pt_data = await _run_post_type(llm, redis, partial_result, task_flags, "stage2", backend_override)
                 out["post_type"] = pt_data.get("post_type")
                 out["post_type_confidence"] = pt_data.get("post_type_confidence")
                 backend = backend or pt_data.get("_llm_backend")
@@ -686,7 +691,7 @@ async def _process_message(
 
         if task_flags.get("want_insight", False):
             try:
-                insight_data = await _run_insight(llm, redis, partial_result, task_flags, role, backend_override)
+                insight_data = await _run_insight(llm, redis, partial_result, task_flags, "stage2", backend_override)
                 if insight_data.get("refined_topics"):
                     out["topics"] = insight_data["refined_topics"]
                 out["intents"] = insight_data.get("intents") or []
@@ -701,7 +706,7 @@ async def _process_message(
         return out
 
     # ---- Lane B: comment analysis (context-aware stance → comment summary) ----
-    # Runs on the llm_b slot. Re-labels every embedded comment by its stance
+    # Runs on the stage2 slot. Re-labels every embedded comment by its stance
     # toward the post (batched) and mutates stage1_result["comment_analysis"] in
     # place so the assembler persists the context-aware labels. The comment
     # summary must run AFTER stance (it reads the recomputed breakdowns), so this

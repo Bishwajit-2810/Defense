@@ -36,27 +36,47 @@ T = TypeVar("T")
 # Role → model-id maps
 # ---------------------------------------------------------------------------
 
+# Roles:
+#   stage1 — the Stage-1 Fast-NLP model (sentiment/emotion/topic/intent/toxicity/
+#            NER/keywords over caption + comments). One fast, small model carries
+#            the high-volume per-post + per-comment work — see architecture.md §3.4.
+#   stage2 — the Stage-2 model (summary/post-type/insight + context-aware comment
+#            stance/summary). A larger, higher-quality model than stage1.
+#   llm_a / llm_b — the architectural LLM-A (fast) / LLM-B (quality) roles still
+#            used by the agents + report layer (services/agents, reports.py).
+#   vlm    — vision-language model for image-grounded summaries.
 _ROLE_LOCAL_ENV: dict[str, str] = {
+    "stage1": "STAGE1_LOCAL_MODEL",
+    "stage2": "STAGE2_LOCAL_MODEL",
     "llm_a": "LLM_A_LOCAL_MODEL",
     "llm_b": "LLM_B_LOCAL_MODEL",
     "vlm":   "VLM_LOCAL_MODEL",
 }
 
 _ROLE_GROQ_ENV: dict[str, str] = {
+    "stage1": "STAGE1_GROQ_MODEL",
+    "stage2": "STAGE2_GROQ_MODEL",
     "llm_a": "LLM_A_GROQ_MODEL",
     "llm_b": "LLM_B_GROQ_MODEL",
     "vlm":   "VLM_GROQ_MODEL",
 }
 
-# Defaults target a local Ollama (OpenAI-compatible) server. Override per role
-# with the LLM_*_LOCAL_MODEL env vars; any model from `ollama list` works.
+# The default backend is `local` (LLM_BACKEND), so these Ollama model ids are the
+# ids actually used out of the box for Stage 1 and Stage 2 — gemma3:4b (fast) for
+# Stage 1, qwen2.5:7b (quality) for Stage 2. Override per role with the
+# *_LOCAL_MODEL env vars; any model from `ollama list` works.
 _ROLE_LOCAL_DEFAULT: dict[str, str] = {
+    "stage1": "gemma3:4b",
+    "stage2": "qwen2.5:7b",
     "llm_a": "qwen2.5:7b",
     "llm_b": "qwen2.5:7b",
     "vlm":   "qwen3-vl:4b",
 }
 
+# Only consulted when LLM_BACKEND=groq (opt-in); local/Ollama is the default.
 _ROLE_GROQ_DEFAULT: dict[str, str] = {
+    "stage1": "llama-3.1-8b-instant",
+    "stage2": "llama-3.3-70b-versatile",
     "llm_a": "llama-3.1-8b-instant",
     "llm_b": "llama-3.3-70b-versatile",
     "vlm":   "meta-llama/llama-4-scout-17b-16e-instruct",
