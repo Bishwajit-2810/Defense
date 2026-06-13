@@ -10,7 +10,11 @@ In real mode the pipeline calls:
   - unitary/toxic-bert for toxicity / hate-speech
   - GLiNER (urchade/gliner_multi-v2.1) for NER
   - KeyBERT for keywords
-  - BAAI/bge-m3 (SentenceTransformer) for dense embeddings
+  - paraphrase-multilingual-mpnet-base-v2 (SentenceTransformer, 768-dim — must
+    match the pgvector analysis_results.embedding vector(768) column; see
+    libs/embeddings.py) for dense embeddings
+  - embedding-prototype cosine for topics/intents (no extra model — reuses the
+    sentence embedding above), unioned with the keyword-seed heuristic
 """
 
 from __future__ import annotations
@@ -27,6 +31,7 @@ sys.path.insert(0, os.path.abspath(os.path.join(os.path.dirname(__file__), "..",
 from common.utils import detect_script, is_banglish  # noqa: E402
 from libs.embeddings import fit_dim  # noqa: E402
 from libs.embeddings import stub_embedding as _shared_stub_embedding  # noqa: E402
+from libs.sentiment_models import resolve as _resolve_sentiment  # noqa: E402
 
 from .models import ModelRegistry  # noqa: E402
 
@@ -136,6 +141,8 @@ def _empty_result() -> dict:
         "entities": [],
         "keywords": [],
         "embedding": None,
+        "sentiment_route": None,
+        "sentiment_model": None,
     }
 
 
@@ -378,17 +385,119 @@ def _real_embedding(text: str, embed_model: object) -> list[float]:
 
 
 # ---------------------------------------------------------------------------
+# Embedding-prototype topic / intent classification (real mode)
+#
+# Reuses the sentence embedding Stage-1 already computes (no extra model, per
+# architecture §10 "one pass, many tasks"): each label is embedded once into a
+# prototype vector and we score the post against them by cosine similarity. The
+# keyword seeds remain a high-precision prior — we union the two. Floors are
+# tunable from a labeled validation set (plan.md / evaluation.md).
+# ---------------------------------------------------------------------------
+
+# Label -> short descriptive phrase (embedded as the prototype). "general" /
+# "inform" are deliberately excluded: they are the fallbacks when nothing scores
+# above the floor.
+_TOPIC_LABELS: dict[str, str] = {
+    "politics": "politics, government, elections, political parties",
+    "religion": "religion, islam, faith, mosque, religious practice",
+    "crime": "crime, police, arrest, murder, law enforcement",
+    "protest": "protest, demonstration, rally, strike, movement",
+    "grief": "grief, mourning, death, remembrance, condolence",
+    "india": "India, Indian politics or relations",
+    "bangladesh": "Bangladesh, Dhaka, national affairs",
+    "economy": "economy, prices, business, market, inflation",
+    "sports": "sports, cricket, football, match, tournament",
+    "entertainment": "entertainment, film, music, celebrity, drama",
+}
+
+_INTENT_LABELS: dict[str, str] = {
+    "express_grievance": "expressing anger, grievance, or complaint",
+    "commemorate": "commemorating or remembering a person or event",
+    "call_to_action": "calling people to act, share, support, or vote",
+    "question": "asking a question",
+    "promote": "promoting or advertising a product or service",
+}
+
+# Tunable similarity floors / multi-label margin.
+_TOPIC_PROTO_FLOOR: float = float(os.getenv("TOPIC_PROTO_FLOOR", "0.28"))
+_INTENT_PROTO_FLOOR: float = float(os.getenv("INTENT_PROTO_FLOOR", "0.30"))
+_PROTO_MARGIN: float = float(os.getenv("PROTO_MARGIN", "0.05"))
+
+# Prototype-vector cache, keyed by "<label-set>|<model-name>" so a model swap
+# (EMBEDDING_MODEL change) transparently re-embeds the prototypes.
+_PROTOTYPE_CACHE: dict[str, dict[str, list[float]]] = {}
+
+
+def _embed_prototypes(name: str, labels: dict[str, str], embed_model: object) -> dict[str, list[float]]:
+    """Embed each label phrase once (cached). Vectors are L2-normalized."""
+    key = f"{name}|{os.getenv('EMBEDDING_MODEL', '')}"
+    cached = _PROTOTYPE_CACHE.get(key)
+    if cached is not None:
+        return cached
+    protos: dict[str, list[float]] = {}
+    for label, phrase in labels.items():
+        vec = embed_model.encode(phrase, normalize_embeddings=True)  # type: ignore[union-attr]
+        protos[label] = [float(v) for v in vec]
+    _PROTOTYPE_CACHE[key] = protos
+    return protos
+
+
+def _cosine(a: list[float], b: list[float]) -> float:
+    """Cosine similarity; safe for already-normalized or raw vectors."""
+    n = min(len(a), len(b))
+    if n == 0:
+        return 0.0
+    dot = sum(a[i] * b[i] for i in range(n))
+    na = sum(x * x for x in a[:n]) ** 0.5
+    nb = sum(x * x for x in b[:n]) ** 0.5
+    if na == 0.0 or nb == 0.0:
+        return 0.0
+    return dot / (na * nb)
+
+
+def _classify_by_prototype(
+    embedding: list[float] | None,
+    name: str,
+    labels: dict[str, str],
+    embed_model: object,
+    floor: float,
+    top_k: int,
+) -> list[str]:
+    """Return labels whose prototype cosine clears the floor, near the top score.
+
+    Empty list when the post embedding is missing or nothing beats ``floor`` —
+    the caller then falls back to the keyword heuristic / default label.
+    """
+    if not embedding:
+        return []
+    protos = _embed_prototypes(name, labels, embed_model)
+    sims = {label: _cosine(embedding, vec) for label, vec in protos.items()}
+    ranked = sorted(sims, key=lambda label: sims[label], reverse=True)
+    top_sim = sims[ranked[0]]
+    if top_sim < floor:
+        return []
+    cutoff = max(floor, top_sim - _PROTO_MARGIN)
+    return [label for label in ranked if sims[label] >= cutoff][:top_k]
+
+
+# ---------------------------------------------------------------------------
 # Public entry-point
 # ---------------------------------------------------------------------------
 
-async def analyze_sentiment(text: str | None, registry: ModelRegistry) -> tuple[str, float, float]:
+async def analyze_sentiment(
+    text: str | None,
+    registry: ModelRegistry,
+    sentiment_override: str | None = None,
+) -> tuple[str, float, float]:
     """Sentiment-only classification for a single string — (label, score, confidence).
 
     A lightweight cousin of :func:`analyze_text` used for per-comment scoring.
     It deliberately skips the expensive embedding / NER / keyword stages so the
     hybrid comment classifier can score thousands of comments per post without
-    generating a dense vector for each one. Uses the real XLM-R sentiment model
-    when available (``MODEL_STUB_MODE=false``), otherwise the deterministic stub.
+    generating a dense vector for each one. The sentiment model is chosen by the
+    comment's own language (BanglaBERT/BanglishBERT/XLM-R via the shared router),
+    honouring ``sentiment_override``; falls back to the deterministic stub when
+    ``MODEL_STUB_MODE=true`` or the model is unavailable.
     """
     if not text or not text.strip():
         return "neutral", 0.0, 0.0
@@ -398,14 +507,21 @@ async def analyze_sentiment(text: str | None, registry: ModelRegistry) -> tuple[
     if registry.stub_mode:
         return _stub_sentiment(text)
 
-    sent_pair = registry.get_sentiment_model()
+    _key, hf_name = _resolve_sentiment(
+        detect_script(text), is_banglish(text), None, sentiment_override
+    )
+    sent_pair = registry.get_sentiment_model(hf_name)
     if sent_pair is not None:
         tokenizer, sent_model = sent_pair
         return _real_sentiment(text, tokenizer, sent_model)
     return _stub_sentiment(text)
 
 
-async def analyze_text(text: str | None, registry: ModelRegistry) -> dict:
+async def analyze_text(
+    text: str | None,
+    registry: ModelRegistry,
+    sentiment_override: str | None = None,
+) -> dict:
     """Run the full text NLP pipeline on a single text string.
 
     Returns a dict with all NLP fields.  When text is None or empty, returns
@@ -419,6 +535,11 @@ async def analyze_text(text: str | None, registry: ModelRegistry) -> dict:
 
     if registry.stub_mode:
         language, script, banglish, lang_conf = _stub_language(text)
+        # Record which model the router *would* pick (transparency in stub mode);
+        # the stub sentiment is model-independent.
+        sent_route, sent_model_name = _resolve_sentiment(
+            script, banglish, language, sentiment_override
+        )
         sentiment_label, sentiment_score, sentiment_conf = _stub_sentiment(text)
         emotion = _stub_emotion(sentiment_label, text)
         topics = _stub_topics(text)
@@ -432,8 +553,11 @@ async def analyze_text(text: str | None, registry: ModelRegistry) -> dict:
         detector = registry.get_lang_detector()
         language, script, banglish, lang_conf = _real_language(text, detector)
 
-        # --- Sentiment ---
-        sent_pair = registry.get_sentiment_model()
+        # --- Sentiment (language-routed model) ---
+        sent_route, sent_model_name = _resolve_sentiment(
+            script, banglish, language, sentiment_override
+        )
+        sent_pair = registry.get_sentiment_model(sent_model_name)
         if sent_pair is not None:
             tokenizer, sent_model = sent_pair
             sentiment_label, sentiment_score, sentiment_conf = _real_sentiment(
@@ -477,9 +601,26 @@ async def analyze_text(text: str | None, registry: ModelRegistry) -> dict:
         else:
             embedding = _stub_embedding(text)
 
-        # Topics / intents remain heuristic for now (use stub logic as prior)
-        topics = _stub_topics(text)
-        intents = _stub_intents(text)
+        # --- Topics / intents ---
+        # Union the keyword seeds (high precision) with embedding-prototype
+        # classification (recall for paraphrases / Banglish), reusing the post
+        # embedding. Prototypes need a real embedding model + real (non-stub)
+        # vectors; otherwise fall back to the heuristic alone.
+        if embed_model is not None:
+            proto_topics = _classify_by_prototype(
+                embedding, "topics", _TOPIC_LABELS, embed_model, _TOPIC_PROTO_FLOOR, top_k=3
+            )
+            proto_intents = _classify_by_prototype(
+                embedding, "intents", _INTENT_LABELS, embed_model, _INTENT_PROTO_FLOOR, top_k=2
+            )
+            seed_topics = [t for t in _stub_topics(text) if t != "general"]
+            seed_intents = [i for i in _stub_intents(text) if i != "inform"]
+            # dict.fromkeys preserves order while de-duplicating.
+            topics = list(dict.fromkeys(seed_topics + proto_topics)) or ["general"]
+            intents = list(dict.fromkeys(seed_intents + proto_intents)) or ["inform"]
+        else:
+            topics = _stub_topics(text)
+            intents = _stub_intents(text)
 
     return {
         "language": language,
@@ -497,4 +638,7 @@ async def analyze_text(text: str | None, registry: ModelRegistry) -> dict:
         "entities": entities,
         "keywords": keywords,
         "embedding": embedding,
+        # Which sentiment model the language router selected for this post.
+        "sentiment_route": sent_route,
+        "sentiment_model": sent_model_name,
     }

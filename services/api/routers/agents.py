@@ -10,7 +10,7 @@ import structlog
 from fastapi import APIRouter, Depends, HTTPException, Query, status
 from pydantic import BaseModel
 
-from deps import get_current_user
+from deps import get_current_user, rate_limit
 
 log = structlog.get_logger(__name__)
 
@@ -55,6 +55,7 @@ class AgentQueryRequest(BaseModel):
     "/query",
     summary="Submit a query to the agents service",
     status_code=status.HTTP_200_OK,
+    dependencies=[Depends(rate_limit)],
 )
 async def query_agent(
     request: AgentQueryRequest,

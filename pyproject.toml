@@ -31,6 +31,7 @@ dependencies = [
     "passlib[bcrypt]>=1.7.4",
     "python-multipart>=0.0.12",
     "prometheus-fastapi-instrumentator>=7.0.0,<8",  # 8.x pulls an incompatible starlette
+    "fastmcp>=3.4.0",
 ]
 
 [project.optional-dependencies]
@@ -49,6 +50,18 @@ ml = [
 dev = [
     "pytest>=8.0.0",
     "ruff>=0.6.0",
+]
+# OpenTelemetry tracing (§10) — only needed with OTEL_ENABLED=true. Install with:
+# uv sync --extra obs. Exports spans via OTLP to the compose Jaeger/collector.
+obs = [
+    "opentelemetry-sdk>=1.27.0",
+    "opentelemetry-exporter-otlp-proto-grpc>=1.27.0",
+    "opentelemetry-instrumentation-fastapi>=0.48b0",
+]
+# Kafka bus backend (prod) — only needed with BUS_BACKEND=kafka. Install with:
+# uv sync --extra kafka. Redis Streams (the default MVP bus) needs nothing extra.
+kafka = [
+    "aiokafka>=0.11.0",
 ]
 
 [tool.uv]

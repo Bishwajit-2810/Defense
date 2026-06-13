@@ -67,7 +67,8 @@ Goal: prove the hybrid pipeline and output quality end-to-end, cheaply.
   - _Text:_ language/Banglish detection (fastText) → shared XLM-R encoder with
     sentiment/emotion/topic/intent heads (**recomputed** `text_sentiment`, upstream
     score kept as baseline) → toxicity/hate → NER (GLiNER/spaCy) → embedding
-    (bge-m3) → keywords.
+    (`paraphrase-multilingual-mpnet-base-v2`, 768-dim — matches the
+    `analysis_results.embedding vector(768)` column) → keywords.
   - _Vision (image posts):_ a cheap **visual** model (SigLIP/CLIP zero-shot or a
     fine-tuned ViT) scores `image_sentiment`; we **run OCR** (PaddleOCR/Tesseract);
     a small VLM (Qwen2.5-VL) produces an image description.

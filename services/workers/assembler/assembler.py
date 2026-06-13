@@ -44,6 +44,7 @@ from persistence import (
 # Logging — everything funnels into loguru (see libs/common/logging.py)
 # ---------------------------------------------------------------------------
 from common.logging import setup_logging  # noqa: E402
+from dlq import record_failure  # noqa: E402
 
 setup_logging("assembler")
 log: structlog.BoundLogger = structlog.get_logger(__name__)
@@ -53,6 +54,9 @@ log: structlog.BoundLogger = structlog.get_logger(__name__)
 # ---------------------------------------------------------------------------
 STREAM_KEY = "assembler:queue"
 CONSUMER_GROUP = "assembler-group"
+
+# Bounded retry before a failed message is dead-lettered to assembler:queue:dlq.
+ASSEMBLER_MAX_RETRIES = int(os.getenv("ASSEMBLER_MAX_RETRIES", "3"))
 CONSUMER_NAME = f"assembler-{os.getpid()}"
 BLOCK_MS = 5_000          # block this long when the stream is empty
 BATCH_SIZE = 10           # messages per XREADGROUP call
@@ -414,5 +418,18 @@ async def run_assembler(
                         msg_id=msg_id,
                         error=str(exc),
                     )
-                    # Continue to next message; failed message is left
-                    # pending in the consumer group for redelivery.
+                    # Bounded retry-by-re-enqueue, then dead-letter (§8) so a
+                    # poison message can't sit in the PEL forever.
+                    try:
+                        outcome = await record_failure(
+                            redis_client,
+                            stream=STREAM_KEY,
+                            group=CONSUMER_GROUP,
+                            msg_id=msg_id_raw,
+                            fields=fields,
+                            error=exc,
+                            max_retries=ASSEMBLER_MAX_RETRIES,
+                        )
+                        log.warning("assembler_failure_handled", msg_id=msg_id, outcome=outcome)
+                    except Exception as dlq_exc:
+                        log.error("assembler_dlq_failed", msg_id=msg_id, error=str(dlq_exc))

@@ -151,12 +151,16 @@ def _fast_classify(text: str, tokens: list[str]) -> tuple[str, float]:
     return "neutral", 0.0
 
 
-async def classify_comment(text: str, registry: Any) -> dict:
+async def classify_comment(
+    text: str, registry: Any, sentiment_override: str | None = None
+) -> dict:
     """Classify one comment's sentiment + emotion via the hybrid router.
 
     Returns {"sentiment", "sentiment_score", "emotion", "method", "keywords"}.
     The emotion label is always derived from the free emoji+lexicon heuristic
     here; Stage-2 upgrades the top-N comments' emotion via the LLM later.
+    ``sentiment_override`` forces a specific sentiment model on the model path
+    (the fast emoji/lexicon path is model-independent).
     """
     tokens = _WORD_RE.findall(text or "")
     emotion = _fast_emotion(text or "", tokens)
@@ -171,7 +175,7 @@ async def classify_comment(text: str, registry: Any) -> dict:
             "keywords": [],
         }
 
-    label, score, _conf = await analyze_sentiment(text, registry)
+    label, score, _conf = await analyze_sentiment(text, registry, sentiment_override)
     # Cheap keyword extraction (longest unique tokens) — no model needed.
     uniq: list[str] = []
     seen: set[str] = set()
@@ -259,6 +263,7 @@ def _aggregate_top_keywords(analyzed_comments: list[dict]) -> list[str]:
 async def analyze_comments(
     comments: list[dict],
     registry: Any,  # ModelRegistry — avoid circular import
+    sentiment_override: str | None = None,
 ) -> dict:
     """Analyse all embedded comments and return a comment_analysis dict.
 
@@ -303,7 +308,7 @@ async def analyze_comments(
     for comment in comments:
         text = comment.get("text") or ""
         try:
-            nlp = await classify_comment(text, registry)
+            nlp = await classify_comment(text, registry, sentiment_override)
         except Exception as exc:
             logger.warning("Comment NLP failed for id=%s: %s", comment.get("id"), exc)
             nlp = {

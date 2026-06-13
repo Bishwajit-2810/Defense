@@ -10,17 +10,29 @@ Provides:
 from __future__ import annotations
 
 import os
+import sys
 from typing import AsyncGenerator
 
 import redis.asyncio as aioredis
 import structlog
-from fastapi import Header, HTTPException, Query, Security, status
+from fastapi import Depends, Header, HTTPException, Query, Request, Response, Security, status
 from sqlalchemy import text
 from fastapi.security import HTTPAuthorizationCredentials, HTTPBearer
 from jose import JWTError, jwt
 from sqlalchemy.ext.asyncio import AsyncSession, async_sessionmaker, create_async_engine
 
+# Repo root on path so `libs.*` imports when the API runs from services/api.
+_REPO_ROOT = os.path.abspath(os.path.join(os.path.dirname(__file__), "..", ".."))
+if _REPO_ROOT not in sys.path:
+    sys.path.insert(0, _REPO_ROOT)
+
+from libs.ratelimit import check_rate_limit  # noqa: E402
+
 log = structlog.get_logger(__name__)
+
+# Per-identity request rate limit (architecture §9).
+RATE_LIMIT_ENABLED = os.getenv("RATE_LIMIT_ENABLED", "true").lower() == "true"
+RATE_LIMIT_PER_MIN = int(os.getenv("RATE_LIMIT_PER_MIN", "120"))
 
 # ---------------------------------------------------------------------------
 # Database
@@ -167,6 +179,41 @@ async def get_current_user(
         detail="Authentication required: provide a Bearer token or X-API-Key header",
         headers={"WWW-Authenticate": "Bearer"},
     )
+
+
+# ---------------------------------------------------------------------------
+# Rate limiting (architecture §9) — per authenticated principal (or client IP)
+# ---------------------------------------------------------------------------
+
+
+async def rate_limit(
+    request: Request,
+    response: Response,
+    redis: aioredis.Redis = Depends(get_redis),
+    current_user: dict = Depends(get_current_user),
+) -> None:
+    """Dependency that enforces a per-identity request budget per minute.
+
+    Attach to expensive endpoints (analysis runs, report/agent generation). Sets
+    ``X-RateLimit-*`` headers and raises 429 with ``Retry-After`` when exceeded.
+    Disabled with ``RATE_LIMIT_ENABLED=false``.
+    """
+    if not RATE_LIMIT_ENABLED:
+        return
+
+    ident = current_user.get("sub") or (request.client.host if request.client else "anon")
+    result = await check_rate_limit(
+        redis, ident, limit=RATE_LIMIT_PER_MIN, window_seconds=60
+    )
+    response.headers["X-RateLimit-Limit"] = str(result.limit)
+    response.headers["X-RateLimit-Remaining"] = str(result.remaining)
+    if not result.allowed:
+        log.warning("rate_limited", identity=ident, limit=result.limit)
+        raise HTTPException(
+            status_code=status.HTTP_429_TOO_MANY_REQUESTS,
+            detail="Rate limit exceeded — slow down.",
+            headers={"Retry-After": str(result.window_seconds)},
+        )
 
 
 # ---------------------------------------------------------------------------

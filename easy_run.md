@@ -79,8 +79,20 @@ submit. (Dev mode accepts any key.) Four tabs:
 
 - **Posts** — the ingested posts
 - **Analysis Jobs** — submit / track analysis runs
-- **Reports** — generate & read reports
-- **Search** — keyword search over the analyzed posts
+- **Reports** — generate & read reports (headline metrics, topic clusters, **and
+  embedding clusters with one LLM summary per cluster**)
+- **Search** — semantic + keyword search over the analyzed posts
+- **Pipeline** — **real-time data flow**: each stage (Ingestion → Stage-1 → Router
+  → Stage-2 → Assembler) shows live backlog (waiting) · in-flight (processing) ·
+  dead-lettered (failed), streamed over SSE; plus the payload Inspector
+
+**Header chips (click to open settings, switch at runtime):**
+
+- **LLM: …** — the Stage-2 LLM backend (`Local (Ollama)` ⇄ `Groq Cloud`).
+- **NLP: …** — the Stage-1 **sentiment model**. `Auto-route` picks by detected
+  language (Bangla→BanglaBERT, Banglish→BanglishBERT, else→XLM-R); you can force
+  one. In stub mode everything resolves to XLM-R and the Bangla/Banglish slots
+  show greyed-out until their `*_SENTIMENT_MODEL` checkpoint is configured.
 
 ---
 
@@ -106,7 +118,28 @@ curl -s -X POST http://127.0.0.1:8001/v1/agents/query \
 
 ---
 
-## 5. If something's off
+## 5. (Optional) Runtime knobs & advanced extras
+
+The defaults work out of the box; these only matter if you want to tune or go
+beyond stub mode. Set env vars before `uv run run_all.py` (or in the manual §B
+block). Full reference in [run.md](run.md).
+
+- **Rate limiting** (on by default, 120 req/min per API key on analysis/report/agent
+  calls): `RATE_LIMIT_ENABLED=false` to turn off in dev, or `RATE_LIMIT_PER_MIN=…`.
+- **Near-duplicate reuse** (on by default): a post within cosine `NEAR_DUP_THRESHOLD`
+  (0.97) of an already-analyzed one reuses that result and skips Stage-1/2.
+  `NEAR_DUP_DEDUP=false` to disable. (In stub mode only *identical* captions match.)
+- **Dead-letter queues**: failed messages retry then land on `<stream>:dlq`
+  (`STAGE1_MAX_RETRIES`, `ASSEMBLER_MAX_RETRIES`).
+- **Tracing (OpenTelemetry → Jaeger/Loki)**: `uv sync --extra obs`, then
+  `OTEL_ENABLED=true` and `( cd deploy && docker compose up -d jaeger loki promtail )`.
+  Jaeger UI on **<http://127.0.0.1:16686>**. Off by default (no-op without the extra).
+- **Kafka bus (prod)**: `uv sync --extra kafka` + `BUS_BACKEND=kafka`. The MVP
+  default is Redis Streams; the local quickstart always uses Redis.
+
+---
+
+## 6. If something's off
 
 - **A service didn't come up** → read its log: `/tmp/<name>.log`
   (`api`, `stage1`, `router`, `stage2`, `assembler`, `ingestion`, `dashboard`,

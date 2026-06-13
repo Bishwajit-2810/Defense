@@ -1,6 +1,6 @@
-"""retrieval-mcp — FastAPI MCP server for semantic search and post retrieval.
+"""retrieval-mcp — MCP server for semantic search and post retrieval.
 
-Backed by:
+Real MCP server (FastMCP, streamable-HTTP transport). Backed by:
   - Postgres + pgvector (vector search on analysis_results.embedding)
   - Postgres (full analysis_results + comments tables)
 
@@ -17,7 +17,7 @@ RETRIEVAL_MCP_STUB      true | false  (default false)
 MODEL_STUB_MODE         true | false — query embedding via libs/embeddings.py
 EMBEDDING_MODEL         SentenceTransformer name (default 768-dim multilingual;
                         must match the analysis_results.embedding column dim)
-PORT                    8001  (default)
+PORT                    8101  (default)
 """
 
 from __future__ import annotations
@@ -25,7 +25,7 @@ from __future__ import annotations
 import logging
 import os
 import sys
-from typing import Any
+from typing import Annotated, Any
 
 import structlog
 
@@ -33,13 +33,13 @@ import structlog
 _REPO_ROOT = os.path.abspath(os.path.join(os.path.dirname(__file__), "..", ".."))
 if _REPO_ROOT not in sys.path:
     sys.path.insert(0, _REPO_ROOT)
-from fastapi import FastAPI, HTTPException, status
-from fastapi.middleware.cors import CORSMiddleware
-from pydantic import BaseModel, Field
+
+from fastmcp import FastMCP
+from pydantic import Field
 from sqlalchemy import text
 from sqlalchemy.ext.asyncio import AsyncSession, async_sessionmaker, create_async_engine
-
-from manifest import TOOL_MANIFEST
+from starlette.requests import Request
+from starlette.responses import JSONResponse
 
 # ---------------------------------------------------------------------------
 # Structured logging
@@ -103,109 +103,38 @@ from libs.embeddings import embed_text, to_pgvector_literal  # noqa: E402
 
 
 # ---------------------------------------------------------------------------
-# FastAPI application
+# MCP server
 # ---------------------------------------------------------------------------
 
-app = FastAPI(
-    title="retrieval-mcp",
-    version="1.0.0",
-    description="MCP server: semantic search (pgvector) + post/thread retrieval (Postgres).",
-    docs_url="/docs",
-    redoc_url="/redoc",
+mcp = FastMCP(
+    name="retrieval-mcp",
+    instructions=(
+        "Semantic search (pgvector) + post/thread retrieval (Postgres) over "
+        "analyzed posts. Read-only; scoped to a campaign when campaign_id is given."
+    ),
 )
 
-app.add_middleware(
-    CORSMiddleware,
-    allow_origins=["*"],
-    allow_credentials=True,
-    allow_methods=["*"],
-    allow_headers=["*"],
-)
 
 # ---------------------------------------------------------------------------
-# Request / Response models
+# Tool: semantic_search
 # ---------------------------------------------------------------------------
 
 
-class ToolCallRequest(BaseModel):
-    name: str = Field(..., description="Tool name to invoke")
-    arguments: dict[str, Any] = Field(default_factory=dict, description="Tool arguments")
-
-
-class ToolCallResponse(BaseModel):
-    name: str
-    result: Any
-    error: str | None = None
-
-
-# ---------------------------------------------------------------------------
-# Routes
-# ---------------------------------------------------------------------------
-
-
-@app.get("/health", summary="Liveness probe")
-async def health() -> dict:
-    return {"status": "ok", "service": "retrieval-mcp", "version": "1.0.0"}
-
-
-@app.get("/mcp/manifest", summary="Return the MCP tool manifest")
-async def get_manifest() -> list[dict]:
-    return TOOL_MANIFEST
-
-
-@app.post(
-    "/tools/call",
-    response_model=ToolCallResponse,
-    summary="Invoke a retrieval tool",
-)
-async def tools_call(req: ToolCallRequest) -> ToolCallResponse:
-    """Route a tool call to the appropriate handler."""
-    log.info("tool_call", tool=req.name, args=req.arguments)
-
-    dispatch = {
-        "semantic_search": _handle_semantic_search,
-        "get_post": _handle_get_post,
-        "get_thread": _handle_get_thread,
-        "representative_comments": _handle_representative_comments,
-    }
-
-    handler = dispatch.get(req.name)
-    if handler is None:
-        raise HTTPException(
-            status_code=status.HTTP_404_NOT_FOUND,
-            detail=f"Unknown tool: {req.name!r}",
-        )
-
-    try:
-        result = await handler(req.arguments)
-        return ToolCallResponse(name=req.name, result=result)
-    except HTTPException:
-        raise
-    except Exception as exc:
-        log.error("tool_call_failed", tool=req.name, error=str(exc), exc_info=True)
-        return ToolCallResponse(name=req.name, result=None, error=str(exc))
-
-
-# ---------------------------------------------------------------------------
-# Handler: semantic_search
-# ---------------------------------------------------------------------------
-
-
-async def _handle_semantic_search(args: dict[str, Any]) -> list[dict]:
-    """Vector search via Postgres/pgvector, or stub fallback by recency."""
-    query: str = args["query"]
-    campaign_id: str | None = args.get("campaign_id")
-    limit: int = min(int(args.get("limit", 10)), 50)
-    sentiment_filter: str | None = args.get("sentiment_filter")
+@mcp.tool
+async def semantic_search(
+    query: Annotated[str, Field(description="Natural-language search query.")],
+    campaign_id: Annotated[str | None, Field(description="Optional campaign to scope the search.")] = None,
+    limit: Annotated[int, Field(description="Max results to return (max 50).", ge=1, le=50)] = 10,
+    sentiment_filter: Annotated[
+        str | None, Field(description="Optional overall_sentiment filter (positive/negative/neutral/mixed).")
+    ] = None,
+) -> list[dict]:
+    """Vector (pgvector cosine) search over analyzed posts; returns post_id, score,
+    campaign_id, overall_sentiment, and post_summary. Falls back to recency in stub mode."""
+    limit = min(int(limit), 50)
+    log.info("tool_call", tool="semantic_search", campaign_id=campaign_id, stub=_STUB_MODE)
 
     if _STUB_MODE:
-        log.info(
-            "semantic_search_stub",
-            query=query,
-            campaign_id=campaign_id,
-            limit=limit,
-            sentiment_filter=sentiment_filter,
-        )
         return await _stub_semantic_search(campaign_id, limit, sentiment_filter)
 
     # --- Real path: embed query and run a pgvector cosine-similarity search ---
@@ -250,12 +179,7 @@ async def _handle_semantic_search(args: dict[str, Any]) -> list[dict]:
         for row in rows
     ]
 
-    log.info(
-        "semantic_search_completed",
-        query=query,
-        hits=len(results),
-        stub=False,
-    )
+    log.info("semantic_search_completed", query=query, hits=len(results), stub=False)
     return results
 
 
@@ -305,14 +229,21 @@ async def _stub_semantic_search(
 
 
 # ---------------------------------------------------------------------------
-# Handler: get_post
+# Tool: get_post
 # ---------------------------------------------------------------------------
 
 
-async def _handle_get_post(args: dict[str, Any]) -> dict | None:
-    """SELECT result FROM analysis_results WHERE post_id=$1."""
-    post_id: str = args["post_id"]
+@mcp.tool
+async def get_post(
+    post_id: Annotated[str, Field(description="Post id (CUID) to fetch the analysis result for.")],
+) -> dict:
+    """Return the latest stored analysis result for a single post."""
+    log.info("tool_call", tool="get_post", post_id=post_id)
+    return await _get_post(post_id)
 
+
+async def _get_post(post_id: str) -> dict:
+    """SELECT result FROM analysis_results WHERE post_id=$1 (latest)."""
     # scraped_at lives on the posts table (analysis_results has no such column).
     sql = text(
         """
@@ -336,10 +267,7 @@ async def _handle_get_post(args: dict[str, Any]) -> dict | None:
 
     if row is None:
         log.warning("get_post_not_found", post_id=post_id)
-        raise HTTPException(
-            status_code=status.HTTP_404_NOT_FOUND,
-            detail=f"Post not found: {post_id!r}",
-        )
+        raise ValueError(f"Post not found: {post_id!r}")
 
     return {
         "id": row["id"],
@@ -352,22 +280,23 @@ async def _handle_get_post(args: dict[str, Any]) -> dict | None:
 
 
 # ---------------------------------------------------------------------------
-# Handler: get_thread
+# Tool: get_thread
 # ---------------------------------------------------------------------------
 
 
-async def _handle_get_thread(args: dict[str, Any]) -> dict | None:
-    """Fetch post analysis + optionally all stored comments."""
-    post_id: str = args["post_id"]
-    include_comments: bool = bool(args.get("include_comments", True))
-
-    # Fetch the post analysis result
-    post = await _handle_get_post({"post_id": post_id})
+@mcp.tool
+async def get_thread(
+    post_id: Annotated[str, Field(description="Post id (CUID) whose thread to fetch.")],
+    include_comments: Annotated[bool, Field(description="Include all stored comments.")] = True,
+) -> dict:
+    """Fetch a post's analysis result plus (optionally) all of its stored comments,
+    ordered by likes."""
+    log.info("tool_call", tool="get_thread", post_id=post_id, include_comments=include_comments)
+    post = await _get_post(post_id)
 
     if not include_comments:
         return {"post": post, "comments": None}
 
-    # Fetch all comments stored for this post
     sql = text(
         """
         SELECT
@@ -407,19 +336,21 @@ async def _handle_get_thread(args: dict[str, Any]) -> dict | None:
 
 
 # ---------------------------------------------------------------------------
-# Handler: representative_comments
+# Tool: representative_comments
 # ---------------------------------------------------------------------------
 
 
-async def _handle_representative_comments(args: dict[str, Any]) -> list[dict]:
-    """Extract representative comments from the stored analysis result JSON.
-
-    Falls back to querying the comments table directly when the
-    comment_analysis.representative_comments field is absent.
-    """
-    post_id: str = args["post_id"]
-    sentiment: str = args.get("sentiment", "all")
-    limit: int = int(args.get("limit", 5))
+@mcp.tool
+async def representative_comments(
+    post_id: Annotated[str, Field(description="Post id (CUID) to pull representative comments for.")],
+    sentiment: Annotated[
+        str, Field(description="Sentiment bucket filter: positive/negative/neutral, or 'all'.")
+    ] = "all",
+    limit: Annotated[int, Field(description="Max comments to return.", ge=1, le=50)] = 5,
+) -> list[dict]:
+    """Return representative comments for a post (from the stored analysis JSON,
+    falling back to the comments table), filtered by sentiment and ranked by likes."""
+    log.info("tool_call", tool="representative_comments", post_id=post_id, sentiment=sentiment)
 
     # First try: pull from stored analysis JSON
     sql_result = text(
@@ -433,15 +364,10 @@ async def _handle_representative_comments(args: dict[str, Any]) -> list[dict]:
     )
 
     async with _AsyncSessionLocal() as session:
-        row = (
-            await session.execute(sql_result, {"post_id": post_id})
-        ).mappings().first()
+        row = (await session.execute(sql_result, {"post_id": post_id})).mappings().first()
 
     if row is None:
-        raise HTTPException(
-            status_code=status.HTTP_404_NOT_FOUND,
-            detail=f"Post not found: {post_id!r}",
-        )
+        raise ValueError(f"Post not found: {post_id!r}")
 
     rcs = row["rcs"]  # list[dict] or None
     if rcs and isinstance(rcs, list) and len(rcs) > 0:
@@ -451,11 +377,7 @@ async def _handle_representative_comments(args: dict[str, Any]) -> list[dict]:
         return filtered[:limit]
 
     # Fallback: query comments table directly
-    log.info(
-        "representative_comments_fallback_to_table",
-        post_id=post_id,
-        sentiment=sentiment,
-    )
+    log.info("representative_comments_fallback_to_table", post_id=post_id, sentiment=sentiment)
     return await _representative_comments_from_table(post_id, sentiment, limit)
 
 
@@ -513,12 +435,22 @@ async def _representative_comments_from_table(
 
 
 # ---------------------------------------------------------------------------
-# Entry point
+# Health probe + ASGI app
 # ---------------------------------------------------------------------------
+
+
+@mcp.custom_route("/health", methods=["GET"])
+async def health(_request: Request) -> JSONResponse:
+    return JSONResponse({"status": "ok", "service": "retrieval-mcp", "stub_mode": _STUB_MODE})
+
+
+# ASGI app served by uvicorn: streamable-HTTP MCP endpoint mounted at /mcp.
+app = mcp.http_app(path="/mcp")
+
 
 if __name__ == "__main__":
     import uvicorn
 
-    port = int(os.environ.get("PORT", 8001))
+    port = int(os.environ.get("PORT", 8101))
     log.info("retrieval_mcp_starting", port=port, stub=_STUB_MODE)
-    uvicorn.run("server:app", host="0.0.0.0", port=port, reload=False)
+    uvicorn.run(app, host="0.0.0.0", port=port)

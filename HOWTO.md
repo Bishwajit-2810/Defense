@@ -70,7 +70,7 @@ The other docs say _what/why_; this says _what to do next_.
 | ------------ | ------------------------------------------------------------------------------------------------------------------------------------------------------- |
 | Language/API | **Python 3.11+ / FastAPI** (async) for all services                                                                                                     |
 | Workers      | Python consumers (Celery or Ray); micro-batch on GPU                                                                                                    |
-| NLP          | fastText (lang) · XLM-R/mBERT + BanglaBERT (sentiment/emotion/topic/intent/tox) · GLiNER/spaCy (NER) · KeyBERT (keywords) · bge-m3 (embeddings)         |
+| NLP          | fastText (lang) · XLM-R/mBERT + BanglaBERT (sentiment/emotion/topic/intent/tox) · GLiNER/spaCy (NER) · KeyBERT (keywords) · paraphrase-multilingual-mpnet-base-v2 / 768-dim (embeddings) |
 | Vision       | **SigLIP/CLIP** zero-shot (image sentiment) · **PaddleOCR/Tesseract** (OCR, bn+en)                                                                      |
 | LLM/VLM      | Stage-2 via **vLLM** (`local`: Qwen2.5-7B/32B-Instruct + Qwen2.5-VL-7B) ⇄ **Groq** (`groq`: Llama text + a vision model). One OpenAI-compatible client. |
 | Serving      | Triton/ONNX/CTranslate2 for the NLP fleet                                                                                                               |

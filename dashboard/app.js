@@ -18,6 +18,7 @@ var authToken = localStorage.getItem('auth_token');
 var apiKey    = localStorage.getItem('api_key') || '';
 var currentTab = 'overview';
 var llmConfig = null;           // last loaded /v1/config/llm payload (null = unavailable)
+var nlpConfig = null;           // last loaded /v1/config/nlp payload (null = unavailable)
 var pollTimers = {};            // jobId -> timer id
 var agentPollTimers = {};       // runId -> timer id
 var sseStreams = {};            // jobId -> EventSource
@@ -144,6 +145,13 @@ function showTab(tabName) {
   var tabBtn = document.querySelector('[data-tab="' + tabName + '"]');
   if (tabBtn) tabBtn.classList.add('active');
 
+  // Live pipeline flow streams only while its tab is open.
+  if (tabName === 'pipeline') {
+    connectPipelineLive();
+  } else {
+    disconnectPipelineLive();
+  }
+
   refreshTab(tabName);
 }
 
@@ -161,6 +169,8 @@ function refreshTab(tabName, background) {
     loadReports(background);
   } else if (tabName === 'agents') {
     loadAgentRuns(background);
+  } else if (tabName === 'pipeline') {
+    loadPipeline(background);
   }
   // 'search' is on-demand only.
 }
@@ -2213,6 +2223,131 @@ async function setLlmBackend(backend) {
 }
 
 /* ============================================================
+   Stage-1 sentiment model config (Settings panel + header chip)
+   ============================================================ */
+function nlpModelLabel(key) {
+  if (!key) return 'Auto';
+  if (nlpConfig && nlpConfig.options) {
+    for (var i = 0; i < nlpConfig.options.length; i++) {
+      if (nlpConfig.options[i].key === key) return nlpConfig.options[i].label;
+    }
+  }
+  return key;
+}
+
+async function loadNlpConfig() {
+  try {
+    nlpConfig = await apiCall('/v1/config/nlp', { method: 'GET' });
+  } catch (err) {
+    nlpConfig = null;  // endpoint absent/unreachable — hide the chip
+  }
+  updateNlpChip();
+}
+
+function updateNlpChip() {
+  var chip = document.getElementById('nlp-chip');
+  if (!chip) return;
+  if (!nlpConfig) {
+    chip.classList.add('hidden');
+    return;
+  }
+  chip.textContent = 'NLP: ' + (nlpConfig.mode === 'forced'
+    ? nlpModelLabel(nlpConfig.override)
+    : 'Auto-route');
+  chip.classList.remove('hidden');
+}
+
+function openNlpSettings() {
+  var overlay = document.getElementById('nlp-settings-overlay');
+  if (!overlay) return;
+  overlay.classList.remove('hidden');
+  renderNlpSettings();
+  loadNlpConfig().then(renderNlpSettings);
+}
+
+function closeNlpSettings() {
+  var overlay = document.getElementById('nlp-settings-overlay');
+  if (overlay) overlay.classList.add('hidden');
+}
+
+function renderNlpSettings() {
+  var body = document.getElementById('nlp-settings-body');
+  if (!body) return;
+
+  if (!nlpConfig) {
+    body.innerHTML = '<div class="alert alert-info">Sentiment-model configuration is not available on this server.</div>';
+    return;
+  }
+
+  var c = nlpConfig;
+  var html = '';
+
+  // ---- Status ----
+  html += '<div class="modal-section">'
+    + '<div class="modal-section-title">Status</div>'
+    + '<div class="meta-grid">'
+    + makeMetaField('Mode',     c.mode === 'forced' ? 'Forced' : 'Auto-route by language')
+    + makeMetaField('Active',   c.mode === 'forced' ? nlpModelLabel(c.override) : 'per detected language')
+    + makeMetaField('Fallback', nlpModelLabel(c.default_key))
+    + '</div>'
+  + '</div>';
+
+  // ---- Switch ----
+  var btns = '<button type="button" class="llm-segment' + (c.mode !== 'forced' ? ' active' : '')
+    + '" onclick="setNlpModel(null)">Auto-route</button>';
+  (c.options || []).forEach(function(o) {
+    var active = (c.mode === 'forced' && c.override === o.key) ? ' active' : '';
+    var dis = o.available ? '' : ' disabled';
+    var title = o.available ? '' : ' title="No checkpoint configured — set ' + escHtml(o.key.toUpperCase()) + '_SENTIMENT_MODEL"';
+    btns += '<button type="button" class="llm-segment' + active + '"' + dis + title
+      + ' onclick="setNlpModel(\'' + o.key + '\')">' + escHtml(o.label)
+      + (o.available ? '' : ' (n/a)') + '</button>';
+  });
+  html += '<div class="modal-section">'
+    + '<div class="modal-section-title">Switch Model</div>'
+    + '<div class="llm-segmented" style="flex-wrap:wrap">' + btns + '</div>'
+  + '</div>';
+
+  // ---- Route table ----
+  var rt = c.route_table || {};
+  html += '<div class="modal-section">'
+    + '<div class="modal-section-title">Auto-route Table</div>'
+    + '<div class="meta-grid">'
+    + makeMetaField('Bangla (script)',  nlpModelLabel(rt.bn))
+    + makeMetaField('Banglish / mixed', nlpModelLabel(rt.banglish))
+    + makeMetaField('English / other',  nlpModelLabel(rt.en))
+    + '</div>'
+  + '</div>';
+
+  // ---- Note ----
+  html += '<div class="alert alert-warning" style="margin-bottom:0">'
+    + '<strong>Note:</strong>&nbsp;Applies to new Stage-1 work. Greyed-out models need a '
+    + 'sentiment-fine-tuned checkpoint (their <code>*_SENTIMENT_MODEL</code> env var) before they can be forced.'
+  + '</div>';
+
+  body.innerHTML = html;
+}
+
+async function setNlpModel(model) {
+  try {
+    var data = await apiCall('/v1/config/nlp', {
+      method: 'PUT',
+      body: JSON.stringify({ model: model })
+    });
+    nlpConfig = data;
+    updateNlpChip();
+    renderNlpSettings();
+    if (model === null) {
+      showToast('Sentiment model set to auto-route by language.', 'success');
+    } else {
+      showToast('Sentiment model forced to ' + nlpModelLabel(data.override) + '.', 'success');
+    }
+  } catch (err) {
+    showToast('Failed to update sentiment model: ' + err.message, 'error');
+  }
+}
+
+/* ============================================================
    Status bar & auth UI helpers
    ============================================================ */
 function updateApiStatus(state) {
@@ -2285,6 +2420,7 @@ async function handleLoginSubmit(evt) {
     hideLoginModal();
     refreshTab(currentTab);
     loadLlmConfig();
+    loadNlpConfig();
   } catch (err) {
     if (errEl) errEl.textContent = err.message;
   } finally {
@@ -2329,6 +2465,389 @@ function setLoading(btn, isLoading) {
       btn.innerHTML = btn._origText;
       btn._origText = null;
     }
+  }
+}
+
+/* ============================================================
+   PIPELINE TAB (live flow) — real-time per-stage state via SSE
+   ------------------------------------------------------------
+   Streams GET /v1/pipeline/stream (a `stats` frame ~every 1.5s) and renders
+   each stage with its backlog (waiting), in-flight (processing) and DLQ
+   (failed) counts. Falls back to polling /v1/pipeline/stats if SSE is
+   unavailable. Active only while the Pipeline tab is open.
+   ============================================================ */
+
+var pipelineES = null;          // EventSource for the live stream
+var pipelinePollTimer = null;   // setInterval fallback id
+
+function setPipelineLiveStatus(state) {
+  var el = document.getElementById('pipeline-live-status');
+  if (!el) return;
+  var map = {
+    live:    ['Live', 'tag-success'],
+    polling: ['Polling', 'tag-warning'],
+    offline: ['Offline', 'tag-danger'],
+    connecting: ['connecting…', '']
+  };
+  var m = map[state] || map.connecting;
+  el.textContent = m[0];
+  el.className = 'tag tag-sm ' + m[1];
+}
+
+function connectPipelineLive() {
+  if (pipelineES || pipelinePollTimer) return;  // already streaming
+  setPipelineLiveStatus('connecting');
+
+  if (typeof EventSource !== 'undefined') {
+    var url = API_BASE + '/v1/pipeline/stream?api_key=' + sseCredential();
+    try {
+      pipelineES = new EventSource(url);
+    } catch (e) {
+      pipelineES = null;
+    }
+    if (pipelineES) {
+      pipelineES.addEventListener('connected', function () { setPipelineLiveStatus('live'); });
+      pipelineES.addEventListener('stats', function (evt) {
+        try { renderPipelineLive(JSON.parse(evt.data)); setPipelineLiveStatus('live'); }
+        catch (e) { /* ignore a malformed frame */ }
+      });
+      pipelineES.addEventListener('timeout', function () {
+        // Server closes the stream after its max duration — reconnect.
+        stopPipelineES();
+        if (currentTab === 'pipeline') connectPipelineLive();
+      });
+      pipelineES.addEventListener('error', function () {
+        if (pipelineES && pipelineES.readyState === EventSource.CLOSED) {
+          stopPipelineES();
+          startPipelinePoll();  // degrade to polling
+        }
+      });
+      return;
+    }
+  }
+  startPipelinePoll();
+}
+
+function startPipelinePoll() {
+  if (pipelinePollTimer) return;
+  var tick = function () {
+    apiCall('/v1/pipeline/stats', { method: 'GET' })
+      .then(function (s) { renderPipelineLive(s); setPipelineLiveStatus('polling'); })
+      .catch(function () { setPipelineLiveStatus('offline'); });
+  };
+  tick();
+  pipelinePollTimer = setInterval(tick, 2000);
+}
+
+function stopPipelineES() {
+  if (pipelineES) {
+    try { pipelineES.close(); } catch (e) { /* noop */ }
+    pipelineES = null;
+  }
+}
+
+function disconnectPipelineLive() {
+  stopPipelineES();
+  if (pipelinePollTimer) { clearInterval(pipelinePollTimer); pipelinePollTimer = null; }
+}
+
+/** Render the live stage-flow row from a /v1/pipeline stats payload. */
+function renderPipelineLive(stats) {
+  var host = document.getElementById('pipeline-flow');
+  if (!host || !stats || !stats.stages) return;
+
+  var html = '';
+  stats.stages.forEach(function (s, i) {
+    var active = (s.in_flight || 0) > 0;
+    var waiting = (s.backlog || 0) > 0;
+    html += '<div class="flow-node' + (active ? ' active' : '') + (waiting ? ' waiting' : '') + '">'
+      + '<div class="flow-node-label">' + escHtml(s.label) + '</div>'
+      + '<div class="flow-node-metrics">'
+      + '<span class="flow-metric proc" title="in-flight (processing)">&#9654; ' + (s.in_flight || 0) + '</span>'
+      + '<span class="flow-metric wait" title="backlog (waiting)">&#9612; ' + (s.backlog || 0) + '</span>'
+      + ((s.dlq || 0) > 0
+          ? '<span class="flow-metric dlq" title="dead-lettered (failed)">&#10007; ' + s.dlq + '</span>'
+          : '')
+      + '</div></div>';
+
+    // Arrow between stages — "flowing" when work is moving across it.
+    var next = stats.stages[i + 1];
+    var flowing = active || (next && (next.in_flight || 0) > 0) || waiting;
+    html += '<div class="flow-arrow' + (flowing ? ' flowing' : '') + '">&#8594;</div>';
+  });
+
+  // Terminal "Completed" node (rows persisted to analysis_results).
+  html += '<div class="flow-node done"><div class="flow-node-label">Completed</div>'
+    + '<div class="flow-node-metrics"><span class="flow-metric ok" title="analysis_results rows">&#10003; '
+    + (stats.completed || 0) + '</span></div></div>';
+
+  host.innerHTML = html;
+
+  var sum = document.getElementById('pipeline-flow-summary');
+  if (sum) {
+    sum.innerHTML =
+      '<span class="flow-sum proc">' + (stats.in_flight_total || 0) + ' processing</span>'
+      + '<span class="flow-sum wait">' + (stats.backlog_total || 0) + ' waiting</span>'
+      + '<span class="flow-sum dlq">' + (stats.dlq_total || 0) + ' failed</span>'
+      + '<span class="flow-sum ok">' + (stats.completed || 0) + ' completed</span>'
+      + '<span class="flow-sum muted">' + (stats.total_processed || 0) + ' processed total · '
+      + (stats.llm_routed || 0) + ' routed to LLM</span>';
+  }
+}
+
+/* ============================================================
+   PIPELINE TAB — visualize the payload each stage hands the next
+   ------------------------------------------------------------
+   The ingestion → analysis flow is a chain of Redis Stream queues:
+
+     Ingestion ─▶ Stage 1 (NLP) ─▶ Router ─▶ Stage 2 (LLM) ─▶ Assembler
+
+   Each arrow is a queue carrying a JSON envelope. This tab renders a
+   stepper of the five stages and a slider that scrubs across the four
+   transitions, showing the exact payload (queue + JSON) on that edge.
+
+   "What I send to Stage 2 from Stage 1" is transition index 2
+   (Router ─▶ Stage 2), so the slider defaults there.
+
+   Data source: if a recently-analyzed post is available we reconstruct
+   real-looking payloads from it; otherwise we fall back to sample data.
+   ============================================================ */
+
+// The five pipeline stages, in order.
+var PIPELINE_STAGES = [
+  { key: 'ingest',  label: 'Ingestion',     sub: 'normalize raw posts' },
+  { key: 'stage1',  label: 'Stage 1 · NLP', sub: 'language, sentiment, vision, comments' },
+  { key: 'router',  label: 'Router',        sub: 'decide if LLM is needed' },
+  { key: 'stage2',  label: 'Stage 2 · LLM', sub: 'summary, post-type, insight' },
+  { key: 'assembler', label: 'Assembler',   sub: 'merge + persist' }
+];
+
+// The four transitions (edges) between stages, with the queue each rides.
+var PIPELINE_EDGES = [
+  { from: 0, to: 1, queue: 'nlp:stage1:queue',  title: 'Ingestion ▶ Stage 1' },
+  { from: 1, to: 2, queue: 'router:queue',      title: 'Stage 1 ▶ Router' },
+  { from: 2, to: 3, queue: 'llm:stage2:queue',  title: 'Router ▶ Stage 2' },
+  { from: 3, to: 4, queue: 'assembler:queue',   title: 'Stage 2 ▶ Assembler' }
+];
+
+var pipelinePayloads = null;   // [edgeIndex] -> payload object
+var pipelineLive = false;      // true when built from a real post
+var pipelineEdgeIndex = 2;     // default: Stage 1 ▶ Stage 2
+
+/** Build the four edge payloads. If `post` is given, fold its real values
+ * into the envelopes; otherwise everything is sample data. */
+function buildPipelinePayloads(post) {
+  var p = post || {};
+  var postId = p.post_id || p.id || 'cmsamplepost000000000000';
+  var campaignId = p.campaign_id || 'cmsamplecampaign00000000';
+  var platform = p.platform || 'facebook';
+  var lang = p.language || 'bn';
+  var text = p.post_text || p.text || 'জ্বালানি তেলের দাম আবার বাড়ানো হয়েছে — মানুষ ক্ষুব্ধ।';
+  var sentiment = p.overall_sentiment || 'negative';
+  var sentScore = (typeof p.sentiment_score === 'number') ? p.sentiment_score : -0.62;
+  var toxicity = (typeof p.toxicity_score === 'number') ? p.toxicity_score : 0.18;
+  var topics = p.topics || ['fuel prices', 'economy', 'public anger'];
+  var summary = p.post_summary || null;
+  var postType = p.post_type || null;
+
+  // Stage-1 result block (produced by the NLP worker). Real fields when
+  // present on the post, representative samples otherwise.
+  var stage1Result = {
+    post_id: postId,
+    campaign_id: campaignId,
+    platform: platform,
+    media_type: p.media_type || 'PHOTO_TEXT',
+    language: lang,
+    language_confidence: 0.97,
+    is_banglish: !!p.is_banglish,
+    overall_sentiment: sentiment,
+    sentiment_score: sentScore,
+    text_sentiment: { label: sentiment, score: Math.abs(sentScore) },
+    image_sentiment: p.image_sentiment || { label: 'negative', score: 0.55 },
+    emotion: p.emotion || { primary: 'anger', scores: { anger: 0.61, sadness: 0.22, fear: 0.1 } },
+    topics: topics,
+    intents: p.intents || ['complain', 'inform'],
+    toxicity_score: toxicity,
+    hate_speech_score: (typeof p.hate_speech_score === 'number') ? p.hate_speech_score : 0.04,
+    entities: p.entities || [{ text: 'BPC', type: 'ORG' }],
+    keywords: p.keywords || ['জ্বালানি', 'তেল', 'দাম'],
+    embedding: ['…768-dim vector…'],
+    image_analysis: { image_count: 1, ocr_text: 'নতুন মূল্য তালিকা', vision_model: 'SigLIP' },
+    comment_analysis: {
+      analyzed: 42,
+      coverage: 0.84,
+      sentiment_breakdown: { positive: 5, negative: 31, neutral: 6 },
+      themes: ['price hike', 'government'],
+      representative_comments: ['এটা অন্যায়', 'দাম কমান']
+    },
+    engagement: { reactions: 1240, comment_count: 50, share_count: 88, stored_comments: 42 },
+    // Stage-2 fields are always null coming out of Stage 1:
+    post_type: null,
+    post_summary: null,
+    post_summary_lang: null,
+    confidence: 0.71,
+    processing: { unit: 'post+thread', stage1_ms: painlessNum(p.stage1_ms, 312), llm_used: false, vision_used: true, vision_model: 'SigLIP' }
+  };
+
+  // Normalized upstream post (carried through for grounding in Stage 2).
+  var normalizedPost = {
+    post_id: postId,
+    campaign_id: campaignId,
+    platform: platform,
+    platform_post_id: p.platform_post_id || '100xxxxxxxxxxxx_900xxxxxxxxx',
+    text: text,
+    media_type: stage1Result.media_type,
+    url: p.url || 'https://facebook.com/…',
+    images: [{ ref: 's3://media/sample.jpg' }],
+    comments: [{ id: 'c1', text: 'এটা অন্যায়' }, { id: 'c2', text: 'দাম কমান' }],
+    scraped_at: p.scraped_at || '2026-06-13T08:00:00Z'
+  };
+
+  // Router's decision flags for Stage 2.
+  var taskFlags = {
+    want_summary: true,
+    want_post_type: true,
+    want_insight: true,
+    target_lang: null
+  };
+
+  // Stage-2 result (only exists after the LLM worker runs).
+  var stage2Result = {
+    post_summary: summary || 'A photo-and-text post protesting a new fuel-price hike; commenters are overwhelmingly angry and demand a rollback.',
+    post_summary_lang: 'en',
+    post_summary_source: 'vlm',
+    post_summary_grounding: 'caption+ocr+image',
+    post_type: postType || 'grievance',
+    post_type_confidence: 0.88,
+    topics: topics,
+    intents: ['complain', 'mobilize'],
+    insight: 'Fuel-price grievance with high negative engagement — candidate for alerting.',
+    processing: { stage2_ms: painlessNum(p.stage2_ms, 1840), llm_backend: 'groq', llm_model: 'llama-3.3-70b' }
+  };
+
+  return [
+    // Edge 0: Ingestion ▶ Stage 1
+    { post_id: postId, raw_post: normalizedPost },
+    // Edge 1: Stage 1 ▶ Router
+    { post_id: postId, stage1_result: stage1Result },
+    // Edge 2: Router ▶ Stage 2  ← "what Stage 1 sends to Stage 2"
+    { post_id: postId, stage1_result: stage1Result, normalized_post: normalizedPost, task_flags: taskFlags },
+    // Edge 3: Stage 2 ▶ Assembler
+    { post_id: postId, stage1_result: stage1Result, stage2_result: stage2Result, normalized_post: normalizedPost }
+  ];
+}
+
+function painlessNum(v, fallback) {
+  return (typeof v === 'number' && !isNaN(v)) ? v : fallback;
+}
+
+/** Load (or rebuild) the pipeline view. Tries to seed from the most recent
+ * analyzed post; falls back to sample data when the corpus is empty. */
+async function loadPipeline(background) {
+  var stepper = document.getElementById('pipeline-stepper');
+  if (!stepper) return;
+
+  var post = null;
+  try {
+    var data = await apiCall('/v1/analysis/latest?limit=1&include=results', { method: 'GET' });
+    var results = (data && data.results) || (Array.isArray(data) ? data : []);
+    if (results && results.length) post = results[0];
+  } catch (err) {
+    // API unreachable or no corpus — sample data is fine.
+  }
+
+  pipelineLive = !!post;
+  pipelinePayloads = buildPipelinePayloads(post);
+
+  var note = document.getElementById('pipeline-source-note');
+  if (note) {
+    note.innerHTML = pipelineLive
+      ? 'Live — payloads reconstructed from the most recent analyzed post '
+        + '<code>' + escHtml(shortenId(post.post_id || post.id || '')) + '</code>. '
+        + 'Scrub the slider to step through each hand-off.'
+      : 'Idle — no analyzed posts yet, so this shows <strong>sample data</strong>. '
+        + 'Scrub the slider to step through each stage hand-off.';
+  }
+
+  renderPipelineTicks();
+  renderPipeline(pipelineEdgeIndex);
+  markRefreshed();
+}
+
+/** Render the slider tick labels (one per transition). */
+function renderPipelineTicks() {
+  var ticks = document.getElementById('pipeline-slider-ticks');
+  if (!ticks) return;
+  var html = '';
+  for (var i = 0; i < PIPELINE_EDGES.length; i++) {
+    html += '<span class="pipeline-tick' + (i === pipelineEdgeIndex ? ' active' : '') + '">'
+      + escHtml(PIPELINE_EDGES[i].title) + '</span>';
+  }
+  ticks.innerHTML = html;
+}
+
+/** Render everything that depends on the selected edge: stepper highlight,
+ * edge header, and the payload JSON. */
+function renderPipeline(edgeIndex) {
+  pipelineEdgeIndex = edgeIndex;
+  var edge = PIPELINE_EDGES[edgeIndex];
+
+  // --- Stepper ---
+  var stepper = document.getElementById('pipeline-stepper');
+  if (stepper) {
+    var html = '';
+    for (var i = 0; i < PIPELINE_STAGES.length; i++) {
+      var s = PIPELINE_STAGES[i];
+      var cls = 'pipeline-node';
+      if (i === edge.from) cls += ' source';
+      else if (i === edge.to) cls += ' target';
+      else if (i < edge.from) cls += ' done';
+      html += '<div class="' + cls + '">'
+        + '<div class="pipeline-node-dot">' + (i + 1) + '</div>'
+        + '<div class="pipeline-node-label">' + escHtml(s.label) + '</div>'
+        + '<div class="pipeline-node-sub">' + escHtml(s.sub) + '</div>'
+        + '</div>';
+      if (i < PIPELINE_STAGES.length - 1) {
+        var arrowCls = 'pipeline-arrow' + (i === edge.from ? ' active' : '');
+        html += '<div class="' + arrowCls + '">&#10142;</div>';
+      }
+    }
+    stepper.innerHTML = html;
+  }
+
+  // --- Edge header ---
+  var head = document.getElementById('pipeline-edge-head');
+  if (head) {
+    var fromStage = PIPELINE_STAGES[edge.from];
+    var toStage = PIPELINE_STAGES[edge.to];
+    head.className = 'card-header';
+    head.innerHTML =
+      '<div>'
+        + '<div class="card-title">' + escHtml(fromStage.label) + ' &#10142; ' + escHtml(toStage.label) + '</div>'
+        + '<div class="card-description">Payload pushed onto Redis stream '
+          + '<code>' + escHtml(edge.queue) + '</code></div>'
+      + '</div>'
+      + '<span class="badge ' + (pipelineLive ? 'badge-positive' : 'badge-neutral') + '">'
+        + (pipelineLive ? 'live data' : 'sample data') + '</span>';
+  }
+
+  // --- Payload ---
+  var payloadEl = document.getElementById('pipeline-payload');
+  if (payloadEl && pipelinePayloads) {
+    var obj = pipelinePayloads[edgeIndex];
+    var keys = Object.keys(obj);
+    var chips = '';
+    for (var k = 0; k < keys.length; k++) {
+      chips += '<span class="tag tag-sm">' + escHtml(keys[k]) + '</span>';
+    }
+    var json = '';
+    try { json = JSON.stringify(obj, null, 2); } catch (e) { json = String(obj); }
+    payloadEl.innerHTML =
+      '<div class="pipeline-fields">'
+        + '<span class="pipeline-fields-label">Top-level fields (' + keys.length + '):</span>'
+        + chips
+      + '</div>'
+      + '<pre class="pipeline-json">' + escHtml(json) + '</pre>';
   }
 }
 
@@ -2406,6 +2925,16 @@ function init() {
       showTab(this.getAttribute('data-tab'));
     });
   });
+
+  // Pipeline transition slider
+  var pipelineSlider = document.getElementById('pipeline-slider');
+  if (pipelineSlider) {
+    pipelineSlider.addEventListener('input', function() {
+      var idx = parseInt(this.value, 10) || 0;
+      renderPipeline(idx);
+      renderPipelineTicks();
+    });
+  }
 
   // Auto-refresh toggle
   var refreshToggle = document.getElementById('auto-refresh-toggle');
@@ -2553,6 +3082,24 @@ function init() {
     llmCloseBtn.addEventListener('click', closeLlmSettings);
   }
 
+  // NLP (sentiment model) chip + settings modal
+  var nlpChip = document.getElementById('nlp-chip');
+  if (nlpChip) {
+    nlpChip.addEventListener('click', openNlpSettings);
+  }
+
+  var nlpOverlay = document.getElementById('nlp-settings-overlay');
+  if (nlpOverlay) {
+    nlpOverlay.addEventListener('click', function(e) {
+      if (e.target === nlpOverlay) closeNlpSettings();
+    });
+  }
+
+  var nlpCloseBtn = document.getElementById('nlp-settings-close-btn');
+  if (nlpCloseBtn) {
+    nlpCloseBtn.addEventListener('click', closeNlpSettings);
+  }
+
   // Login form
   var loginForm = document.getElementById('login-form');
   if (loginForm) {
@@ -2569,6 +3116,7 @@ function init() {
     if (ok) {
       showTab('overview');
       loadLlmConfig();
+      loadNlpConfig();
     } else {
       // API unreachable — show login modal if no creds
       if (!authToken && !apiKey) {

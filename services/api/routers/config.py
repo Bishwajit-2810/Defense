@@ -19,12 +19,18 @@ from pydantic import BaseModel
 
 from deps import get_current_user, get_redis
 
+from libs import sentiment_models
+
 log = structlog.get_logger(__name__)
 
 router = APIRouter(prefix="/v1/config", tags=["config"])
 
 LLM_BACKEND_KEY = "config:llm_backend"
 _VALID_BACKENDS = ("local", "groq")
+
+# Runtime sentiment-model override (mirrors the Stage-1 worker's key). Absent =>
+# auto-route by detected language.
+SENTIMENT_MODEL_KEY = "config:sentiment_model"
 
 # Mirrors libs/llm/client.py role→model defaults.
 _MODEL_ENVS = {
@@ -97,3 +103,71 @@ async def put_llm_config(
             detail=f"backend must be one of {list(_VALID_BACKENDS)} or null",
         )
     return await _current(redis)
+
+
+# ---------------------------------------------------------------------------
+# Stage-1 sentiment model (language-routed, runtime-switchable)
+# ---------------------------------------------------------------------------
+
+
+class NLPConfigUpdate(BaseModel):
+    # A model key (e.g. "xlmr", "banglabert") to force, or null to clear the
+    # override and return to auto-routing by detected language.
+    model: Optional[str] = None
+
+
+async def _nlp_current(redis: aioredis.Redis) -> dict:
+    raw = await redis.get(SENTIMENT_MODEL_KEY)
+    override = raw.decode() if isinstance(raw, bytes) else raw
+    if override not in sentiment_models.valid_keys():
+        override = None
+    return {
+        "override": override,                       # forced key, or None
+        "mode": "forced" if override else "auto",   # auto = route by language
+        "default_key": sentiment_models.DEFAULT_KEY,
+        "route_table": sentiment_models.route_table(),
+        "options": sentiment_models.options_status(),
+    }
+
+
+@router.get("/nlp", summary="Get the active Stage-1 sentiment-model configuration")
+async def get_nlp_config(
+    redis: aioredis.Redis = Depends(get_redis),
+    current_user: dict = Depends(get_current_user),
+) -> dict:
+    return await _nlp_current(redis)
+
+
+@router.put("/nlp", summary="Force a sentiment model or clear the override (auto-route)")
+async def put_nlp_config(
+    body: NLPConfigUpdate,
+    redis: aioredis.Redis = Depends(get_redis),
+    current_user: dict = Depends(get_current_user),
+) -> dict:
+    """Applies to new Stage-1 work only; in-flight messages keep their model.
+
+    ``{"model": null}`` clears the override (auto-route by language). A forced
+    model must be a known key **and** currently available (its checkpoint
+    configured) — unavailable slots are rejected so the UI can't pin a model
+    that would silently fall back.
+    """
+    if body.model is None:
+        await redis.delete(SENTIMENT_MODEL_KEY)
+        log.info("sentiment_model_override_cleared")
+    elif body.model not in sentiment_models.valid_keys():
+        raise HTTPException(
+            status_code=status.HTTP_422_UNPROCESSABLE_ENTITY,
+            detail=f"model must be one of {sentiment_models.valid_keys()} or null",
+        )
+    elif not sentiment_models.is_available(body.model):
+        raise HTTPException(
+            status_code=status.HTTP_422_UNPROCESSABLE_ENTITY,
+            detail=(
+                f"model {body.model!r} has no checkpoint configured "
+                "(set its *_SENTIMENT_MODEL env var first)"
+            ),
+        )
+    else:
+        await redis.set(SENTIMENT_MODEL_KEY, body.model)
+        log.info("sentiment_model_override_set", model=body.model)
+    return await _nlp_current(redis)

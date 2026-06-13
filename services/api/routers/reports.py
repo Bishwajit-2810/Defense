@@ -20,7 +20,7 @@ from fastapi import APIRouter, Depends, HTTPException, Request, status
 from sqlalchemy import text
 from sqlalchemy.ext.asyncio import AsyncSession
 
-from deps import get_current_user, get_db, get_redis
+from deps import get_current_user, get_db, get_redis, rate_limit
 from models import ReportRequest, ReportResponse
 
 log = structlog.get_logger(__name__)
@@ -230,6 +230,143 @@ async def _llm_narrative(
 
 
 # ---------------------------------------------------------------------------
+# Embedding cluster summarization (architecture §5 — the LLM cost lever)
+# ---------------------------------------------------------------------------
+
+# Cap the corpus pulled for clustering so a huge campaign stays bounded.
+_CLUSTER_SAMPLE_CAP = int(os.environ.get("REPORT_CLUSTER_SAMPLE_CAP", "1500"))
+
+
+async def _embedding_clusters(
+    db: AsyncSession,
+    campaign_id: str,
+    backend_override: str | None,
+) -> list[dict]:
+    """Cluster post embeddings (pgvector → k-means) and summarize one slice per
+    cluster with a single LLM-B call each — N posts, ~k LLM calls (§5).
+
+    Returns [] when there are too few embeddings or clustering is unavailable;
+    cluster summaries degrade to None (not an error) if the LLM is unreachable.
+    """
+    try:
+        from libs.clustering import cluster_embeddings, parse_pgvector  # noqa: PLC0415
+    except Exception as exc:  # numpy missing, etc.
+        log.warning("clustering_unavailable", error=str(exc))
+        return []
+
+    scoped = campaign_id not in ("", "all")
+    where = "WHERE ar.embedding IS NOT NULL"
+    params: dict = {"lim": _CLUSTER_SAMPLE_CAP}
+    if scoped:
+        where += " AND ar.campaign_id = :cid"
+        params["cid"] = campaign_id
+
+    rows = (
+        await db.execute(
+            text(
+                f"""
+                SELECT ar.post_id                          AS post_id,
+                       ar.embedding::text                  AS emb,
+                       ar.result->>'post_summary'          AS summary,
+                       ar.result->>'overall_sentiment'     AS sentiment
+                FROM analysis_results ar
+                {where}
+                ORDER BY ar.created_at DESC
+                LIMIT :lim
+                """
+            ),
+            params,
+        )
+    ).mappings().all()
+
+    vectors: list[list[float]] = []
+    meta: list[dict] = []
+    for r in rows:
+        vec = parse_pgvector(r["emb"])
+        if vec:
+            vectors.append(vec)
+            meta.append({
+                "post_id": r["post_id"],
+                "summary": r["summary"],
+                "sentiment": r["sentiment"] or "neutral",
+            })
+
+    if len(vectors) < 2:
+        return []
+
+    cr = cluster_embeddings(vectors)
+
+    # One LLM-B call per cluster over a representative slice. Reuse one client;
+    # if it can't be built, clusters are still returned (summaries just None).
+    llm = None
+    try:
+        from libs.llm.client import LLMClient  # noqa: PLC0415
+        llm = LLMClient()
+    except Exception:
+        llm = None
+
+    clusters: list[dict] = []
+    for ci in range(cr.k):
+        member_idx = cr.members[ci] if ci < len(cr.members) else []
+        if not member_idx:
+            continue
+        rep_idx = cr.representative_indices[ci]
+        # dominant sentiment in the cluster
+        sent_counts: dict[str, int] = {}
+        for mi in member_idx:
+            s = meta[mi]["sentiment"]
+            sent_counts[s] = sent_counts.get(s, 0) + 1
+        top_sentiment = max(sent_counts, key=sent_counts.get)
+
+        # representative + a few member summaries as grounding for the LLM
+        sample = [meta[mi]["summary"] for mi in ([rep_idx] + member_idx[:5]) if meta[mi]["summary"]]
+        summary = await _summarize_cluster(llm, sample, top_sentiment, backend_override)
+
+        clusters.append({
+            "cluster_id": f"emb-{ci}",
+            "size": cr.sizes[ci],
+            "top_sentiment": top_sentiment,
+            "representative_post_id": meta[rep_idx]["post_id"] if rep_idx >= 0 else None,
+            "summary": summary,
+        })
+
+    clusters.sort(key=lambda c: c["size"], reverse=True)
+    return clusters
+
+
+async def _summarize_cluster(
+    llm,
+    sample_summaries: list[str],
+    top_sentiment: str,
+    backend_override: str | None,
+) -> str | None:
+    """One LLM-B call summarizing a cluster from representative post summaries."""
+    if llm is None or not sample_summaries:
+        return None
+    try:
+        prompt = (
+            "These are post summaries from one cluster of similar social-media "
+            f"posts (dominant sentiment: {top_sentiment}). In ONE neutral "
+            "sentence, state the common theme. No preamble.\n\n"
+            + "\n".join(f"- {s}" for s in sample_summaries[:6])
+        )
+        resp = await asyncio.wait_for(
+            llm.chat(
+                role="llm_b",
+                messages=[{"role": "user", "content": prompt}],
+                backend_override=backend_override,
+                max_tokens=120,
+                temperature=0.2,
+            ),
+            timeout=30.0,
+        )
+        return (resp.get("content") or "").strip() or None
+    except Exception as exc:
+        log.warning("cluster_summary_failed", error=str(exc))
+        return None
+
+
+# ---------------------------------------------------------------------------
 # GET /v1/reports
 # ---------------------------------------------------------------------------
 
@@ -271,6 +408,7 @@ async def list_reports(
     status_code=status.HTTP_202_ACCEPTED,
     response_model=ReportResponse,
     summary="Request an async report generation",
+    dependencies=[Depends(rate_limit)],
 )
 async def create_report(
     body: ReportRequest,
@@ -326,6 +464,17 @@ async def create_report(
                 content["aggregate_summary"] = content["summary"]
                 content["summary"] = narrative
                 content["summary_source"] = "llm"
+
+            # Embedding clusters + per-cluster LLM summaries (§5 cost lever):
+            # ~k LLM calls for the whole corpus, not one per post. Best-effort —
+            # never fail report creation if clustering/LLM is unavailable.
+            try:
+                content["embedding_clusters"] = await _embedding_clusters(
+                    db, campaign_id, backend_override
+                )
+            except Exception as exc:
+                log.warning("embedding_clusters_failed", error=str(exc))
+                content["embedding_clusters"] = []
 
         options["result"] = content
         await db.execute(

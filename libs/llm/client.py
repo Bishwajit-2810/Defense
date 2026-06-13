@@ -27,6 +27,7 @@ from tenacity import (
     wait_exponential,
 )
 
+from .circuit import CircuitBreaker
 from .policy import DEFAULT_POLICY, PolicyViolationError, TenantPolicy, enforce_policy
 
 T = TypeVar("T")
@@ -112,6 +113,15 @@ class LLMClient:
         self._groq_models: dict[str, str] = {
             role: os.environ.get(_ROLE_GROQ_ENV[role], _ROLE_GROQ_DEFAULT[role])
             for role in VALID_ROLES
+        }
+
+        # Per-backend circuit breakers (§8): take a flapping backend out of
+        # rotation for a cooldown instead of hammering it every request.
+        cb_threshold = int(os.environ.get("LLM_CB_FAILURE_THRESHOLD", "5"))
+        cb_cooldown = float(os.environ.get("LLM_CB_COOLDOWN_SECONDS", "30"))
+        self._breakers: dict[str, CircuitBreaker] = {
+            "local": CircuitBreaker("local", cb_threshold, cb_cooldown),
+            "groq": CircuitBreaker("groq", cb_threshold, cb_cooldown),
         }
 
     # ------------------------------------------------------------------
@@ -200,6 +210,14 @@ class LLMClient:
 
         model_id = self._resolve_model(role, effective_backend)
 
+        # Preemptive failover: if Groq's circuit is open (recent repeated
+        # failures), don't even try it — route straight to local, which is
+        # always available and privacy-safe (§8).
+        if effective_backend == "groq" and not self._breakers["groq"].allow():
+            log.warning("llm_groq_circuit_open_preempting_local role={}", role)
+            effective_backend = "local"
+            model_id = self._resolve_model(role, "local")
+
         t0 = time.perf_counter()
         try:
             completion = await self._call_api(
@@ -210,7 +228,9 @@ class LLMClient:
                 max_tokens=max_tokens,
                 temperature=temperature,
             )
+            self._breakers[effective_backend].record_success()
         except Exception as exc:
+            self._breakers[effective_backend].record_failure()
             # A Groq failure (bad/expired key, connection, rate limit) must never
             # take down analysis — fall back to the local Ollama backend, which is
             # always available and privacy-safe. Local failures still propagate.
@@ -229,6 +249,7 @@ class LLMClient:
                     max_tokens=max_tokens,
                     temperature=temperature,
                 )
+                self._breakers["local"].record_success()
             else:
                 log.error(
                     "llm_call_failed backend={} role={} model={} error={}",

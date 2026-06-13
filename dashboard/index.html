@@ -5,7 +5,7 @@
   <meta name="viewport" content="width=device-width, initial-scale=1.0" />
   <title>Defense Analysis Dashboard</title>
   <link rel="icon" href="data:image/svg+xml,%3Csvg xmlns='http://www.w3.org/2000/svg' viewBox='0 0 16 16'%3E%3Crect width='16' height='16' rx='3' fill='%236366f1'/%3E%3C/svg%3E" />
-  <link rel="stylesheet" href="styles.css?v=5" />
+  <link rel="stylesheet" href="styles.css?v=6" />
   <!-- API the dashboard talks to. Change this for other deployments
        (e.g. 'http://localhost:8000' for Mode B). -->
   <script>window.API_BASE = 'http://127.0.0.1:8001';</script>
@@ -32,6 +32,7 @@
         <span class="refresh-toggle-label">Auto-refresh</span>
       </label>
       <button id="llm-chip" class="llm-chip hidden" type="button" title="LLM backend — click to open settings">LLM: ...</button>
+      <button id="nlp-chip" class="llm-chip hidden" type="button" title="Stage-1 sentiment model — click to open settings">NLP: ...</button>
       <span id="header-auth-status" class="auth-status disconnected">Not authenticated</span>
       <button id="header-login-btn" class="btn btn-secondary btn-sm">Login / API Key</button>
     </div>
@@ -64,6 +65,10 @@
     <button class="nav-tab" data-tab="agents" role="tab" aria-controls="tab-agents">
       <svg class="nav-tab-icon" viewBox="0 0 20 20" fill="currentColor"><path d="M10 2a4 4 0 014 4v1h1a2 2 0 012 2v6a2 2 0 01-2 2H5a2 2 0 01-2-2V9a2 2 0 012-2h1V6a4 4 0 014-4zm0 2a2 2 0 00-2 2v1h4V6a2 2 0 00-2-2zM7.5 11a1 1 0 100 2 1 1 0 000-2zm5 0a1 1 0 100 2 1 1 0 000-2z"/></svg>
       Agents
+    </button>
+    <button class="nav-tab" data-tab="pipeline" role="tab" aria-controls="tab-pipeline">
+      <svg class="nav-tab-icon" viewBox="0 0 20 20" fill="currentColor"><path d="M5 3a2 2 0 100 4 2 2 0 000-4zM3 5a2 2 0 114 0 2 2 0 01-4 0zm12 8a2 2 0 100 4 2 2 0 000-4zm-2 2a2 2 0 114 0 2 2 0 01-4 0z"/><path fill-rule="evenodd" d="M6 5h5a4 4 0 014 4v4h-2V9a2 2 0 00-2-2H6V5z" clip-rule="evenodd"/></svg>
+      Pipeline
     </button>
   </nav>
 
@@ -459,6 +464,60 @@
 
     </section><!-- /tab-agents -->
 
+    <!-- =========================================================
+         PIPELINE TAB — visualize what each stage hands the next
+         ========================================================= -->
+    <section id="tab-pipeline" class="tab-panel" role="tabpanel">
+
+      <!-- Real-time data flow across the 5 pipeline stages (SSE-driven) -->
+      <div class="card">
+        <div class="card-header">
+          <div>
+            <div class="card-title">Live Data Flow</div>
+            <div class="card-description">
+              Real-time stage state over Redis Streams — <strong>waiting</strong> (backlog) ·
+              <strong>processing</strong> (in-flight) · <strong>failed</strong> (dead-lettered).
+              Updates ~every 1.5s.
+            </div>
+          </div>
+          <span id="pipeline-live-status" class="tag tag-sm">connecting…</span>
+        </div>
+        <div id="pipeline-flow" class="pipeline-flow"></div>
+        <div id="pipeline-flow-summary" class="pipeline-flow-summary"></div>
+      </div>
+
+      <div class="card">
+        <div class="card-header">
+          <div>
+            <div class="card-title">Pipeline Inspector</div>
+            <div class="card-description" id="pipeline-source-note">
+              Scrub the slider to see exactly what payload one stage hands to the next over Redis Streams.
+            </div>
+          </div>
+          <button class="btn btn-secondary btn-sm" onclick="loadPipeline()">
+            <svg width="13" height="13" viewBox="0 0 20 20" fill="currentColor"><path fill-rule="evenodd" d="M4 2a1 1 0 011 1v2.101a7.002 7.002 0 0111.601 2.566 1 1 0 11-1.885.666A5.002 5.002 0 005.999 7H9a1 1 0 010 2H4a1 1 0 01-1-1V3a1 1 0 011-1zm.008 9.057a1 1 0 011.276.61A5.002 5.002 0 0014.001 13H11a1 1 0 110-2h5a1 1 0 011 1v5a1 1 0 11-2 0v-2.101a7.002 7.002 0 01-11.601-2.566 1 1 0 01.61-1.276z" clip-rule="evenodd"/></svg>
+            Refresh
+          </button>
+        </div>
+
+        <!-- Stage stepper (filled in by app.js) -->
+        <div id="pipeline-stepper" class="pipeline-stepper"></div>
+
+        <!-- Transition slider -->
+        <div class="pipeline-slider-wrap">
+          <input type="range" id="pipeline-slider" class="pipeline-slider" min="0" max="3" step="1" value="2" aria-label="Pipeline transition" />
+          <div id="pipeline-slider-ticks" class="pipeline-slider-ticks"></div>
+        </div>
+      </div>
+
+      <!-- Payload viewer for the selected transition -->
+      <div class="card">
+        <div id="pipeline-edge-head"></div>
+        <div id="pipeline-payload"></div>
+      </div>
+
+    </section><!-- /tab-pipeline -->
+
   </main><!-- /main-content -->
 
   <!-- ============================================================
@@ -582,11 +641,31 @@
     </div>
   </div>
 
+  <!-- ============================================================
+       Stage-1 sentiment model settings modal
+       ============================================================ -->
+  <div id="nlp-settings-overlay" class="modal-overlay hidden" role="dialog" aria-modal="true" aria-labelledby="nlp-settings-title">
+    <div class="modal" style="max-width:560px">
+      <div class="modal-header">
+        <div>
+          <div class="modal-title" id="nlp-settings-title">Sentiment Model Settings</div>
+          <div class="modal-subtitle">Auto-route by language, or force one model for Stage-1 sentiment</div>
+        </div>
+        <button class="modal-close" id="nlp-settings-close-btn" aria-label="Close">&times;</button>
+      </div>
+      <div class="modal-body" id="nlp-settings-body">
+        <div class="loading-overlay">
+          <div class="spinner spinner-dark"></div> Loading sentiment-model configuration...
+        </div>
+      </div>
+    </div>
+  </div>
+
   <!-- Toast container -->
   <div id="toast-container" aria-live="polite"></div>
 
 </div><!-- /app -->
 
-<script src="app.js?v=11"></script>
+<script src="app.js?v=12"></script>
 </body>
 </html>

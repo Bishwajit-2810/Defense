@@ -405,11 +405,12 @@ export CLICKHOUSE_HOST=$(ipof clickhouse) CLICKHOUSE_PORT=9000 \
 # (retrieval-mcp's real path queries pgvector and needs sentence-transformers.)
 export ANALYTICS_MCP_STUB=true RETRIEVAL_MCP_STUB=true
 
-# analytics_mcp uses package-relative imports — launch it by module path from $REPO:
-uvicorn mcp.analytics_mcp.server:app --host 127.0.0.1 --port 8110 --log-level warning > /tmp/analytics_mcp.log 2>&1 &
-( cd $REPO/mcp/retrieval_mcp && uvicorn server:app --host 127.0.0.1 --port 8101 --log-level warning ) > /tmp/retrieval_mcp.log 2>&1 &
-( cd $REPO/mcp/ingest_mcp    && uvicorn server:app --host 127.0.0.1 --port 8102 --log-level warning ) > /tmp/ingest_mcp.log 2>&1 &
-# agents also uses package-relative imports — module path from $REPO:
+# Each MCP server is a FastMCP app exposing the streamable-HTTP endpoint at /mcp.
+# analytics_mcp launches by module path from $REPO:
+uvicorn mcp_servers.analytics_mcp.server:app --host 127.0.0.1 --port 8110 --log-level warning > /tmp/analytics_mcp.log 2>&1 &
+( cd $REPO/mcp_servers/retrieval_mcp && uvicorn server:app --host 127.0.0.1 --port 8101 --log-level warning ) > /tmp/retrieval_mcp.log 2>&1 &
+( cd $REPO/mcp_servers/ingest_mcp    && uvicorn server:app --host 127.0.0.1 --port 8102 --log-level warning ) > /tmp/ingest_mcp.log 2>&1 &
+# agents uses package-relative imports — module path from $REPO:
 uvicorn services.agents.main:app --host 127.0.0.1 --port 8010 --log-level warning > /tmp/agents.log 2>&1 &
 ```
 
@@ -507,6 +508,8 @@ back to if unset.
 | ----------------- | ------------------------------------------------------------------------------------------- | --------------------- | ----------------- |
 | `MODEL_STUB_MODE` | `true` = deterministic heuristic stubs (no weights, no GPU); `false` = load real ML models. | default `true`        | `true`            |
 | `EMBEDDING_MODEL` | Real sentence-embedding model (only when `MODEL_STUB_MODE=false`); must output `EMBEDDING_DIM` dims. Shared by Stage-1, the API and retrieval-mcp via `libs/embeddings.py`. | default `paraphrase-multilingual-mpnet-base-v2` (768-dim) | — |
+| `SENTIMENT_MODEL` | Default sentiment checkpoint (XLM-R) — the `xlmr` option / fallback for every language. Must have a 3-class sentiment head. | default `cardiffnlp/twitter-xlm-roberta-base-sentiment` | — |
+| `BANGLABERT_SENTIMENT_MODEL` / `BANGLISHBERT_SENTIMENT_MODEL` / `MBERT_SENTIMENT_MODEL` | Sentiment-**fine-tuned** checkpoints that activate the BanglaBERT / BanglishBERT / mBERT options. Unset ⇒ the option stays unavailable and the language router falls back to XLM-R. Auto-route: Bangla-script→BanglaBERT, Banglish/mixed→BanglishBERT, else→XLM-R. Force one at runtime via `PUT /v1/config/nlp` (dashboard "NLP" chip). | unset | — |
 
 ### Agents + MCP stack (only for §11)
 

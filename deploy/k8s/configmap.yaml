@@ -17,3 +17,12 @@ data:
   RETRIEVAL_MCP_URL: "http://retrieval-mcp.defense.svc.cluster.local:8101"
   INGEST_MCP_URL: "http://ingest-mcp.defense.svc.cluster.local:8102"
   AGENTS_SERVICE_URL: "http://agents.defense.svc.cluster.local:8010"
+  # Observability (§10) — flip OTEL_ENABLED to "true" once the obs extra is in
+  # the image (uv sync --extra obs) to export traces to the collector.
+  OTEL_ENABLED: "false"
+  OTEL_EXPORTER_OTLP_ENDPOINT: "http://jaeger.defense.svc.cluster.local:4317"
+  # Message bus (§7): "redis" (MVP default) or "kafka" (prod; needs the kafka extra).
+  BUS_BACKEND: "redis"
+  # Rate limit (§9) + near-duplicate reuse (§3.2) knobs.
+  RATE_LIMIT_PER_MIN: "120"
+  NEAR_DUP_THRESHOLD: "0.97"

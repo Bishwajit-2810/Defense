@@ -1,5 +1,10 @@
 """
-analytics-mcp  —  ClickHouse + Postgres analytics tools exposed as MCP / REST.
+analytics-mcp  —  ClickHouse + Postgres analytics tools exposed over MCP.
+
+Real MCP server (FastMCP, streamable-HTTP transport). The agent orchestrator
+connects with an MCP client and discovers/calls these tools over the protocol;
+there is no bespoke REST contract any more. Tool schemas are derived from the
+typed function signatures below.
 
 Environment variables
 ---------------------
@@ -18,13 +23,13 @@ from __future__ import annotations
 import os
 import random
 from datetime import date, datetime, timedelta
-from typing import Any
+from typing import Annotated, Any, Literal
 
 import structlog
-from fastapi import FastAPI, HTTPException
-from pydantic import BaseModel, Field
-
-from .manifest import TOOL_MANIFEST
+from fastmcp import FastMCP
+from pydantic import Field
+from starlette.requests import Request
+from starlette.responses import JSONResponse
 
 # ---------------------------------------------------------------------------
 # Logging
@@ -340,83 +345,85 @@ def _handle_reaction_mix(
 
 
 # ---------------------------------------------------------------------------
-# Tool dispatch table
+# MCP server + tool definitions
 # ---------------------------------------------------------------------------
 
-_TOOL_HANDLERS = {
-    "trend_query": _handle_trend_query,
-    "sentiment_over_time": _handle_sentiment_over_time,
-    "top_posts": _handle_top_posts,
-    "reaction_mix": _handle_reaction_mix,
-}
-
-# ---------------------------------------------------------------------------
-# FastAPI app
-# ---------------------------------------------------------------------------
-
-app = FastAPI(
-    title="analytics-mcp",
-    description="ClickHouse + Postgres analytics tools exposed as MCP / REST (ClusterIP-only).",
-    version="1.0.0",
+mcp = FastMCP(
+    name="analytics-mcp",
+    instructions=(
+        "ClickHouse + Postgres analytics over analyzed social-media posts. "
+        "Corpus/campaign-level aggregations only — never per-post analysis."
+    ),
 )
 
 
-class ToolCall(BaseModel):
-    tool_name: str = Field(..., description="Name of the MCP tool to invoke.")
-    arguments: dict[str, Any] = Field(default_factory=dict, description="Tool arguments as key-value pairs.")
+@mcp.tool
+def trend_query(
+    campaign_id: Annotated[str, Field(description="CUID/UUID of the campaign to query.")],
+    from_date: Annotated[str, Field(description="Inclusive start date (YYYY-MM-DD).")],
+    to_date: Annotated[str, Field(description="Inclusive end date (YYYY-MM-DD).")],
+    granularity: Literal["hour", "day", "week"] = "day",
+    metric: Literal["post_count", "avg_sentiment", "avg_toxicity"] = "post_count",
+) -> list[dict]:
+    """Query analytics time-series for a campaign. Returns period buckets with
+    post count, avg sentiment, and avg toxicity (all three are always returned)."""
+    log.info("tool_call", tool="trend_query", campaign_id=campaign_id, stub=STUB_MODE)
+    return _handle_trend_query(campaign_id, from_date, to_date, granularity, metric)
 
 
-class ToolResult(BaseModel):
-    tool_name: str
-    result: Any = None
-    error: str | None = None
+@mcp.tool
+def sentiment_over_time(
+    campaign_id: Annotated[str, Field(description="CUID/UUID of the campaign to query.")],
+    from_date: Annotated[str, Field(description="Inclusive start date (YYYY-MM-DD).")],
+    to_date: Annotated[str, Field(description="Inclusive end date (YYYY-MM-DD).")],
+    granularity: Literal["hour", "day", "week"] = "day",
+) -> list[dict]:
+    """Returns sentiment breakdown (positive/negative/neutral/mixed counts) per
+    time period for a campaign."""
+    log.info("tool_call", tool="sentiment_over_time", campaign_id=campaign_id, stub=STUB_MODE)
+    return _handle_sentiment_over_time(campaign_id, from_date, to_date, granularity)
 
 
-@app.get("/mcp/manifest", summary="MCP tool manifest")
-def get_manifest() -> dict:
-    """
-    Returns the full OpenAI-compatible tool manifest listing all available
-    analytics tools with their JSON Schema parameter definitions.
-    Agent orchestrators poll this endpoint to discover tools.
-    """
-    return {"tools": TOOL_MANIFEST}
+@mcp.tool
+def top_posts(
+    campaign_id: Annotated[str, Field(description="CUID/UUID of the campaign to query.")],
+    metric: Literal[
+        "total_reactions", "comment_count", "toxicity_score", "hate_speech_score"
+    ] = "total_reactions",
+    limit: Annotated[int, Field(description="Number of posts to return (max 100).", ge=1, le=100)] = 10,
+    from_date: Annotated[str | None, Field(description="Optional inclusive start date (YYYY-MM-DD).")] = None,
+    to_date: Annotated[str | None, Field(description="Optional inclusive end date (YYYY-MM-DD).")] = None,
+) -> list[dict]:
+    """Returns the top posts for a campaign ranked by the given metric (descending)."""
+    log.info("tool_call", tool="top_posts", campaign_id=campaign_id, metric=metric, stub=STUB_MODE)
+    return _handle_top_posts(campaign_id, metric, limit, from_date, to_date)
 
 
-@app.post("/tools/call", response_model=ToolResult, summary="Invoke an MCP tool")
-async def call_tool(call: ToolCall) -> ToolResult:
-    """
-    Route a tool call to the appropriate handler and return the result.
-    On handler error the response still uses HTTP 200 with a populated
-    `error` field so that agent orchestrators can surface the error without
-    treating it as a transport failure.
-    """
-    handler = _TOOL_HANDLERS.get(call.tool_name)
-    if handler is None:
-        known = sorted(_TOOL_HANDLERS.keys())
-        raise HTTPException(
-            status_code=404,
-            detail=f"Unknown tool {call.tool_name!r}. Known tools: {known}",
-        )
-
-    log.info("tool_call", tool=call.tool_name, args=call.arguments, stub=STUB_MODE)
-
-    try:
-        result = handler(**call.arguments)
-        log.info("tool_call_ok", tool=call.tool_name)
-        return ToolResult(tool_name=call.tool_name, result=result)
-    except TypeError as exc:
-        # Missing / unexpected arguments
-        log.warning("tool_call_bad_args", tool=call.tool_name, error=str(exc))
-        return ToolResult(tool_name=call.tool_name, error=f"Invalid arguments: {exc}")
-    except ValueError as exc:
-        log.warning("tool_call_value_error", tool=call.tool_name, error=str(exc))
-        return ToolResult(tool_name=call.tool_name, error=str(exc))
-    except Exception as exc:
-        log.error("tool_call_error", tool=call.tool_name, error=str(exc))
-        return ToolResult(tool_name=call.tool_name, error=f"Backend error: {exc}")
+@mcp.tool
+def reaction_mix(
+    campaign_id: Annotated[str, Field(description="CUID/UUID of the campaign to query.")],
+    from_date: Annotated[str | None, Field(description="Optional inclusive start date (YYYY-MM-DD).")] = None,
+    to_date: Annotated[str | None, Field(description="Optional inclusive end date (YYYY-MM-DD).")] = None,
+) -> dict:
+    """Returns the aggregated reaction breakdown (LIKE/LOVE/HAHA/WOW/SAD/ANGRY/CARE)
+    totals and percentages for a campaign."""
+    log.info("tool_call", tool="reaction_mix", campaign_id=campaign_id, stub=STUB_MODE)
+    return _handle_reaction_mix(campaign_id, from_date, to_date)
 
 
-@app.get("/health", summary="Health check")
-def health() -> dict:
+@mcp.custom_route("/health", methods=["GET"])
+async def health(_request: Request) -> JSONResponse:
     """Liveness probe — always returns 200 when the process is running."""
-    return {"status": "ok", "service": "analytics-mcp", "stub_mode": STUB_MODE}
+    return JSONResponse({"status": "ok", "service": "analytics-mcp", "stub_mode": STUB_MODE})
+
+
+# ASGI app served by uvicorn: streamable-HTTP MCP endpoint mounted at /mcp.
+app = mcp.http_app(path="/mcp")
+
+
+if __name__ == "__main__":
+    import uvicorn
+
+    port = int(os.environ.get("PORT", 8100))
+    log.info("analytics_mcp_starting", port=port, stub=STUB_MODE)
+    uvicorn.run(app, host="0.0.0.0", port=port)

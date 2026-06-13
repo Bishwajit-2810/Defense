@@ -23,7 +23,7 @@ from sqlalchemy import text
 from sqlalchemy.ext.asyncio import AsyncSession
 
 import redis.asyncio as aioredis
-from deps import check_llm_backend_policy, get_current_user, get_db, get_redis
+from deps import check_llm_backend_policy, get_current_user, get_db, get_redis, rate_limit
 from models import (
     AnalysisDetailResponse,
     AnalysisResultResponse,
@@ -80,6 +80,7 @@ async def _create_analysis_job(
     status_code=status.HTTP_202_ACCEPTED,
     response_model=AnalysisRunResponse,
     summary="Enqueue an analysis job",
+    dependencies=[Depends(rate_limit)],
 )
 async def analysis_run(
     body: AnalysisRunRequest,

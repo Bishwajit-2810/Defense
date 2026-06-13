@@ -1,0 +1,26 @@
+# Promtail — ships Docker container logs to Loki (architecture §10).
+server:
+  http_listen_port: 9080
+  grpc_listen_port: 0
+
+positions:
+  filename: /tmp/positions.yaml
+
+clients:
+  - url: http://loki:3100/loki/api/v1/push
+
+scrape_configs:
+  # Tail every container's JSON log file; the container name becomes a label.
+  - job_name: docker
+    static_configs:
+      - targets: [localhost]
+        labels:
+          job: docker
+          __path__: /var/lib/docker/containers/*/*-json.log
+    pipeline_stages:
+      - json:
+          expressions:
+            log: log
+            stream: stream
+      - output:
+          source: log

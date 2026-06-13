@@ -405,11 +405,12 @@ def start_agents(py: str, env: dict) -> None:
         "ANALYTICS_MCP_STUB": "true", "RETRIEVAL_MCP_STUB": "true",
     })
     uvi = [py, "-m", "uvicorn", "--host", "127.0.0.1", "--log-level", _uvicorn_level()]
-    # analytics_mcp + agents use package-relative imports → module path from repo
-    # root; retrieval/ingest use cwd-relative imports → run from their own dir.
-    start("analytics_mcp", uvi + ["mcp.analytics_mcp.server:app", "--port", "8110"], a, REPO)
-    start("retrieval_mcp", uvi + ["server:app", "--port", "8101"], a, REPO / "mcp/retrieval_mcp")
-    start("ingest_mcp", uvi + ["server:app", "--port", "8102"], a, REPO / "mcp/ingest_mcp")
+    # analytics_mcp + agents launch by module path from the repo root; retrieval/
+    # ingest run from their own dir (server:app). Each FastMCP server exposes the
+    # streamable-HTTP MCP endpoint at /mcp.
+    start("analytics_mcp", uvi + ["mcp_servers.analytics_mcp.server:app", "--port", "8110"], a, REPO)
+    start("retrieval_mcp", uvi + ["server:app", "--port", "8101"], a, REPO / "mcp_servers/retrieval_mcp")
+    start("ingest_mcp", uvi + ["server:app", "--port", "8102"], a, REPO / "mcp_servers/ingest_mcp")
     start("agents", uvi + ["services.agents.main:app", "--port", "8010"], a, REPO)
     ok("agent layer started (analytics :8110, retrieval :8101, ingest :8102, agents :8010)")
 

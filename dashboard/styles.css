@@ -1741,3 +1741,215 @@ canvas {
   width: 44px;
   font-size: 0.8rem;
 }
+
+/* ============================================================
+   Pipeline Inspector tab
+   ============================================================ */
+.pipeline-stepper {
+  display: flex;
+  align-items: flex-start;
+  gap: 4px;
+  margin: 18px 0 4px;
+  overflow-x: auto;
+  padding-bottom: 6px;
+}
+
+.pipeline-node {
+  flex: 1 1 0;
+  min-width: 96px;
+  text-align: center;
+  opacity: 0.55;
+  transition: opacity 0.15s ease;
+}
+.pipeline-node.done   { opacity: 0.8; }
+.pipeline-node.source,
+.pipeline-node.target { opacity: 1; }
+
+.pipeline-node-dot {
+  width: 34px;
+  height: 34px;
+  margin: 0 auto 8px;
+  border-radius: 50%;
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  font-weight: 600;
+  font-size: 0.875rem;
+  background: var(--bg-page);
+  color: var(--text-secondary);
+  border: 2px solid var(--border-color);
+}
+.pipeline-node.done .pipeline-node-dot {
+  background: rgba(34,197,94,0.12);
+  border-color: var(--color-positive);
+  color: var(--color-positive);
+}
+.pipeline-node.source .pipeline-node-dot {
+  background: var(--accent);
+  border-color: var(--accent);
+  color: #fff;
+  box-shadow: 0 0 0 4px var(--accent-light);
+}
+.pipeline-node.target .pipeline-node-dot {
+  background: var(--accent-light);
+  border-color: var(--accent);
+  color: var(--accent);
+}
+
+.pipeline-node-label {
+  font-size: 0.8125rem;
+  font-weight: 600;
+  color: var(--text-primary, var(--text-secondary));
+  line-height: 1.2;
+}
+.pipeline-node-sub {
+  font-size: 0.6875rem;
+  color: var(--text-muted);
+  margin-top: 2px;
+  line-height: 1.25;
+}
+
+.pipeline-arrow {
+  flex: 0 0 auto;
+  align-self: center;
+  margin-top: 4px;
+  font-size: 1.25rem;
+  color: var(--border-color);
+}
+.pipeline-arrow.active { color: var(--accent); }
+
+/* Slider */
+.pipeline-slider-wrap { margin: 8px 4px 0; }
+.pipeline-slider {
+  width: 100%;
+  accent-color: var(--accent);
+  cursor: pointer;
+}
+.pipeline-slider-ticks {
+  display: flex;
+  justify-content: space-between;
+  margin-top: 6px;
+}
+.pipeline-tick {
+  flex: 1 1 0;
+  text-align: center;
+  font-size: 0.6875rem;
+  color: var(--text-muted);
+}
+.pipeline-tick.active { color: var(--accent); font-weight: 600; }
+
+/* ============================================================
+   Live data flow (SSE) — stage nodes + animated arrows
+   ============================================================ */
+.tag-success { background: rgba(34,197,94,0.14);  color: var(--success); }
+.tag-warning { background: rgba(245,158,11,0.16); color: var(--warning); }
+.tag-danger  { background: rgba(239,68,68,0.14);  color: var(--danger); }
+
+.pipeline-flow {
+  display: flex;
+  align-items: stretch;
+  gap: 4px;
+  flex-wrap: wrap;
+  padding: 8px 4px 4px;
+}
+.flow-node {
+  flex: 1 1 0;
+  min-width: 120px;
+  border: 1px solid var(--border-color);
+  border-radius: var(--border-radius);
+  background: var(--bg-card);
+  padding: 10px 12px;
+  transition: border-color 0.3s, box-shadow 0.3s, transform 0.3s;
+}
+.flow-node.active {
+  border-color: var(--accent);
+  box-shadow: 0 0 0 3px var(--accent-light);
+  animation: flow-pulse 1.2s ease-in-out infinite;
+}
+.flow-node.waiting { border-color: var(--warning); }
+.flow-node.done { background: rgba(34,197,94,0.06); border-color: var(--success); }
+.flow-node-label {
+  font-size: 0.74rem;
+  font-weight: 600;
+  color: var(--text-primary, #1e293b);
+  margin-bottom: 6px;
+  white-space: nowrap;
+}
+.flow-node-metrics { display: flex; gap: 8px; flex-wrap: wrap; }
+.flow-metric {
+  font-size: 0.72rem;
+  font-variant-numeric: tabular-nums;
+  white-space: nowrap;
+}
+.flow-metric.proc { color: var(--accent); font-weight: 600; }
+.flow-metric.wait { color: var(--warning); }
+.flow-metric.dlq  { color: var(--danger); font-weight: 600; }
+.flow-metric.ok   { color: var(--success); font-weight: 600; }
+
+.flow-arrow {
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  color: var(--text-muted);
+  font-size: 1.1rem;
+  min-width: 16px;
+  flex: 0 0 auto;
+}
+.flow-arrow.flowing {
+  color: var(--accent);
+  animation: flow-slide 0.9s linear infinite;
+}
+@keyframes flow-pulse {
+  0%, 100% { box-shadow: 0 0 0 3px var(--accent-light); }
+  50%      { box-shadow: 0 0 0 6px var(--accent-light); }
+}
+@keyframes flow-slide {
+  0%   { transform: translateX(-2px); opacity: 0.5; }
+  50%  { transform: translateX(2px);  opacity: 1; }
+  100% { transform: translateX(-2px); opacity: 0.5; }
+}
+
+.pipeline-flow-summary {
+  display: flex;
+  flex-wrap: wrap;
+  gap: 14px;
+  padding: 8px 8px 2px;
+  border-top: 1px solid var(--border-color);
+  margin-top: 6px;
+  font-size: 0.74rem;
+  font-variant-numeric: tabular-nums;
+}
+.flow-sum.proc { color: var(--accent); }
+.flow-sum.wait { color: var(--warning); }
+.flow-sum.dlq  { color: var(--danger); }
+.flow-sum.ok   { color: var(--success); }
+.flow-sum.muted { color: var(--text-muted); margin-left: auto; }
+
+/* Payload viewer */
+.pipeline-fields {
+  display: flex;
+  flex-wrap: wrap;
+  align-items: center;
+  gap: 6px;
+  margin-bottom: 12px;
+}
+.pipeline-fields-label {
+  font-size: 0.75rem;
+  color: var(--text-secondary);
+  margin-right: 4px;
+}
+.pipeline-json {
+  margin: 0;
+  padding: 14px 16px;
+  background: var(--bg-page);
+  border: 1px solid var(--border-color);
+  border-radius: var(--border-radius);
+  font-family: var(--font-mono);
+  font-size: 0.78rem;
+  line-height: 1.5;
+  color: var(--text-secondary);
+  overflow-x: auto;
+  max-height: 520px;
+  overflow-y: auto;
+  white-space: pre;
+}

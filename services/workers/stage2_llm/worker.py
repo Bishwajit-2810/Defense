@@ -63,6 +63,7 @@ _EMOTION_LABELS = {"anger", "sadness", "joy", "fear", "disgust", "surprise", "ne
 _EMOTION_KEYS = ("anger", "sadness", "joy", "fear", "disgust", "surprise", "neutral")
 
 from libs.common.logging import setup_logging  # noqa: E402
+from libs.dlq import record_failure  # noqa: E402
 
 setup_logging("stage2")
 logger = structlog.get_logger(__name__)
@@ -76,6 +77,9 @@ CONSUMER_NAME: str = os.environ.get("HOSTNAME", "stage2-llm-0")
 
 BLOCK_MS: int = 5_000
 COUNT: int = 10  # LLM calls are slow — keep batches small
+
+# Bounded retry before a failed message is dead-lettered to llm:stage2:queue:dlq (§8).
+STAGE2_MAX_RETRIES: int = int(os.environ.get("STAGE2_MAX_RETRIES", "3"))
 
 
 # ---------------------------------------------------------------------------
@@ -830,20 +834,34 @@ async def run() -> None:
             for message_id, fields in messages:
                 try:
                     await _process_message(llm, redis, message_id, fields)
+                    await redis.xack(STAGE2_QUEUE, CONSUMER_GROUP, message_id)
                 except Exception as exc:
                     logger.error(
                         "stage2_message_error",
                         message_id=message_id,
                         error=str(exc),
                     )
-                finally:
+                    # Bounded retry, then dead-letter (§8) — never silently drop.
                     try:
-                        await redis.xack(STAGE2_QUEUE, CONSUMER_GROUP, message_id)
-                    except Exception as ack_exc:
+                        outcome = await record_failure(
+                            redis,
+                            stream=STAGE2_QUEUE,
+                            group=CONSUMER_GROUP,
+                            msg_id=message_id,
+                            fields=fields,
+                            error=exc,
+                            max_retries=STAGE2_MAX_RETRIES,
+                        )
                         logger.warning(
-                            "stage2_ack_failed",
+                            "stage2_failure_handled",
                             message_id=message_id,
-                            error=str(ack_exc),
+                            outcome=outcome,
+                        )
+                    except Exception as dlq_exc:
+                        logger.error(
+                            "stage2_dlq_failed",
+                            message_id=message_id,
+                            error=str(dlq_exc),
                         )
 
     logger.info("stage2_llm_stopped")

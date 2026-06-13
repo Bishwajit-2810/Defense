@@ -42,6 +42,8 @@ from common.utils import (  # noqa: E402
     reaction_breakdown_to_dict,
 )
 
+from dlq import record_failure  # noqa: E402
+
 from .comment_analyzer import analyze_comments  # noqa: E402
 from .fusion import fuse_sentiment  # noqa: E402
 from .models import ModelRegistry  # noqa: E402
@@ -70,6 +72,13 @@ CONSUMER_NAME = os.getenv(
 )
 BLOCK_MS = int(os.getenv("REDIS_BLOCK_MS", "2000"))
 BATCH_SIZE = int(os.getenv("STAGE1_BATCH_SIZE", "1"))
+
+# Runtime sentiment-model override set from the dashboard (PUT /v1/config/nlp).
+# Read fresh per poll; absent/blank => auto-route by detected language.
+SENTIMENT_MODEL_CONFIG_KEY = os.getenv("SENTIMENT_MODEL_CONFIG_KEY", "config:sentiment_model")
+
+# Bounded retry before a failed message is dead-lettered to nlp:stage1:queue:dlq.
+STAGE1_MAX_RETRIES = int(os.getenv("STAGE1_MAX_RETRIES", "3"))
 
 
 # ---------------------------------------------------------------------------
@@ -219,6 +228,12 @@ def _build_result(
             "vision_used": image_result is not None,
             "vision_model": "stub" if os.getenv("MODEL_STUB_MODE", "true").lower() == "true" else "SigLIP",
             "stub_mode": os.getenv("MODEL_STUB_MODE", "true").lower() == "true",
+            # Which concrete models produced this result (reproducibility); the
+            # sentiment model is language-routed / runtime-switchable.
+            "model_versions": {
+                "sentiment": text_result.get("sentiment_model"),
+                "sentiment_route": text_result.get("sentiment_route"),
+            },
         },
     }
 
@@ -230,15 +245,21 @@ def _build_result(
 async def _process_message(
     post: dict,
     registry: ModelRegistry,
+    sentiment_override: str | None = None,
 ) -> dict:
-    """Run the full Stage-1 pipeline on a single post-with-details object."""
+    """Run the full Stage-1 pipeline on a single post-with-details object.
+
+    ``sentiment_override`` is the runtime UI/Redis selection (a key like
+    ``"banglabert"``) forcing a specific sentiment model; ``None`` means
+    auto-route by detected language (see libs/sentiment_models.py).
+    """
 
     caption: str | None = post.get("caption")
     photo_urls: list[str] = post.get("photoUrls") or []
     comments: list[dict] = post.get("comments") or []
 
     # 1. Text NLP on caption
-    text_result = await analyze_text(caption, registry)
+    text_result = await analyze_text(caption, registry, sentiment_override)
 
     # 2. Image analysis — MVP: only the first image
     image_result: dict | None = None
@@ -246,7 +267,7 @@ async def _process_message(
         image_result = await analyze_image(photo_urls[0], registry)
 
     # 3. Comment analysis
-    comment_analysis = await analyze_comments(comments, registry)
+    comment_analysis = await analyze_comments(comments, registry, sentiment_override)
 
     # 4. Sentiment fusion
     reaction_breakdown = post.get("reactionBreakdown") or {}
@@ -325,6 +346,13 @@ async def run_worker() -> None:
             if not messages:
                 continue
 
+            # Read the runtime sentiment-model override once per poll (cheap GET).
+            # Blank/missing => None => auto-route by detected language.
+            try:
+                sentiment_override = await redis.get(SENTIMENT_MODEL_CONFIG_KEY) or None
+            except Exception:
+                sentiment_override = None
+
             # messages: [(stream_name, [(msg_id, {field: value, ...}), ...])]
             for _stream, entries in messages:
                 for msg_id, fields in entries:
@@ -352,7 +380,7 @@ async def run_worker() -> None:
                             comment_analysis,
                             overall_sentiment,
                             sentiment_score,
-                        ) = await _process_message(post, registry)
+                        ) = await _process_message(post, registry, sentiment_override)
 
                         stage1_ms = (time.monotonic() - t0) * 1000.0
 
@@ -395,6 +423,24 @@ async def run_worker() -> None:
                             stage1_ms=round(stage1_ms, 1),
                             exc_info=True,
                         )
-                        # Do NOT ack — leave in PEL for retry / dead-letter logic.
+                        # Bounded retry-by-re-enqueue, then dead-letter (§8).
+                        try:
+                            outcome = await record_failure(
+                                redis,
+                                stream=INPUT_STREAM,
+                                group=CONSUMER_GROUP,
+                                msg_id=msg_id,
+                                fields=fields,
+                                error=exc,
+                                max_retries=STAGE1_MAX_RETRIES,
+                            )
+                            log.warning(
+                                "stage1_failure_handled",
+                                post_id=post_id,
+                                msg_id=msg_id,
+                                outcome=outcome,
+                            )
+                        except Exception as dlq_exc:
+                            log.error("stage1_dlq_failed", msg_id=msg_id, error=str(dlq_exc))
     finally:
         await redis.aclose()

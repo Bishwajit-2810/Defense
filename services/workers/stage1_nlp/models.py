@@ -28,8 +28,9 @@ class ModelRegistry:
         )
         # Cached model handles (None until first use)
         self._lang_detector: Any = None
-        self._sentiment_tokenizer: Any = None
-        self._sentiment_model: Any = None
+        # Sentiment models are cached per HF checkpoint name so the language-aware
+        # router (libs/sentiment_models.py) can switch between them at runtime.
+        self._sentiment_models: dict[str, tuple[Any, Any]] = {}
         self._clip_processor: Any = None
         self._clip_model: Any = None
         self._ner_model: Any = None
@@ -78,31 +79,41 @@ class ModelRegistry:
     # Text sentiment / zero-shot classification
     # ------------------------------------------------------------------
 
-    def get_sentiment_model(self) -> tuple[Any, Any] | None:
-        """Return (tokenizer, model) for XLM-R/mBERT sentiment or None in stub mode."""
+    def get_sentiment_model(self, model_name: str | None = None) -> tuple[Any, Any] | None:
+        """Return (tokenizer, model) for the named sentiment checkpoint.
+
+        ``model_name`` is the HF checkpoint chosen by the language-aware router
+        (libs/sentiment_models.py); defaults to ``SENTIMENT_MODEL`` when omitted.
+        Each distinct checkpoint is loaded once and cached, so switching models
+        at runtime only pays the load cost on first use of each.
+        Returns None in stub mode.
+        """
         if self._stub_mode:
             return None
-        if self._sentiment_model is None:
-            try:
-                from transformers import (  # type: ignore
-                    AutoModelForSequenceClassification,
-                    AutoTokenizer,
-                )
 
-                model_name = os.getenv(
-                    "SENTIMENT_MODEL",
-                    "cardiffnlp/twitter-xlm-roberta-base-sentiment",
-                )
-                self._sentiment_tokenizer = AutoTokenizer.from_pretrained(model_name)
-                self._sentiment_model = (
-                    AutoModelForSequenceClassification.from_pretrained(model_name)
-                )
-                self._sentiment_model.eval()
-                logger.info("Sentiment model loaded: %s", model_name)
-            except Exception as exc:
-                logger.error("Failed to load sentiment model: %s", exc)
-                raise
-        return (self._sentiment_tokenizer, self._sentiment_model)
+        name = model_name or os.getenv(
+            "SENTIMENT_MODEL",
+            "cardiffnlp/twitter-xlm-roberta-base-sentiment",
+        )
+        cached = self._sentiment_models.get(name)
+        if cached is not None:
+            return cached
+
+        try:
+            from transformers import (  # type: ignore
+                AutoModelForSequenceClassification,
+                AutoTokenizer,
+            )
+
+            tokenizer = AutoTokenizer.from_pretrained(name)
+            model = AutoModelForSequenceClassification.from_pretrained(name)
+            model.eval()
+            self._sentiment_models[name] = (tokenizer, model)
+            logger.info("Sentiment model loaded: %s", name)
+        except Exception as exc:
+            logger.error("Failed to load sentiment model %s: %s", name, exc)
+            raise
+        return self._sentiment_models[name]
 
     def get_emotion_pipeline(self) -> Any:
         """Return a HuggingFace pipeline for emotion detection or None in stub mode."""

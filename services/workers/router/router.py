@@ -18,11 +18,15 @@ import structlog
 
 from .rules import get_task_flags, should_use_llm
 from libs.common.logging import setup_logging
+from libs.dlq import record_failure
 
 setup_logging("router")
 logger = structlog.get_logger(__name__)
 
 REDIS_URL: str = os.environ.get("REDIS_URL", "redis://localhost:6379/0")
+
+# Bounded retry before a failed message is dead-lettered to router:queue:dlq (§8).
+ROUTER_MAX_RETRIES: int = int(os.environ.get("ROUTER_MAX_RETRIES", "3"))
 
 # Stream / consumer-group names
 ROUTER_QUEUE: str = "router:queue"
@@ -169,21 +173,35 @@ async def run() -> None:
             for message_id, fields in messages:
                 try:
                     await _process_message(redis, message_id, fields)
+                    await redis.xack(ROUTER_QUEUE, CONSUMER_GROUP, message_id)
                 except Exception as exc:
                     logger.error(
                         "router_message_error",
                         message_id=message_id,
                         error=str(exc),
                     )
-                finally:
-                    # Always acknowledge so the message doesn't pile up in PEL
+                    # Bounded retry, then dead-letter (§8) — never silently drop
+                    # a failed message (record_failure ACKs the original).
                     try:
-                        await redis.xack(ROUTER_QUEUE, CONSUMER_GROUP, message_id)
-                    except Exception as ack_exc:
+                        outcome = await record_failure(
+                            redis,
+                            stream=ROUTER_QUEUE,
+                            group=CONSUMER_GROUP,
+                            msg_id=message_id,
+                            fields=fields,
+                            error=exc,
+                            max_retries=ROUTER_MAX_RETRIES,
+                        )
                         logger.warning(
-                            "router_ack_failed",
+                            "router_failure_handled",
                             message_id=message_id,
-                            error=str(ack_exc),
+                            outcome=outcome,
+                        )
+                    except Exception as dlq_exc:
+                        logger.error(
+                            "router_dlq_failed",
+                            message_id=message_id,
+                            error=str(dlq_exc),
                         )
 
     logger.info("router_stopped")

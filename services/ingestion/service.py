@@ -37,6 +37,8 @@ if _REPO_ROOT not in sys.path:
     sys.path.insert(0, _REPO_ROOT)
 
 from libs.common import content_hash, get_settings
+from libs.dlq import record_failure
+from libs.embeddings import embed_text, to_pgvector_literal
 from .normalizer import normalize_post
 
 # ---------------------------------------------------------------------------
@@ -66,6 +68,15 @@ XREAD_COUNT = 10
 
 # Redis TTL for dedup keys (7 days in seconds).
 DEDUP_TTL_SECONDS = 7 * 24 * 3600
+
+# Near-duplicate reuse (architecture §3.2): after the exact-hash miss, embed the
+# caption and reuse a prior analysis whose embedding is within cosine threshold,
+# skipping Stage-1/2 entirely. High threshold so only true near-dups trigger.
+NEAR_DUP_ENABLED = os.getenv("NEAR_DUP_DEDUP", "true").lower() == "true"
+NEAR_DUP_THRESHOLD = float(os.getenv("NEAR_DUP_THRESHOLD", "0.97"))
+
+# Bounded retry before a failed message is dead-lettered to ingestion:queue:dlq (§8).
+INGESTION_MAX_RETRIES = int(os.getenv("INGESTION_MAX_RETRIES", "3"))
 
 # ---------------------------------------------------------------------------
 # Database helpers
@@ -213,6 +224,62 @@ async def _is_duplicate(redis: Redis, hash_value: str) -> bool:
         ex=DEDUP_TTL_SECONDS,
     )
     return was_set is None  # None means key already existed → duplicate
+
+
+async def _find_near_duplicate(
+    session: AsyncSession,
+    caption: str,
+    campaign_id: str | None,
+) -> tuple[str, float] | None:
+    """Return (source_post_id, score) of a prior analysis within cosine
+    threshold of this caption's embedding, or None. Scoped to the campaign."""
+    qvec = to_pgvector_literal(embed_text(caption))
+    params: dict[str, Any] = {"qvec": qvec}
+    where = "WHERE ar.embedding IS NOT NULL"
+    if campaign_id:
+        where += " AND ar.campaign_id = :cid"
+        params["cid"] = campaign_id
+
+    sql = text(
+        f"""
+        SELECT ar.post_id                                    AS post_id,
+               1 - (ar.embedding <=> CAST(:qvec AS vector))  AS score
+        FROM analysis_results ar
+        {where}
+        ORDER BY ar.embedding <=> CAST(:qvec AS vector)
+        LIMIT 1
+        """
+    )
+    row = (await session.execute(sql, params)).mappings().first()
+    if row and row["score"] is not None and float(row["score"]) >= NEAR_DUP_THRESHOLD:
+        return row["post_id"], float(row["score"])
+    return None
+
+
+async def _reuse_analysis(session: AsyncSession, src_post_id: str, new_post_id: str) -> bool:
+    """Copy a prior analysis_results row onto a new post_id (near-dup reuse).
+
+    The new post gets a full result without ever touching Stage-1/2. Returns
+    True when a row was written.
+    """
+    sql = text(
+        """
+        INSERT INTO analysis_results
+            (post_id, campaign_id, result, embedding, schema_version, created_at, updated_at)
+        SELECT :new_id, ar.campaign_id, ar.result, ar.embedding, ar.schema_version, NOW(), NOW()
+        FROM analysis_results ar
+        WHERE ar.post_id = :src
+        ORDER BY ar.created_at DESC
+        LIMIT 1
+        ON CONFLICT (post_id) DO UPDATE SET
+            result         = EXCLUDED.result,
+            embedding      = EXCLUDED.embedding,
+            schema_version = EXCLUDED.schema_version,
+            updated_at     = NOW()
+        """
+    )
+    res = await session.execute(sql, {"new_id": new_post_id, "src": src_post_id})
+    return (res.rowcount or 0) > 0
 
 
 # ---------------------------------------------------------------------------
@@ -488,6 +555,32 @@ async def _process_message(
     async with session_factory() as session:
         await _upsert_post(session, normalized, raw)
 
+    # Step 5b — near-duplicate reuse (§3.2): if this caption is within cosine
+    # threshold of an already-analyzed post, copy that result and skip Stage-1/2
+    # entirely. Best-effort — any failure falls back to normal processing.
+    caption = normalized.get("caption")
+    if NEAR_DUP_ENABLED and caption:
+        try:
+            async with session_factory() as session:
+                dup = await _find_near_duplicate(session, caption, raw.get("campaignId"))
+                if dup and await _reuse_analysis(session, dup[0], post_id):
+                    await session.commit()
+                    log.info(
+                        "ingestion.near_duplicate_reused",
+                        post_id=post_id,
+                        source_post_id=dup[0],
+                        score=round(dup[1], 4),
+                        message_id=msg_id_str,
+                    )
+                    if job_id:
+                        await _count_skipped_for_job(
+                            redis, session_factory, job_id, post_id, "near_duplicate_reused"
+                        )
+                    await redis.xack(stream_name, CONSUMER_GROUP, message_id)
+                    return
+        except Exception as exc:
+            log.warning("ingestion.near_dup_check_failed", post_id=post_id, error=str(exc))
+
     # Step 6 — enqueue to NLP stage-1 stream.
     await _enqueue_nlp(redis, normalized, raw, job_id=job_id, options=options)
 
@@ -633,18 +726,29 @@ async def run_service() -> None:
                             error=str(exc),
                             exc_info=True,
                         )
-                        # ACK even on failure so a bad message does not block
-                        # the stream indefinitely.  Failed messages can be
-                        # inspected via XPENDING / dead-letter patterns.
+                        # Bounded retry, then dead-letter to
+                        # ingestion:queue:dlq (§8) — never silently drop a bad
+                        # message (record_failure ACKs the original).
                         try:
-                            await redis.xack(
-                                stream_name_str, CONSUMER_GROUP, message_id
+                            outcome = await record_failure(
+                                redis,
+                                stream=stream_name_str,
+                                group=CONSUMER_GROUP,
+                                msg_id=message_id,
+                                fields=fields,
+                                error=exc,
+                                max_retries=INGESTION_MAX_RETRIES,
                             )
-                        except Exception as ack_exc:
-                            log.error(
-                                "ingestion.ack_error",
+                            log.warning(
+                                "ingestion.failure_handled",
                                 message_id=msg_id_str,
-                                error=str(ack_exc),
+                                outcome=outcome,
+                            )
+                        except Exception as dlq_exc:
+                            log.error(
+                                "ingestion.dlq_error",
+                                message_id=msg_id_str,
+                                error=str(dlq_exc),
                             )
 
     except (KeyboardInterrupt, asyncio.CancelledError):
