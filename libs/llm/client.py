@@ -15,7 +15,7 @@ Usage:
 import json
 import os
 import time
-from typing import Any, Optional, Type, TypeVar
+from typing import Any, AsyncIterator, Optional, Type, TypeVar
 
 import openai
 from loguru import logger as log
@@ -200,6 +200,7 @@ class LLMClient:
         response_format: Optional[dict[str, Any]] = None,
         max_tokens: int = 2048,
         temperature: float = 0.1,
+        model: Optional[str] = None,
     ) -> dict[str, Any]:
         """
         Send a chat request and return a normalised response dict.
@@ -228,7 +229,10 @@ class LLMClient:
             default_backend=self._default_backend,
         )
 
-        model_id = self._resolve_model(role, effective_backend)
+        # An explicit `model` overrides the role→model default for the chosen
+        # backend. On any failover to local below we drop the override and use the
+        # local role default, since a backend-specific model id won't exist there.
+        model_id = model or self._resolve_model(role, effective_backend)
 
         # Preemptive failover: if Groq's circuit is open (recent repeated
         # failures), don't even try it — route straight to local, which is
@@ -298,6 +302,105 @@ class LLMClient:
             "backend": effective_backend,
         }
 
+    async def chat_stream(
+        self,
+        role: str,
+        messages: list[dict[str, Any]],
+        backend_override: Optional[str] = None,
+        tenant_policy: Optional[TenantPolicy] = None,
+        max_tokens: int = 1024,
+        temperature: float = 0.3,
+        model: Optional[str] = None,
+    ) -> AsyncIterator[dict[str, Any]]:
+        """Stream a chat completion token-by-token (for the chatbot endpoint).
+
+        Backend resolution and tenant-policy enforcement match ``chat()``. Yields
+        a sequence of event dicts:
+
+            {"type": "meta",  "backend": str, "model": str}          # once, first
+            {"type": "delta", "content": str}                         # zero or more
+            {"type": "done",  "backend": str, "model": str, "usage": {...}}  # last
+            {"type": "error", "error": str}                           # instead of done, on failure
+
+        Failover to local happens only when Groq fails BEFORE the first token —
+        once bytes are on the wire a mid-stream failure just ends with an error
+        event (we can't cleanly restart a partially-streamed answer).
+        """
+        effective_backend = enforce_policy(
+            tenant_policy=tenant_policy,
+            requested_backend=backend_override,
+            default_backend=self._default_backend,
+        )
+        # An explicit `model` overrides the role→model default; dropped on any
+        # failover to local (a backend-specific model id won't exist there).
+        model_id = model or self._resolve_model(role, effective_backend)
+
+        # Preemptive failover: Groq circuit open → go straight to local.
+        if effective_backend == "groq" and not self._breakers["groq"].allow():
+            log.warning("llm_stream_groq_circuit_open_preempting_local role={}", role)
+            effective_backend = "local"
+            model_id = self._resolve_model(role, "local")
+
+        async def _open(backend: str, model: str):
+            # stream_options is intentionally omitted: some Ollama builds reject
+            # unknown params. Usage is therefore best-effort on streams (exact
+            # counts are available via the non-streaming chat()).
+            return await self._get_client(backend).chat.completions.create(
+                model=model,
+                messages=messages,
+                max_tokens=max_tokens,
+                temperature=temperature,
+                stream=True,
+            )
+
+        t0 = time.perf_counter()
+        try:
+            stream = await _open(effective_backend, model_id)
+        except Exception as exc:
+            self._breakers[effective_backend].record_failure()
+            if effective_backend == "groq":
+                log.warning(
+                    "llm_stream_groq_open_failed_falling_back_to_local model={} error={}",
+                    model_id, exc,
+                )
+                effective_backend = "local"
+                model_id = self._resolve_model(role, "local")
+                stream = await _open(effective_backend, model_id)
+            else:
+                log.error("llm_stream_open_failed backend={} error={}", effective_backend, exc)
+                yield {"type": "error", "error": str(exc)}
+                return
+
+        yield {"type": "meta", "backend": effective_backend, "model": model_id}
+
+        usage = {"prompt_tokens": 0, "completion_tokens": 0, "total_tokens": 0}
+        try:
+            async for chunk in stream:
+                if getattr(chunk, "usage", None):
+                    usage = {
+                        "prompt_tokens": chunk.usage.prompt_tokens or 0,
+                        "completion_tokens": chunk.usage.completion_tokens or 0,
+                        "total_tokens": chunk.usage.total_tokens or 0,
+                    }
+                if not chunk.choices:
+                    continue
+                delta = chunk.choices[0].delta.content
+                if delta:
+                    yield {"type": "delta", "content": delta}
+            self._breakers[effective_backend].record_success()
+        except Exception as exc:
+            self._breakers[effective_backend].record_failure()
+            log.error("llm_stream_failed backend={} model={} error={}", effective_backend, model_id, exc)
+            yield {"type": "error", "error": str(exc)}
+            return
+
+        latency_ms = round((time.perf_counter() - t0) * 1000.0, 1)
+        log.info(
+            "llm_stream backend={} role={} model={} tokens={} latency_ms={}",
+            effective_backend, role, model_id, usage["total_tokens"], latency_ms,
+        )
+        yield {"type": "done", "backend": effective_backend, "model": model_id, "usage": usage}
+
     async def chat_structured(
         self,
         role: str,
@@ -342,3 +445,27 @@ class LLMClient:
         data = json.loads(raw_json)
         # schema_class is expected to be a Pydantic BaseModel subclass
         return schema_class.model_validate(data)
+
+    # ------------------------------------------------------------------
+    # Model discovery (for the chat model picker)
+    # ------------------------------------------------------------------
+
+    def default_model(self, role: str, backend: str) -> str:
+        """The role→model default for a backend (public wrapper)."""
+        return self._resolve_model(role, backend)
+
+    async def list_models(self, backend: str) -> list[str]:
+        """Best-effort list of model ids the backend can serve.
+
+        Queries the backend's OpenAI-compatible ``/v1/models`` (Ollama returns
+        every pulled model; Groq returns its hosted catalogue). Returns ``[]`` if
+        the backend is unreachable or unauthenticated — the caller can still fall
+        back to the configured default.
+        """
+        try:
+            resp = await self._get_client(backend).models.list()
+        except Exception as exc:
+            log.warning("llm_list_models_failed backend={} error={}", backend, exc)
+            return []
+        ids = {getattr(m, "id", None) for m in getattr(resp, "data", []) or []}
+        return sorted(i for i in ids if i)

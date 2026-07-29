@@ -7,7 +7,7 @@ from fastapi import FastAPI
 from fastapi.middleware.cors import CORSMiddleware
 from prometheus_fastapi_instrumentator import Instrumentator
 
-from routers import analysis, auth, config, health, ingest, pipeline, reports, search
+from routers import analysis, auth, chat, config, health, ingest, pipeline, reports, search
 from routers.agents import router as agents_router
 from routers.usage import router as usage_router
 
@@ -77,6 +77,7 @@ app.include_router(analysis.router)
 app.include_router(reports.router)
 app.include_router(search.router)
 app.include_router(config.router)
+app.include_router(chat.router)
 app.include_router(pipeline.router)
 app.include_router(agents_router)
 app.include_router(usage_router)

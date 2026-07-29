@@ -6,8 +6,10 @@ Run it with uv (recommended):
     uv run run_all.py                 # core pipeline + dashboard, load the 50 posts
     uv run run_all.py --with-agents   # also start the agents + 3 MCP servers
     uv run run_all.py --reset         # wipe prior data, then load the 50 posts fresh
-    uv run run_all.py --fast          # run LLM work on Groq Cloud (needs GROQ_API_KEY) — much faster
+    uv run run_all.py --groq          # run LLM work on Groq Cloud (needs GROQ_API_KEY) — much faster (--fast synonym)
+    uv run run_all.py --ollama        # force local Ollama for LLM work (the default backend)
     uv run run_all.py --no-load       # don't push the sample posts
+    uv run run_all.py --manual-load   # bring the UI up first; you push the posts yourself via the API
     uv run run_all.py --no-dashboard  # skip serving the web UI
     uv run run_all.py --down          # on exit, also `docker compose down`
 
@@ -382,6 +384,21 @@ def apply_fast_preset(env: dict) -> None:
        f"llm_b={env['LLM_B_GROQ_MODEL']})")
 
 
+def apply_ollama_preset(env: dict) -> None:
+    """--ollama: pin Stage-2 + agents to the local Ollama backend (the default).
+
+    build_env already sets LLM_BACKEND=local, so the only extra work is clearing
+    the dashboard's runtime backend override in Redis — Stage-2 reads that key
+    BEFORE the env default, so a prior --groq/--fast run could otherwise leave it
+    pinned to groq. (Runs after reset_data's FLUSHALL.)
+    """
+    env["LLM_BACKEND"] = "local"
+    subprocess.run(["docker", "exec", "deploy-redis-1", "redis-cli", "SET",
+                    "config:llm_backend", "local"], capture_output=True)
+    ok(f"--ollama: Stage-2/agents → local Ollama  (stage1={env['STAGE1_LOCAL_MODEL']}, "
+       f"stage2={env['STAGE2_LOCAL_MODEL']})")
+
+
 def start_pipeline(py: str, env: dict) -> None:
     start("stage1", [py, "-m", "services.workers.stage1_nlp"], env, REPO)
     start("router", [py, "-m", "services.workers.router"], env, REPO)
@@ -461,6 +478,44 @@ def reset_data() -> None:
                    capture_output=True)
 
 
+# The pipeline's Redis Stream queues → their consumer group, in flow order.
+# Consumers read only new entries (XREADGROUP ">"), so any messages a prior run
+# enqueued but never delivered sit in the stream and get processed the moment the
+# workers restart. (Pending/unacked entries are never reclaimed — no worker uses
+# XAUTOCLAIM — so undelivered backlog is the only thing that auto-resumes.)
+_QUEUE_GROUPS = [
+    ("ingestion:queue",  "ingestion-workers"),
+    ("nlp:stage1:queue", "stage1-nlp-group"),
+    ("router:queue",     "router-workers"),
+    ("llm:stage2:queue", "stage2-llm-workers"),
+    ("assembler:queue",  "assembler-group"),
+]
+
+
+def pause_pipeline_queues() -> None:
+    """Quiet the pipeline for a PRIOR run's leftover work WITHOUT deleting any
+    stream data: reset each stage's consumer group so it has **0 in-flight and 0
+    backlog**, then only NEW messages — your manual uploads — get delivered.
+
+    We DESTROY the consumer group (dropping its pending-entries list — those are
+    the delivered-but-unacked messages the Pipeline tab reports as "processing/
+    in-flight", and which no worker ever reclaims) and re-CREATE it at the tail
+    (``$``) so its lag is 0 too. The stream's entries are left untouched, so
+    nothing is cleared from Redis — the workers just start past them.
+
+    This is what --manual-load / --no-load want: an idle pipeline with all data
+    (queue entries + Postgres/ClickHouse results) intact. Use --reset for a wipe.
+    """
+    def rc(*cmd):
+        subprocess.run(["docker", "exec", "deploy-redis-1", "redis-cli", *cmd],
+                       capture_output=True)
+    log("quieting the pipeline (reset consumer groups → 0 waiting / 0 in-flight) — "
+        "stream data kept, nothing auto-processes …")
+    for stream, group in _QUEUE_GROUPS:
+        rc("XGROUP", "DESTROY", stream, group)                  # drop the group + its pending list
+        rc("XGROUP", "CREATE", stream, group, "$", "MKSTREAM")  # recreate fresh, at the tail
+
+
 def load_posts(skip_if_loaded: bool) -> None:
     if skip_if_loaded and pg_count() > 0:
         ok(f"posts already loaded ({pg_count()} results) — skipping upload (use --reset to redo)")
@@ -490,7 +545,7 @@ def load_posts(skip_if_loaded: bool) -> None:
     warn("fewer than 50 results so far — check the worker logs in /tmp/*.log")
 
 
-def banner(with_agents: bool, dash_port: int | None) -> None:
+def banner(with_agents: bool, dash_port: int | None, manual_load: bool = False) -> None:
     print()
     ok("════════════════════════════════════════════════════════════")
     ok("  Smart Layer is up.")
@@ -499,6 +554,12 @@ def banner(with_agents: bool, dash_port: int | None) -> None:
         print(f"   • Dashboard  →  http://127.0.0.1:{dash_port}   (log in with API key: demo)")
     if with_agents:
         print("   • Agents     →  POST http://127.0.0.1:%d/v1/agents/query" % API_PORT)
+    if manual_load:
+        print(f"   • {_C['yellow']}No posts auto-loaded{_C['off']} — load them yourself when ready:")
+        if dash_port:
+            print("       – UI:  Dashboard → Posts tab → drop  posts_with_details.json  onto the upload box")
+        print(f"       – API: POST http://127.0.0.1:{API_PORT}/v1/posts/upload  with body {{\"posts\": [...]}}")
+        print("              (ready-to-run command in easy_run.md §D; or re-run without --manual-load to auto-load)")
     if _STREAM:
         flt = f" (filtered: '{_LOG_FILTER}')" if _LOG_FILTER else ""
         print(f"   • Logs       →  streaming live below{flt}  +  /tmp/<service>.log")
@@ -517,10 +578,17 @@ def main() -> None:
     ap.add_argument("--with-agents", action="store_true", help="also start agents + 3 MCP servers")
     ap.add_argument("--no-dashboard", action="store_true", help="don't serve the web UI")
     ap.add_argument("--no-load", action="store_true", help="don't push the 50 sample posts")
+    ap.add_argument("--manual-load", action="store_true",
+                    help="serve the UI first and DON'T auto-load the sample posts (also skips any leftover "
+                         "queued work — kept in Redis, not deleted — so nothing processes in the background) — "
+                         "push data yourself via POST /v1/posts/upload or the dashboard Posts tab")
     ap.add_argument("--reset", action="store_true", help="wipe prior data before loading posts")
     ap.add_argument("--down", action="store_true", help="on exit, also `docker compose down`")
-    ap.add_argument("--fast", action="store_true",
-                    help="route Stage-2 + agents through Groq Cloud (much faster than local Ollama; needs GROQ_API_KEY)")
+    backend = ap.add_mutually_exclusive_group()
+    backend.add_argument("--groq", "--fast", dest="groq", action="store_true",
+                         help="route Stage-2 + agents through Groq Cloud (much faster than local Ollama; needs GROQ_API_KEY). --fast is a synonym.")
+    backend.add_argument("--ollama", action="store_true",
+                         help="pin Stage-2 + agents to local Ollama (the default backend); also clears any Groq override left in Redis by a prior --groq run")
     ap.add_argument("--logs", "-l", action="store_true",
                     help="stream every service's logs live to this terminal (still tee'd to /tmp/*.log)")
     ap.add_argument("--log-level", default="INFO",
@@ -534,25 +602,43 @@ def main() -> None:
     _LOG_LEVEL = args.log_level.upper()
     _LOG_FILTER = args.log_filter
 
+    # --manual-load / --no-load mean "don't auto-load". They must also NOT let the
+    # workers resume a PRIOR run's leftover queue backlog (that's the phantom
+    # background loading), so we park the pipeline backlog — skip it, delete
+    # nothing — before the workers start.
+    defer_load = args.no_load or args.manual_load
+
     py = ensure_deps()
     reap_stale()
     start_infra()
     ensure_ollama()
     env = build_env()
     if args.reset:
-        reset_data()
-    if args.fast:
+        reset_data()               # full wipe (Redis + Postgres + ClickHouse)
+    elif defer_load:
+        pause_pipeline_queues()    # skip leftover backlog, delete nothing
+    if args.groq:
         apply_fast_preset(env)
+    elif args.ollama:
+        apply_ollama_preset(env)
     start_pipeline(py, env)
     if args.with_agents:
         start_agents(py, env)
-    if not args.no_load:
-        load_posts(skip_if_loaded=not args.reset)
+
+    # Serve the dashboard BEFORE loading any posts so the UI is up immediately.
+    # You open it first, then either watch the auto-load populate it or push the
+    # data yourself (--manual-load / --no-load). Previously the blocking load ran
+    # first, so the UI only appeared minutes later.
     dash_port = None
     if not args.no_dashboard:
         dash_port = serve_dashboard(py, env)
+        if dash_port:
+            ok(f"dashboard live → http://127.0.0.1:{dash_port}   (log in with API key: demo)")
 
-    banner(args.with_agents, dash_port)
+    if not defer_load:
+        load_posts(skip_if_loaded=not args.reset)
+
+    banner(args.with_agents, dash_port, manual_load=defer_load)
 
     stop = {"flag": False}
     signal.signal(signal.SIGINT, lambda *_: stop.__setitem__("flag", True))

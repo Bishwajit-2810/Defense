@@ -53,8 +53,9 @@ That's it. The script brings everything up, waits for it to be healthy, loads th
 > First run is slower than you might expect: Stage-1 NLP (`gemma3:4b`) and Stage-2
 > (`qwen2.5:7b`) make real Ollama calls per post **on CPU**, so analysing the 50
 > posts can take several minutes (the model weights also load on first call). The
-> dashboard is usable as soon as the first results land. To go faster, point the
-> LLM backend at Groq from the dashboard, or set `STAGE1_LLM=false` for stub NLP.
+> dashboard is usable as soon as the first results land. To go faster, run with
+> `--groq` (or point the LLM backend at Groq from the dashboard), or set
+> `STAGE1_LLM=false` for stub NLP.
 
 <details>
 <summary>What it does, in order</summary>
@@ -63,8 +64,9 @@ That's it. The script brings everything up, waits for it to be healthy, loads th
 2. `docker compose up` the datastores → waits until healthy → creates the ClickHouse tables
 3. checks **Ollama** (starts it if installed but not running)
 4. launches the **5 workers + API** (on :8001), waits for `/v1/health`
-5. uploads the **50 sample posts** and waits for all 50 to be analysed
-6. **serves the dashboard on :8080** (it already targets the dev API on :8001)
+5. **serves the dashboard on :8080** (it already targets the dev API on :8001) — **the UI is up now**
+6. uploads the **50 sample posts** and waits for all 50 to be analysed — the dashboard is
+   already open, so you watch them populate live (skip this with `--manual-load` and push them yourself)
 
 </details>
 
@@ -72,11 +74,42 @@ That's it. The script brings everything up, waits for it to be healthy, loads th
 
 ```bash
 uv run run_all.py --with-agents   # also start the agents + MCP layer (§4)
+uv run run_all.py --groq          # run LLM work on Groq Cloud instead of Ollama — much faster (needs GROQ_API_KEY)
+uv run run_all.py --ollama        # force local Ollama (the default) & clear any leftover Groq override
 uv run run_all.py --reset         # wipe prior data, then reload the 50 posts
 uv run run_all.py --no-load       # skip pushing the sample posts
+uv run run_all.py --manual-load   # UI up first, no auto-load — push the posts yourself via the API
 uv run run_all.py --no-dashboard  # don't serve the UI
 uv run run_all.py --down          # on Ctrl-C, also `docker compose down`
 ```
+
+`--groq`/`--ollama` pick the LLM backend for Stage-2 + agents + the Chat tab; omit
+both to use the default (local Ollama). `--fast` is an accepted synonym for `--groq`.
+You can also switch at runtime from the dashboard's **LLM** chip. Groq needs
+`GROQ_API_KEY` in `.env` or the environment.
+
+The dashboard is now served **before** the sample posts load, so the UI is up
+right away regardless. With **`--manual-load`** nothing is auto-loaded and any
+**leftover queued work from a previous run is quieted** — each stage's consumer
+group is reset to **0 waiting / 0 in-flight** (the stream entries stay in Redis,
+the workers just start past them), so the Pipeline tab sits idle and nothing runs
+in the background. You push data yourself whenever you want, either from the
+**Posts** tab (drop `posts_with_details.json` on the upload box) or via the API:
+
+```bash
+# body must be {"posts": [...]}; the file is a bare array, so wrap it:
+curl -s -X POST http://127.0.0.1:8001/v1/posts/upload \
+  -H "X-API-Key: demo" -H "Content-Type: application/json" \
+  -d "$(python -c "import json;print(json.dumps({'posts':json.load(open('posts_with_details.json'))}))")"
+```
+
+> **Note:** `--manual-load` deletes nothing — it just parks the leftover queue
+> backlog (skipped, still in Redis) and keeps results already stored in
+> Postgres/ClickHouse, so the dashboard still shows posts analysed on earlier runs.
+> For a truly blank slate, add **`--reset`** (`uv run run_all.py --manual-load
+> --reset`) to wipe the datastores and queues.
+
+(`--no-load` behaves the same but is the quiet "don't load anything" variant.)
 
 ---
 
@@ -85,13 +118,24 @@ uv run run_all.py --down          # on Ctrl-C, also `docker compose down`
 Open **<http://127.0.0.1:8080>** in your browser.
 
 **Log in:** put any non-empty value in the **API key** field — e.g. `demo` — and
-submit. (Dev mode accepts any key.) Four tabs:
+submit. (Dev mode accepts any key.) The tabs:
 
+- **Overview** — usage/cost counters + corpus charts
 - **Posts** — the ingested posts
 - **Analysis Jobs** — submit / track analysis runs
 - **Reports** — generate & read reports (headline metrics, topic clusters, **and
   embedding clusters with one LLM summary per cluster**)
 - **Search** — semantic + keyword search over the analyzed posts
+- **Agents** — natural-language Q&A over the corpus (needs `--with-agents`, §4)
+- **Chat** — a **free-form chatbot** backed by the same LLM (`/v1/chat/stream`).
+  Ask it anything: answers stream in live and render as Markdown (bold, lists,
+  code blocks), each with a Copy button; an empty chat offers clickable prompt
+  suggestions. In the header, a **backend** selector (Auto / Local / Groq —
+  **Auto** follows the LLM toggle) and a **model** dropdown let you choose exactly
+  which model answers (the dropdown lists the backend's available models, e.g.
+  `gemma3:4b` / `qwen2.5:7b` locally; leave it on *Default* for the configured
+  one). It's a general assistant with **no access to your posts** — use **Agents**
+  for that.
 - **Pipeline** — **real-time data flow**: each stage (Ingestion → Stage-1 → Router
   → Stage-2 → Assembler) shows live backlog (waiting) · in-flight (processing) ·
   dead-lettered (failed), streamed over SSE; plus the payload Inspector

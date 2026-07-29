@@ -102,8 +102,9 @@ is the original system-design request. It has been reconciled with
   vLLM in production, Ollama for local dev — no per-token bill, no data egress;
   the default) or **`groq`** (Groq Cloud API — fastest inference, zero GPU ops,
   per-token cost). Both speak an OpenAI-compatible API, so switching is a
-  config/flag change, and you can run hybrid/failover. Pin privacy-sensitive
-  tenants to `local`.
+  config/flag change (`run_all.py --groq` / `--ollama`, the dashboard **LLM**
+  chip, or a per-request `backend`), and you can run hybrid/failover. Pin
+  privacy-sensitive tenants to `local`.
 - **Queue-based, horizontally scalable.** API → ingestion → message bus →
   stateless GPU/CPU workers → result store. Workers scale independently per
   stage.
@@ -117,6 +118,10 @@ is the original system-design request. It has been reconciled with
   layer (FastAPI orchestrator on LLM-B) reaches data via **MCP servers**
   (`analytics`/`retrieval`/`ingest`) for analyst Q&A, grounded reports, and
   coverage deep-dives — gated, cached, budget-capped, never per post.
+- **Free-form chatbot (`POST /v1/chat`, `/v1/chat/stream`).** Ask the platform
+  LLM anything from the API or the dashboard **Chat** tab; replies stream token
+  by token (SSE) and use whichever backend the toggle points at (local ⇄ Groq),
+  overridable per request and subject to the same tenant privacy policy.
 - **Backend FastAPI; dashboard plain HTML/CSS/JS.**
 - **Deployment:** Docker Compose for MVP, Kubernetes (with KEDA autoscaling on
   queue depth) for Production and beyond.

@@ -85,7 +85,7 @@ Suggested monorepo layout:
 
 ```text
 /services
-  /api            FastAPI: gateway routes, ingestion, reporting, auth, /v1/agents
+  /api            FastAPI: gateway routes, ingestion, reporting, auth, /v1/agents, /v1/chat
   /ingestion      upstream client (pull post-with-details) → normalize → enqueue
   /workers
     /stage1_nlp   text suite + vision (image sentiment) + OCR

@@ -242,6 +242,46 @@ curl -s -X PUT $API/v1/config/llm -H "$KEY" -H "Content-Type: application/json" 
   -d '{"backend":null}'                                                # back to default (local)
 ```
 
+### Chatbot (ask it anything — honours the LLM toggle above)
+
+Free-form chat backed by the same LLM the pipeline uses. Backend is resolved as
+`request.backend` → the runtime toggle (`/v1/config/llm`) → env default, so it
+follows whatever `--groq`/`--ollama` (or the dashboard switch) selected. Pass
+`backend:"local"|"groq"` to force one for a single call; a privacy-locked tenant
+can't force `groq`. Pass `model:"<id>"` to pick a specific model (omit for the
+backend's configured default).
+
+```bash
+# Single-turn (uses the current toggle)
+curl -s -X POST $API/v1/chat -H "$KEY" -H "Content-Type: application/json" \
+  -d '{"message":"Summarize the main themes in the fuel-price posts."}'
+# → {"reply":"…","backend":"local","model":"qwen2.5:7b","usage":{"total_tokens":…}}
+
+# Force a specific backend + model for this call
+curl -s -X POST $API/v1/chat -H "$KEY" -H "Content-Type: application/json" \
+  -d '{"message":"hi","backend":"local","model":"gemma3:4b"}'
+
+# Multi-turn history + force Groq for this call
+curl -s -X POST $API/v1/chat -H "$KEY" -H "Content-Type: application/json" -d '{
+  "backend":"groq",
+  "messages":[{"role":"user","content":"hi"},{"role":"assistant","content":"Hello!"},
+              {"role":"user","content":"what can you do?"}]
+}'
+
+# Token streaming (Server-Sent Events)
+curl -sN -X POST $API/v1/chat/stream -H "$KEY" -H "Content-Type: application/json" \
+  -d '{"message":"write a haiku about monitoring"}'
+# event: meta   → {"backend":"groq","model":"llama-3.3-70b-versatile"}
+# event: delta  → {"content":"..."}   (many)
+# event: done   → {"usage":{…}}
+
+# List the models available per backend (populates the dashboard's model picker)
+curl -s -H "$KEY" $API/v1/chat/models
+# → {"active_backend":"local",
+#    "backends":{"local":{"models":["gemma3:4b","qwen2.5:7b",…],"default":"qwen2.5:7b"},
+#                "groq":{"models":[…],"default":"llama-3.3-70b-versatile"}}}
+```
+
 ### Jobs list
 
 ```bash

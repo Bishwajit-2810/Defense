@@ -5,7 +5,7 @@
   <meta name="viewport" content="width=device-width, initial-scale=1.0" />
   <title>Defense Analysis Dashboard</title>
   <link rel="icon" href="data:image/svg+xml,%3Csvg xmlns='http://www.w3.org/2000/svg' viewBox='0 0 16 16'%3E%3Crect width='16' height='16' rx='3' fill='%236366f1'/%3E%3C/svg%3E" />
-  <link rel="stylesheet" href="styles.css?v=6" />
+  <link rel="stylesheet" href="styles.css?v=9" />
   <!-- API the dashboard talks to. Change this for other deployments
        (e.g. 'http://localhost:8000' for Mode B). -->
   <script>window.API_BASE = 'http://127.0.0.1:8001';</script>
@@ -65,6 +65,10 @@
     <button class="nav-tab" data-tab="agents" role="tab" aria-controls="tab-agents">
       <svg class="nav-tab-icon" viewBox="0 0 20 20" fill="currentColor"><path d="M10 2a4 4 0 014 4v1h1a2 2 0 012 2v6a2 2 0 01-2 2H5a2 2 0 01-2-2V9a2 2 0 012-2h1V6a4 4 0 014-4zm0 2a2 2 0 00-2 2v1h4V6a2 2 0 00-2-2zM7.5 11a1 1 0 100 2 1 1 0 000-2zm5 0a1 1 0 100 2 1 1 0 000-2z"/></svg>
       Agents
+    </button>
+    <button class="nav-tab" data-tab="chat" role="tab" aria-controls="tab-chat">
+      <svg class="nav-tab-icon" viewBox="0 0 20 20" fill="currentColor"><path fill-rule="evenodd" d="M18 10c0 3.866-3.582 7-8 7a8.84 8.84 0 01-4.083-.98L2 17l1.338-3.123C2.493 12.767 2 11.434 2 10c0-3.866 3.582-7 8-7s8 3.134 8 7zM7 9a1 1 0 100 2h6a1 1 0 100-2H7z" clip-rule="evenodd"/></svg>
+      Chat
     </button>
     <button class="nav-tab" data-tab="pipeline" role="tab" aria-controls="tab-pipeline">
       <svg class="nav-tab-icon" viewBox="0 0 20 20" fill="currentColor"><path d="M5 3a2 2 0 100 4 2 2 0 000-4zM3 5a2 2 0 114 0 2 2 0 01-4 0zm12 8a2 2 0 100 4 2 2 0 000-4zm-2 2a2 2 0 114 0 2 2 0 01-4 0z"/><path fill-rule="evenodd" d="M6 5h5a4 4 0 014 4v4h-2V9a2 2 0 00-2-2H6V5z" clip-rule="evenodd"/></svg>
@@ -464,6 +468,68 @@
 
     </section><!-- /tab-agents -->
 
+    <!-- ============================================================
+         CHAT TAB — free-form chatbot over the pipeline LLM
+         ============================================================ -->
+    <section id="tab-chat" class="tab-panel" role="tabpanel">
+      <div class="chat-shell">
+
+        <!-- header -->
+        <div class="chat-topbar">
+          <div class="chat-topbar-id">
+            <div class="chat-avatar assistant" aria-hidden="true">
+              <svg viewBox="0 0 20 20" fill="currentColor"><path d="M10 1.4l1.8 4.3 4.3 1.8-4.3 1.8L10 13.6 8.2 9.3 3.9 7.5l4.3-1.8L10 1.4z"/><circle cx="15.5" cy="14.5" r="1.6"/><circle cx="4.6" cy="14.2" r="1.1"/></svg>
+            </div>
+            <div class="chat-topbar-text">
+              <div class="chat-topbar-title">Assistant</div>
+              <div class="chat-topbar-sub" id="chat-backend-hint">General assistant</div>
+            </div>
+          </div>
+          <div class="chat-controls">
+            <div class="llm-segmented" id="chat-backend-seg" title="Which LLM backend to use for this chat">
+              <button type="button" class="llm-segment active" data-backend="auto">Auto</button>
+              <button type="button" class="llm-segment" data-backend="local">Local</button>
+              <button type="button" class="llm-segment" data-backend="groq">Groq</button>
+            </div>
+            <select id="chat-model" class="chat-model-select" title="Model for this chat" aria-label="Chat model">
+              <option value="">Default model</option>
+            </select>
+            <button id="chat-clear-btn" class="chat-icon-btn" type="button" title="Clear conversation" aria-label="Clear conversation">
+              <svg viewBox="0 0 20 20" fill="currentColor"><path fill-rule="evenodd" d="M9 2a1 1 0 00-.894.553L7.382 4H4a1 1 0 000 2h12a1 1 0 100-2h-3.382l-.724-1.447A1 1 0 0011 2H9zM5 8a1 1 0 011 1v6a1 1 0 11-2 0V9a1 1 0 011-1zm5 0a1 1 0 011 1v6a1 1 0 11-2 0V9a1 1 0 011-1zm5 0a1 1 0 011 1v6a1 1 0 11-2 0V9a1 1 0 011-1z" clip-rule="evenodd"/></svg>
+            </button>
+          </div>
+        </div>
+
+        <!-- messages -->
+        <div id="chat-messages" class="chat-messages" aria-live="polite">
+          <div class="chat-empty" id="chat-empty">
+            <div class="chat-empty-icon" aria-hidden="true">
+              <svg viewBox="0 0 20 20" fill="currentColor"><path d="M10 1.4l1.8 4.3 4.3 1.8-4.3 1.8L10 13.6 8.2 9.3 3.9 7.5l4.3-1.8L10 1.4z"/><circle cx="15.5" cy="14.5" r="1.6"/><circle cx="4.6" cy="14.2" r="1.1"/></svg>
+            </div>
+            <div class="chat-empty-title">Ask me anything</div>
+            <div class="chat-empty-sub">A general-purpose assistant powered by the same LLM as the pipeline. It doesn't see your analyzed posts — use the <strong>Agents</strong> tab for questions about your data.</div>
+            <div class="chat-suggestions">
+              <button class="chat-suggestion" type="button">What can you help me with?</button>
+              <button class="chat-suggestion" type="button">Explain the trade-offs of local vs cloud LLMs</button>
+              <button class="chat-suggestion" type="button">Write a haiku about data pipelines</button>
+              <button class="chat-suggestion" type="button">Give me 3 social-media monitoring tips</button>
+            </div>
+          </div>
+        </div>
+
+        <!-- composer -->
+        <div class="chat-composer">
+          <textarea id="chat-input" class="chat-input" rows="1"
+            placeholder="Message the assistant…" autocomplete="off"></textarea>
+          <button id="chat-send-btn" class="chat-send" type="button" title="Send (Enter)" aria-label="Send message">
+            <svg viewBox="0 0 24 24" fill="currentColor"><path d="M3.4 20.4l17.45-7.48a1 1 0 000-1.84L3.4 3.6a.993.993 0 00-1.39.91L2 9.12c0 .5.37.93.87.99L17 12 2.87 13.88c-.5.07-.87.5-.87 1l.01 4.61c0 .68.72 1.15 1.39.91z"/></svg>
+          </button>
+        </div>
+        <div class="chat-footnote">Enter to send · Shift+Enter for a new line · replies stream live</div>
+
+      </div>
+    </section><!-- /tab-chat -->
+
     <!-- =========================================================
          PIPELINE TAB — visualize what each stage hands the next
          ========================================================= -->
@@ -547,7 +613,11 @@
           <div class="modal-title" id="modal-post-id">Post Detail</div>
           <div class="modal-subtitle" id="modal-platform"></div>
         </div>
-        <button class="modal-close" id="modal-close-btn" aria-label="Close">&times;</button>
+        <div class="modal-header-actions">
+          <button class="btn btn-sm btn-secondary" id="modal-pdf-btn" type="button"
+                  title="Download these post details as a PDF">&#8681; PDF</button>
+          <button class="modal-close" id="modal-close-btn" aria-label="Close">&times;</button>
+        </div>
       </div>
       <div class="modal-body" id="modal-body">
         <div class="loading-overlay">
@@ -666,6 +736,6 @@
 
 </div><!-- /app -->
 
-<script src="app.js?v=12"></script>
+<script src="app.js?v=15"></script>
 </body>
 </html>

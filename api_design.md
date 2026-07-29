@@ -494,6 +494,9 @@ egresses to Groq.
 | `GET /v1/usage`                    | Per-tenant usage + cost metering (posts, LLM calls, by backend incl. Groq tokens/cost) |
 | `GET /v1/search?q=&semantic=true`  | Semantic/keyword search over analyzed posts (pgvector + ClickHouse)                    |
 | `GET /v1/agents/{id}`              | Poll an agent run (analyst query / report) — status, answer, citations, usage          |
+| `POST /v1/chat`                    | Free-form chatbot over the pipeline LLM (backend follows the toggle)                   |
+| `POST /v1/chat/stream`             | Same as `/v1/chat` but streams the reply token-by-token (SSE)                          |
+| `GET /v1/chat/models`              | Models available per backend (+ defaults) for the chat model picker                    |
 | `DELETE /v1/posts/{id}`            | Data deletion (retention / GDPR-style)                                                 |
 
 > The **MCP servers** (`analytics-mcp`, `retrieval-mcp`, `ingest-mcp` — see

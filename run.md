@@ -259,6 +259,17 @@ it runs a pgvector cosine query over `analysis_results.embedding`. In stub mode
 the vectors are deterministic hashes (results are stable, not meaning-based);
 real semantic quality needs `MODEL_STUB_MODE=false` + `uv sync --extra ml`.
 
+The **chatbot** endpoint uses the live LLM backend (whatever §7's toggle points
+at), so it's a quick end-to-end check that Ollama/Groq is reachable:
+
+```bash
+curl -s -X POST http://127.0.0.1:8001/v1/chat \
+  -H "X-API-Key: demo" -H "Content-Type: application/json" \
+  -d '{"message":"In one sentence, what is this platform for?"}' | python -m json.tool
+# → {"reply":"…","backend":"local","model":"qwen2.5:7b","usage":{…}}
+# Add "backend":"groq" to force Groq for one call; POST /v1/chat/stream streams tokens (SSE).
+```
+
 ---
 
 ## 7. Switching the LLM backend
@@ -267,6 +278,10 @@ Stub mode only affects the **NLP/vision** models (`MODEL_STUB_MODE`). Stage-2 al
 calls a real OpenAI-compatible endpoint. The default (§3/§4) is local Ollama; to
 change it:
 
+- **Launcher flags (`run_all.py`):** `--groq` starts the stack with Stage-2 +
+  agents + Chat on Groq Cloud (needs `GROQ_API_KEY`; `--fast` is a synonym);
+  `--ollama` forces local Ollama (the default) and clears any Groq override left
+  in Redis by a prior run. Omit both for the local default.
 - **Runtime toggle (no restart):** the dashboard's **LLM chip** (header) — or
   `curl -X PUT :8001/v1/config/llm -H 'X-API-Key: demo' -d '{"backend":"groq"}'` —
   sets a Redis override that Stage-2 picks up per message. `{"backend": null}`
@@ -364,6 +379,21 @@ attribute 'name'`): you're on stale code — the logging fix is already in the r
 - **Posts upload returns 202 but nothing appears in Postgres:** check
   `/tmp/ingestion.log`. A `dedup_skipped` means the content hash was already seen —
   `redis-cli --scan --pattern 'dedup:*'` and delete those keys, or `FLUSHALL`.
+- **The pipeline keeps processing posts on startup (or the Pipeline tab shows
+  "in-flight/processing N") even though you didn't load any:** the Redis Stream
+  queues persist across runs. Consumers read new entries (`XREADGROUP ">"`), so
+  anything a previous run enqueued-but-never-delivered resumes the moment the
+  workers restart; and any delivered-but-unacked entries stay in the group's
+  pending list (no worker reclaims them) and show as "in-flight" forever. With
+  `run_all.py` this is handled: **`--manual-load`** (and `--no-load`) reset each
+  stage's consumer group so it has **0 backlog and 0 in-flight** — the stream
+  entries are kept in Redis, the workers just start past them; **`--reset`** wipes
+  everything. By hand, per stream, destroy + recreate the group at the tail, e.g.
+  `redis-cli XGROUP DESTROY nlp:stage1:queue stage1-nlp-group` then
+  `redis-cli XGROUP CREATE nlp:stage1:queue stage1-nlp-group '$' MKSTREAM`
+  (repeat for `ingestion:queue`/`ingestion-workers`,
+  `router:queue`/`router-workers`, `llm:stage2:queue`/`stage2-llm-workers`,
+  `assembler:queue`/`assembler-group`), or `FLUSHALL` to clear everything.
 - **`/v1/agents/query` returns 502/timeout:** the agents service or an MCP server
   isn't up — see [§11](#11-run-the-full-stack--agents--mcp--dashboard). Check
   `/tmp/agents.log` and `/tmp/*_mcp.log`. The agents service also needs the same
@@ -483,7 +513,7 @@ back to if unset.
 | --------------- | ------------------------------------------------------------------------------------------------------ | ------------- | ----------------- |
 | `EMBEDDING_DIM` | Dim of the `analysis_results.embedding` column; must match the DB column **and** the Stage-1 embedder. | default `768` | `768`             |
 
-### LLM / VLM backend (Stage-2 + agents)
+### LLM / VLM backend (Stage-2 + agents + chat)
 
 | Variable             | Purpose                                             | Required?                                           | Example / default           |
 | -------------------- | --------------------------------------------------- | --------------------------------------------------- | --------------------------- |

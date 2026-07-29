@@ -5,7 +5,8 @@
  *
  * Tabs: Overview (usage + corpus charts), Posts (upload + results),
  * Jobs (run analysis + live SSE progress), Reports (grounded LLM reports),
- * Search (keyword/semantic), Agents (analyst Q&A).
+ * Search (keyword/semantic), Agents (analyst Q&A), Chat (free-form chatbot),
+ * Pipeline (live stage flow).
  * The active tab auto-refreshes every 15 s (toggle in the header).
  */
 
@@ -26,6 +27,11 @@ var currentPostId = null;       // post being shown in modal
 var analysisResultsCache = [];  // last loaded results
 var agentRunsCache = [];        // last loaded agent runs
 var autoRefreshEnabled = true;
+var chatHistory = [];           // [{role, content}] conversation for /v1/chat[/stream]
+var chatBackend = 'auto';       // 'auto' (follow toggle) | 'local' | 'groq'
+var chatBusy = false;           // a chat request is in flight (blocks concurrent sends)
+var chatModel = '';             // '' = the backend's default model, else a specific model id
+var chatModelsData = null;      // last /v1/chat/models payload (per-backend model lists)
 
 /* ============================================================
    API helpers
@@ -150,6 +156,13 @@ function showTab(tabName) {
     connectPipelineLive();
   } else {
     disconnectPipelineLive();
+  }
+
+  // Chat is stateful (keeps its conversation); just refresh the backend hint
+  // and focus the composer instead of reloading data.
+  if (tabName === 'chat') {
+    initChatTab();
+    return;
   }
 
   refreshTab(tabName);
@@ -864,6 +877,114 @@ function renderPostModal(r) {
   if (r.comment_analysis && (r.post_id || currentPostId)) {
     mountCommentInsights('modal', r);
   }
+}
+
+/* ============================================================
+   Post detail → PDF
+   ============================================================
+   No PDF library and no build step: clone the rendered modal body into an
+   offscreen iframe that links the dashboard stylesheet, then let the browser
+   print it ("Save as PDF" in the print dialog). Two things need fixing up in
+   the clone — cloneNode() does not copy canvas pixels (so each chart is
+   rasterized to a PNG), and interactive controls are meaningless on paper
+   (so they are dropped). What is on screen is what lands in the file,
+   including any lazily-loaded comment pages. */
+function downloadPostPdf() {
+  var body = document.getElementById('modal-body');
+  if (!body || !body.children.length || body.querySelector('.loading-overlay')) {
+    showToast('Post details are still loading.', 'error');
+    return;
+  }
+
+  var clone = body.cloneNode(true);
+
+  // Canvas pixels don't survive cloneNode — swap each chart for a PNG at the
+  // size it renders on screen. Both lists come from querySelectorAll on the
+  // same markup, so they stay index-aligned while we replace nodes.
+  var liveCanvas  = body.querySelectorAll('canvas');
+  var clonedCanvas = clone.querySelectorAll('canvas');
+  for (var i = 0; i < liveCanvas.length && i < clonedCanvas.length; i++) {
+    var src;
+    try {
+      src = liveCanvas[i].toDataURL('image/png');
+    } catch (e) {
+      continue;   // tainted or zero-sized canvas — leave the blank one in place
+    }
+    var img = document.createElement('img');
+    img.src = src;
+    img.className = 'pdf-chart';
+    img.style.width  = (liveCanvas[i].offsetWidth  || liveCanvas[i].width)  + 'px';
+    img.style.height = (liveCanvas[i].offsetHeight || liveCanvas[i].height) + 'px';
+    clonedCanvas[i].parentNode.replaceChild(img, clonedCanvas[i]);
+  }
+
+  // Drop controls (filters, "load more", pagination) and any spinner.
+  clone.querySelectorAll('button, select, input, .spinner, .loading-overlay').forEach(function(el) {
+    if (el.parentNode) el.parentNode.removeChild(el);
+  });
+
+  // Same stylesheets the dashboard uses — .href is already absolute, so this
+  // resolves whether the dashboard is served over http:// or opened as file://.
+  var sheets = Array.prototype.map.call(
+    document.querySelectorAll('link[rel="stylesheet"]'),
+    function(l) { return '<link rel="stylesheet" href="' + escAttr(l.href) + '" />'; }
+  ).join('');
+
+  var postId   = currentPostId || '';
+  var platform = (document.getElementById('modal-platform') || {}).textContent || '';
+  // Chrome/Firefox seed the "Save as PDF" filename from the document title.
+  var fileName = 'post-' + (String(postId).replace(/[^A-Za-z0-9_-]/g, '') || 'detail') + '-analysis';
+
+  var doc = '<!DOCTYPE html><html lang="en"><head><meta charset="utf-8" />'
+    + '<title>' + escHtml(fileName) + '</title>'
+    + sheets
+    + '</head><body class="pdf-doc">'
+    + '<div class="pdf-head">'
+    +   '<div class="pdf-brand">Defense Analysis — Post Detail</div>'
+    +   '<div class="pdf-meta">'
+    +     '<span>Post ID: ' + escHtml(postId || '—') + '</span>'
+    +     (platform ? '<span>' + escHtml(platform) + '</span>' : '')
+    +     '<span>Generated ' + escHtml(new Date().toLocaleString()) + '</span>'
+    +   '</div>'
+    + '</div>'
+    + '<div class="pdf-body">' + clone.innerHTML + '</div>'
+    + '</body></html>';
+
+  var stale = document.getElementById('pdf-print-frame');
+  if (stale && stale.parentNode) stale.parentNode.removeChild(stale);
+
+  var frame = document.createElement('iframe');
+  frame.id = 'pdf-print-frame';
+  frame.className = 'pdf-print-frame';
+  frame.setAttribute('aria-hidden', 'true');
+  document.body.appendChild(frame);
+
+  var fdoc = frame.contentWindow.document;
+  fdoc.open();
+  fdoc.write(doc);
+  fdoc.close();
+
+  function cleanup() {
+    if (frame && frame.parentNode) frame.parentNode.removeChild(frame);
+    frame = null;
+  }
+
+  // Let the linked stylesheet and the inline PNGs settle before printing.
+  setTimeout(function() {
+    if (!frame) return;
+    showToast('Choose “Save as PDF” in the print dialog.', 'info');
+    try {
+      frame.contentWindow.onafterprint = cleanup;
+      frame.contentWindow.focus();
+      frame.contentWindow.print();
+    } catch (err) {
+      showToast('Could not open the print dialog: ' + err.message, 'error');
+      cleanup();
+      return;
+    }
+    // onafterprint is not fired by every browser — reclaim the frame anyway.
+    setTimeout(cleanup, 60000);
+  }, 400);
 }
 
 // ---- Per-comment sentiment + emotion (full coverage) ---------------------
@@ -2907,6 +3028,399 @@ function readFileAsText(file) {
 }
 
 /* ============================================================
+   CHAT TAB — free-form chatbot over the pipeline LLM
+   Streams /v1/chat/stream (POST SSE via fetch; EventSource can't POST),
+   with a one-shot /v1/chat fallback when streaming is unavailable.
+   ============================================================ */
+
+var CHAT_AVATAR = {
+  assistant: '<svg viewBox="0 0 20 20" fill="currentColor"><path d="M10 1.4l1.8 4.3 4.3 1.8-4.3 1.8L10 13.6 8.2 9.3 3.9 7.5l4.3-1.8L10 1.4z"/><circle cx="15.5" cy="14.5" r="1.6"/><circle cx="4.6" cy="14.2" r="1.1"/></svg>',
+  user: '<svg viewBox="0 0 20 20" fill="currentColor"><path fill-rule="evenodd" d="M10 9a3 3 0 100-6 3 3 0 000 6zm-7 9a7 7 0 1114 0H3z" clip-rule="evenodd"/></svg>'
+};
+
+/** The welcome/empty state shown when there are no messages. */
+function chatEmptyHTML() {
+  return '<div class="chat-empty" id="chat-empty">'
+    + '<div class="chat-empty-icon" aria-hidden="true">' + CHAT_AVATAR.assistant + '</div>'
+    + '<div class="chat-empty-title">Ask me anything</div>'
+    + '<div class="chat-empty-sub">A general-purpose assistant powered by the same LLM as the pipeline. '
+    + 'It doesn’t see your analyzed posts — use the <strong>Agents</strong> tab for questions about your data.</div>'
+    + '<div class="chat-suggestions">'
+    + '<button class="chat-suggestion" type="button">What can you help me with?</button>'
+    + '<button class="chat-suggestion" type="button">Explain the trade-offs of local vs cloud LLMs</button>'
+    + '<button class="chat-suggestion" type="button">Write a haiku about data pipelines</button>'
+    + '<button class="chat-suggestion" type="button">Give me 3 social-media monitoring tips</button>'
+    + '</div></div>';
+}
+
+/** Minimal, safe Markdown → HTML for assistant replies (bold/italic/code/
+ * links/lists). Everything is HTML-escaped before formatting tags are added,
+ * so model output can never inject markup. */
+function renderMarkdown(src) {
+  if (src == null) return '';
+  src = String(src);
+  var blocks = [], inlines = [];
+  // Pull out fenced code blocks, then inline code, replacing each with an
+  // ASCII sentinel (contents escaped now, restored verbatim at the end).
+  src = src.replace(/```[ \t]*[\w+-]*\n?([\s\S]*?)```/g, function(_, code) {
+    blocks.push('<pre class="chat-code"><code>' + escHtml(code.replace(/\n$/, '')) + '</code></pre>');
+    return '@@BLK' + (blocks.length - 1) + '@@';
+  });
+  src = src.replace(/`([^`\n]+)`/g, function(_, code) {
+    inlines.push('<code class="chat-inline-code">' + escHtml(code) + '</code>');
+    return '@@INL' + (inlines.length - 1) + '@@';
+  });
+  src = escHtml(src);
+  src = src.replace(/\[([^\]]+)\]\((https?:\/\/[^\s)]+)\)/g,
+    '<a href="$2" target="_blank" rel="noopener noreferrer">$1</a>');
+  src = src.replace(/\*\*([^*]+?)\*\*/g, '<strong>$1</strong>');
+  src = src.replace(/__([^_]+?)__/g, '<strong>$1</strong>');
+  src = src.replace(/(^|[^*])\*([^*\n]+?)\*/g, '$1<em>$2</em>');
+
+  var lines = src.split('\n'), out = '', listType = null, para = [];
+  function flushPara() { if (para.length) { out += '<p>' + para.join('<br>') + '</p>'; para = []; } }
+  function closeList() { if (listType) { out += '</' + listType + '>'; listType = null; } }
+  for (var k = 0; k < lines.length; k++) {
+    var t = lines[k].trim();
+    if (t === '') { flushPara(); closeList(); continue; }
+    if (/^@@BLK\d+@@$/.test(t)) { flushPara(); closeList(); out += t; continue; }
+    var ul = t.match(/^[-*]\s+(.*)$/), ol = t.match(/^\d+\.\s+(.*)$/), h = t.match(/^#{1,6}\s+(.*)$/);
+    if (ul) { flushPara(); if (listType !== 'ul') { closeList(); out += '<ul class="chat-list">'; listType = 'ul'; } out += '<li>' + ul[1] + '</li>'; continue; }
+    if (ol) { flushPara(); if (listType !== 'ol') { closeList(); out += '<ol class="chat-list">'; listType = 'ol'; } out += '<li>' + ol[1] + '</li>'; continue; }
+    if (h)  { flushPara(); closeList(); out += '<p class="chat-h"><strong>' + h[1] + '</strong></p>'; continue; }
+    closeList(); para.push(t);
+  }
+  flushPara(); closeList();
+  out = out.replace(/@@BLK(\d+)@@/g, function(_, i) { return blocks[+i]; });
+  out = out.replace(/@@INL(\d+)@@/g, function(_, i) { return inlines[+i]; });
+  return out;
+}
+
+/** Render the final assistant text as Markdown and attach a Copy button. */
+function finalizeAssistant(refs, text) {
+  if (!refs) return;
+  refs.body.innerHTML = renderMarkdown(text);
+  addCopyButton(refs, text);
+  scrollChatToBottom();
+}
+
+function addCopyButton(refs, text) {
+  if (!refs || !refs.meta) return;
+  var btn = document.createElement('button');
+  btn.className = 'chat-copy';
+  btn.type = 'button';
+  btn.textContent = 'Copy';
+  btn.addEventListener('click', function() {
+    try {
+      navigator.clipboard.writeText(text).then(function() {
+        btn.textContent = 'Copied';
+        setTimeout(function() { btn.textContent = 'Copy'; }, 1200);
+      });
+    } catch (e) { /* clipboard unavailable */ }
+  });
+  refs.meta.appendChild(btn);
+}
+
+/** Opening the tab: sync the backend hint, load the model list, focus composer. */
+function initChatTab() {
+  updateChatBackendHint();
+  loadLlmConfig().then(function() { updateChatBackendHint(); populateChatModelSelect(); });
+  refreshChatModels();
+  var input = document.getElementById('chat-input');
+  if (input) setTimeout(function() { input.focus(); }, 30);
+}
+
+/** Header subtitle: which backend a message will actually use. */
+function updateChatBackendHint() {
+  var hint = document.getElementById('chat-backend-hint');
+  if (!hint) return;
+  if (chatBackend === 'auto') {
+    var active = (llmConfig && llmConfig.backend) ? llmBackendLabel(llmConfig.backend) : 'server default';
+    hint.textContent = 'General assistant · Auto (' + active + ')';
+  } else {
+    hint.textContent = 'General assistant · ' + llmBackendLabel(chatBackend) + ' (forced)';
+  }
+}
+
+function setChatBackend(backend) {
+  chatBackend = backend;
+  document.querySelectorAll('#chat-backend-seg .llm-segment').forEach(function(b) {
+    b.classList.toggle('active', b.getAttribute('data-backend') === backend);
+  });
+  updateChatBackendHint();
+  // Model lists differ per backend — reset the pick and repopulate for this one.
+  chatModel = '';
+  populateChatModelSelect();
+}
+
+/** Which backend's model list to show: the forced one, or (Auto) the active one. */
+function chatActiveBackend() {
+  if (chatBackend !== 'auto') return chatBackend;
+  if (chatModelsData && chatModelsData.active_backend) return chatModelsData.active_backend;
+  if (llmConfig && llmConfig.backend) return llmConfig.backend;
+  return 'local';
+}
+
+/** Fetch the per-backend model catalogue, then fill the picker. */
+async function refreshChatModels() {
+  try {
+    chatModelsData = await apiCall('/v1/chat/models', { method: 'GET' });
+  } catch (e) {
+    chatModelsData = null;  // endpoint absent / unreachable — picker stays at Default
+  }
+  populateChatModelSelect();
+}
+
+/** Populate the model <select> for the currently-active backend. */
+function populateChatModelSelect() {
+  var sel = document.getElementById('chat-model');
+  if (!sel) return;
+  var be = chatActiveBackend();
+  var info = (chatModelsData && chatModelsData.backends && chatModelsData.backends[be]) || null;
+  var models = (info && info.models) || [];
+  var def = (info && info.default) || '';
+
+  var html = '<option value="">Default' + (def ? ' (' + escHtml(def) + ')' : ' model') + '</option>';
+  for (var i = 0; i < models.length; i++) {
+    html += '<option value="' + escAttr(models[i]) + '">' + escHtml(models[i]) + '</option>';
+  }
+  sel.innerHTML = html;
+
+  // Keep the current pick if it's still offered by this backend, else default.
+  if (chatModel && models.indexOf(chatModel) !== -1) {
+    sel.value = chatModel;
+  } else {
+    chatModel = '';
+    sel.value = '';
+  }
+}
+
+function clearChat() {
+  chatHistory = [];
+  var box = document.getElementById('chat-messages');
+  if (box) box.innerHTML = chatEmptyHTML();
+}
+
+/** Append a message row (avatar + bubble + meta); returns refs so a streaming
+ * reply can update the bubble in place. */
+function appendChatBubble(role, text) {
+  var box = document.getElementById('chat-messages');
+  if (!box) return null;
+  var empty = box.querySelector('.chat-empty');
+  if (empty) empty.parentNode.removeChild(empty);
+
+  var isUser = role === 'user';
+
+  var wrap = document.createElement('div');
+  wrap.className = 'chat-msg ' + (isUser ? 'user' : 'assistant');
+
+  var avatar = document.createElement('div');
+  avatar.className = 'chat-avatar ' + (isUser ? 'user' : 'assistant');
+  avatar.setAttribute('aria-hidden', 'true');
+  avatar.innerHTML = isUser ? CHAT_AVATAR.user : CHAT_AVATAR.assistant;
+
+  var col = document.createElement('div');
+  col.className = 'chat-col';
+
+  var bubble = document.createElement('div');
+  bubble.className = 'chat-bubble';
+  var body = document.createElement('div');
+  body.className = 'chat-bubble-text';
+  if (text != null) body.textContent = text;
+  bubble.appendChild(body);
+  col.appendChild(bubble);
+
+  var meta = document.createElement('div');
+  meta.className = 'chat-meta';
+  col.appendChild(meta);
+
+  wrap.appendChild(avatar);
+  wrap.appendChild(col);
+  box.appendChild(wrap);
+  box.scrollTop = box.scrollHeight;
+  return { wrap: wrap, bubble: bubble, body: body, meta: meta };
+}
+
+function setChatTyping(refs) {
+  if (refs) refs.body.innerHTML = '<span class="chat-typing"><span></span><span></span><span></span></span>';
+}
+
+function scrollChatToBottom() {
+  var box = document.getElementById('chat-messages');
+  if (box) box.scrollTop = box.scrollHeight;
+}
+
+function setChatBusy(busy) {
+  chatBusy = busy;
+  var btn = document.getElementById('chat-send-btn');
+  if (btn) btn.disabled = busy;  // the send button is an icon; just disable it
+}
+
+function autoGrowChatInput() {
+  var input = document.getElementById('chat-input');
+  if (!input) return;
+  input.style.height = 'auto';
+  input.style.height = Math.min(input.scrollHeight, 160) + 'px';
+}
+
+function showChatError(refs, msg, keepText) {
+  if (!refs) { showToast(msg, 'error'); return; }
+  refs.bubble.classList.add('chat-error');
+  if (keepText) {
+    refs.meta.textContent = '⚠ ' + msg;
+  } else {
+    refs.body.textContent = '⚠ ' + msg;
+  }
+}
+
+/** Parse one SSE frame ("event: x\ndata: y") into {event, data}. */
+function parseSseFrame(frame) {
+  var event = 'message';
+  var data = '';
+  frame.split('\n').forEach(function(line) {
+    if (line.indexOf('event:') === 0) event = line.slice(6).trim();
+    else if (line.indexOf('data:') === 0) data += line.slice(5).replace(/^ /, '');
+  });
+  return { event: event, data: data };
+}
+
+/** POST /v1/chat/stream and dispatch each SSE frame to onEvent(evt, data).
+ * Returns quietly (no events) if the browser can't read the response stream —
+ * the caller then uses the non-streaming fallback. */
+async function streamChat(body, onEvent) {
+  var headers = { 'Content-Type': 'application/json' };
+  if (authToken) headers['Authorization'] = 'Bearer ' + authToken;
+  else if (apiKey) headers['X-API-Key'] = apiKey;
+
+  var resp = await fetch(API_BASE + '/v1/chat/stream', {
+    method: 'POST', headers: headers, body: JSON.stringify(body)
+  });
+
+  if (resp.status === 401) {
+    authToken = null; localStorage.removeItem('auth_token'); updateAuthStatus(false);
+    throw new Error('Unauthorized — please log in again.');
+  }
+  if (!resp.ok) {
+    var errText = '';
+    try { errText = await resp.text(); } catch (e) { /* ignore */ }
+    var msg = 'API error ' + resp.status;
+    try {
+      var j = JSON.parse(errText);
+      if (j && j.detail) msg = typeof j.detail === 'string' ? j.detail : JSON.stringify(j.detail);
+    } catch (e) { if (errText) msg = errText; }
+    throw new Error(msg);
+  }
+  if (!resp.body || !resp.body.getReader) return;  // no streaming → caller falls back
+
+  var reader = resp.body.getReader();
+  var decoder = new TextDecoder();
+  var buffer = '';
+  while (true) {
+    var chunk = await reader.read();
+    if (chunk.done) break;
+    buffer += decoder.decode(chunk.value, { stream: true });
+    var frames = buffer.split('\n\n');
+    buffer = frames.pop();  // trailing partial frame stays buffered
+    for (var i = 0; i < frames.length; i++) {
+      var p = parseSseFrame(frames[i]);
+      if (p.data !== '') onEvent(p.event, p.data);
+    }
+  }
+  if (buffer.trim()) {
+    var last = parseSseFrame(buffer);
+    if (last.data !== '') onEvent(last.event, last.data);
+  }
+}
+
+/** Non-streaming fallback: one POST /v1/chat, render the whole reply. */
+async function chatFallback(body, refs) {
+  var result = await apiCall('/v1/chat', { method: 'POST', body: JSON.stringify(body) });
+  var reply = (result && result.reply) || '';
+  if (refs && reply) {
+    var meta = llmBackendLabel(result.backend) + ' · ' + (result.model || '');
+    if (result.usage && result.usage.total_tokens) meta += ' · ' + result.usage.total_tokens + ' tok';
+    refs.meta.textContent = meta;
+    finalizeAssistant(refs, reply);
+  }
+  return reply;
+}
+
+async function sendChatMessage() {
+  if (chatBusy) return;
+  var input = document.getElementById('chat-input');
+  var text = input ? input.value.trim() : '';
+  if (!text) return;
+
+  input.value = '';
+  autoGrowChatInput();
+  appendChatBubble('user', text);
+  chatHistory.push({ role: 'user', content: text });
+
+  var refs = appendChatBubble('assistant', null);
+  setChatTyping(refs);
+  setChatBusy(true);
+
+  // Send only the recent tail — the server caps history at 50 messages.
+  var body = { messages: chatHistory.slice(-40), backend: chatBackend };
+  if (chatModel) body.model = chatModel;  // omit → backend's default model
+  var acc = '';
+  var gotDelta = false;
+  var gotAnyEvent = false;
+  var metaText = '';
+
+  try {
+    await streamChat(body, function(evt, data) {
+      gotAnyEvent = true;
+      var payload = {};
+      try { payload = JSON.parse(data); } catch (e) { /* keep {} */ }
+      if (evt === 'meta') {
+        metaText = llmBackendLabel(payload.backend) + ' · ' + (payload.model || '');
+        if (refs) refs.meta.textContent = metaText;
+      } else if (evt === 'delta') {
+        if (!gotDelta) { gotDelta = true; if (refs) refs.body.textContent = ''; }
+        acc += (payload.content || '');
+        if (refs) refs.body.textContent = acc;
+        scrollChatToBottom();
+      } else if (evt === 'done') {
+        if (payload.usage && payload.usage.total_tokens && refs) {
+          refs.meta.textContent = metaText + ' · ' + payload.usage.total_tokens + ' tok';
+        }
+      } else if (evt === 'error') {
+        throw new Error(payload.error || 'stream error');
+      }
+    });
+
+    if (!gotAnyEvent) {
+      acc = await chatFallback(body, refs);      // streaming unsupported → one-shot
+    } else if (acc) {
+      finalizeAssistant(refs, acc);              // Markdown-render the streamed text
+    }
+
+    if (acc) {
+      chatHistory.push({ role: 'assistant', content: acc });
+    } else if (refs && !refs.bubble.classList.contains('chat-error')) {
+      refs.body.textContent = '(no response)';
+    }
+
+  } catch (err) {
+    // Failed before any token → try the one-shot endpoint once more.
+    if (!gotDelta) {
+      try {
+        acc = await chatFallback(body, refs);
+        if (acc) chatHistory.push({ role: 'assistant', content: acc });
+      } catch (err2) {
+        showChatError(refs, err2.message || String(err2), false);
+      }
+    } else {
+      if (acc) finalizeAssistant(refs, acc);     // keep the partial answer, rendered
+      showChatError(refs, err.message || String(err), true);
+    }
+  } finally {
+    setChatBusy(false);
+  }
+}
+
+/* ============================================================
    Initialization
    ============================================================ */
 document.addEventListener('DOMContentLoaded', init);
@@ -3043,6 +3557,51 @@ function init() {
     });
   }
 
+  // Chat
+  var chatSendBtn = document.getElementById('chat-send-btn');
+  if (chatSendBtn) {
+    chatSendBtn.addEventListener('click', sendChatMessage);
+  }
+  var chatClearBtn = document.getElementById('chat-clear-btn');
+  if (chatClearBtn) {
+    chatClearBtn.addEventListener('click', clearChat);
+  }
+  var chatInput = document.getElementById('chat-input');
+  if (chatInput) {
+    chatInput.addEventListener('input', autoGrowChatInput);
+    chatInput.addEventListener('keydown', function(e) {
+      // Enter sends; Shift+Enter inserts a newline.
+      if (e.key === 'Enter' && !e.shiftKey) {
+        e.preventDefault();
+        sendChatMessage();
+      }
+    });
+  }
+  var chatSeg = document.getElementById('chat-backend-seg');
+  if (chatSeg) {
+    chatSeg.addEventListener('click', function(e) {
+      var btn = e.target.closest ? e.target.closest('.llm-segment') : null;
+      if (btn && btn.getAttribute('data-backend')) {
+        setChatBackend(btn.getAttribute('data-backend'));
+      }
+    });
+  }
+  var chatModelSel = document.getElementById('chat-model');
+  if (chatModelSel) {
+    chatModelSel.addEventListener('change', function() { chatModel = this.value; });
+  }
+  // Suggestion chips in the empty state — click to send that prompt.
+  var chatMessages = document.getElementById('chat-messages');
+  if (chatMessages) {
+    chatMessages.addEventListener('click', function(e) {
+      var chip = e.target.closest ? e.target.closest('.chat-suggestion') : null;
+      if (!chip) return;
+      var input = document.getElementById('chat-input');
+      if (input) { input.value = chip.textContent; autoGrowChatInput(); }
+      sendChatMessage();
+    });
+  }
+
   // Modal close
   var modalOverlay = document.getElementById('modal-overlay');
   if (modalOverlay) {
@@ -3054,6 +3613,12 @@ function init() {
   var closeBtn = document.getElementById('modal-close-btn');
   if (closeBtn) {
     closeBtn.addEventListener('click', closeModal);
+  }
+
+  // Post detail → PDF
+  var pdfBtn = document.getElementById('modal-pdf-btn');
+  if (pdfBtn) {
+    pdfBtn.addEventListener('click', downloadPostPdf);
   }
 
   // Keyboard close modals
