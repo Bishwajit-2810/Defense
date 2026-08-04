@@ -20,7 +20,16 @@ only covers the classification/extraction fields.
 from __future__ import annotations
 
 import json
+import os
+import sys
 from typing import Any
+
+# Ensure the repo root is importable for `libs.*` when running standalone.
+sys.path.insert(
+    0, os.path.abspath(os.path.join(os.path.dirname(__file__), "..", "..", ".."))
+)
+
+from libs.labels import POST_TYPES, POST_TYPE_SET  # noqa: E402
 
 # Label vocabularies — kept in lock-step with the stub/real paths in
 # text_analyzer.py and comment_analyzer.py and with libs/schemas/output_schema.json.
@@ -52,6 +61,8 @@ Return JSON with EXACTLY these keys:
   "emotion": one of "joy","sadness","anger","fear","surprise","disgust","neutral",
   "topics": array of up to 3 short lowercase tags (e.g. "politics","religion","crime","protest","grief","economy","sports","entertainment","bangladesh","india"),
   "intents": array of up to 2 of "inform","express_grievance","commemorate","call_to_action","question","promote",
+  "post_type": one of {post_types} — the single kind of post this is, or null if the text does not say,
+  "post_type_confidence": number 0.0 to 1.0 — how sure you are of post_type,
   "toxicity_score": number 0.0 (clean) to 1.0 (very toxic/abusive),
   "hate_speech_score": number 0.0 to 1.0 (targeted hate against a group),
   "entities": array of {{"text": "...", "label": "PERSON" or "ORG" or "GPE" or "LOC" or "EVENT" or "DATE"}},
@@ -92,9 +103,41 @@ def _clamp(v: Any, lo: float, hi: float, default: float = 0.0) -> float:
         return default
 
 
-def _norm_sentiment(label: Any) -> str:
+def _parse_sentiment(label: Any) -> str | None:
+    """Strict sentiment parse — None when the model gave no usable label.
+
+    Coercing a missing/garbled label to "neutral" publishes a verdict the model
+    never reached, and the surrounding defaults make it look deliberate: score
+    0.0, toxicity 0.0, no keywords, a flat high confidence. Callers must treat
+    None as a failed analysis and fall back, not as "this post is neutral".
+    """
     s = str(label or "").lower().strip()
-    return s if s in _SENTIMENT_LABELS else "neutral"
+    return s if s in _SENTIMENT_LABELS else None
+
+
+def _coherent_score(label: str, raw: Any) -> float:
+    """The model's score for ``label``, repaired when the number contradicts it.
+
+    Small models routinely emit ``{"sentiment": "negative", "sentiment_score": 0}``.
+    Taking that 0.0 at face value flattens the post to neutral during fusion, so
+    fall back to a half-strength score with the label's own sign.
+    """
+    score = _clamp(raw, -1.0, 1.0)
+    if label == "positive" and score <= 0.0:
+        return 0.5
+    if label == "negative" and score >= 0.0:
+        return -0.5
+    return score
+
+
+def _sentiment_confidence(score: float) -> float:
+    """Confidence derived from the strength the model itself reported.
+
+    A chat LLM emits no class probabilities, so |sentiment_score| is the only
+    self-reported signal available. A fixed 0.9 (the previous value) made every
+    answer — including empty ones — look equally trustworthy.
+    """
+    return round(0.5 + 0.45 * min(abs(score), 1.0), 3)
 
 
 def _norm_emotion(label: Any) -> str:
@@ -112,6 +155,21 @@ def _emotion_block(primary: str) -> dict:
     rest = round((1.0 - 0.7) / (len(_EMOTION_LABELS) - 1), 3)
     scores = {e: (0.7 if e == primary else rest) for e in _EMOTION_LABELS}
     return {"primary": primary, "scores": scores}
+
+
+def _parse_post_type(label: Any, raw_conf: Any) -> tuple[str | None, float]:
+    """Validate the model's post_type against the canonical vocabulary.
+
+    An out-of-vocabulary or missing label becomes ``(None, 0.0)`` — "unknown",
+    which is what the router's Rule 2 escalates. Coercing it to "other" with a
+    default confidence would hide the failure behind a plausible answer.
+    """
+    s = str(label or "").lower().strip()
+    if s not in POST_TYPE_SET or s == "other":
+        return None, 0.0
+    # A chat LLM's self-reported confidence is not calibrated; cap it below the
+    # agreement-backed ceiling the non-LLM path uses.
+    return s, min(_clamp(raw_conf, 0.0, 1.0, default=0.6) or 0.6, 0.9)
 
 
 def _norm_str_list(value: Any, limit: int) -> list[str]:
@@ -159,7 +217,11 @@ async def analyze_text_llm(
     script flags and the embedding, which the caller fills). Raises on LLM /
     JSON failure so the caller can fall back to the deterministic stub.
     """
-    messages = [{"role": "user", "content": _POST_PROMPT.format(text=text[:4000])}]
+    prompt = _POST_PROMPT.format(
+        text=text[:4000],
+        post_types=", ".join(f'"{t}"' for t in POST_TYPES),
+    )
+    messages = [{"role": "user", "content": prompt}]
     response = await llm.chat(
         role=_STAGE1_ROLE,
         messages=messages,
@@ -172,15 +234,28 @@ async def analyze_text_llm(
     if not isinstance(data, dict):
         raise ValueError("stage1 LLM did not return a JSON object")
 
-    sentiment = _norm_sentiment(data.get("sentiment"))
+    sentiment = _parse_sentiment(data.get("sentiment"))
+    if sentiment is None:
+        # Includes the `{}` reply grammar-constrained decoding can produce: valid
+        # JSON, zero analysis. Raise so the caller falls back instead of recording
+        # a fabricated "neutral".
+        raise ValueError(
+            f"stage1 LLM returned no usable sentiment (keys={sorted(data)!r})"
+        )
+    sentiment_score = _coherent_score(sentiment, data.get("sentiment_score"))
+    post_type, post_type_conf = _parse_post_type(
+        data.get("post_type"), data.get("post_type_confidence")
+    )
     return {
         "language": (str(data.get("language") or "").lower().strip() or None),
         "sentiment": sentiment,
-        "sentiment_score": _clamp(data.get("sentiment_score"), -1.0, 1.0),
-        "sentiment_confidence": 0.9,
+        "sentiment_score": sentiment_score,
+        "sentiment_confidence": _sentiment_confidence(sentiment_score),
         "emotion": _emotion_block(data.get("emotion")),
         "topics": _norm_str_list(data.get("topics"), 3) or ["general"],
         "intents": _norm_str_list(data.get("intents"), 2) or ["inform"],
+        "post_type": post_type,
+        "post_type_confidence": post_type_conf,
         "toxicity_score": _clamp(data.get("toxicity_score"), 0.0, 1.0),
         "hate_speech_score": _clamp(data.get("hate_speech_score"), 0.0, 1.0),
         "entities": _norm_entities(data.get("entities")),
@@ -239,7 +314,11 @@ async def classify_comments_llm(
             continue
         if not (1 <= idx <= len(texts)):
             continue
-        sentiment = _norm_sentiment(item.get("s", item.get("sentiment")))
+        sentiment = _parse_sentiment(item.get("s", item.get("sentiment")))
+        if sentiment is None:
+            # Leave the slot None so the caller keeps its heuristic label for this
+            # comment rather than counting an unanswered one as neutral.
+            continue
         out[idx - 1] = {
             "sentiment": sentiment,
             "sentiment_score": _score[sentiment],

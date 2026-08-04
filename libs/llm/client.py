@@ -85,6 +85,23 @@ _ROLE_GROQ_DEFAULT: dict[str, str] = {
 VALID_ROLES = frozenset(_ROLE_LOCAL_DEFAULT)
 
 
+def _is_degenerate_json(content: Optional[str]) -> bool:
+    """True when a JSON-mode reply is well-formed but carries no content.
+
+    Grammar-constrained decoding lets a weak model bail out with `{}` / `[]` /
+    `null` instead of failing outright, which is indistinguishable from "the
+    model had nothing to say" unless we check for it here.
+    """
+    s = (content or "").strip()
+    if not s:
+        return True
+    try:
+        parsed = json.loads(s)
+    except ValueError:
+        return False  # unparseable — the caller's own parser/fallback handles it
+    return parsed is None or (isinstance(parsed, (dict, list)) and not parsed)
+
+
 def _retryable(func):
     """Decorator that applies tenacity retry logic to an async method."""
     return retry(
@@ -282,6 +299,30 @@ class LLMClient:
                 raise
 
         choice = completion.choices[0]
+
+        # JSON-mode degeneracy retry: Ollama turns `response_format=json_object`
+        # into grammar-constrained decoding, and small models (gemma3:4b) satisfy
+        # that grammar with the *empty* object `{}` — 2 completion tokens, a
+        # syntactically valid answer carrying no analysis. Every caller then reads
+        # its own defaults back out as if the model had judged them (a post scored
+        # "neutral 0.00" that is plainly negative). Retry once unconstrained; the
+        # same model/prompt then answers properly and callers' parsers already
+        # tolerate ```json fences.
+        if response_format is not None and _is_degenerate_json(choice.message.content):
+            log.warning(
+                "llm_json_mode_degenerate_retrying_unconstrained backend={} role={} model={}",
+                effective_backend, role, model_id,
+            )
+            completion = await self._call_api(
+                client=self._get_client(effective_backend),
+                model=model_id,
+                messages=messages,
+                response_format=None,
+                max_tokens=max_tokens,
+                temperature=temperature,
+            )
+            choice = completion.choices[0]
+
         usage = completion.usage
         total_tokens = usage.total_tokens if usage else 0
         latency_ms = round((time.perf_counter() - t0) * 1000.0, 1)

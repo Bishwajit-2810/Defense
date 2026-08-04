@@ -28,6 +28,7 @@ if _LIBS_PATH not in sys.path:
     sys.path.insert(0, os.path.abspath(_LIBS_PATH))
 
 from libs.llm import LLMClient  # noqa: E402
+from libs.progress import publish_stage  # noqa: E402
 
 from .cache import get_cached, set_cached  # noqa: E402
 from .prompts import (  # noqa: E402
@@ -622,6 +623,18 @@ async def _process_message(
 
     log.info("stage2_processing", task_flags=task_flags, backend_override=backend_override)
 
+    job_id = payload.get("job_id")
+    await publish_stage(
+        redis, "stage2", "running",
+        job_id=job_id, post_id=post_id,
+        detail={
+            "tasks": [k for k, v in task_flags.items() if v is True],
+            "target_lang": task_flags.get("target_lang"),
+            "backend": backend_override or os.environ.get("LLM_BACKEND", "local"),
+        },
+        log=log,
+    )
+
     # Build a working view the per-task prompts can read caption/OCR from.
     image_analysis = stage1_result.get("image_analysis") or {}
     partial_result: dict = {
@@ -660,7 +673,11 @@ async def _process_message(
         out: dict = {}
         backend = model = None
 
+        # Each task logs on the way out with its own latency and whether the
+        # answer came from the Redis response cache — the two numbers that explain
+        # Stage-2 cost. `_cache_hit` is set by the _run_* helpers.
         if task_flags.get("want_summary", False):
+            t = time.monotonic()
             try:
                 summary_data = await _run_summary(llm, redis, partial_result, task_flags, role, backend_override)
                 out["post_summary"] = summary_data.get("post_summary")
@@ -676,20 +693,46 @@ async def _process_message(
                 out["post_summary_grounding"] = grounding
                 backend = backend or summary_data.get("_llm_backend")
                 model = model or summary_data.get("_llm_model")
+                log.info(
+                    "stage2_summary_done",
+                    role=role,
+                    chars=len(out.get("post_summary") or ""),
+                    lang=out.get("post_summary_lang"),
+                    source=out.get("post_summary_source"),
+                    grounding=grounding,
+                    cache_hit=bool(summary_data.get("_cache_hit")),
+                    ms=round((time.monotonic() - t) * 1000, 1),
+                )
             except Exception as exc:
-                log.error("stage2_summary_error", error=str(exc))
+                log.error("stage2_summary_error", error=str(exc),
+                          ms=round((time.monotonic() - t) * 1000, 1))
 
         if task_flags.get("want_post_type", False):
+            t = time.monotonic()
             try:
                 pt_data = await _run_post_type(llm, redis, partial_result, task_flags, "stage2", backend_override)
                 out["post_type"] = pt_data.get("post_type")
                 out["post_type_confidence"] = pt_data.get("post_type_confidence")
                 backend = backend or pt_data.get("_llm_backend")
                 model = model or pt_data.get("_llm_model")
+                log.info(
+                    "stage2_post_type_done",
+                    post_type=out.get("post_type"),
+                    confidence=out.get("post_type_confidence"),
+                    # Length of the text the classifier actually saw — a 0 here
+                    # means it was asked to classify nothing.
+                    input_chars=len(
+                        (partial_result.get("caption") or partial_result.get("ocr_text") or "")
+                    ),
+                    cache_hit=bool(pt_data.get("_cache_hit")),
+                    ms=round((time.monotonic() - t) * 1000, 1),
+                )
             except Exception as exc:
-                log.error("stage2_post_type_error", error=str(exc))
+                log.error("stage2_post_type_error", error=str(exc),
+                          ms=round((time.monotonic() - t) * 1000, 1))
 
         if task_flags.get("want_insight", False):
+            t = time.monotonic()
             try:
                 insight_data = await _run_insight(llm, redis, partial_result, task_flags, "stage2", backend_override)
                 if insight_data.get("refined_topics"):
@@ -698,8 +741,17 @@ async def _process_message(
                 out["insight"] = insight_data.get("insight") or ""
                 backend = backend or insight_data.get("_llm_backend")
                 model = model or insight_data.get("_llm_model")
+                log.info(
+                    "stage2_insight_done",
+                    refined_topics=insight_data.get("refined_topics") or [],
+                    intents=out.get("intents"),
+                    insight_chars=len(out.get("insight") or ""),
+                    cache_hit=bool(insight_data.get("_cache_hit")),
+                    ms=round((time.monotonic() - t) * 1000, 1),
+                )
             except Exception as exc:
-                log.error("stage2_insight_error", error=str(exc))
+                log.error("stage2_insight_error", error=str(exc),
+                          ms=round((time.monotonic() - t) * 1000, 1))
 
         out["_llm_backend"] = backend
         out["_llm_model"] = model
@@ -765,6 +817,31 @@ async def _process_message(
     payload.pop("task_flags", None)
     await redis.xadd(ASSEMBLER_QUEUE, {"data": json.dumps(payload, ensure_ascii=False)})
     log.info("stage2_done", elapsed_ms=elapsed_ms, destination="assembler:queue")
+
+    summary = stage2_result.get("post_summary") or ""
+    ca_out = stage1_result.get("comment_analysis") or {}
+    await publish_stage(
+        redis, "stage2", "done",
+        job_id=job_id, post_id=post_id,
+        ms=elapsed_ms,
+        detail={
+            "post_type": stage2_result.get("post_type"),
+            "post_type_confidence": stage2_result.get("post_type_confidence"),
+            # The summary can be long; send a prefix for the trace and let the
+            # tab fetch the full canonical result when the post lands.
+            "post_summary_preview": summary[:220],
+            "post_summary_chars": len(summary),
+            "post_summary_lang": stage2_result.get("post_summary_lang"),
+            "post_summary_source": stage2_result.get("post_summary_source"),
+            "grounding": stage2_result.get("post_summary_grounding"),
+            "role": role,
+            "llm_backend": llm_backend,
+            "llm_model": llm_model,
+            "comment_summary_added": bool(ca_out.get("summary")),
+            "next_stream": ASSEMBLER_QUEUE,
+        },
+        log=log,
+    )
 
 
 # ---------------------------------------------------------------------------

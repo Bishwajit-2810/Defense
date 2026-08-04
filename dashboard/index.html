@@ -5,7 +5,7 @@
   <meta name="viewport" content="width=device-width, initial-scale=1.0" />
   <title>Defense Analysis Dashboard</title>
   <link rel="icon" href="data:image/svg+xml,%3Csvg xmlns='http://www.w3.org/2000/svg' viewBox='0 0 16 16'%3E%3Crect width='16' height='16' rx='3' fill='%236366f1'/%3E%3C/svg%3E" />
-  <link rel="stylesheet" href="styles.css?v=9" />
+  <link rel="stylesheet" href="styles.css?v=11" />
   <!-- API the dashboard talks to. Change this for other deployments
        (e.g. 'http://localhost:8000' for Mode B). -->
   <script>window.API_BASE = 'http://127.0.0.1:8001';</script>
@@ -73,6 +73,15 @@
     <button class="nav-tab" data-tab="pipeline" role="tab" aria-controls="tab-pipeline">
       <svg class="nav-tab-icon" viewBox="0 0 20 20" fill="currentColor"><path d="M5 3a2 2 0 100 4 2 2 0 000-4zM3 5a2 2 0 114 0 2 2 0 01-4 0zm12 8a2 2 0 100 4 2 2 0 000-4zm-2 2a2 2 0 114 0 2 2 0 01-4 0z"/><path fill-rule="evenodd" d="M6 5h5a4 4 0 014 4v4h-2V9a2 2 0 00-2-2H6V5z" clip-rule="evenodd"/></svg>
       Pipeline
+    </button>
+    <button class="nav-tab" data-tab="trace" role="tab" aria-controls="tab-trace">
+      <svg class="nav-tab-icon" viewBox="0 0 20 20" fill="currentColor"><path fill-rule="evenodd" d="M3 10a1 1 0 011-1h2.6l1.7-4.3a1 1 0 011.87.04L12 11.2l1.1-2.6A1 1 0 0114 8h2a1 1 0 110 2h-1.34l-1.74 4.14a1 1 0 01-1.86-.03L9.03 7.9 8.1 10.3A1 1 0 017.2 11H4a1 1 0 01-1-1z" clip-rule="evenodd"/></svg>
+      Trace
+    </button>
+    <button class="nav-tab" data-tab="logs" role="tab" aria-controls="tab-logs" title="Server-side + request logs (Ctrl+`)">
+      <svg class="nav-tab-icon" viewBox="0 0 20 20" fill="currentColor"><path fill-rule="evenodd" d="M4 3a1 1 0 00-1 1v12a1 1 0 001 1h12a1 1 0 001-1V4a1 1 0 00-1-1H4zm2 3h3v1.2H6V6zm0 3h8v1.2H6V9zm0 3h8v1.2H6V12zm5-6h3v1.2h-3V6z" clip-rule="evenodd"/></svg>
+      Logs
+      <span id="logs-badge" class="logs-badge">0</span>
     </button>
   </nav>
 
@@ -584,6 +593,167 @@
 
     </section><!-- /tab-pipeline -->
 
+    <!-- =========================================================
+         TRACE TAB — follow ONE post through the real pipeline
+         ---------------------------------------------------------
+         The Pipeline tab answers "how busy is each stage". This one
+         answers "what happened to this post". Pressing Run Trace
+         POSTs /v1/analysis/run for a single post, then subscribes to
+         that job's SSE stream and renders each stage event as the
+         worker publishes it — so Stage 1's real output appears, then
+         Stage 2 starts, in the order it actually happened.
+         ========================================================= -->
+    <section id="tab-trace" class="tab-panel" role="tabpanel">
+
+      <div class="card">
+        <div class="card-header">
+          <div>
+            <div class="card-title">Trace One Post</div>
+            <div class="card-description">
+              Re-runs a stored post through the <strong>real</strong> pipeline and follows it
+              live: ingestion → Stage&nbsp;1 → router → Stage&nbsp;2 → assembler. Each layer
+              reports its own output as it finishes.
+            </div>
+          </div>
+          <span id="trace-status" class="tag tag-sm">idle</span>
+        </div>
+
+        <div class="trace-controls">
+          <label class="trace-field">
+            <span class="trace-label">Post</span>
+            <select id="trace-post" class="form-select">
+              <option value="">Loading stored posts…</option>
+            </select>
+          </label>
+          <label class="trace-check" title="Sets options.want_summary, which the router reads as rule R3">
+            <input type="checkbox" id="trace-want-summary" checked />
+            <span>Request a summary <code>(want_summary)</code></span>
+          </label>
+          <button class="btn btn-primary" id="trace-run">
+            <svg width="13" height="13" viewBox="0 0 20 20" fill="currentColor"><path fill-rule="evenodd" d="M10 18a8 8 0 100-16 8 8 0 000 16zM8 7.5v5l4-2.5-4-2.5z" clip-rule="evenodd"/></svg>
+            Run Trace
+          </button>
+          <button class="btn btn-secondary" id="trace-clear">Clear</button>
+        </div>
+
+        <div id="trace-meta" class="trace-meta"></div>
+      </div>
+
+      <!-- The layer-by-layer rail, filled in by app.js -->
+      <div class="card">
+        <div class="card-header">
+          <div>
+            <div class="card-title">Layers</div>
+            <div class="card-description" id="trace-rail-note">
+              Nothing traced yet — pick a post and press Run Trace.
+            </div>
+          </div>
+          <span id="trace-elapsed" class="trace-elapsed"></span>
+        </div>
+        <div id="trace-rail" class="trace-rail"></div>
+      </div>
+
+      <!-- Final canonical result, fetched once the post lands -->
+      <div class="card" id="trace-result-card" hidden>
+        <div class="card-header">
+          <div>
+            <div class="card-title">Canonical Result</div>
+            <div class="card-description">
+              What the assembler validated and persisted — fetched from
+              <code>GET /v1/analysis/{post_id}</code>.
+            </div>
+          </div>
+        </div>
+        <div id="trace-result"></div>
+      </div>
+
+      <!-- Raw event tape: the actual SSE frames, in arrival order -->
+      <div class="card">
+        <div class="card-header">
+          <div>
+            <div class="card-title">Event Tape</div>
+            <div class="card-description">
+              Raw stage frames off <code>analysis:progress:{job_id}</code>, newest last.
+              <span class="text-muted">R = replayed from the buffer rather than received live.</span>
+            </div>
+          </div>
+        </div>
+        <div id="trace-tape" class="trace-tape"><div class="table-empty">No frames yet.</div></div>
+      </div>
+
+    </section><!-- /tab-trace -->
+
+    <!-- =========================================================
+         LOGS TAB — server-side logs + this session's API traffic
+         ---------------------------------------------------------
+         Two sources merged on one timeline:
+           client — every apiCall(), tagged with the tab that made it
+           server — SSE tail of /v1/logs/stream, i.e. every service's
+                    log lines mirrored through Redis by the sink in
+                    libs/common/logging.py
+         An entry's X-Request-ID matches the request_id field on the
+         API's own http_request line, so a slow call can be followed
+         from the browser into the backend.
+         ========================================================= -->
+    <section id="tab-logs" class="tab-panel" role="tabpanel">
+
+      <div class="card">
+        <div class="card-header">
+          <div>
+            <div class="card-title">Server &amp; Request Logs</div>
+            <div class="card-description">
+              Every backend service's log lines, live, plus each request this dashboard made.
+              Scope <strong>this tab</strong> shows only what the tab you were last on asked for;
+              <strong>all</strong> shows the whole pipeline.
+            </div>
+          </div>
+          <span id="log-stream-status" class="log-stream-status" title="Server log stream state">offline</span>
+        </div>
+
+        <div class="log-controls">
+          <div class="log-seg" role="group" aria-label="Scope">
+            <button data-scope="tab" title="Only requests made by the tab you were last on">this tab</button>
+            <button data-scope="all" class="active" title="Every tab, plus all server-side logs">all</button>
+          </div>
+
+          <div class="log-seg" role="group" aria-label="Source">
+            <button data-source="all" class="active">both</button>
+            <button data-source="client" title="Requests this dashboard made">client</button>
+            <button data-source="server" title="Log lines from the backend services">server</button>
+          </div>
+
+          <select id="log-level" class="log-select" title="Minimum server log level">
+            <option value="">all levels</option>
+            <option value="DEBUG">DEBUG+</option>
+            <option value="INFO" selected>INFO+</option>
+            <option value="WARNING">WARNING+</option>
+            <option value="ERROR">ERROR only</option>
+          </select>
+
+          <select id="log-service" class="log-select" title="Filter by service">
+            <option value="">all services</option>
+          </select>
+
+          <input type="search" id="log-search" class="log-search" placeholder="filter text…" aria-label="Filter logs by text" />
+
+          <label class="log-check" title="Keep scrolled to the newest line">
+            <input type="checkbox" id="log-follow" checked /> <span>follow</span>
+          </label>
+
+          <span class="log-controls-spacer"></span>
+
+          <span id="log-count" class="log-count"></span>
+          <button id="log-clear" class="btn btn-secondary btn-sm" title="Clear this view (leaves the server buffer alone)">Clear view</button>
+          <button id="log-purge" class="btn btn-secondary btn-sm" title="Delete the server-side log buffer in Redis">Purge server</button>
+        </div>
+      </div>
+
+      <div class="card log-card">
+        <div id="log-body" class="log-body"><div class="table-empty">Connecting to the log stream…</div></div>
+      </div>
+
+    </section><!-- /tab-logs -->
+
   </main><!-- /main-content -->
 
   <!-- ============================================================
@@ -736,6 +906,6 @@
 
 </div><!-- /app -->
 
-<script src="app.js?v=15"></script>
+<script src="app.js?v=17"></script>
 </body>
 </html>

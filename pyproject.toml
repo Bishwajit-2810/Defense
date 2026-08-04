@@ -49,6 +49,9 @@ ml = [
 # Test + lint tooling. Install with: uv sync --extra dev
 dev = [
     "pytest>=8.0.0",
+    # tests/test_stage1_llm_sentiment.py uses @pytest.mark.asyncio; without this
+    # plugin those tests error out rather than skip.
+    "pytest-asyncio>=0.24.0",
     "ruff>=0.6.0",
 ]
 # OpenTelemetry tracing (§10) — only needed with OTEL_ENABLED=true. Install with:

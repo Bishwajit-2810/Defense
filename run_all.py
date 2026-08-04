@@ -53,6 +53,9 @@ _LOG_LEVEL = "INFO"
 # Only print lines matching this substring filter when set (e.g. "llm" to watch
 # just LLM activity). None = print every line.
 _LOG_FILTER: str | None = None
+# Mirror log lines into Redis for the dashboard's log drawer / GET /v1/logs.
+# On by default; --no-server-logs turns it off for a lean run.
+_LOG_TO_REDIS = True
 _STREAM_COLORS = ["\033[36m", "\033[32m", "\033[33m", "\033[35m", "\033[34m",
                   "\033[91m", "\033[92m", "\033[93m", "\033[95m", "\033[96m"]
 _color_idx = 0
@@ -330,6 +333,11 @@ def build_env() -> dict:
         "MODEL_STUB_MODE": "true",
         "JWT_SECRET": "demo",
         "LOG_LEVEL": _LOG_LEVEL,
+        # Mirror every service's log lines into Redis so the dashboard's log
+        # drawer (and GET /v1/logs) can show them — the services don't share a
+        # filesystem, but they do share a Redis. --no-server-logs turns it off.
+        "LOG_TO_REDIS": "true" if _LOG_TO_REDIS else "false",
+        "LOG_REDIS_MAX": os.environ.get("LOG_REDIS_MAX", "3000"),
         "PYTHONPATH": str(REPO),
         # The API proxies /v1/agents/* to the agents service; its default
         # (http://agents:8010) is the compose hostname, which doesn't resolve
@@ -564,7 +572,10 @@ def banner(with_agents: bool, dash_port: int | None, manual_load: bool = False) 
         flt = f" (filtered: '{_LOG_FILTER}')" if _LOG_FILTER else ""
         print(f"   • Logs       →  streaming live below{flt}  +  /tmp/<service>.log")
     else:
-        print("   • Logs       →  /tmp/<service>.log   (add --logs to stream them here live)")
+        print("   • Logs       →  /tmp/<service>.log   (add --log to stream them here live)")
+    if _LOG_TO_REDIS:
+        print(f"                   in the browser: dashboard → Logs (Ctrl+`), or "
+              f"GET http://127.0.0.1:{API_PORT}/v1/logs")
     ok("  Press Ctrl-C to stop everything this script started.")
     ok("════════════════════════════════════════════════════════════")
     print()
@@ -589,18 +600,23 @@ def main() -> None:
                          help="route Stage-2 + agents through Groq Cloud (much faster than local Ollama; needs GROQ_API_KEY). --fast is a synonym.")
     backend.add_argument("--ollama", action="store_true",
                          help="pin Stage-2 + agents to local Ollama (the default backend); also clears any Groq override left in Redis by a prior --groq run")
-    ap.add_argument("--logs", "-l", action="store_true",
-                    help="stream every service's logs live to this terminal (still tee'd to /tmp/*.log)")
+    ap.add_argument("--log", "--logs", "-l", dest="logs", action="store_true",
+                    help="stream every service's logs live to this terminal (still tee'd to /tmp/*.log "
+                         "and mirrored to Redis for the dashboard's Logs drawer). --logs is a synonym.")
     ap.add_argument("--log-level", default="INFO",
                     help="log level for all services (DEBUG/INFO/WARNING/ERROR); default INFO")
     ap.add_argument("--log-filter", metavar="STR",
-                    help="with --logs, only print lines containing STR (e.g. 'llm' to watch LLM activity)")
+                    help="with --log, only print lines containing STR (e.g. 'llm' to watch LLM activity)")
+    ap.add_argument("--no-server-logs", action="store_true",
+                    help="don't mirror service logs into Redis — the dashboard's Logs drawer and "
+                         "GET /v1/logs will be empty (saves one Redis write per log line)")
     args = ap.parse_args()
 
-    global _STREAM, _LOG_LEVEL, _LOG_FILTER
+    global _STREAM, _LOG_LEVEL, _LOG_FILTER, _LOG_TO_REDIS
     _STREAM = args.logs or bool(args.log_filter)
     _LOG_LEVEL = args.log_level.upper()
     _LOG_FILTER = args.log_filter
+    _LOG_TO_REDIS = not args.no_server_logs
 
     # --manual-load / --no-load mean "don't auto-load". They must also NOT let the
     # workers resume a PRIOR run's leftover queue backlog (that's the phantom

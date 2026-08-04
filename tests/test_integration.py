@@ -299,27 +299,6 @@ class TestRouterRules:
         assert use_llm is True
         assert any("high_toxicity" in r for r in reasons)
 
-    def test_routing_rate_sample(self):
-        """With confidence=0.9, post_type set, no summary: <20% of 50 posts route to LLM."""
-        routed_to_llm = 0
-        for post in SAMPLE_POSTS:
-            partial = {
-                "overall_confidence": 0.9,
-                "toxicity_score": 0.05,
-                "post_type": "news",
-                "photo_urls": [],
-                "caption": "",
-                "language": "bn",
-            }
-            use_llm, _ = should_use_llm(partial, {})
-            if use_llm:
-                routed_to_llm += 1
-
-        rate = routed_to_llm / len(SAMPLE_POSTS)
-        assert rate < 0.20, (
-            f"Expected <20% of posts routed to LLM, got {rate:.0%} ({routed_to_llm}/50)"
-        )
-
     def test_unclassified_post_type_routes_to_llm(self):
         """post_type=None triggers the unclassified rule -> use_llm=True."""
         use_llm, reasons = should_use_llm(
@@ -358,6 +337,252 @@ class TestRouterRules:
             {"want_summary": False},
         )
         assert flags["want_summary"] is False
+
+    def test_get_task_flags_skips_post_type_when_stage1_is_confident(self):
+        """A confidently typed post must not pay for an LLM post_type call."""
+        flags = get_task_flags(
+            {"confidence": 0.9, "post_type": "political", "post_type_confidence": 0.81,
+             "topics": ["a", "b"]},
+            {},
+        )
+        assert flags["want_post_type"] is False
+
+    def test_get_task_flags_wants_post_type_when_stage1_is_unsure(self):
+        flags = get_task_flags(
+            {"confidence": 0.9, "post_type": "political", "post_type_confidence": 0.4,
+             "topics": ["a", "b"]},
+            {},
+        )
+        assert flags["want_post_type"] is True
+
+
+# ---------------------------------------------------------------------------
+# TestRouterReadsRealStage1Shape
+# ---------------------------------------------------------------------------
+
+class TestRouterReadsRealStage1Shape:
+    """Regression tests for the 100%-routing defect (PROJECT_ASSESSMENT.md §4).
+
+    Every assertion here is about *field names*. The router's only input is the
+    dict ``stage1_nlp/worker._build_result`` returns, so a rule reading a key that
+    dict never contains is a silently dead rule — and a placeholder ``None`` read
+    as a verdict is a rule that always fires. Between them those two mistakes sent
+    100% of posts to Stage 2 while the docs claimed single digits.
+    """
+
+    @staticmethod
+    def _real_stage1_result(post: dict) -> dict:
+        """Run the genuine Stage-1 text path (stub NLP) and build the result dict."""
+        import asyncio
+
+        os.environ["MODEL_STUB_MODE"] = "true"
+        os.environ["STAGE1_LLM"] = "false"
+        from services.workers.stage1_nlp.models import ModelRegistry
+        from services.workers.stage1_nlp.text_analyzer import analyze_text
+        from services.workers.stage1_nlp.worker import _build_result
+
+        registry = ModelRegistry()
+        text_result = asyncio.run(analyze_text(post.get("caption") or "", registry))
+        image_result = (
+            {"image_sentiment": "neutral", "image_sentiment_score": 0.0, "ocr_text": ""}
+            if post.get("photoUrls")
+            else None
+        )
+        return _build_result(
+            post=post,
+            text_result=text_result,
+            image_result=image_result,
+            comment_analysis={"analyzed": 0, "sentiment_breakdown": {}},
+            overall_sentiment="neutral",
+            sentiment_score=0.0,
+            stage1_ms=1.0,
+        )
+
+    def test_stage1_emits_every_field_the_rules_read(self):
+        """The router reads these six names; Stage 1 must emit all of them."""
+        result = self._real_stage1_result(FIRST_POST)
+        for key in (
+            "confidence",
+            "post_type",
+            "post_type_confidence",
+            "photo_urls",
+            "caption_chars",
+            "toxicity_score",
+            "script",
+        ):
+            assert key in result, f"_build_result dropped {key!r}, a routing input"
+
+    def test_confidence_gate_is_live_on_real_stage1_output(self):
+        """Stage 1's confidence must reach Rule 1 — it used to be unreadable."""
+        from services.workers.router.rules import read_overall_confidence
+
+        result = self._real_stage1_result(FIRST_POST)
+        assert read_overall_confidence(result) == result["confidence"]
+        assert read_overall_confidence(result) is not None
+
+        # A zero-confidence post routes; the same post at 0.99 does not fire Rule 1.
+        result["confidence"] = 0.0
+        _, reasons = should_use_llm(result, {})
+        assert any("confidence" in r for r in reasons)
+
+    def test_bypass_leg_is_reachable(self):
+        """At least one of the 50 real posts must skip Stage 2.
+
+        The whole cost argument rests on this branch existing at runtime. When
+        every rule either always fires or can never fire, it is dead code.
+        """
+        bypassed = [
+            p for p in SAMPLE_POSTS
+            if not should_use_llm(self._real_stage1_result(p), {})[0]
+        ]
+        assert bypassed, "no post bypasses Stage 2 — the routing gate does not gate"
+
+    def test_placeholder_post_type_does_not_route_every_post(self):
+        """Rule 2 must fire on *unclassifiable* posts, not on all of them."""
+        routed = [
+            p for p in SAMPLE_POSTS
+            if should_use_llm(self._real_stage1_result(p), {})[0]
+        ]
+        assert len(routed) < len(SAMPLE_POSTS), (
+            f"{len(routed)}/{len(SAMPLE_POSTS)} posts routed — Rule 2 is firing "
+            "on a Stage-2 placeholder again"
+        )
+
+    def test_long_mixed_rule_reads_stage1_script_field(self):
+        """Rule 6 needs caption_chars + script; it used to read caption + language."""
+        result = self._real_stage1_result(FIRST_POST)
+        result.update(
+            {"confidence": 0.9, "post_type": "news", "post_type_confidence": 0.9,
+             "toxicity_score": 0.0, "caption_chars": 4000, "script": "mixed"}
+        )
+        _, reasons = should_use_llm(result, {})
+        assert any("long_mixed_text" in r for r in reasons)
+
+    def test_image_rule_reads_the_image_analysis_block(self):
+        """Rule 4 must see photos via image_analysis too, not only photo_urls."""
+        partial = {
+            "confidence": 0.9,
+            "post_type": "news",
+            "post_type_confidence": 0.9,
+            "image_analysis": {"image_count": 2, "images": [{"sentiment": None}]},
+        }
+        use_llm, reasons = should_use_llm(partial, {})
+        assert use_llm is True
+        assert any("image_no_sentiment" in r for r in reasons)
+
+    def test_nested_assembler_confidence_shape_is_understood(self):
+        """The assembler emits confidence.overall; the gate must still read it."""
+        partial = {
+            "confidence": {"overall": 0.2, "sentiment": 0.3},
+            "post_type": "news",
+            "post_type_confidence": 0.9,
+        }
+        use_llm, reasons = should_use_llm(partial, {})
+        assert use_llm is True
+        assert any("low_confidence:0.200" in r for r in reasons)
+
+
+# ---------------------------------------------------------------------------
+# TestStage1PostType
+# ---------------------------------------------------------------------------
+
+class TestStage1PostType:
+    """Stage 1 owns a best-effort post_type + confidence (assessment §7 item 2)."""
+
+    def test_political_text_is_typed_with_usable_confidence(self):
+        from services.workers.stage1_nlp.text_analyzer import _stub_post_type
+
+        label, confidence = _stub_post_type(
+            "সরকার ও নির্বাচন নিয়ে রাজনীতি এখন উত্তপ্ত, ভোট নিয়ে সংসদে আলোচনা"
+        )
+        assert label == "political"
+        assert 0.0 < confidence <= 0.85
+
+    def test_unclassifiable_text_says_unknown_not_other(self):
+        """None is what Rule 2 escalates; 'other' would hide the uncertainty."""
+        from services.workers.stage1_nlp.text_analyzer import _stub_post_type
+
+        label, confidence = _stub_post_type("zzz qqq vvv")
+        assert label is None
+        assert confidence == 0.0
+
+    def test_single_weak_hit_stays_below_the_router_threshold(self):
+        from services.workers.router.rules import POST_TYPE_CONFIDENCE_THRESHOLD
+        from services.workers.stage1_nlp.text_analyzer import _stub_post_type
+
+        label, confidence = _stub_post_type("আজ নির্বাচন")
+        assert label == "political"
+        assert confidence < POST_TYPE_CONFIDENCE_THRESHOLD
+
+    def test_empty_text_result_carries_the_post_type_keys(self):
+        from services.workers.stage1_nlp.text_analyzer import _empty_result
+
+        empty = _empty_result()
+        assert empty["post_type"] is None
+        assert empty["post_type_confidence"] == 0.0
+
+
+# ---------------------------------------------------------------------------
+# TestBypassLegEndToEnd
+# ---------------------------------------------------------------------------
+
+class TestBypassLegEndToEnd:
+    """The router -> assembler leg (Stage 2 skipped) on a real post.
+
+    Until the gate was fixed this branch never executed on real traffic, so its
+    output was never actually validated: a bypassed post has no post_summary and
+    must still produce a schema-valid canonical result.
+    """
+
+    @staticmethod
+    def _run_stage1(raw_post: dict, max_comments: int = 5) -> tuple[dict, dict]:
+        import asyncio
+
+        os.environ["MODEL_STUB_MODE"] = "true"
+        os.environ["STAGE1_LLM"] = "false"
+        from services.workers.stage1_nlp.models import ModelRegistry
+        from services.workers.stage1_nlp import worker as s1
+
+        post = dict(raw_post)
+        post["comments"] = (raw_post.get("comments") or [])[:max_comments]
+        registry = ModelRegistry()
+
+        async def _go():
+            (
+                text_result,
+                image_result,
+                comment_analysis,
+                overall_sentiment,
+                sentiment_score,
+            ) = await s1._process_message(post, registry)
+            return s1._build_result(
+                post=post,
+                text_result=text_result,
+                image_result=image_result,
+                comment_analysis=comment_analysis,
+                overall_sentiment=overall_sentiment,
+                sentiment_score=sentiment_score,
+                stage1_ms=1.0,
+            )
+
+        return normalize_post(post), asyncio.run(_go())
+
+    def test_bypassed_post_yields_schema_valid_output(self):
+        for raw_post in SAMPLE_POSTS:
+            normalized, stage1 = self._run_stage1(raw_post)
+            if should_use_llm(stage1, {})[0]:
+                continue
+            # This is the branch router.py takes when no rule fires.
+            result = build_canonical_result(normalized, stage1, None)
+            valid, errors = validate_output(result)
+            assert valid is True, f"bypass-leg output invalid: {errors}"
+            assert result["post_summary"] is None
+            assert result["processing"]["llm_used"] is False
+            # Stage 1's own classification must survive to the canonical result —
+            # otherwise a bypassed post carries no post_type at all.
+            assert result["post_type"] is not None
+            return
+        pytest.fail("no sample post bypassed Stage 2 — cannot test the bypass leg")
 
 
 # ---------------------------------------------------------------------------

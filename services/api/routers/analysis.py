@@ -23,6 +23,7 @@ from sqlalchemy import text
 from sqlalchemy.ext.asyncio import AsyncSession
 
 import redis.asyncio as aioredis
+from libs.progress import publish_stage, replay_events
 from deps import check_llm_backend_policy, get_current_user, get_db, get_redis, rate_limit
 from models import (
     AnalysisDetailResponse,
@@ -162,6 +163,33 @@ async def analysis_run(
                 {"data": json.dumps(envelope, ensure_ascii=False, default=str)},
             )
             enqueued += 1
+
+            # Opening frame for the dashboard's Trace tab. This path re-enqueues
+            # directly rather than going through the ingestion worker, so it has
+            # to report the ingest layer itself.
+            eng = normalized.get("engagement") or {}
+            await publish_stage(
+                redis,
+                "ingest",
+                "done",
+                job_id=analysis_id,
+                post_id=normalized["post_id"],
+                detail={
+                    "source": "re-normalized from stored raw_payload",
+                    "platform": normalized.get("platform"),
+                    "media_type": normalized.get("media_type"),
+                    "caption_chars": len(normalized.get("caption") or ""),
+                    "photo_count": len(normalized.get("photo_urls") or []),
+                    "comment_rows": len(normalized.get("comments") or []),
+                    "comment_count": eng.get("comment_count"),
+                    "coverage": eng.get("coverage"),
+                    "content_hash": (normalized.get("content_hash") or "")[:16],
+                    "baseline_sentiment": normalized.get("baseline_sentiment"),
+                    "options": options,
+                    "next_stream": _NLP_STAGE1_STREAM,
+                },
+                log=log,
+            )
         if enqueued == 0:
             raise HTTPException(
                 status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,
@@ -183,9 +211,11 @@ async def analysis_run(
     except Exception as exc:
         log.warning("analysis_run_total_record_failed", analysis_id=analysis_id, error=str(exc))
 
-    # Estimate the LLM share from the router's observed routing rate; falls
-    # back to the 5% design target before any traffic has been processed.
-    estimated_share = 0.05
+    # Report the router's OBSERVED routing rate. Before any traffic there is no
+    # rate, so this stays None rather than repeating the 5% design target as if
+    # it were a measurement (the docs asserting that target while the gate routed
+    # 100% is exactly the defect PROJECT_ASSESSMENT.md §4 describes).
+    estimated_share: float | None = None
     try:
         total_stat = int(await redis.get("stats:total_processed") or 0)
         llm_stat = int(await redis.get("stats:llm_routed") or 0)
@@ -720,6 +750,15 @@ async def _sse_generator(
     try:
         # Send an initial "connected" event so the client knows the stream is live
         yield f"event: connected\ndata: {json.dumps({'analysis_id': analysis_id})}\n\n"
+
+        # Replay any stage events already published for this job. The first one
+        # (ingestion) is emitted while POST /v1/analysis/run is still running, so
+        # a client can never subscribe in time to see it live. Replaying after
+        # the pubsub subscribe above means no frame can fall between the two.
+        # Each frame carries a `seq`, so a client can drop a duplicate.
+        for buffered in await replay_events(redis, analysis_id):
+            buffered["replay"] = True
+            yield f"event: {buffered.get('event', 'stage')}\ndata: {json.dumps(buffered, ensure_ascii=False)}\n\n"
 
         timeout_seconds = 300  # 5-minute max stream duration
         deadline = asyncio.get_event_loop().time() + timeout_seconds

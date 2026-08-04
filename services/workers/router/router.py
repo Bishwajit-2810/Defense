@@ -2,7 +2,11 @@
 Router worker — reads "router:queue" and dispatches each post to either
 "llm:stage2:queue" or "assembler:queue" based on routing rules.
 
-Golden Rule: Only single-digit % of posts should reach Stage-2 LLM.
+Design target: keep the share of posts reaching Stage-2 LLM low. That share is
+measured, not assumed — `stats:llm_routed / stats:total_processed`, exported by
+this worker and surfaced as `estimated_llm_share` on the analysis API. See
+rules.py for what each gate reads and PROJECT_ASSESSMENT.md §4 for the measured
+rate on the 50-post sample.
 """
 
 from __future__ import annotations
@@ -16,9 +20,17 @@ import time
 import redis.asyncio as aioredis
 import structlog
 
-from .rules import get_task_flags, should_use_llm
+from .rules import (
+    get_task_flags,
+    read_image_sentiment,
+    read_overall_confidence,
+    read_photo_count,
+    read_text_length,
+    should_use_llm,
+)
 from libs.common.logging import setup_logging
 from libs.dlq import record_failure
+from libs.progress import publish_stage
 
 setup_logging("router")
 logger = structlog.get_logger(__name__)
@@ -86,9 +98,33 @@ async def _process_message(
     options: dict = payload.get("options", {})
 
     use_llm, reasons = should_use_llm(stage1_result, options)
+    job_id = payload.get("job_id")
+
+    # Log the inputs the six rules actually read, not just the verdict — via the
+    # same readers the rules use, so this can never report a field the gate did
+    # not see (it used to log raw key lookups, which read None for fields Stage 1
+    # emits under another name and made three dead rules look like passing ones).
+    logger.info(
+        "router_rules_evaluated",
+        post_id=post_id,
+        use_llm=use_llm,
+        fired=reasons or [],
+        confidence=read_overall_confidence(stage1_result),
+        post_type=stage1_result.get("post_type"),
+        post_type_confidence=stage1_result.get("post_type_confidence"),
+        want_summary=options.get("want_summary", False),
+        photo_count=read_photo_count(stage1_result),
+        image_sentiment=read_image_sentiment(stage1_result),
+        toxicity_score=stage1_result.get("toxicity_score"),
+        language=stage1_result.get("language"),
+        script=stage1_result.get("script"),
+        is_banglish=bool(stage1_result.get("is_banglish")),
+        caption_chars=read_text_length(stage1_result),
+    )
 
     if use_llm:
-        payload["task_flags"] = get_task_flags(stage1_result, options)
+        task_flags = get_task_flags(stage1_result, options)
+        payload["task_flags"] = task_flags
         await redis.xadd(STAGE2_QUEUE, {"data": json.dumps(payload)})
         await redis.incr(STAT_LLM)
         logger.info(
@@ -96,6 +132,18 @@ async def _process_message(
             post_id=post_id,
             destination="llm:stage2:queue",
             reasons=reasons,
+        )
+        await publish_stage(
+            redis, "router", "done",
+            job_id=job_id, post_id=post_id,
+            ms=(time.monotonic() - t0) * 1000.0,
+            detail={
+                "use_llm": True,
+                "reasons": reasons,
+                "task_flags": task_flags,
+                "next_stream": STAGE2_QUEUE,
+            },
+            log=logger,
         )
     else:
         payload["stage2_result"] = None
@@ -105,6 +153,25 @@ async def _process_message(
             post_id=post_id,
             destination="assembler:queue",
             reasons=[],
+        )
+        await publish_stage(
+            redis, "router", "done",
+            job_id=job_id, post_id=post_id,
+            ms=(time.monotonic() - t0) * 1000.0,
+            detail={
+                "use_llm": False,
+                "reasons": [],
+                "next_stream": ASSEMBLER_QUEUE,
+            },
+            log=logger,
+        )
+        # Stage 2 is bypassed entirely — say so explicitly so the trace shows a
+        # skipped layer rather than a silently missing one.
+        await publish_stage(
+            redis, "stage2", "skipped",
+            job_id=job_id, post_id=post_id,
+            detail={"reason": "no routing rule fired"},
+            log=logger,
         )
 
     await redis.incr(STAT_TOTAL)

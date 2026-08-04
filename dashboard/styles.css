@@ -2317,3 +2317,458 @@ canvas {
   }
   @page { size: A4; margin: 14mm; }
 }
+
+/* ============================================================
+   TRACE TAB — per-post layer-by-layer pipeline trace
+   Uses the shared tokens above, so dark mode comes for free.
+   ============================================================ */
+
+.trace-controls {
+  display: flex;
+  flex-wrap: wrap;
+  align-items: flex-end;
+  gap: 12px;
+  padding: 4px 0 2px;
+}
+
+.trace-field { display: flex; flex-direction: column; gap: 5px; min-width: 0; flex: 1 1 22rem; }
+
+.trace-label {
+  font-family: var(--font-mono);
+  font-size: 0.68rem;
+  letter-spacing: 0.08em;
+  text-transform: uppercase;
+  color: var(--text-secondary);
+}
+
+.trace-check {
+  display: flex;
+  align-items: center;
+  gap: 7px;
+  font-size: 0.85rem;
+  color: var(--text-secondary);
+  padding-bottom: 9px;
+  cursor: pointer;
+}
+
+.trace-check code { font-size: 0.78rem; }
+
+.trace-meta {
+  display: flex;
+  flex-wrap: wrap;
+  gap: 6px 18px;
+  margin-top: 14px;
+  font-size: 0.8rem;
+  color: var(--text-secondary);
+}
+
+.trace-meta:empty { display: none; }
+.trace-meta-item { display: inline-flex; align-items: baseline; gap: 6px; }
+
+.trace-meta-k {
+  font-family: var(--font-mono);
+  font-size: 0.66rem;
+  letter-spacing: 0.08em;
+  text-transform: uppercase;
+  color: var(--text-muted);
+}
+
+.trace-meta-hint { color: var(--text-muted); font-style: italic; }
+
+.trace-elapsed {
+  font-family: var(--font-mono);
+  font-size: 0.8rem;
+  color: var(--text-secondary);
+  font-variant-numeric: tabular-nums;
+}
+
+/* ---- the vertical rail ---- */
+
+.trace-rail { padding: 4px 0 8px; }
+
+.trace-wire {
+  position: relative;
+  height: 30px;
+  display: flex;
+  align-items: center;
+  padding-left: 34px;
+}
+
+.trace-wire::before {
+  content: "";
+  position: absolute;
+  left: 13px;
+  top: 0;
+  bottom: 0;
+  width: 2px;
+  background: var(--border-color);
+}
+
+.trace-wire.lit::before { background: var(--accent); }
+
+.trace-queue {
+  font-family: var(--font-mono);
+  font-size: 0.7rem;
+  color: var(--text-muted);
+  background: var(--bg-card);
+  padding: 1px 6px;
+}
+
+.trace-wire.lit .trace-queue { color: var(--accent); }
+
+.trace-layer {
+  border: 1px solid var(--border-color);
+  border-left: 3px solid var(--border-color);
+  border-radius: var(--border-radius);
+  background: var(--bg-card);
+  padding: 11px 14px 13px;
+  transition: border-color var(--transition), background var(--transition);
+}
+
+.trace-layer[data-status="running"] {
+  border-left-color: var(--accent);
+  background: var(--accent-light);
+}
+
+.trace-layer[data-status="done"]    { border-left-color: var(--success); }
+.trace-layer[data-status="skipped"] { border-left-color: var(--color-neutral); opacity: 0.72; }
+.trace-layer[data-status="stalled"] { border-left-color: var(--warning); }
+.trace-layer[data-status="idle"]    { opacity: 0.55; }
+
+.trace-layer-head { display: flex; align-items: center; gap: 9px; flex-wrap: wrap; }
+
+.trace-pip {
+  width: 8px;
+  height: 8px;
+  border-radius: 50%;
+  border: 1px solid var(--border-color);
+  flex: 0 0 auto;
+}
+
+.trace-layer[data-status="running"] .trace-pip {
+  background: var(--accent);
+  border-color: var(--accent);
+  animation: tracePulse 1s ease-in-out infinite;
+}
+
+.trace-layer[data-status="done"] .trace-pip { background: var(--success); border-color: var(--success); }
+.trace-layer[data-status="skipped"] .trace-pip { background: var(--color-neutral); border-color: var(--color-neutral); }
+.trace-layer[data-status="stalled"] .trace-pip { background: var(--warning); border-color: var(--warning); }
+
+@keyframes tracePulse { 0%,100% { opacity: 1; } 50% { opacity: 0.25; } }
+
+@media (prefers-reduced-motion: reduce) {
+  .trace-layer[data-status="running"] .trace-pip { animation: none; }
+}
+
+.trace-layer-n {
+  font-family: var(--font-mono);
+  font-size: 0.72rem;
+  color: var(--text-muted);
+  font-variant-numeric: tabular-nums;
+}
+
+.trace-layer-name { font-weight: 600; font-size: 0.9rem; color: var(--text-primary); }
+
+.trace-layer-state {
+  font-family: var(--font-mono);
+  font-size: 0.64rem;
+  letter-spacing: 0.09em;
+  text-transform: uppercase;
+  color: var(--text-secondary);
+  border: 1px solid var(--border-color);
+  border-radius: 3px;
+  padding: 1px 5px;
+}
+
+.trace-layer-ms {
+  margin-left: auto;
+  font-family: var(--font-mono);
+  font-size: 0.76rem;
+  color: var(--text-secondary);
+  font-variant-numeric: tabular-nums;
+}
+
+.trace-layer-note {
+  font-size: 0.8rem;
+  color: var(--text-muted);
+  margin: 4px 0 0 17px;
+}
+
+/* ---- detail key/value grid ---- */
+
+.trace-kv {
+  display: grid;
+  grid-template-columns: minmax(0, 11rem) minmax(0, 1fr);
+  gap: 3px 14px;
+  margin: 11px 0 0 17px;
+}
+
+.trace-kv-wide { grid-template-columns: minmax(0, 13rem) minmax(0, 1fr); margin-left: 0; }
+
+.trace-kv dt {
+  font-family: var(--font-mono);
+  font-size: 0.72rem;
+  color: var(--text-secondary);
+  padding-top: 2px;
+  word-break: break-word;
+}
+
+.trace-kv dd {
+  margin: 0;
+  font-size: 0.82rem;
+  color: var(--text-primary);
+  display: flex;
+  flex-wrap: wrap;
+  gap: 4px;
+  align-items: baseline;
+  min-width: 0;
+}
+
+.trace-num { font-family: var(--font-mono); font-variant-numeric: tabular-nums; }
+.trace-null { color: var(--text-muted); font-family: var(--font-mono); font-size: 0.76rem; }
+.trace-yes { color: var(--success); font-family: var(--font-mono); font-weight: 600; }
+.trace-no  { color: var(--text-muted); font-family: var(--font-mono); }
+
+.trace-chip {
+  font-family: var(--font-mono);
+  font-size: 0.7rem;
+  background: var(--bg-table-row);
+  border: 1px solid var(--border-color);
+  border-radius: 3px;
+  padding: 1px 5px;
+  color: var(--text-secondary);
+  word-break: break-word;
+}
+
+.trace-text {
+  display: block;
+  width: 100%;
+  line-height: 1.5;
+  color: var(--text-primary);
+}
+
+/* ---- raw frame tape ---- */
+
+.trace-tape {
+  max-height: 17rem;
+  overflow-y: auto;
+  border: 1px solid var(--border-color);
+  border-radius: var(--border-radius);
+  background: var(--bg-page);
+}
+
+.trace-frame {
+  display: grid;
+  grid-template-columns: 2.6rem 1.6rem minmax(0, 1fr) auto;
+  gap: 10px;
+  align-items: baseline;
+  padding: 5px 11px;
+  border-bottom: 1px solid var(--border-color);
+  font-family: var(--font-mono);
+  font-size: 0.74rem;
+}
+
+.trace-frame:last-child { border-bottom: 0; }
+
+.trace-frame-seq { color: var(--text-muted); font-variant-numeric: tabular-nums; text-align: right; }
+
+.trace-frame-flag {
+  color: var(--text-secondary);
+  font-size: 0.64rem;
+  border: 1px solid var(--border-color);
+  border-radius: 3px;
+  text-align: center;
+}
+
+.trace-frame-name { color: var(--text-primary); word-break: break-word; }
+.trace-frame-ms { color: var(--text-secondary); font-variant-numeric: tabular-nums; }
+
+@media (max-width: 640px) {
+  .trace-kv, .trace-kv-wide { grid-template-columns: minmax(0, 1fr); gap: 1px; }
+  .trace-kv dd { margin-bottom: 7px; }
+  .trace-layer-ms { margin-left: 0; }
+}
+
+/* ============================================================
+   LOGS TAB — server-side logs + dashboard API traffic
+   ============================================================ */
+
+/* Unseen-lines badge on the Logs nav tab. The nav bar is always dark in both
+   themes (--bg-nav is the same value in each), so these are fixed colours
+   rather than theme tokens — token-based greys would vanish against it. */
+.logs-badge {
+  display: inline-block;
+  min-width: 1.15rem;
+  padding: 0 4px;
+  border-radius: 9px;
+  background: #334155;
+  color: #cbd5e1;
+  font-family: var(--font-mono);
+  font-size: 0.66rem;
+  text-align: center;
+  font-variant-numeric: tabular-nums;
+}
+
+.logs-badge.has-unseen { background: var(--accent); color: #fff; }
+.logs-badge.has-error  { background: var(--danger); color: #fff; }
+
+/* Filter bar inside the first card. */
+.log-controls {
+  display: flex;
+  flex-wrap: wrap;
+  align-items: center;
+  gap: 8px;
+  padding: 4px 0 2px;
+}
+
+.log-controls-spacer { flex: 1 1 auto; }
+
+.log-count {
+  font-family: var(--font-mono);
+  font-size: 0.7rem;
+  color: var(--text-muted);
+  font-variant-numeric: tabular-nums;
+}
+
+/* The log view fills the rest of the viewport and scrolls on its own, so the
+   page itself never grows a second scrollbar for thousands of lines. */
+.log-card {
+  padding: 0;
+  overflow: hidden;
+  display: flex;
+  flex-direction: column;
+  height: calc(100vh - 22rem);
+  min-height: 18rem;
+}
+
+.log-seg { display: flex; border: 1px solid var(--border-color); border-radius: 5px; overflow: hidden; }
+
+.log-seg button {
+  appearance: none;
+  background: none;
+  border: 0;
+  padding: 3px 9px;
+  font-family: var(--font-mono);
+  font-size: 0.68rem;
+  color: var(--text-secondary);
+  cursor: pointer;
+}
+
+.log-seg button:hover { background: var(--bg-card); color: var(--text-primary); }
+.log-seg button.active { background: var(--accent); color: #fff; }
+
+.log-select, .log-search {
+  font-family: var(--font-mono);
+  font-size: 0.68rem;
+  padding: 3px 6px;
+  border: 1px solid var(--border-color);
+  border-radius: 5px;
+  background: var(--bg-input);
+  color: var(--text-primary);
+}
+
+.log-search { min-width: 8rem; flex: 0 1 12rem; }
+
+.log-check {
+  display: inline-flex;
+  align-items: center;
+  gap: 4px;
+  font-family: var(--font-mono);
+  font-size: 0.68rem;
+  color: var(--text-secondary);
+  cursor: pointer;
+}
+
+.log-stream-status {
+  font-family: var(--font-mono);
+  font-size: 0.64rem;
+  padding: 2px 6px;
+  border-radius: 4px;
+  border: 1px solid var(--border-color);
+  color: var(--text-muted);
+}
+
+.log-stream-status.live { color: var(--success); border-color: var(--success); }
+.log-stream-status.offline { color: var(--text-muted); }
+.log-stream-status.connecting,
+.log-stream-status.timeout { color: var(--warning); border-color: var(--warning); }
+
+.log-body {
+  flex: 1 1 auto;
+  overflow-y: auto;
+  overflow-x: hidden;
+  background: var(--bg-page);
+  font-family: var(--font-mono);
+  font-size: 0.72rem;
+  line-height: 1.5;
+}
+
+.log-row {
+  display: grid;
+  grid-template-columns: 5.6rem 2.6rem 6rem minmax(7rem, 1.1fr) minmax(0, 2fr);
+  gap: 9px;
+  padding: 2px 11px;
+  border-bottom: 1px solid var(--bg-table-row);
+  align-items: baseline;
+}
+
+.log-row:hover { background: var(--bg-table-row); }
+
+.log-t   { color: var(--text-muted); font-variant-numeric: tabular-nums; }
+.log-lvl { color: var(--text-secondary); font-size: 0.64rem; letter-spacing: 0.05em; }
+.log-svc { color: var(--accent); overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+.log-msg { color: var(--text-primary); word-break: break-word; }
+
+.log-detail { display: flex; flex-wrap: wrap; gap: 4px; align-items: baseline; min-width: 0; }
+
+.log-row.lvl-WARNING .log-lvl { color: var(--warning); }
+.log-row.lvl-ERROR   .log-lvl,
+.log-row.lvl-CRITICAL .log-lvl { color: var(--danger); font-weight: 700; }
+.log-row.lvl-ERROR, .log-row.lvl-CRITICAL { background: rgba(239,68,68,0.06); }
+.log-row.lvl-DEBUG .log-msg, .log-row.lvl-DEBUG .log-t { opacity: 0.72; }
+
+/* client rows get a left accent so the two sources are distinguishable */
+.log-row.is-client { box-shadow: inset 2px 0 0 var(--accent); }
+
+.log-kv {
+  color: var(--text-secondary);
+  background: var(--bg-card);
+  border: 1px solid var(--border-color);
+  border-radius: 3px;
+  padding: 0 4px;
+  max-width: 100%;
+  word-break: break-all;
+}
+
+.log-kv i { color: var(--text-muted); font-style: normal; margin-right: 3px; }
+
+.log-status {
+  font-weight: 700;
+  border-radius: 3px;
+  padding: 0 4px;
+  background: var(--bg-card);
+  border: 1px solid var(--border-color);
+}
+
+.log-status.s2 { color: var(--success); border-color: var(--success); }
+.log-status.s3 { color: var(--accent);  border-color: var(--accent); }
+.log-status.s4 { color: var(--warning); border-color: var(--warning); }
+.log-status.s5, .log-status.sx { color: var(--danger); border-color: var(--danger); }
+
+.log-ms  { color: var(--text-secondary); font-variant-numeric: tabular-nums; }
+.log-tab { color: var(--text-muted); border: 1px dashed var(--border-color); border-radius: 3px; padding: 0 4px; }
+.log-rid { color: var(--text-muted); }
+.log-err { color: var(--danger); word-break: break-word; }
+
+@media (max-width: 900px) {
+  .log-row {
+    grid-template-columns: 4.8rem 2.4rem minmax(0, 1fr);
+    row-gap: 1px;
+  }
+  .log-svc { grid-column: 3; }
+  .log-msg, .log-detail { grid-column: 1 / -1; }
+  /* Taller filter bar wraps to more rows here, so give the view a bit less. */
+  .log-card { height: calc(100vh - 26rem); }
+  .log-controls-spacer { flex-basis: 100%; height: 0; }
+}

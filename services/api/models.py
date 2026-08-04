@@ -125,7 +125,10 @@ class AnalysisRunRequest(BaseModel):
 class AnalysisRunResponse(BaseModel):
     analysis_id: str
     status: str = "queued"
-    estimated_llm_share: float = 0.05
+    # Observed share of posts the router sent to Stage 2 (stats:llm_routed /
+    # stats:total_processed). None — not a design target dressed up as an
+    # estimate — until the router has actually routed something.
+    estimated_llm_share: float | None = None
     status_url: str
 
 

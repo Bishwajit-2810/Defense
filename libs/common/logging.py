@@ -14,10 +14,25 @@ single loguru sink with a consistent, readable format. It captures three sources
      call-site changes.
 
 Idempotent: safe to call from several module imports in the same process.
+
+Second sink — Redis, for the dashboard
+--------------------------------------
+Every service also mirrors its lines into a capped Redis list (``logs:recent``)
+and publishes them on ``logs:live``, which is what ``GET /v1/logs`` and
+``GET /v1/logs/stream`` serve to the dashboard's log drawer. Redis rather than
+tailing ``/tmp/*.log`` because the services do not share a filesystem once they
+are containers or pods, but they already share a Redis.
+
+It is deliberately defensive: the sink runs on loguru's queue thread
+(``enqueue=True``) so it never sits in a request or a worker loop, it drops its
+own errors instead of logging them (logging from a log sink recurses), and it
+disables itself after a few consecutive failures so a dead Redis costs nothing.
+Turn it off with ``LOG_TO_REDIS=false``.
 """
 
 from __future__ import annotations
 
+import json
 import logging
 import os
 import sys
@@ -25,6 +40,86 @@ import sys
 from loguru import logger
 
 _CONFIGURED = False
+
+# ---------------------------------------------------------------------------
+# Redis log mirror
+# ---------------------------------------------------------------------------
+
+LOG_LIST_KEY = "logs:recent"
+LOG_CHANNEL = "logs:live"
+
+_LOG_MAX = int(os.environ.get("LOG_REDIS_MAX", "3000"))
+_LOG_TTL = int(os.environ.get("LOG_REDIS_TTL", "86400"))
+_MAX_MSG = 2000
+
+_redis_sink_client = None
+_redis_sink_fails = 0
+_REDIS_SINK_GIVE_UP = 5
+
+
+def _redis_enabled() -> bool:
+    return os.environ.get("LOG_TO_REDIS", "true").lower() == "true"
+
+
+def _sink_client():
+    """Lazily build a sync Redis client for the sink thread (None if unusable)."""
+    global _redis_sink_client
+    if _redis_sink_client is None:
+        import redis as _redis  # local import: only needed when the sink runs
+
+        _redis_sink_client = _redis.Redis.from_url(
+            os.environ.get("REDIS_URL", "redis://localhost:6379/0"),
+            decode_responses=True,
+            socket_timeout=1.0,
+            socket_connect_timeout=1.0,
+        )
+    return _redis_sink_client
+
+
+def _redis_sink(message) -> None:
+    """loguru sink: mirror one record into Redis. Never raises, never logs."""
+    global _redis_sink_fails
+
+    if _redis_sink_fails >= _REDIS_SINK_GIVE_UP:
+        return
+
+    try:
+        rec = message.record
+        extra = rec.get("extra") or {}
+        fields = {
+            k: v for k, v in extra.items()
+            if k not in _RESERVED and not k.startswith("_")
+        }
+        entry = {
+            # Wall-clock ms — the dashboard sorts and displays on this.
+            "ts": rec["time"].timestamp(),
+            "level": rec["level"].name,
+            "service": extra.get("service") or "-",
+            "message": str(rec["message"])[:_MAX_MSG],
+            "fields": {k: str(v)[:400] for k, v in fields.items()},
+            "module": f"{rec['name']}:{rec['line']}",
+        }
+        body = json.dumps(entry, ensure_ascii=False, default=str)
+
+        r = _sink_client()
+        pipe = r.pipeline(transaction=False)
+        pipe.rpush(LOG_LIST_KEY, body)
+        pipe.ltrim(LOG_LIST_KEY, -_LOG_MAX, -1)
+        pipe.expire(LOG_LIST_KEY, _LOG_TTL)
+        pipe.publish(LOG_CHANNEL, body)
+        pipe.execute()
+        _redis_sink_fails = 0
+
+    except Exception:
+        # Do NOT log this — a sink that logs its own failure recurses forever.
+        _redis_sink_fails += 1
+        if _redis_sink_fails == _REDIS_SINK_GIVE_UP:
+            print(
+                "[logging] Redis log mirror disabled after "
+                f"{_REDIS_SINK_GIVE_UP} consecutive failures; "
+                "dashboard log drawer will be empty (set LOG_TO_REDIS=false to silence)",
+                file=sys.stderr,
+            )
 
 # Compact, coloured, aligned format. ``extra`` carries structured fields (service
 # name + any bound key/values from structlog or loguru.bind()).
@@ -107,6 +202,18 @@ def setup_logging(service: str = "app", level: str | None = None) -> "logger":
         logger.remove()
         logger.configure(patcher=_patch_fields)
         logger.add(sys.stderr, level=lvl, format=_FORMAT, enqueue=True, backtrace=False, diagnose=False)
+
+        # Mirror into Redis so the dashboard can show every service's logs.
+        # enqueue=True keeps the Redis round-trip off the caller's thread.
+        if _redis_enabled():
+            logger.add(
+                _redis_sink,
+                level=lvl,
+                enqueue=True,
+                backtrace=False,
+                diagnose=False,
+                catch=True,
+            )
 
         # stdlib logging → loguru (replace any handlers, capture everything)
         logging.basicConfig(handlers=[InterceptHandler()], level=0, force=True)

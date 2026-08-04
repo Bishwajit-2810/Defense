@@ -31,8 +31,13 @@ and some have no caption, so the image is not optional — see
 [data_contract.md](data_contract.md) §4.
 
 It is built around a **smart routing layer** ("thinking layer") that decides, per
-thread, how much intelligence each one needs: cheap NLP models do ~90–95% of the
-work, and a selective LLM handles only the summarization/insight work. That LLM
+thread, how much intelligence each one needs: cheap NLP models carry the bulk of
+the work, and a selective LLM handles the summarization/insight work and the cases
+Stage 1 is not confident about. The share of posts that reach the LLM is a
+**measured** quantity, not an assumption — the router exports it as
+`stats:llm_routed / stats:total_processed` (see
+[PROJECT_ASSESSMENT.md](PROJECT_ASSESSMENT.md) §4 for the rate on the 50-post
+sample, and §7 for the accuracy-vs-cost sweep over the confidence threshold). That LLM
 runs behind a **pluggable, runtime-switchable backend — `local` (self-hosted
 vLLM) or `groq` (Groq Cloud API)** — so the operator can choose no-egress/no-bill
 local serving or fastest/zero-GPU Groq, and switch anytime. The hard goals:
@@ -91,10 +96,12 @@ is the original system-design request. It has been reconciled with
   [data_contract.md](data_contract.md)). Processing order: **post sentiment first,
   then comments**.
 - **Hybrid analysis pipeline.** Cheap, fast NLP models (fastText, transformer
-  classifiers, spaCy/GLiNER) run over the post and every comment and handle
-  ~90–95% of the work. An LLM is invoked **selectively** only for the
-  original-language summary, insight, and low-confidence/ambiguous cases. This is
-  the central cost-control idea.
+  classifiers, spaCy/GLiNER) run over the post and every comment. An LLM is invoked
+  **selectively** — for the original-language summary, insight, and the
+  low-confidence / unclassified / high-toxicity / long-code-mixed cases the router's
+  six gates single out ([rules.py](services/workers/router/rules.py)). This is the
+  central cost-control idea, and the routing rate it produces is reported from the
+  router's own counters rather than assumed.
 - **Two LLM roles, a pluggable backend (local ⇄ Groq), switchable at runtime.**
   The selective stage uses **LLM-A** (fast 7B/8B) for per-post refinement and
   **LLM-B** (larger 14B/32B) for cluster summarization, insight, and grounded

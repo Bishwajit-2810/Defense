@@ -51,8 +51,21 @@ async function apiCall(path, options) {
   var url = API_BASE + path;
   var fetchOptions = Object.assign({}, options, { headers: headers });
 
+  // Every call is recorded for the log drawer, tagged with the tab that made it,
+  // so each section shows what it asked for and what came back. The log
+  // endpoints themselves are skipped — otherwise reading the logs generates
+  // logs, which quickly buries everything else.
+  var logStarted = (typeof performance !== 'undefined' ? performance.now() : Date.now());
+  var logMethod = (options.method || 'GET').toUpperCase();
+  var traceable = path.indexOf('/v1/logs') !== 0;
+
   try {
     var response = await fetch(url, fetchOptions);
+
+    if (traceable) {
+      logClient(logMethod, path, response.status, logStarted,
+                response.headers ? response.headers.get('X-Request-ID') : null);
+    }
 
     if (response.status === 401) {
       authToken = null;
@@ -86,8 +99,10 @@ async function apiCall(path, options) {
   } catch (err) {
     if (err.name === 'TypeError' && err.message.indexOf('fetch') !== -1) {
       updateApiStatus('error');
+      if (traceable) logClient(logMethod, path, 'unreachable', logStarted, null, err.message);
       throw new Error('Cannot reach API at ' + API_BASE + '. Is the server running?');
     }
+    if (traceable) logClient(logMethod, path, 'error', logStarted, null, err.message);
     throw err;
   }
 }
@@ -136,6 +151,9 @@ async function checkHealth() {
    Tab management & auto-refresh
    ============================================================ */
 function showTab(tabName) {
+  // Remember where we came from so the Logs tab's "this tab" scope, and the
+  // Ctrl+` toggle, both have somewhere sensible to point.
+  if (tabName === 'logs' && currentTab !== 'logs') logPrevTab = currentTab;
   currentTab = tabName;
 
   document.querySelectorAll('.tab-panel').forEach(function(p) {
@@ -157,6 +175,9 @@ function showTab(tabName) {
   } else {
     disconnectPipelineLive();
   }
+
+  // Same for the log tail: hold the SSE connection only while Logs is visible.
+  if (tabName !== 'logs') suspendLogs();
 
   // Chat is stateful (keeps its conversation); just refresh the backend hint
   // and focus the composer instead of reloading data.
@@ -184,6 +205,10 @@ function refreshTab(tabName, background) {
     loadAgentRuns(background);
   } else if (tabName === 'pipeline') {
     loadPipeline(background);
+  } else if (tabName === 'trace') {
+    loadTrace(background);
+  } else if (tabName === 'logs') {
+    loadLogs(background);
   }
   // 'search' is on-demand only.
 }
@@ -3421,6 +3446,780 @@ async function sendChatMessage() {
 }
 
 /* ============================================================
+   TRACE TAB — follow ONE post through the real pipeline
+   ------------------------------------------------------------
+   The Pipeline tab shows aggregate stage pressure (how many posts are
+   waiting / in-flight per queue). This tab answers a different
+   question: what happened to *this* post, layer by layer, as it
+   happened.
+
+   Mechanism:
+     1. POST /v1/analysis/run for a single post_id -> { analysis_id }
+     2. Subscribe to /v1/analysis/{analysis_id}/stream (SSE)
+     3. Workers publish one `stage` frame per layer boundary onto
+        analysis:progress:{job_id} (see libs/progress.py); render each
+        as it lands.
+     4. On the terminal `done` frame, fetch the canonical result.
+
+   The first frame (ingestion) is published while step 1 is still
+   running, so it can never be seen live — the API replays the buffered
+   frames on connect and each carries a `seq` we dedupe on.
+   ============================================================ */
+
+// Layers in pipeline order, with the stream each one reads from. Mirrors
+// STAGES in libs/progress.py and the chain in architecture.md §3.
+var TRACE_LAYERS = [
+  { key: 'ingest',    label: 'Ingestion',      queue: 'ingestion:queue',  note: 'normalize · OCR · dedup · enqueue' },
+  { key: 'stage1',    label: 'Stage 1 · NLP',  queue: 'nlp:stage1:queue', note: 'text · vision · fuse · comments' },
+  { key: 'router',    label: 'Router',         queue: 'router:queue',     note: 'six rules decide if the LLM runs' },
+  { key: 'stage2',    label: 'Stage 2 · LLM',  queue: 'llm:stage2:queue', note: 'summary · post type · insight' },
+  { key: 'assembler', label: 'Assembler',      queue: 'assembler:queue',  note: 'merge · validate · fan-out' }
+];
+
+// Field render order per layer. Anything the worker sends that isn't listed
+// still renders, just after these — so adding a detail key server-side never
+// requires a dashboard change.
+var TRACE_FIELD_ORDER = {
+  ingest: ['platform', 'media_type', 'caption_chars', 'photo_count', 'comment_rows',
+           'comment_count', 'coverage', 'content_hash', 'baseline_sentiment'],
+  stage1: ['language', 'script', 'is_banglish', 'text_sentiment', 'image_sentiment',
+           'overall_sentiment', 'sentiment_score', 'emotion', 'topics', 'keywords',
+           'toxicity_score', 'entity_count', 'embedding_dims', 'comments_analyzed',
+           'comment_coverage', 'comment_breakdown', 'confidence',
+           'post_type', 'post_type_confidence'],
+  router: ['use_llm', 'reasons', 'task_flags'],
+  stage2: ['post_type', 'post_type_confidence', 'post_summary_preview', 'post_summary_chars',
+           'post_summary_lang', 'post_summary_source', 'grounding', 'role',
+           'llm_backend', 'llm_model', 'comment_summary_added', 'tasks', 'target_lang', 'backend'],
+  assembler: ['schema_version', 'schema_valid', 'top_level_keys', 'confidence',
+              'overall_sentiment', 'post_type', 'llm_used', 'stage1_ms', 'stage2_ms',
+              'embedding_stored', 'writes']
+};
+
+var traceES = null;          // EventSource for the traced job
+var traceJobId = null;
+var tracePostId = null;
+var traceSeen = {};          // seq -> true, so a replayed frame isn't drawn twice
+var traceState = {};         // layer key -> { status, ms, detail }
+var traceTape = [];          // every frame, in arrival order
+var traceStartedAt = 0;
+var traceTimer = null;       // elapsed-clock interval
+
+function setTraceStatus(state, text) {
+  var el = document.getElementById('trace-status');
+  if (!el) return;
+  var map = {
+    idle:     ['idle', ''],
+    starting: ['starting…', 'tag-warning'],
+    live:     ['live', 'tag-success'],
+    done:     ['complete', 'tag-success'],
+    failed:   ['failed', 'tag-danger'],
+    timeout:  ['stream timed out', 'tag-warning']
+  };
+  var m = map[state] || map.idle;
+  el.textContent = text || m[0];
+  el.className = 'tag tag-sm ' + m[1];
+}
+
+/** Populate the post picker from the most recent analysis results. */
+async function loadTrace(background) {
+  var sel = document.getElementById('trace-post');
+  if (!sel) return;
+
+  // Don't clobber a running trace's selection on a background refresh.
+  if (background && traceES) return;
+
+  try {
+    var data = await apiCall('/v1/analysis/latest?limit=50&include=results', { method: 'GET' });
+    var results = (data && data.results) || (Array.isArray(data) ? data : []);
+
+    if (!results.length) {
+      sel.innerHTML = '<option value="">No stored posts — upload some on the Posts tab first</option>';
+      return;
+    }
+
+    var keep = sel.value;
+    sel.innerHTML = results.map(function (r) {
+      var txt = (r.post_text || '').replace(/\s+/g, ' ').trim();
+      var label = (r.media_type || 'POST') + ' · '
+        + (txt ? txt.slice(0, 60) + (txt.length > 60 ? '…' : '') : '(no caption)');
+      return '<option value="' + escHtml(r.post_id) + '">' + escHtml(label) + '</option>';
+    }).join('');
+    if (keep) sel.value = keep;
+
+  } catch (err) {
+    sel.innerHTML = '<option value="">Could not load posts: ' + escHtml(err.message) + '</option>';
+  }
+}
+
+/** Reset the tab to its empty state and drop any open stream. */
+function clearTrace() {
+  stopTrace();
+  traceJobId = null;
+  tracePostId = null;
+  traceSeen = {};
+  traceState = {};
+  traceTape = [];
+  traceStartedAt = 0;
+
+  var meta = document.getElementById('trace-meta');
+  if (meta) meta.innerHTML = '';
+  var rail = document.getElementById('trace-rail');
+  if (rail) rail.innerHTML = '';
+  var note = document.getElementById('trace-rail-note');
+  if (note) note.textContent = 'Nothing traced yet — pick a post and press Run Trace.';
+  var elapsed = document.getElementById('trace-elapsed');
+  if (elapsed) elapsed.textContent = '';
+  var tape = document.getElementById('trace-tape');
+  if (tape) tape.innerHTML = '<div class="table-empty">No frames yet.</div>';
+  var card = document.getElementById('trace-result-card');
+  if (card) card.hidden = true;
+  setTraceStatus('idle');
+}
+
+function stopTrace() {
+  if (traceES) {
+    try { traceES.close(); } catch (e) { /* noop */ }
+    traceES = null;
+  }
+  if (traceTimer) { clearInterval(traceTimer); traceTimer = null; }
+}
+
+/** Kick off a real pipeline run for the selected post and follow it. */
+async function runTrace() {
+  var sel = document.getElementById('trace-post');
+  var btn = document.getElementById('trace-run');
+  var postId = sel ? sel.value : '';
+
+  if (!postId) {
+    showToast('Pick a post to trace first.', 'warning');
+    return;
+  }
+
+  clearTrace();
+  tracePostId = postId;
+  if (btn) btn.disabled = true;
+  setTraceStatus('starting');
+
+  // Seed the rail so every layer is visible as "waiting" before anything runs.
+  TRACE_LAYERS.forEach(function (l) { traceState[l.key] = { status: 'idle' }; });
+  renderTraceRail();
+
+  var wantSummary = !!(document.getElementById('trace-want-summary') || {}).checked;
+
+  try {
+    var resp = await apiCall('/v1/analysis/run', {
+      method: 'POST',
+      body: JSON.stringify({
+        post_ids: [postId],
+        options: { want_summary: wantSummary }
+      })
+    });
+
+    traceJobId = resp.analysis_id || resp.id || resp.job_id;
+    if (!traceJobId) throw new Error('No analysis_id in the run response');
+
+    traceStartedAt = Date.now();
+    traceTimer = setInterval(renderTraceElapsed, 200);
+    renderTraceMeta(resp);
+    openTraceStream(traceJobId);
+    setTraceStatus('live');
+
+  } catch (err) {
+    setTraceStatus('failed');
+    var note = document.getElementById('trace-rail-note');
+    if (note) note.textContent = 'Could not start: ' + err.message;
+    showToast('Trace failed to start: ' + err.message, 'error');
+    if (btn) btn.disabled = false;
+  }
+}
+
+function openTraceStream(jobId) {
+  if (typeof EventSource === 'undefined') {
+    setTraceStatus('failed', 'no EventSource');
+    return;
+  }
+  var url = API_BASE + '/v1/analysis/' + encodeURIComponent(jobId)
+    + '/stream?api_key=' + sseCredential();
+
+  try {
+    traceES = new EventSource(url);
+  } catch (e) {
+    setTraceStatus('failed', 'stream error');
+    return;
+  }
+
+  traceES.addEventListener('stage', function (evt) { onTraceFrame(evt, 'stage'); });
+  traceES.addEventListener('progress', function (evt) { onTraceFrame(evt, 'progress'); });
+  traceES.addEventListener('done', function (evt) { onTraceFrame(evt, 'done'); });
+  traceES.addEventListener('timeout', function () {
+    setTraceStatus('timeout');
+    finishTrace();
+  });
+  traceES.addEventListener('error', function () {
+    // EventSource retries on its own unless the socket is closed for good.
+    if (traceES && traceES.readyState === EventSource.CLOSED) {
+      setTraceStatus('failed', 'stream closed');
+      finishTrace();
+    }
+  });
+}
+
+function onTraceFrame(evt, kind) {
+  var f = {};
+  try { f = JSON.parse(evt.data); } catch (e) { return; }
+
+  // A frame can arrive twice — once replayed from the buffer, once live.
+  if (f.seq != null) {
+    if (traceSeen[f.seq]) return;
+    traceSeen[f.seq] = true;
+  }
+
+  // A multi-post job would interleave; this tab traces one post, so ignore
+  // frames about any other.
+  if (f.post_id && tracePostId && f.post_id !== tracePostId) return;
+
+  traceTape.push({ kind: kind, frame: f, at: Date.now() });
+
+  if (kind === 'stage' && f.stage) {
+    var prev = traceState[f.stage] || {};
+    traceState[f.stage] = {
+      status: f.status || 'done',
+      ms: (f.ms != null) ? f.ms : prev.ms,
+      detail: Object.assign({}, prev.detail || {}, f.detail || {}),
+      replay: !!f.replay
+    };
+    // A layer reporting in means every earlier layer must have finished, even
+    // if its frame was lost (buffer trimmed, worker restarted mid-flight).
+    var idx = TRACE_LAYERS.map(function (l) { return l.key; }).indexOf(f.stage);
+    TRACE_LAYERS.slice(0, Math.max(idx, 0)).forEach(function (l) {
+      var s = traceState[l.key];
+      if (s && (s.status === 'idle' || s.status === 'running')) s.status = 'done';
+    });
+    renderTraceRail();
+  }
+
+  renderTraceTape();
+
+  if (kind === 'done' || f.event === 'done') {
+    setTraceStatus('done');
+    finishTrace();
+    loadTraceResult();
+  } else if (f.event === 'error' || f.error) {
+    setTraceStatus('failed');
+    finishTrace();
+  }
+}
+
+function finishTrace() {
+  stopTrace();
+  renderTraceElapsed();
+  var btn = document.getElementById('trace-run');
+  if (btn) btn.disabled = false;
+  // Any layer still marked running never reported a terminal frame.
+  TRACE_LAYERS.forEach(function (l) {
+    var s = traceState[l.key];
+    if (s && s.status === 'running') s.status = 'stalled';
+  });
+  renderTraceRail();
+}
+
+function renderTraceElapsed() {
+  var el = document.getElementById('trace-elapsed');
+  if (!el || !traceStartedAt) return;
+  var secs = (Date.now() - traceStartedAt) / 1000;
+  el.textContent = secs.toFixed(1) + 's wall clock';
+}
+
+function renderTraceMeta(resp) {
+  var el = document.getElementById('trace-meta');
+  if (!el) return;
+  el.innerHTML =
+    '<span class="trace-meta-item"><span class="trace-meta-k">job</span> <code>' + escHtml(traceJobId) + '</code></span>'
+    + '<span class="trace-meta-item"><span class="trace-meta-k">post</span> <code>' + escHtml(tracePostId) + '</code></span>'
+    + '<span class="trace-meta-item"><span class="trace-meta-k">posts queued</span> ' + escHtml(String(resp.post_count != null ? resp.post_count : 1)) + '</span>'
+    + '<span class="trace-meta-item trace-meta-hint">Frames arrive from the workers themselves — nothing here is simulated.</span>';
+
+  var note = document.getElementById('trace-rail-note');
+  if (note) note.textContent = 'Following job ' + traceJobId + ' — each layer fills in as its worker reports.';
+}
+
+/** Pretty-print one detail value for the layer cards. */
+function traceValue(key, v) {
+  if (v === null || v === undefined) return '<span class="trace-null">null</span>';
+  if (typeof v === 'boolean') {
+    return '<span class="' + (v ? 'trace-yes' : 'trace-no') + '">' + v + '</span>';
+  }
+  if (Array.isArray(v)) {
+    if (!v.length) return '<span class="trace-null">[]</span>';
+    return v.map(function (x) {
+      return '<span class="trace-chip">' + escHtml(typeof x === 'object' ? JSON.stringify(x) : String(x)) + '</span>';
+    }).join('');
+  }
+  if (typeof v === 'object') {
+    return Object.keys(v).map(function (k) {
+      return '<span class="trace-chip">' + escHtml(k) + ' ' + escHtml(String(v[k])) + '</span>';
+    }).join('');
+  }
+  if (typeof v === 'number') {
+    var n = Number.isInteger(v) ? v : Math.round(v * 10000) / 10000;
+    return '<span class="trace-num">' + n + '</span>';
+  }
+  var s = String(v);
+  // Long free text (a summary preview) gets its own block so it can wrap.
+  if (s.length > 90) return '<span class="trace-text">' + escHtml(s) + '</span>';
+  return escHtml(s);
+}
+
+function traceDetailRows(layerKey, detail) {
+  if (!detail) return '';
+  var order = TRACE_FIELD_ORDER[layerKey] || [];
+  var keys = order.filter(function (k) { return detail[k] !== undefined; });
+  Object.keys(detail).forEach(function (k) {
+    if (k !== 'next_stream' && keys.indexOf(k) === -1) keys.push(k);
+  });
+
+  if (!keys.length) return '';
+  return '<dl class="trace-kv">' + keys.map(function (k) {
+    return '<dt>' + escHtml(k) + '</dt><dd>' + traceValue(k, detail[k]) + '</dd>';
+  }).join('') + '</dl>';
+}
+
+function renderTraceRail() {
+  var host = document.getElementById('trace-rail');
+  if (!host) return;
+
+  var html = '';
+  TRACE_LAYERS.forEach(function (l, i) {
+    var st = traceState[l.key] || { status: 'idle' };
+    var status = st.status || 'idle';
+
+    // Queue chip above each layer — lit once that layer has reported.
+    html += '<div class="trace-wire' + (status !== 'idle' ? ' lit' : '') + '">'
+      + '<span class="trace-queue">' + escHtml(l.queue) + '</span></div>';
+
+    var ms = (st.ms != null)
+      ? (st.ms >= 1000 ? (st.ms / 1000).toFixed(2) + ' s' : st.ms + ' ms')
+      : '';
+
+    html += '<div class="trace-layer" data-status="' + status + '">'
+      + '<div class="trace-layer-head">'
+      + '<span class="trace-pip"></span>'
+      + '<span class="trace-layer-n">' + String(i + 1).padStart(2, '0') + '</span>'
+      + '<span class="trace-layer-name">' + escHtml(l.label) + '</span>'
+      + '<span class="trace-layer-state">' + escHtml(status) + '</span>'
+      + (ms ? '<span class="trace-layer-ms">' + ms + '</span>' : '')
+      + '</div>'
+      + '<div class="trace-layer-note">' + escHtml(l.note) + '</div>'
+      + traceDetailRows(l.key, st.detail)
+      + '</div>';
+  });
+
+  host.innerHTML = html;
+}
+
+function renderTraceTape() {
+  var host = document.getElementById('trace-tape');
+  if (!host) return;
+  if (!traceTape.length) {
+    host.innerHTML = '<div class="table-empty">No frames yet.</div>';
+    return;
+  }
+  host.innerHTML = traceTape.map(function (t) {
+    var f = t.frame;
+    var name = f.stage ? (f.stage + ' · ' + (f.status || '')) : (f.event || t.kind);
+    return '<div class="trace-frame">'
+      + '<span class="trace-frame-seq">' + escHtml(String(f.seq != null ? f.seq : '–')) + '</span>'
+      + '<span class="trace-frame-flag">' + (f.replay ? 'R' : 'L') + '</span>'
+      + '<span class="trace-frame-name">' + escHtml(name) + '</span>'
+      + '<span class="trace-frame-ms">' + escHtml(f.ms != null ? f.ms + ' ms' : '') + '</span>'
+      + '</div>';
+  }).join('');
+  host.scrollTop = host.scrollHeight;
+}
+
+/** Once the post lands, show what was actually persisted. */
+async function loadTraceResult() {
+  var card = document.getElementById('trace-result-card');
+  var host = document.getElementById('trace-result');
+  if (!host || !tracePostId) return;
+
+  host.innerHTML = '<div class="loading-overlay"><div class="spinner spinner-dark"></div> Fetching canonical result…</div>';
+  if (card) card.hidden = false;
+
+  try {
+    var r = await apiCall('/v1/analysis/' + encodeURIComponent(tracePostId), { method: 'GET' });
+    var proc = r.processing || {};
+    var conf = r.confidence;
+    var ca = r.comment_analysis || {};
+
+    host.innerHTML =
+      '<dl class="trace-kv trace-kv-wide">'
+      + '<dt>overall_sentiment</dt><dd>' + traceValue('s', r.overall_sentiment) + ' ' + traceValue('n', r.sentiment_score) + '</dd>'
+      + '<dt>post_type</dt><dd>' + traceValue('s', r.post_type) + '</dd>'
+      + '<dt>post_summary</dt><dd>' + traceValue('long', r.post_summary || null) + '</dd>'
+      + '<dt>summary_lang</dt><dd>' + traceValue('s', r.post_summary_lang) + '</dd>'
+      + '<dt>grounding</dt><dd>' + traceValue('a', r.post_summary_grounding) + '</dd>'
+      + '<dt>confidence</dt><dd>' + traceValue('o', (conf && typeof conf === 'object') ? conf : { overall: conf }) + '</dd>'
+      + '<dt>comments</dt><dd>' + traceValue('n', ca.analyzed) + ' analyzed, coverage ' + traceValue('n', ca.coverage) + '</dd>'
+      + '<dt>processing</dt><dd>' + traceValue('o', proc) + '</dd>'
+      + '</dl>';
+
+  } catch (err) {
+    host.innerHTML = '<div class="alert alert-error">Could not fetch the result: ' + escHtml(err.message) + '</div>';
+  }
+}
+
+/* ============================================================
+   LOGS TAB — server-side logs + this session's API traffic
+   ------------------------------------------------------------
+   Two sources on one timeline:
+
+     client — one entry per apiCall(), tagged with the tab that made
+              it, so every section shows what it requested and what
+              came back (status + duration + X-Request-ID).
+     server — SSE tail of /v1/logs/stream. Each backend service
+              mirrors its log lines into Redis via the sink in
+              libs/common/logging.py, so this is genuinely every
+              service's output, not just the API's.
+
+   The X-Request-ID on a client entry matches the request_id field on
+   the API's own http_request line, so a slow call can be followed
+   from the browser into the server.
+   ============================================================ */
+
+var LOG_MAX_ENTRIES = 1500;      // ring buffer; oldest dropped first
+var logEntries = [];
+var logSeqCounter = 0;
+var logES = null;                // EventSource for /v1/logs/stream
+var logOpen = false;
+var logUnseen = 0;
+// Scope defaults to 'all': the Logs tab is its own section now, so "this tab"
+// can only sensibly mean the tab you were last on — see logScopeTab().
+var logFilters = { scope: 'all', source: 'all', level: 'INFO', service: '', text: '' };
+// Last non-Logs tab. Client entries are tagged with the tab that made the
+// request, and once you are *on* the Logs tab `currentTab` is 'logs' — which
+// would scope the view to the Logs tab's own requests. This is the tab a user
+// means by "this tab".
+var logPrevTab = 'overview';
+
+function logScopeTab() {
+  return (currentTab === 'logs') ? logPrevTab : currentTab;
+}
+
+var LOG_LEVEL_RANK = {
+  TRACE: 0, DEBUG: 1, INFO: 2, SUCCESS: 3, WARNING: 4, ERROR: 5, CRITICAL: 6
+};
+
+function logRank(level) {
+  var r = LOG_LEVEL_RANK[(level || '').toUpperCase()];
+  return (r === undefined) ? 99 : r;   // unknown levels sort high, never hidden
+}
+
+/** Push an entry and repaint if the drawer is open. */
+function logPush(entry) {
+  entry.seq = ++logSeqCounter;
+  logEntries.push(entry);
+  if (logEntries.length > LOG_MAX_ENTRIES) {
+    logEntries.splice(0, logEntries.length - LOG_MAX_ENTRIES);
+  }
+  if (logOpen) {
+    renderLogs();
+  } else {
+    logUnseen++;
+    updateLogBadge();
+  }
+}
+
+/** Record one dashboard→API call. */
+function logClient(method, path, status, startedAt, requestId, errorMsg) {
+  var now = (typeof performance !== 'undefined' ? performance.now() : Date.now());
+  var ms = Math.round((now - startedAt) * 10) / 10;
+  var numeric = (typeof status === 'number');
+  var level = (!numeric || status >= 500) ? 'ERROR'
+            : (status >= 400) ? 'WARNING'
+            : 'INFO';
+  logPush({
+    source: 'client',
+    tab: currentTab,
+    ts: Date.now() / 1000,
+    level: level,
+    service: 'dashboard',
+    message: method + ' ' + path,
+    status: status,
+    ms: ms,
+    requestId: requestId || null,
+    error: errorMsg || null
+  });
+}
+
+/** Record a server log line arriving over SSE. */
+function logServer(entry) {
+  logPush({
+    source: 'server',
+    tab: null,
+    ts: entry.ts || (Date.now() / 1000),
+    level: entry.level || 'INFO',
+    service: entry.service || '-',
+    message: entry.message || '',
+    fields: entry.fields || {},
+    module: entry.module || '',
+    backfill: !!entry.backfill
+  });
+}
+
+/** Badge on the Logs nav tab: unseen count, red if any of it is an error. */
+function updateLogBadge() {
+  var badge = document.getElementById('logs-badge');
+  if (!badge) return;
+  badge.textContent = logUnseen > 999 ? '999+' : String(logUnseen);
+  badge.classList.toggle('has-unseen', logUnseen > 0);
+  var errs = logEntries.slice(-200).some(function (e) { return logRank(e.level) >= 5; });
+  badge.classList.toggle('has-error', errs);
+}
+
+function setLogStreamStatus(state) {
+  var el = document.getElementById('log-stream-status');
+  if (!el) return;
+  var map = { live: 'live', connecting: 'connecting…', offline: 'offline', timeout: 'reconnecting…' };
+  el.textContent = map[state] || state;
+  el.className = 'log-stream-status ' + state;
+}
+
+/** Open (or reopen) the server log tail. */
+function connectLogStream() {
+  if (logES || typeof EventSource === 'undefined') return;
+  setLogStreamStatus('connecting');
+
+  var qs = '?api_key=' + sseCredential() + '&backfill=120';
+  if (logFilters.level) qs += '&min_level=' + encodeURIComponent(logFilters.level);
+
+  try {
+    logES = new EventSource(API_BASE + '/v1/logs/stream' + qs);
+  } catch (e) {
+    logES = null;
+    setLogStreamStatus('offline');
+    return;
+  }
+
+  logES.addEventListener('connected', function () { setLogStreamStatus('live'); });
+  logES.addEventListener('log', function (evt) {
+    try { logServer(JSON.parse(evt.data)); setLogStreamStatus('live'); }
+    catch (e) { /* skip a malformed frame */ }
+  });
+  logES.addEventListener('timeout', function () {
+    // The server closes the tail after its max duration — reopen while visible.
+    setLogStreamStatus('timeout');
+    disconnectLogStream();
+    if (logOpen) connectLogStream();
+  });
+  logES.addEventListener('error', function () {
+    if (logES && logES.readyState === EventSource.CLOSED) {
+      disconnectLogStream();
+      setLogStreamStatus('offline');
+    }
+  });
+}
+
+function disconnectLogStream() {
+  if (logES) {
+    try { logES.close(); } catch (e) { /* noop */ }
+    logES = null;
+  }
+}
+
+/** Entering the Logs tab: start the tail and clear the unseen badge. */
+function loadLogs(background) {
+  logOpen = true;
+  logUnseen = 0;
+  updateLogBadge();
+  connectLogStream();
+  if (!background) refreshLogServiceFilter();
+  renderLogs();
+}
+
+/** Leaving the Logs tab: drop the SSE connection.
+ * Entries keep accumulating from `logClient` regardless, so the badge still
+ * counts dashboard traffic while the tab is closed — it just stops holding a
+ * server connection open for a view nobody is looking at. */
+function suspendLogs() {
+  logOpen = false;
+  disconnectLogStream();
+  setLogStreamStatus('offline');
+}
+
+/** Populate the service dropdown from the server's buffer. */
+async function refreshLogServiceFilter() {
+  var sel = document.getElementById('log-service');
+  if (!sel) return;
+  try {
+    var data = await apiCall('/v1/logs/services', { method: 'GET' });
+    var keep = sel.value;
+    var opts = ['<option value="">all services</option>',
+                '<option value="dashboard">dashboard (client)</option>'];
+    (data.services || []).forEach(function (s) {
+      opts.push('<option value="' + escHtml(s.service) + '">'
+        + escHtml(s.service) + ' (' + s.count + ')</option>');
+    });
+    sel.innerHTML = opts.join('');
+    if (keep) sel.value = keep;
+  } catch (e) {
+    /* filter stays as-is — not worth surfacing */
+  }
+}
+
+function logMatches(e) {
+  if (logFilters.source !== 'all' && e.source !== logFilters.source) return false;
+  // Scope applies to client entries only: server lines have no tab.
+  if (logFilters.scope === 'tab' && e.source === 'client' && e.tab !== logScopeTab()) return false;
+  if (logFilters.level && logRank(e.level) < logRank(logFilters.level)) return false;
+  if (logFilters.service && (e.service || '-') !== logFilters.service) return false;
+  if (logFilters.text) {
+    var needle = logFilters.text.toLowerCase();
+    var hay = [
+      e.message, e.service, e.module, e.tab, e.status, e.requestId, e.error,
+      e.fields ? Object.keys(e.fields).map(function (k) { return k + '=' + e.fields[k]; }).join(' ') : ''
+    ].join(' ').toLowerCase();
+    if (hay.indexOf(needle) === -1) return false;
+  }
+  return true;
+}
+
+function logTime(ts) {
+  var d = new Date(ts * 1000);
+  return ('0' + d.getHours()).slice(-2) + ':' + ('0' + d.getMinutes()).slice(-2)
+    + ':' + ('0' + d.getSeconds()).slice(-2)
+    + '.' + ('00' + d.getMilliseconds()).slice(-3);
+}
+
+function renderLogs() {
+  var host = document.getElementById('log-body');
+  if (!host) return;
+
+  var rows = logEntries.filter(logMatches);
+
+  var counter = document.getElementById('log-count');
+  if (counter) {
+    counter.textContent = rows.length + ' of ' + logEntries.length + ' shown';
+  }
+
+  if (!rows.length) {
+    host.innerHTML = '<div class="table-empty">Nothing matches these filters.'
+      + (logFilters.scope === 'tab'
+          ? ' Client entries are scoped to the <b>' + escHtml(logScopeTab()) + '</b> tab — switch scope to “all”.'
+          : '')
+      + '</div>';
+    return;
+  }
+
+  var follow = (document.getElementById('log-follow') || {}).checked;
+  var nearBottom = host.scrollHeight - host.scrollTop - host.clientHeight < 60;
+
+  host.innerHTML = rows.map(function (e) {
+    var lvl = (e.level || 'INFO').toUpperCase();
+    var detail;
+
+    if (e.source === 'client') {
+      detail = '<span class="log-status s' + (typeof e.status === 'number' ? Math.floor(e.status / 100) : 'x') + '">'
+        + escHtml(String(e.status)) + '</span>'
+        + '<span class="log-ms">' + e.ms + ' ms</span>'
+        + (e.tab ? '<span class="log-tab">' + escHtml(e.tab) + '</span>' : '')
+        + (e.requestId ? '<span class="log-rid" title="X-Request-ID — matches the server line">'
+            + escHtml(e.requestId) + '</span>' : '')
+        + (e.error ? '<span class="log-err">' + escHtml(e.error) + '</span>' : '');
+    } else {
+      var f = e.fields || {};
+      detail = Object.keys(f).map(function (k) {
+        return '<span class="log-kv"><i>' + escHtml(k) + '</i>' + escHtml(String(f[k])) + '</span>';
+      }).join('');
+    }
+
+    return '<div class="log-row lvl-' + lvl + (e.source === 'client' ? ' is-client' : '') + '">'
+      + '<span class="log-t">' + logTime(e.ts) + '</span>'
+      + '<span class="log-lvl">' + escHtml(lvl.slice(0, 4)) + '</span>'
+      + '<span class="log-svc">' + escHtml(e.service || '-') + '</span>'
+      + '<span class="log-msg">' + escHtml(e.message) + '</span>'
+      + '<span class="log-detail">' + detail + '</span>'
+      + '</div>';
+  }).join('');
+
+  if (follow && nearBottom !== false) host.scrollTop = host.scrollHeight;
+}
+
+function clearLogView() {
+  logEntries = [];
+  logUnseen = 0;
+  updateLogBadge();
+  renderLogs();
+}
+
+async function purgeServerLogs() {
+  try {
+    var r = await apiCall('/v1/logs', { method: 'DELETE' });
+    showToast('Cleared ' + (r.cleared || 0) + ' server log lines.', 'success');
+    logEntries = logEntries.filter(function (e) { return e.source === 'client'; });
+    renderLogs();
+    refreshLogServiceFilter();
+  } catch (err) {
+    showToast('Could not clear server logs: ' + err.message, 'error');
+  }
+}
+
+/** Wire the Logs tab's controls. Called once from init(). */
+function initLogsTab() {
+  var clear = document.getElementById('log-clear');
+  if (clear) clear.addEventListener('click', clearLogView);
+
+  var purge = document.getElementById('log-purge');
+  if (purge) purge.addEventListener('click', purgeServerLogs);
+
+  document.querySelectorAll('#tab-logs .log-seg button').forEach(function (btn) {
+    btn.addEventListener('click', function () {
+      var group = this.parentNode;
+      group.querySelectorAll('button').forEach(function (b) { b.classList.remove('active'); });
+      this.classList.add('active');
+      if (this.dataset.scope) logFilters.scope = this.dataset.scope;
+      if (this.dataset.source) logFilters.source = this.dataset.source;
+      renderLogs();
+    });
+  });
+
+  var level = document.getElementById('log-level');
+  if (level) level.addEventListener('change', function () {
+    logFilters.level = this.value;
+    // The server filters by level too, so reopen the tail to match.
+    disconnectLogStream();
+    if (logOpen) connectLogStream();
+    renderLogs();
+  });
+
+  var svc = document.getElementById('log-service');
+  if (svc) svc.addEventListener('change', function () {
+    logFilters.service = this.value;
+    renderLogs();
+  });
+
+  var search = document.getElementById('log-search');
+  if (search) search.addEventListener('input', function () {
+    logFilters.text = this.value.trim();
+    renderLogs();
+  });
+
+  var follow = document.getElementById('log-follow');
+  if (follow) follow.addEventListener('change', renderLogs);
+
+  // Ctrl+` / Cmd+` jumps to the Logs tab, or back to where you were.
+  document.addEventListener('keydown', function (evt) {
+    if ((evt.ctrlKey || evt.metaKey) && evt.key === '`') {
+      evt.preventDefault();
+      showTab(currentTab === 'logs' ? logPrevTab : 'logs');
+    }
+  });
+
+  updateLogBadge();
+}
+
+/* ============================================================
    Initialization
    ============================================================ */
 document.addEventListener('DOMContentLoaded', init);
@@ -3439,6 +4238,14 @@ function init() {
       showTab(this.getAttribute('data-tab'));
     });
   });
+
+  initLogsTab();
+
+  // Trace tab controls
+  var traceRunBtn = document.getElementById('trace-run');
+  if (traceRunBtn) traceRunBtn.addEventListener('click', runTrace);
+  var traceClearBtn = document.getElementById('trace-clear');
+  if (traceClearBtn) traceClearBtn.addEventListener('click', clearTrace);
 
   // Pipeline transition slider
   var pipelineSlider = document.getElementById('pipeline-slider');

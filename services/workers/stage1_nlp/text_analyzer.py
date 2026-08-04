@@ -32,6 +32,7 @@ sys.path.insert(0, os.path.abspath(os.path.join(os.path.dirname(__file__), "..",
 from common.utils import detect_script, is_banglish  # noqa: E402
 from libs.embeddings import fit_dim  # noqa: E402
 from libs.embeddings import stub_embedding as _shared_stub_embedding  # noqa: E402
+from libs.labels import POST_TYPE_PROTOTYPES  # noqa: E402
 from libs.sentiment_models import resolve as _resolve_sentiment  # noqa: E402
 
 from .llm_analyzer import analyze_text_llm  # noqa: E402
@@ -109,6 +110,48 @@ _INTENT_SEEDS: list[tuple[str, list[str]]] = [
     ("question", ["কেন", "কি", "কিভাবে", "why", "how", "what", "?"]),
 ]
 
+# Post-type seed patterns (stub mode, and a high-precision prior in real mode).
+# Vocabulary is libs/labels.POST_TYPES minus "other" (the no-match fallback).
+_POST_TYPE_SEEDS: list[tuple[str, list[str]]] = [
+    ("political", [
+        "রাজনীতি", "সরকার", "নির্বাচন", "আওয়ামী", "বিএনপি", "জামায়াত", "মন্ত্রী",
+        "প্রধানমন্ত্রী", "সংসদ", "ভোট", "রাষ্ট্র", "ক্ষমতা", "দল",
+        "politics", "govt", "government", "election", "minister", "vote", "regime",
+    ]),
+    ("religious", [
+        "ইসলাম", "আল্লাহ", "নামাজ", "কুরআন", "হাদিস", "মসজিদ", "দোয়া", "রমজান",
+        "ঈদ", "শহীদ", "শাহাদত", "হিন্দু", "পূজা", "ধর্ম", "ইনশাআল্লাহ",
+        "islam", "allah", "quran", "hadith", "namaz", "dua", "inshallah", "alhamdulillah",
+    ]),
+    ("complaint", [
+        "অভিযোগ", "দুর্নীতি", "অন্যায়", "প্রতিবাদ", "ক্ষোভ", "ব্যর্থ", "অবহেলা",
+        "ভোগান্তি", "হয়রানি", "অপপ্রচার", "শোষণ", "অত্যাচার",
+        "complaint", "corruption", "injustice", "negligence", "harassment", "shame",
+    ]),
+    ("news", [
+        "সংবাদ", "খবর", "প্রতিবেদন", "জানা গেছে", "সূত্র", "বিজ্ঞপ্তি", "গ্রেফতার",
+        "নিহত", "আহত", "উদ্ধার", "ঘোষণা",
+        "breaking", "news", "report", "reportedly", "sources said", "arrested", "killed",
+    ]),
+    ("opinion", [
+        "আমার মতে", "মনে করি", "মনে হয়", "উচিত", "বিশ্লেষণ", "প্রশ্ন হলো", "মতামত",
+        "i think", "in my opinion", "imo", "we should", "arguably",
+    ]),
+    ("promotion", [
+        "অফার", "ছাড়", "বিক্রি", "অর্ডার", "দাম", "ইনবক্স", "যোগাযোগ করুন", "হোম ডেলিভারি",
+        "offer", "discount", "sale", "order now", "price", "inbox", "buy now", "whatsapp",
+    ]),
+    ("humor", [
+        "হাহা", "মজা", "কৌতুক", "ট্রল", "হাসতে", "মিম",
+        "funny", "lol", "haha", "meme", "troll", "😂", "🤣",
+    ]),
+    ("personal", [
+        "জন্মদিন", "শুভ জন্মদিন", "বিয়ে", "বিবাহ", "আমার পরিবার", "আমার জীবন",
+        "ধন্যবাদ সবাইকে", "দুআ চাই",
+        "birthday", "anniversary", "graduation", "my wedding", "my family", "thank you all",
+    ]),
+]
+
 # Seed NER labels for stub detection
 _NER_SEEDS: list[tuple[str, str]] = [
     ("আওয়ামী লীগ", "ORG"),
@@ -140,6 +183,9 @@ def _empty_result() -> dict:
         "emotion": {"primary": None, "scores": {}},
         "topics": [],
         "intents": [],
+        # No text at all is a genuine "unknown", not "other" — Rule 2 routes it.
+        "post_type": None,
+        "post_type_confidence": 0.0,
         "toxicity_score": None,
         "hate_speech_score": None,
         "entities": [],
@@ -248,6 +294,37 @@ def _stub_intents(text: str) -> list[str]:
         if any(seed.lower() in text.lower() for seed in seeds):
             intents.append(intent)
     return intents or ["inform"]
+
+
+def _stub_post_type(text: str) -> tuple[str | None, float]:
+    """Classify the semantic post type from seed words: (label, confidence).
+
+    Returns ``(None, 0.0)`` when no seed matches — Stage 1 says "I don't know"
+    rather than guessing "other", because the router's Rule 2 has to be able to
+    tell those two apart (an unknown type is what earns an LLM call).
+
+    The confidence is deliberately modest: one seed hit lands *below* the router
+    threshold, so a post classified on a single keyword still goes to Stage 2.
+    Two independent hits clear it. These numbers are heuristic, not calibrated —
+    calibrating them needs the labeled set evaluation.md calls for.
+    """
+    lower = text.lower()
+    hits: dict[str, int] = {}
+    for label, seeds in _POST_TYPE_SEEDS:
+        n = sum(1 for seed in seeds if seed.lower() in lower)
+        if n:
+            hits[label] = n
+    if not hits:
+        return None, 0.0
+
+    ranked = sorted(hits, key=lambda k: hits[k], reverse=True)
+    top = ranked[0]
+    top_hits = hits[top]
+    runner_hits = hits[ranked[1]] if len(ranked) > 1 else 0
+
+    confidence = 0.45 + 0.12 * min(top_hits, 3)          # 0.57 .. 0.81
+    confidence -= 0.08 * min(runner_hits, 2)             # competing categories
+    return top, round(max(0.30, min(confidence, 0.85)), 3)
 
 
 def _stub_toxicity(text: str) -> tuple[float, float]:
@@ -491,6 +568,57 @@ def _classify_by_prototype(
 # Public entry-point
 # ---------------------------------------------------------------------------
 
+_POST_TYPE_PROTO_FLOOR: float = float(os.getenv("POST_TYPE_PROTO_FLOOR", "0.28"))
+
+
+def _post_type_by_prototype(
+    embedding: list[float] | None,
+    embed_model: object,
+) -> tuple[str | None, float]:
+    """Zero-shot post_type from label-prototype cosine: (label, confidence).
+
+    Confidence is the top similarity rescaled over [floor, 0.60] — an *ordering*
+    signal, not a calibrated probability, and it is capped at 0.9 to say so. The
+    same caveat as the topic/intent floors above applies: the mapping should be
+    fitted on a labeled validation set (evaluation.md §2).
+    """
+    if not embedding:
+        return None, 0.0
+    protos = _embed_prototypes("post_type", POST_TYPE_PROTOTYPES, embed_model)
+    sims = {label: _cosine(embedding, vec) for label, vec in protos.items()}
+    ranked = sorted(sims, key=lambda label: sims[label], reverse=True)
+    top, top_sim = ranked[0], sims[ranked[0]]
+    if top_sim < _POST_TYPE_PROTO_FLOOR:
+        return None, 0.0
+    span = max(0.60 - _POST_TYPE_PROTO_FLOOR, 1e-6)
+    confidence = 0.5 + 0.4 * min((top_sim - _POST_TYPE_PROTO_FLOOR) / span, 1.0)
+    # A close runner-up means the post sits between two categories.
+    runner_sim = sims[ranked[1]] if len(ranked) > 1 else 0.0
+    if top_sim - runner_sim < _PROTO_MARGIN:
+        confidence -= 0.1
+    return top, round(max(0.30, min(confidence, 0.90)), 3)
+
+
+def _combine_post_type(
+    seed: tuple[str | None, float],
+    proto: tuple[str | None, float],
+) -> tuple[str | None, float]:
+    """Merge the seed-keyword and prototype verdicts into one (label, confidence)."""
+    seed_label, seed_conf = seed
+    proto_label, proto_conf = proto
+    if seed_label and proto_label:
+        if seed_label == proto_label:
+            # Two independent methods agreeing is the strongest signal available.
+            return seed_label, round(min(0.95, max(seed_conf, proto_conf) + 0.10), 3)
+        # Disagreement: keep the stronger label but report the *lower* confidence,
+        # so a contested post routes to Stage 2 instead of shipping a coin flip.
+        label = seed_label if seed_conf >= proto_conf else proto_label
+        return label, round(min(seed_conf, proto_conf), 3)
+    if seed_label:
+        return seed_label, seed_conf
+    return proto_label, proto_conf
+
+
 async def analyze_sentiment(
     text: str | None,
     registry: ModelRegistry,
@@ -548,6 +676,12 @@ async def _analyze_text_llm_path(
     banglish = is_banglish(text)
     language = nlp.get("language") or _stub_language(text)[0]
 
+    # Fall back to the seed heuristic when the LLM declined to classify the post
+    # type, so Rule 2 escalates only genuinely unclassifiable posts.
+    post_type, post_type_conf = nlp["post_type"], nlp["post_type_confidence"]
+    if post_type is None:
+        post_type, post_type_conf = _stub_post_type(text)
+
     # Embedding: real model when available (non-stub), else the shared stub.
     embed_model = registry.get_embedding_model()
     embedding = _real_embedding(text, embed_model) if embed_model is not None else _stub_embedding(text)
@@ -563,6 +697,8 @@ async def _analyze_text_llm_path(
         "emotion": nlp["emotion"],
         "topics": nlp["topics"],
         "intents": nlp["intents"],
+        "post_type": post_type,
+        "post_type_confidence": post_type_conf,
         "toxicity_score": nlp["toxicity_score"],
         "hate_speech_score": nlp["hate_speech_score"],
         "entities": nlp["entities"],
@@ -611,6 +747,7 @@ async def analyze_text(
         emotion = _stub_emotion(sentiment_label, text)
         topics = _stub_topics(text)
         intents = _stub_intents(text)
+        post_type, post_type_conf = _stub_post_type(text)
         toxicity, hate = _stub_toxicity(text)
         entities = _stub_ner(text)
         keywords = _stub_keywords(text)
@@ -687,9 +824,14 @@ async def analyze_text(
             # dict.fromkeys preserves order while de-duplicating.
             topics = list(dict.fromkeys(seed_topics + proto_topics)) or ["general"]
             intents = list(dict.fromkeys(seed_intents + proto_intents)) or ["inform"]
+            post_type, post_type_conf = _combine_post_type(
+                _stub_post_type(text),
+                _post_type_by_prototype(embedding, embed_model),
+            )
         else:
             topics = _stub_topics(text)
             intents = _stub_intents(text)
+            post_type, post_type_conf = _stub_post_type(text)
 
     return {
         "language": language,
@@ -702,6 +844,10 @@ async def analyze_text(
         "emotion": emotion,
         "topics": topics,
         "intents": intents,
+        # Stage-1's own best-effort post_type. Stage 2 refines it when the router
+        # asks (low confidence / unknown); the assembler prefers Stage 2's.
+        "post_type": post_type,
+        "post_type_confidence": post_type_conf,
         "toxicity_score": toxicity,
         "hate_speech_score": hate,
         "entities": entities,

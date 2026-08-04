@@ -39,6 +39,7 @@ if _REPO_ROOT not in sys.path:
 from libs.common import content_hash, get_settings
 from libs.dlq import record_failure
 from libs.embeddings import embed_text, to_pgvector_literal
+from libs.progress import publish_stage
 from .normalizer import normalize_post
 
 # ---------------------------------------------------------------------------
@@ -314,6 +315,30 @@ async def _enqueue_nlp(
         {"data": json.dumps(envelope, ensure_ascii=False)},
     )
 
+    # Opening frame of the dashboard's per-post trace: what normalization
+    # derived, before any model has seen the post.
+    engagement = normalized.get("engagement") or {}
+    await publish_stage(
+        redis,
+        "ingest",
+        "done",
+        job_id=job_id,
+        post_id=normalized["post_id"],
+        detail={
+            "platform": normalized.get("platform"),
+            "media_type": normalized.get("media_type"),
+            "caption_chars": len(normalized.get("caption") or ""),
+            "photo_count": len(normalized.get("photo_urls") or []),
+            "comment_rows": len(normalized.get("comments") or []),
+            "comment_count": engagement.get("comment_count"),
+            "coverage": engagement.get("coverage"),
+            "content_hash": (normalized.get("content_hash") or "")[:16],
+            "baseline_sentiment": normalized.get("baseline_sentiment"),
+            "next_stream": NLP_STREAM,
+        },
+        log=log,
+    )
+
 
 async def _count_skipped_for_job(
     redis: Redis,
@@ -527,6 +552,20 @@ async def _process_message(
 
     post_id: str = raw.get("id", "<unknown>")
 
+    # One line per ingestion step below, so a post that never reaches Stage 1 can
+    # be pinned to the step that stopped it (dedup, normalization, near-dup reuse)
+    # instead of just going quiet.
+    log.info(
+        "ingestion.received",
+        post_id=post_id,
+        job_id=job_id,
+        post_type=raw.get("postType"),
+        caption_chars=len(raw.get("caption") or ""),
+        comments=len(raw.get("comments") or []),
+        photos=len(raw.get("photoUrls") or []),
+        message_id=msg_id_str,
+    )
+
     # Step 2 — compute content hash from the raw (upstream) payload.
     hash_value: str = content_hash(raw)
 
@@ -550,10 +589,21 @@ async def _process_message(
 
     # Step 4 — normalize.
     normalized: dict = normalize_post(raw)
+    log.info(
+        "ingestion.normalized",
+        post_id=post_id,
+        platform=normalized.get("platform"),
+        media_type=normalized.get("media_type"),
+        caption_chars=len(normalized.get("caption") or ""),
+        comment_rows=len(normalized.get("comments") or []),
+        coverage=(normalized.get("engagement") or {}).get("coverage"),
+        content_hash=hash_value[:16],
+    )
 
     # Step 5 — upsert into Postgres.
     async with session_factory() as session:
         await _upsert_post(session, normalized, raw)
+    log.debug("ingestion.upserted", post_id=post_id)
 
     # Step 5b — near-duplicate reuse (§3.2): if this caption is within cosine
     # threshold of an already-analyzed post, copy that result and skip Stage-1/2

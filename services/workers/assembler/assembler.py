@@ -45,6 +45,7 @@ from persistence import (
 # ---------------------------------------------------------------------------
 from common.logging import setup_logging  # noqa: E402
 from dlq import record_failure  # noqa: E402
+from progress import publish_stage  # noqa: E402
 
 setup_logging("assembler")
 log: structlog.BoundLogger = structlog.get_logger(__name__)
@@ -263,21 +264,53 @@ async def _process_message(
     # The Stage-1 document embedding rides alongside the canonical result (it
     # is not part of the output schema) and lands in the pgvector column.
     stage1_embedding = stage1_result.get("embedding")
+
+    # Time each backend separately. The fan-out is a gather, so a single
+    # "persist took 4s" line cannot tell you which store was slow — and these
+    # three fail for completely different reasons.
+    async def _timed(name: str, coro):
+        t = time.monotonic()
+        try:
+            await coro
+        except Exception as exc:
+            bound_log.error(
+                "persist_target_failed", target=name, error=str(exc),
+                ms=round((time.monotonic() - t) * 1000, 1),
+            )
+            raise
+        bound_log.info(
+            "persist_target_ok", target=name,
+            ms=round((time.monotonic() - t) * 1000, 1),
+        )
+
+    n_comments = len(((result.get("comment_analysis") or {}).get("comments")) or [])
+    bound_log.info(
+        "persist_fanout_start",
+        targets=["postgres", "clickhouse", "object_storage"],
+        embedding_dims=len(stage1_embedding or []),
+        comment_rows=n_comments,
+    )
+    t_fan = time.monotonic()
     try:
         await asyncio.gather(
-            persist_postgres(result, engine, embedding=stage1_embedding),
+            _timed("postgres", persist_postgres(result, engine, embedding=stage1_embedding)),
             # persist_clickhouse writes both the analytics row AND the per-comment
             # rows on its single connection (sequentially) — they must NOT be
             # separate gather tasks or clickhouse-driver rejects the concurrent use.
-            persist_clickhouse(result, ch_client),
-            persist_minio(result, s3_client, bucket),
+            _timed("clickhouse", persist_clickhouse(result, ch_client)),
+            _timed("object_storage", persist_minio(result, s3_client, bucket)),
         )
     except Exception as exc:
-        bound_log.error("persist_failed", error=str(exc))
+        bound_log.error("persist_failed", error=str(exc),
+                        ms=round((time.monotonic() - t_fan) * 1000, 1))
         if job_id:
             await _update_job_status(engine, job_id, _JOB_STATUS_FAILED, str(exc))
         # Do NOT ACK — leave the message for retry
         raise
+    bound_log.info(
+        "persist_fanout_done",
+        ms=round((time.monotonic() - t_fan) * 1000, 1),
+    )
 
     # --- Publish completion event -------------------------------------------
     pubsub_channel = f"analysis:done:{post_id}"
@@ -296,6 +329,30 @@ async def _process_message(
         bound_log.warning("pubsub_publish_failed", channel=pubsub_channel, error=str(exc))
 
     # --- Update job progress / status ----------------------------------------
+    # The assembler frame goes out before _track_job_progress, because that call
+    # may publish the terminal `done` event which closes the job's SSE stream.
+    conf = result.get("confidence")
+    proc_now = result.get("processing") or {}
+    await publish_stage(
+        redis_client, "assembler", "done",
+        job_id=job_id, post_id=post_id,
+        ms=(time.monotonic() - t0) * 1000,
+        detail={
+            "schema_version": proc_now.get("schema_version"),
+            "schema_valid": True,  # build_canonical_result raises otherwise
+            "top_level_keys": len(result),
+            "confidence": conf.get("overall") if isinstance(conf, dict) else conf,
+            "overall_sentiment": result.get("overall_sentiment"),
+            "post_type": result.get("post_type"),
+            "llm_used": proc_now.get("llm_used"),
+            "stage1_ms": proc_now.get("stage1_ms"),
+            "stage2_ms": proc_now.get("stage2_ms"),
+            "embedding_stored": bool(stage1_embedding),
+            "writes": ["postgres+pgvector", "clickhouse", "object storage"],
+        },
+        log=bound_log,
+    )
+
     if job_id:
         await _track_job_progress(
             redis_client, engine, job_id,
