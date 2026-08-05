@@ -191,6 +191,10 @@ are a primary cost lever, not an afterthought.
   grow 10× without touching the LLM GPUs.
 - **Partitioning.** Partition the bus by `hash(post_id)`; keep partitions ≥ max
   consumers so workers never starve.
+- **Auth/tenancy state lives in Postgres**, not in memory: `api_keys` (hashed,
+  tenant-scoped), `users` (PBKDF2), `tenant_policies` (`privacy_locked`). SSE
+  tickets live in Redis with a ~60s TTL. Nothing about a principal is trusted
+  from the client, which is what makes per-tenant isolation enforceable.
 - **Stateless workers.** All state in queue + stores → scale to zero between
   batches, scale out instantly for a 10k/100k burst.
 - **Spot for batch.** Use preemptible/spot GPU nodes for batch surges; Kafka

@@ -19,7 +19,7 @@ _REPO_ROOT = os.path.abspath(os.path.join(os.path.dirname(__file__), "..", "..",
 if _REPO_ROOT not in sys.path:
     sys.path.insert(0, _REPO_ROOT)
 
-from libs.embeddings import embed_text, to_pgvector_literal  # noqa: E402
+from libs.embeddings import embed_text_with_provenance, to_pgvector_literal  # noqa: E402
 
 log = structlog.get_logger(__name__)
 
@@ -82,7 +82,8 @@ async def _semantic_search(
 
     ``<=>`` is pgvector's cosine-distance operator; score = 1 - distance.
     """
-    qvec = to_pgvector_literal(embed_text(q))
+    query_vec, query_is_stub = embed_text_with_provenance(q)
+    qvec = to_pgvector_literal(query_vec)
 
     params: dict[str, Any] = {"qvec": qvec, "limit": limit}
     where_parts = ["ar.embedding IS NOT NULL"]
@@ -97,6 +98,7 @@ async def _semantic_search(
             ar.campaign_id,
             ar.result->>'post_summary' AS snippet,
             ar.result,
+            COALESCE(ar.embedding_is_stub, FALSE) AS embedding_is_stub,
             1 - (ar.embedding <=> CAST(:qvec AS vector)) AS score
         FROM analysis_results ar
         WHERE {' AND '.join(where_parts)}
@@ -107,6 +109,19 @@ async def _semantic_search(
 
     rows = (await db.execute(sql, params)).mappings().all()
 
+    # §5.9: a stub vector is "deterministic ... not semantic", so kNN over stub
+    # rows returns arbitrary neighbours. The scores look exactly as plausible as
+    # real ones, which is why this has to be said rather than left inferable.
+    stub_rows = sum(1 for row in rows if row.get("embedding_is_stub"))
+    if query_is_stub or stub_rows:
+        log.warning(
+            "semantic_search_over_stub_vectors",
+            query_is_stub=query_is_stub,
+            stub_rows=stub_rows,
+            total_rows=len(rows),
+            detail="results are not semantically meaningful",
+        )
+
     return [
         SearchResult(
             post_id=row["post_id"],
@@ -114,6 +129,9 @@ async def _semantic_search(
             score=round(float(row["score"]), 4) if row["score"] is not None else 0.0,
             snippet=(row["snippet"] or "")[:200] or None,
             result=row["result"],
+            # True when this row's vector — or the query's — is the hash stub.
+            # A caller that renders a "semantic match" badge must not do so here.
+            embedding_is_stub=bool(row.get("embedding_is_stub")) or query_is_stub,
         )
         for row in rows
     ]

@@ -375,16 +375,36 @@ def _stub_embedding(text: str) -> list[float]:
 # Real-model helpers (called when stub_mode is False)
 # ---------------------------------------------------------------------------
 
-def _real_language(text: str, detector: object) -> tuple[str, str, bool, float]:
-    """Use fastText to detect language."""
-    import numpy as np  # noqa: F401 (just in case)
+def _real_language(text: str, detector: object) -> tuple[str, str, bool, float, str]:
+    """Detect language, returning ``(lang, script, banglish, confidence, method)``.
 
-    labels, probs = detector.predict(text.replace("\n", " "), k=1)  # type: ignore[union-attr]
-    lang_code = labels[0].replace("__label__", "")
-    confidence = float(probs[0])
+    ``detector`` may be None — fastText is optional, and its getter now degrades
+    rather than killing the post. The fallback is script-based detection, which
+    for this corpus is the substantive part anyway (bn vs Latin vs code-mixed);
+    fastText mainly contributes confidence calibration. `method` reports which
+    ran, so the degradation is visible rather than inferred.
+    """
     script = detect_script(text)
     banglish = is_banglish(text)
-    return lang_code, script, banglish, confidence
+
+    if detector is not None:
+        try:
+            labels, probs = detector.predict(text.replace("\n", " "), k=1)  # type: ignore[union-attr]
+            return (
+                labels[0].replace("__label__", ""),
+                script,
+                banglish,
+                float(probs[0]),
+                "fasttext",
+            )
+        except Exception as exc:
+            logger.warning("fastText prediction failed, using script detection: %s", exc)
+
+    # Deterministic fallback. Confidence is deliberately moderate: this is a
+    # script heuristic, not a calibrated classifier, and overstating it would
+    # feed the router's confidence gate a number it has not earned.
+    lang_code = "bn" if script == "bengali" else ("mixed" if script == "mixed" else "en")
+    return lang_code, script, banglish, 0.6, "script_heuristic"
 
 
 def _real_sentiment(text: str, tokenizer: object, model: object) -> tuple[str, float, float]:
@@ -408,6 +428,51 @@ def _real_sentiment(text: str, tokenizer: object, model: object) -> tuple[str, f
     # Map to -1..1 score
     score_map = {"negative": -float(probs[0]), "neutral": 0.0, "positive": float(probs[2])}
     return label, round(score_map[label], 4), round(confidence, 4)
+
+
+def _real_sentiment_batch(
+    texts: list[str], tokenizer: object, model: object
+) -> list[tuple[str, float, float]]:
+    """Run XLM-R sentiment over a BATCH in one forward pass (§5.11).
+
+    Per-comment inference was one `tokenizer(...)` + one `model(...)` call per
+    comment — 8,513 of 10,272 comments took that path with no batching, despite
+    transformer inference being 10-30x faster batched. Before any latency
+    benchmark is quoted, this matters: an unbatched throughput number is an
+    artefact of a missing `batch` argument, not a property of the architecture.
+
+    Padding to the longest sequence in the batch (not to 512) keeps the win
+    real — a batch of short comments stays cheap.
+    """
+    if not texts:
+        return []
+    import torch  # type: ignore
+    import torch.nn.functional as F  # type: ignore
+
+    inputs = tokenizer(  # type: ignore[operator]
+        texts,
+        return_tensors="pt",
+        truncation=True,
+        max_length=512,
+        padding=True,
+    )
+    with torch.no_grad():
+        logits = model(**inputs).logits  # type: ignore[operator]
+    probs = F.softmax(logits, dim=-1)
+
+    label_map = {0: "negative", 1: "neutral", 2: "positive"}
+    out: list[tuple[str, float, float]] = []
+    for row in probs:
+        idx = int(row.argmax())
+        label = label_map.get(idx, "neutral")
+        confidence = float(row[idx])
+        score_map = {
+            "negative": -float(row[0]),
+            "neutral": 0.0,
+            "positive": float(row[2]),
+        }
+        out.append((label, round(score_map[label], 4), round(confidence, 4)))
+    return out
 
 
 def _real_emotion(text: str, pipeline: object) -> dict:
@@ -679,6 +744,73 @@ async def analyze_sentiment_engine(
     return label, score, conf, "stub"
 
 
+async def analyze_sentiment_batch(
+    texts: list[str],
+    registry: ModelRegistry,
+    sentiment_override: str | None = None,
+) -> list[tuple[str, float, float, str]]:
+    """Sentiment for MANY strings, batched per resolved model (§5.11).
+
+    Returns one ``(label, score, confidence, engine)`` per input, in order.
+
+    Comments are grouped by the model their language routes them to, then each
+    group runs as a single forward pass. Unbatched inference was the single
+    biggest throughput lever left in the pipeline: 8,513 of 10,272 comments went
+    through one `model(...)` call each.
+
+    Falls back to the per-item path for stub mode and for any group whose model
+    is unavailable, so behaviour is identical — only the speed changes.
+    """
+    results: list[tuple[str, float, float, str] | None] = [None] * len(texts)
+
+    # Empty and whitespace-only inputs never reach a model.
+    pending: list[int] = []
+    for i, t in enumerate(texts):
+        if not t or not t.strip():
+            results[i] = ("neutral", 0.0, 0.0, "empty")
+        else:
+            pending.append(i)
+
+    if registry.stub_mode:
+        for i in pending:
+            label, score, conf = _stub_sentiment(texts[i].strip())
+            results[i] = (label, score, conf, "stub")
+        return [r for r in results if r is not None]
+
+    # Group by the model each text's language routes it to — a batch must be
+    # one model, and this corpus mixes bn / en / banglish within a thread.
+    groups: dict[str, list[int]] = {}
+    for i in pending:
+        text = texts[i].strip()
+        _key, hf_name = _resolve_sentiment(
+            detect_script(text), is_banglish(text), None, sentiment_override
+        )
+        groups.setdefault(hf_name, []).append(i)
+
+    for hf_name, idxs in groups.items():
+        pair = registry.get_sentiment_model(hf_name)
+        if pair is None:
+            for i in idxs:
+                label, score, conf = _stub_sentiment(texts[i].strip())
+                results[i] = (label, score, conf, "stub")
+            continue
+        tokenizer, model = pair
+        try:
+            batch = [texts[i].strip() for i in idxs]
+            for i, (label, score, conf) in zip(
+                idxs, _real_sentiment_batch(batch, tokenizer, model)
+            ):
+                results[i] = (label, score, conf, "model")
+        except Exception as exc:
+            # One bad batch must not cost the post its labels.
+            logger.warning("batched sentiment failed for %s: %s", hf_name, exc)
+            for i in idxs:
+                label, score, conf = _stub_sentiment(texts[i].strip())
+                results[i] = (label, score, conf, "stub")
+
+    return [r if r is not None else ("neutral", 0.0, 0.0, "stub") for r in results]
+
+
 async def _analyze_text_llm_path(
     text: str,
     registry: ModelRegistry,
@@ -780,11 +912,12 @@ async def analyze_text(
         keywords = _stub_keywords(text)
         embedding = _stub_embedding(text)
         engine = "stub"
+        lang_method = "stub"
     else:
         engine = "models"
         # --- Language ---
         detector = registry.get_lang_detector()
-        language, script, banglish, lang_conf = _real_language(text, detector)
+        language, script, banglish, lang_conf, lang_method = _real_language(text, detector)
 
         # --- Sentiment (language-routed model) ---
         sent_route, sent_model_name = _resolve_sentiment(
@@ -885,6 +1018,10 @@ async def analyze_text(
         "sentiment_model": sent_model_name,
         # Which engine produced this result: "stub" | "models" | "llm".
         "engine": engine,
+        # How language was detected: "fasttext" | "script_heuristic" | "stub".
+        # fastText is optional; when it is absent the pipeline degrades to script
+        # detection rather than failing the post, and says which ran.
+        "language_method": lang_method,
         "llm_backend": None,
         "llm_model": None,
     }

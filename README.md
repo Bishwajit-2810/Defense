@@ -108,6 +108,7 @@ concrete input→output, see [examples.md](examples.md).
 
 | Document                                             | What it covers                                                                                                                                                                    |
 | ---------------------------------------------------- | --------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- |
+| [FEATURES.md](FEATURES.md)                           | **Feature list** — every capability, what it does, and whether it is **measured**, works-but-unmeasured, **unexercised**, or planned. Start here for "what does this actually do?"     |
 | [masterplan.md](masterplan.md)                       | **Single-file master plan** — every document below consolidated into one self-contained read                                                                                      |
 | [data_contract.md](data_contract.md)                 | **Upstream input contract** — real post-with-details schema (embedded comments + engagement + reactions + shares), integration (pull + own DB), platform detection, field mapping |
 | [architecture.md](architecture.md)                   | Recommended high- and low-level architecture, the hybrid NLP→LLM pipeline, data flow, service breakdown, security                                                                 |
@@ -122,12 +123,16 @@ concrete input→output, see [examples.md](examples.md).
 | [evaluation.md](evaluation.md)                       | **Evaluation plan** — how we score each task, the summary, the agents, and system properties; gold sets, gates, drift                                                             |
 | [plan.md](plan.md)                                   | Phased implementation roadmap and milestones                                                                                                                                      |
 | [HOWTO.md](HOWTO.md)                                 | **Build guide for coding agents** — golden rules, ordered tasks with definition-of-done, repo layout; how to actually implement this design                                       |
-| [stance_targets.md](stance_targets.md)               | **Watchlist-driven target stance** — the project's novelty item: per-entity stance over a configurable, alias-aware watchlist for code-mixed Bangla/Banglish. **Specified, not built.**            |
+| [stance_targets.md](stance_targets.md)               | **Watchlist-driven target stance** — the project's novelty item: per-entity stance over a configurable, alias-aware watchlist for code-mixed Bangla/Banglish. **Built**; watchlist contents and validation outstanding.  |
 
 Background: the original system-design request has been reconciled with
 [what.txt](what.txt), which is now the authoritative source and supersedes it.
 (`social_media_llm_architecture_prompt.md` was removed in commit `e9fba98`; the
 link is dropped rather than left dangling.)
+
+**What it does, feature by feature:** [FEATURES.md](FEATURES.md) — with each
+capability marked measured / unmeasured / unexercised / planned, so nothing on a
+slide is stated more strongly than the evidence supports.
 
 **Current implementation status** is in
 [PROJECT_ASSESSMENT.md](PROJECT_ASSESSMENT.md) — read its status header first.

@@ -163,6 +163,21 @@ services:
 - **Cluster Autoscaler / Karpenter** to add GPU nodes (incl. **spot**) for batch
   surges; batch tolerates preemption thanks to Kafka replay.
 
+### Database schema to provision
+
+Beyond the analysis tables, three things must be seeded for the API to run
+**closed** rather than in dev-permissive mode (see [run.md](run.md) §"Auth &
+tenancy"):
+
+| Table | Why |
+| ----- | --- |
+| `api_keys` | SHA-256 key hashes plus the **`tenant_id`** each key belongs to. Without rows, unknown keys are accepted in dev and rejected everywhere else. The tenant comes from here, never from a client-supplied token. |
+| `users` | `pbkdf2_sha256` password hashes. Without rows, `POST /v1/auth/token` issues a token to anybody in dev and refuses everyone outside it. |
+| `tenant_policies` | `privacy_locked` per tenant. The check **fails closed**: an unreachable policy table refuses a `groq` request rather than permitting it. |
+
+Also set **`APP_ENV`** to something other than `dev`, or the permissive fallbacks
+stay on and a placeholder `JWT_SECRET` is tolerated.
+
 ### Networking & security
 
 - **Ingress controller** (NGINX) terminates TLS; cert-manager for certs.

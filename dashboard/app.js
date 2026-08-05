@@ -68,9 +68,15 @@ async function apiCall(path, options) {
     }
 
     if (response.status === 401) {
+      // Clear the session AND tear down every open stream. Previously only the
+      // token was dropped, so the UI said "logged out" while the Trace and Logs
+      // tabs kept streaming on the same dead credential — the split state
+      // PROJECT_ASSESSMENT §6.6 defect 4 describes, and very likely what
+      // "JWT auth is not working properly" looked like from the outside.
       authToken = null;
       localStorage.removeItem('auth_token');
       updateAuthStatus(false);
+      disconnectAllStreams();
       throw new Error('Unauthorized — please log in again.');
     }
 
@@ -107,9 +113,46 @@ async function apiCall(path, options) {
   }
 }
 
-/** Credential usable as a query param for EventSource (cannot set headers). */
+/** Close every SSE stream. Called when the session dies, so the UI cannot show
+ *  "logged out" while streams keep delivering data on a dead credential. */
+function disconnectAllStreams() {
+  try { disconnectPipelineLive(); } catch (e) { /* tab may not be mounted */ }
+  try { disconnectLogStream(); } catch (e) { /* idem */ }
+  try { if (typeof traceES !== 'undefined' && traceES) { traceES.close(); traceES = null; } } catch (e) {}
+  try { stopAllJobStreams(); } catch (e) {}
+}
+
+/** Credential usable as a query param for EventSource (cannot set headers).
+ *
+ * DEPRECATED as a bearer credential — prefer sseQuery() below. Kept only as the
+ * fallback for a server that predates POST /v1/auth/sse-ticket.
+ */
 function sseCredential() {
   return encodeURIComponent(apiKey || authToken || 'demo');
+}
+
+/** Query string for an EventSource URL: a single-use ticket where possible.
+ *
+ * `EventSource` genuinely cannot set headers, so a streaming client needs
+ * something in the URL. Putting the SESSION credential there is the wrong
+ * something — URLs land in proxy logs, browser history and Referer headers, and
+ * that credential is good for an hour (or forever, for an API key).
+ *
+ * A ticket is single-use and ~60s, so the same leak is harmless. Falls back to
+ * the old parameter if the endpoint is unavailable, so the dashboard keeps
+ * working against an older server rather than silently showing no data.
+ */
+async function sseQuery(extra) {
+  var suffix = extra ? '&' + extra : '';
+  try {
+    var res = await apiCall('/v1/auth/sse-ticket', {method: 'POST'});
+    if (res && res.ticket) {
+      return '?ticket=' + encodeURIComponent(res.ticket) + suffix;
+    }
+  } catch (err) {
+    console.warn('sse-ticket unavailable, falling back to api_key param:', err.message);
+  }
+  return '?api_key=' + sseCredential() + suffix;
 }
 
 /* ============================================================
@@ -250,14 +293,27 @@ async function loadOverview() {
   }
 
   if (usage) {
+    // Post-vs-comment split: the number that actually bounds cost. The routing
+    // rate alone is not the cost story once every comment reaches an LLM.
+    var lanes = usage.lane_split || {};
+    var postLane = lanes.post || {};
+    var commentLane = lanes.comment || {};
+    var laneNote = (commentLane.calls || postLane.calls)
+      ? pct(commentLane.call_share) + ' of calls are comment-level'
+      : 'no LLM calls recorded yet';
+
     statsEl.innerHTML =
         makeStatCard('Posts analyzed', formatNumber(usage.posts_analyzed), null)
       + makeStatCard('LLM-routed posts', formatNumber(usage.llm_calls),
-                     pct(usage.llm_routing_rate) + ' routing rate')
+                     pct(usage.llm_routing_rate) + ' routing rate — a measure of Stage-1 quality')
       + makeStatCard('LLM API calls', formatNumber(usage.llm_api_calls || 0),
                      (usage.cache_hits || 0) + ' cache hits (' + pct(usage.cache_hit_rate) + ')')
+      + makeStatCard('Cost split', laneNote,
+                     formatNumber(postLane.calls || 0) + ' post-level · '
+                     + formatNumber(commentLane.calls || 0) + ' comment-level')
       + makeStatCard('Tokens used', formatNumber(usage.total_tokens),
-                     '≈ $' + Number(usage.estimated_cost_usd || 0).toFixed(4) + ' est. cost');
+                     costSubtitle(usage));
+    statsEl.innerHTML += usageProvenanceHtml(usage);
     updateStatusText('overview-updated', 'Live counters — refreshed ' + new Date().toLocaleTimeString());
   }
 
@@ -272,6 +328,54 @@ async function loadOverview() {
   renderOverviewCharts(overview);
   renderLlmPanel(overview);
   markRefreshed();
+}
+
+/** Cost subtitle for the token card, priced per backend.
+ *
+ * `local` is 0.0/token by definition (the cost is GPU time, not tokens), so a
+ * bare "$0.0000" would read as "no data" rather than "genuinely free". Say which.
+ */
+function costSubtitle(usage) {
+  var byModel = usage.cost_by_backend_model || {};
+  var models = Object.keys(byModel);
+  var cost = Number(usage.estimated_cost_usd || 0);
+  if (!models.length) return 'no per-model token counters yet';
+  var allLocal = models.every(function(k) { return k.indexOf('local:') === 0; });
+  if (allLocal && cost === 0) {
+    return 'local backend — $0 per token by definition';
+  }
+  return '≈ $' + cost.toFixed(4) + ' across ' + models.length + ' model'
+       + (models.length === 1 ? '' : 's');
+}
+
+/** Per-model token/cost table + the campaign-scope caveat.
+ *
+ * One blended rate used to be applied to every token, which was wrong for both
+ * backends in opposite directions. This shows the dimension that replaced it.
+ */
+function usageProvenanceHtml(usage) {
+  var tokens = usage.tokens_by_backend_model || {};
+  var costs = usage.cost_by_backend_model || {};
+  var keys = Object.keys(tokens);
+  if (!keys.length && !usage.scope_note) return '';
+
+  var html = '<div class="stat-note" style="grid-column:1/-1">';
+  if (keys.length) {
+    html += '<div class="stat-note-title">Tokens by backend and model</div>'
+          + '<div class="mini-list">'
+          + keys.sort(function(a, b) { return tokens[b] - tokens[a]; }).map(function(k) {
+              var c = Number(costs[k] || 0);
+              var priced = k.indexOf('local:') === 0 ? 'free (local)' : '$' + c.toFixed(4);
+              return '<div class="mini-row"><span class="mini-name">' + escHtml(k) + '</span>'
+                   + '<span class="text-muted">' + formatNumber(tokens[k]) + ' tok · ' + priced + '</span></div>';
+            }).join('')
+          + '</div>';
+  }
+  if (usage.scope_note) {
+    html += '<div class="text-muted" style="font-size:.72rem;margin-top:6px">'
+          + escHtml(usage.scope_note) + '</div>';
+  }
+  return html + '</div>';
 }
 
 function makeStatCard(label, value, hint) {
@@ -291,6 +395,28 @@ function pct(v) {
 function renderOverviewCharts(overview) {
   overview = overview || {};
   var sent = overview.sentiment_distribution || {};
+
+  // ---- Corpus-level comment coverage ----
+  // The per-post figure is what every other view shows; the aggregate is much
+  // smaller and it is the one that bounds what a thread-level sentiment claim
+  // can support. It used to appear nowhere.
+  var covEl = document.getElementById('overview-corpus-coverage');
+  if (covEl) {
+    var cc = overview.corpus_coverage || {};
+    if (cc.reported) {
+      covEl.innerHTML =
+          '<span class="tag tag-sm">' + pct(cc.coverage) + ' corpus coverage</span> '
+        + '<span class="text-muted">' + formatNumber(cc.analyzed) + ' comments analysed of '
+        + formatNumber(cc.reported) + ' the platform reports</span>'
+        + (cc.posts_with_anomaly
+            ? ' <span class="tag tag-sm tag-warning" title="stored comments exceed the platform\'s reported count — coverage is capped at 100%">'
+              + cc.posts_with_anomaly + ' upstream mismatch'
+              + (cc.posts_with_anomaly === 1 ? '' : 'es') + '</span>'
+            : '');
+    } else {
+      covEl.innerHTML = '<span class="text-muted">no coverage data yet</span>';
+    }
+  }
 
   // ---- Sentiment donut ----
   var pieCanvas = document.getElementById('overview-sentiment-pie');
@@ -314,7 +440,7 @@ function renderOverviewCharts(overview) {
   var langCanvas = document.getElementById('overview-lang-chart');
   if (langCanvas) {
     renderBarChart(langCanvas, (overview.language_distribution || []).map(function(d) {
-      return { label: d.label, value: d.count, color: '#6366f1' };
+      return { label: d.label, value: d.count, color: chartPalette().accent };
     }));
   }
 
@@ -322,7 +448,7 @@ function renderOverviewCharts(overview) {
   var topicsCanvas = document.getElementById('overview-topics-chart');
   if (topicsCanvas) {
     renderBarChart(topicsCanvas, (overview.top_topics || []).map(function(d) {
-      return { label: d.label, value: d.count, color: '#8b5cf6' };
+      return { label: d.label, value: d.count, color: chartPalette().accentDeep };
     }), 110);
   }
 
@@ -679,15 +805,15 @@ function renderPostModal(r) {
     sentColorVar(r.overall_sentiment)));
   if (r.post_type) chips.push(makeChip('type', r.post_type, 'var(--color-primary, #6366f1)'));
   var langChip = (r.language || 'und') + (r.script ? '/' + r.script : '') + (r.is_banglish ? ' ·banglish' : '');
-  chips.push(makeChip('language', langChip, '#6366f1'));
-  if (emo && emo.primary) chips.push(makeChip('emotion', emo.primary, '#8b5cf6'));
+  chips.push(makeChip('language', langChip, chartPalette().accent));
+  if (emo && emo.primary) chips.push(makeChip('emotion', emo.primary, (EMOTION_META[emo.primary] || {}).color || chartPalette().accentDeep));
   if (typeof r.toxicity_score === 'number') chips.push(makeChip('toxicity', pct(r.toxicity_score), sevColor(r.toxicity_score)));
   if (typeof r.hate_speech_score === 'number') chips.push(makeChip('hate', pct(r.hate_speech_score), sevColor(r.hate_speech_score)));
-  if (typeof conf.overall === 'number') chips.push(makeChip('confidence', pct(conf.overall), '#0ea5e9'));
+  if (typeof conf.overall === 'number') chips.push(makeChip('confidence', pct(conf.overall), chartPalette().accentAlt));
   var eg = r.engagement || {};
-  chips.push(makeChip('♥ reactions', formatNumber(eg.total_reactions || eg.reactions || 0), '#64748b'));
-  chips.push(makeChip('💬 comments', formatNumber(eg.comment_count || 0), '#64748b'));
-  chips.push(makeChip('↗ shares', formatNumber(eg.share_count || 0), '#64748b'));
+  chips.push(makeChip('♥ reactions', formatNumber(eg.total_reactions || eg.reactions || 0), chartPalette().secondary));
+  chips.push(makeChip('💬 comments', formatNumber(eg.comment_count || 0), chartPalette().secondary));
+  chips.push(makeChip('↗ shares', formatNumber(eg.share_count || 0), chartPalette().secondary));
   html += '<div class="chip-strip">' + chips.join('') + '</div>';
 
   // ---- Original post content ----
@@ -751,12 +877,14 @@ function renderPostModal(r) {
     + (emoScores ? '<canvas id="emotion-chart" height="150"></canvas>' : '<div class="text-muted">—</div>')
     + '</div>';
 
-  // Confidence column (DOM bars)
+  // Confidence column (DOM bars). One accent for all four, resolved from the
+  // blue ramp so the theme stays single-sourced in styles.css.
+  var confBarColor = chartPalette().accent;
   html += '<div><p class="chart-title">Confidence</p>'
-    + makeBar('Overall',   conf.overall,   '#0ea5e9')
-    + makeBar('Sentiment', conf.sentiment, '#0ea5e9')
-    + makeBar('Language',  conf.language,  '#0ea5e9')
-    + makeBar('Topics',    conf.topics,    '#0ea5e9')
+    + makeBar('Overall',   conf.overall,   confBarColor)
+    + makeBar('Sentiment', conf.sentiment, confBarColor)
+    + makeBar('Language',  conf.language,  confBarColor)
+    + makeBar('Topics',    conf.topics,    confBarColor)
     + '</div>';
 
   // Safety column (DOM bars)
@@ -894,10 +1022,12 @@ function renderPostModal(r) {
     setTimeout(function() {
       var canvas = document.getElementById('emotion-chart');
       if (!canvas) return;
-      var emoColors = { joy:'#22c55e', sadness:'#3b82f6', anger:'#ef4444', fear:'#a855f7',
-                        surprise:'#f59e0b', disgust:'#84cc16', neutral:'#94a3b8' };
+      // Reuse the one emotion palette rather than keeping a second copy that
+      // can drift from it (EMOTION_META, defined below).
+      var emoColors = {};
+      Object.keys(EMOTION_META).forEach(function(k) { emoColors[k] = EMOTION_META[k].color; });
       var data = Object.keys(emoScores).map(function(k){
-        return { label: k, value: Number(emoScores[k]) || 0, color: emoColors[k] || '#6366f1' };
+        return { label: k, value: Number(emoScores[k]) || 0, color: emoColors[k] || chartPalette().accent };
       }).sort(function(a,b){ return b.value - a.value; });
       renderBarChart(canvas, data, 76);
     }, 50);
@@ -1025,13 +1155,42 @@ var commentCtx = {};   // prefix -> { prefix, postId, sentiment, offset, limit }
 
 // Shared emotion taxonomy → colour + emoji (matches the post emotion chart and
 // the backend libs/schemas/output_schema.json taxonomy).
+/** Read a CSS custom property. Canvas cannot consume `var()`, so charts resolve
+ *  the design tokens once at draw time — keeping styles.css the single source of
+ *  truth for colour rather than duplicating hexes here. */
+function cssVar(name, fallback) {
+  try {
+    var v = getComputedStyle(document.documentElement).getPropertyValue(name).trim();
+    return v || fallback;
+  } catch (e) {
+    return fallback;
+  }
+}
+
+/** Chrome colours for charts, resolved from the blue ramp in styles.css. */
+function chartPalette() {
+  return {
+    accent:    cssVar('--accent', '#2563eb'),
+    accentAlt: cssVar('--blue-400', '#60a5fa'),
+    accentDeep:cssVar('--blue-800', '#1e40af'),
+    muted:     cssVar('--text-muted', '#8aa2c0'),
+    border:    cssVar('--border-color', '#d9e6f7'),
+    card:      cssVar('--bg-card', '#ffffff'),
+    text:      cssVar('--text-primary', '#0f2547'),
+    secondary: cssVar('--text-secondary', '#47617f')
+  };
+}
+
+// Emotion is categorical DATA, so these stay mutually distinguishable rather
+// than being harmonised into the blue ramp — see the note atop styles.css.
+// `sadness` uses the cyan end of the ramp so it cannot be read as UI chrome.
 var EMOTION_META = {
-  anger:    { color: '#ef4444', emoji: '😠' },
-  sadness:  { color: '#3b82f6', emoji: '😢' },
-  joy:      { color: '#22c55e', emoji: '😊' },
-  fear:     { color: '#a855f7', emoji: '😨' },
-  disgust:  { color: '#84cc16', emoji: '🤢' },
-  surprise: { color: '#f59e0b', emoji: '😮' },
+  anger:    { color: '#dc2626', emoji: '😠' },
+  sadness:  { color: '#0891b2', emoji: '😢' },
+  joy:      { color: '#059669', emoji: '😊' },
+  fear:     { color: '#7c3aed', emoji: '😨' },
+  disgust:  { color: '#65a30d', emoji: '🤢' },
+  surprise: { color: '#d97706', emoji: '😮' },
   neutral:  { color: '#94a3b8', emoji: '😐' }
 };
 
@@ -1068,6 +1227,91 @@ function renderEmotionChart(canvas, emotionBreakdown) {
  * Every id is scoped by `prefix` so the modal and any number of expanded rows
  * can coexist. Static parts render from the cached result `r`; the analytics /
  * per-comment list are filled by mountCommentInsights's fetch. */
+/** Per-entity stance rollup from the watchlist (stance_targets.md).
+ *
+ * Rendered as its own block, deliberately apart from the sentiment donut: the
+ * two answer different questions ("is this comment angry?" vs "who is it angry
+ * at?") and conflating them destroys the only distinction the feature exists to
+ * make. The `polarity` badge shows the operator's declared stance, because that
+ * is an editorial choice and should be visible rather than implicit.
+ */
+/** How the per-comment emotion labels were produced.
+ *
+ * Emotion is the free emoji+lexicon heuristic at Stage 1 for EVERY comment, even
+ * in real mode where a transformer emotion head is loaded and used for the post.
+ * Stage 2 upgrades only the comments it re-labels. That was true and documented
+ * in a docstring, and invisible in the UI.
+ */
+function emotionMixNote(ca) {
+  var comments = (ca && ca.comments) || [];
+  if (!comments.length) return 'every comment';
+  var llm = comments.filter(function(c) { return c.emotion_method === 'llm'; }).length;
+  if (!llm) return 'every comment · keyword heuristic';
+  if (llm === comments.length) return 'every comment · LLM';
+  return 'every comment · ' + llm + ' of ' + comments.length + ' via LLM, rest heuristic';
+}
+
+function targetStanceHtml(targets) {
+  if (!targets) return '';
+  var ids = Object.keys(targets);
+  if (!ids.length) return '';
+
+  // Most-mentioned first — that is the ordering an analyst wants.
+  ids.sort(function(a, b) { return (targets[b].mentions || 0) - (targets[a].mentions || 0); });
+
+  var rows = ids.map(function(id) {
+    var t = targets[id] || {};
+    var mentions = t.mentions || 0;
+    var opp = t.opposing || 0, sup = t.supportive || 0, neu = t.neutral || 0;
+    var w = function(n) { return mentions ? Math.round(n / mentions * 100) : 0; };
+
+    var polarityTag = '';
+    if (t.polarity === 'favored') {
+      polarityTag = '<span class="tag tag-sm tag-positive" title="declared FAVORED in the watchlist — an editorial choice, not a measurement">favored</span>';
+    } else if (t.polarity === 'opposed') {
+      polarityTag = '<span class="tag tag-sm tag-negative" title="declared OPPOSED in the watchlist — an editorial choice, not a measurement">opposed</span>';
+    } else {
+      polarityTag = '<span class="tag tag-sm" title="tracked without a declared polarity — stance is reported, no framing imposed">tracked</span>';
+    }
+
+    var methodTag = t.method === 'llm'
+      ? '<span class="tag tag-sm" title="context-aware LLM verdict">llm</span>'
+      : '<span class="tag tag-sm tag-warning" title="deterministic clause-and-cue fallback, not a model">heuristic</span>';
+
+    var aliases = t.aliases_matched || {};
+    var aliasNote = Object.keys(aliases).length
+      ? '<div class="text-muted" style="font-size:.68rem;margin-top:2px">matched as: '
+        + escHtml(Object.keys(aliases).map(function(a) { return a + ' ×' + aliases[a]; }).join(', '))
+        + '</div>'
+      : '';
+
+    return '<div class="target-stance-row">'
+      + '<div class="target-stance-head">'
+      + '<span class="target-stance-name">' + escHtml(t.display || id) + '</span>'
+      + polarityTag + ' ' + methodTag
+      + '<span class="text-muted" style="margin-left:auto">' + mentions + ' mention'
+      + (mentions === 1 ? '' : 's') + '</span>'
+      + '</div>'
+      + '<div class="split-bar target-stance-bar">'
+      + '<span class="split-opposing" style="width:' + w(opp) + '%" title="opposing: ' + opp + '"></span>'
+      + '<span class="split-supportive" style="width:' + w(sup) + '%" title="supportive: ' + sup + '"></span>'
+      + '<span class="split-neutral" style="width:' + w(neu) + '%" title="neutral: ' + neu + '"></span>'
+      + '</div>'
+      + '<div class="text-muted" style="font-size:.7rem">'
+      + opp + ' opposing · ' + sup + ' supportive · ' + neu + ' neutral</div>'
+      + aliasNote
+      + '</div>';
+  }).join('');
+
+  return '<div class="modal-section target-stance-block">'
+    + '<div class="modal-section-title">Stance toward watched entities '
+    + '<span class="text-muted" style="font-weight:400;font-size:.72rem">'
+    + '— separate from comment sentiment above; the watchlist is a stated bias model'
+    + '</span></div>'
+    + rows
+    + '</div>';
+}
+
 function commentInsightsHtml(prefix, r) {
   var ca = (r && r.comment_analysis) || {};
   var coverage = ca.coverage_label || '—';
@@ -1109,10 +1353,18 @@ function commentInsightsHtml(prefix, r) {
     + '</div></div>'
     + '</div>'
     + '<div>'
-    + '<p class="chart-title">Emotion mix <span class="text-muted">(every comment)</span></p>'
+    + '<p class="chart-title">Emotion mix <span class="text-muted">('
+    + emotionMixNote(ca) + ')</span></p>'
     + '<canvas id="cs-emotion-' + prefix + '" height="120"></canvas>'
     + '</div>'
     + '</div>';
+
+  // ---- Target stance (watchlist) ----
+  // The novelty item. A SEPARATE measurement from the sentiment donut above: a
+  // comment can be positive in tone while opposing a listed entity, so these are
+  // never merged. Absent entirely when no watchlist is configured or nothing
+  // was mentioned. See stance_targets.md.
+  html += targetStanceHtml(ca.target_stances);
 
   if (ca.themes && ca.themes.length > 0) {
     html += '<p class="chart-title" style="margin-top:12px">Top Themes</p>'
@@ -1363,7 +1615,7 @@ function sevColor(v) {
 }
 
 function makeChip(label, value, color) {
-  return '<span class="chip"><span class="chip-dot" style="background:' + (color || '#64748b') + '"></span>'
+  return '<span class="chip"><span class="chip-dot" style="background:' + (color || chartPalette().secondary) + '"></span>'
     + '<span class="chip-label">' + escHtml(label) + '</span>'
     + '<span class="chip-val">' + escHtml(String(value)) + '</span></span>';
 }
@@ -1373,7 +1625,7 @@ function makeBar(label, frac, color) {
   var p = Math.max(0, Math.min(100, Math.round(frac * 100)));
   return '<div class="dbar">'
     + '<span class="dbar-label">' + escHtml(label) + '</span>'
-    + '<span class="dbar-track"><span class="dbar-fill" style="width:' + p + '%;background:' + (color || '#6366f1') + '"></span></span>'
+    + '<span class="dbar-track"><span class="dbar-fill" style="width:' + p + '%;background:' + (color || chartPalette().accent) + '"></span></span>'
     + '<span class="dbar-val">' + p + '%</span>'
   + '</div>';
 }
@@ -1394,9 +1646,9 @@ function renderHistogram(canvas, buckets) {
   var gap = 3;
   var bw = (width - gap * (n - 1)) / n;
   var css = getComputedStyle(document.documentElement);
-  var neg = css.getPropertyValue('--color-negative').trim() || '#ef4444';
+  var neg = css.getPropertyValue('--color-negative').trim() || '#dc2626';
   var neu = css.getPropertyValue('--color-neutral').trim() || '#94a3b8';
-  var pos = css.getPropertyValue('--color-positive').trim() || '#22c55e';
+  var pos = css.getPropertyValue('--color-positive').trim() || '#059669';
   for (var i = 0; i < n; i++) {
     var h = (buckets[i] / maxV) * (height - padB - padT);
     var x = i * (bw + gap);
@@ -1457,8 +1709,11 @@ function renderBarChart(canvas, data, labelWidth) {
   ctx.scale(dpr, dpr);
 
   var isDark = window.matchMedia && window.matchMedia('(prefers-color-scheme: dark)').matches;
-  var textColor = isDark ? '#94a3b8' : '#64748b';
-  var trackColor = isDark ? '#1e293b' : '#e2e8f0';
+  // Resolved from the tokens, so the charts follow the theme (including dark
+  // mode) without a second copy of the palette living in JS.
+  var pal = chartPalette();
+  var textColor = pal.muted;
+  var trackColor = pal.border;
 
   ctx.clearRect(0, 0, width, height);
 
@@ -1479,7 +1734,7 @@ function renderBarChart(canvas, data, labelWidth) {
     roundRect(ctx, trackX, y, trackW, barH, 4);
     ctx.fill();
 
-    ctx.fillStyle = d.color || '#6366f1';
+    ctx.fillStyle = d.color || chartPalette().accent;
     roundRect(ctx, trackX, y, fillW, barH, 4);
     ctx.fill();
 
@@ -1496,13 +1751,13 @@ function renderBarChart(canvas, data, labelWidth) {
 function renderReactionChart(canvas, reactionBreakdown) {
   var REACTION_ORDER = ['LIKE','LOVE','HAHA','WOW','SAD','ANGRY','CARE'];
   var REACTION_COLORS = {
-    LIKE:  '#3b82f6',
-    LOVE:  '#ec4899',
-    HAHA:  '#f59e0b',
-    WOW:   '#8b5cf6',
-    SAD:   '#60a5fa',
-    ANGRY: '#ef4444',
-    CARE:  '#f97316'
+    LIKE:  cssVar('--color-like',  '#1d4ed8'),
+    LOVE:  cssVar('--color-love',  '#db2777'),
+    HAHA:  cssVar('--color-haha',  '#d97706'),
+    WOW:   cssVar('--color-wow',   '#7c3aed'),
+    SAD:   cssVar('--color-sad',   '#0891b2'),
+    ANGRY: cssVar('--color-angry', '#dc2626'),
+    CARE:  cssVar('--color-care',  '#ea580c')
   };
 
   var data = [];
@@ -1515,7 +1770,8 @@ function renderReactionChart(canvas, reactionBreakdown) {
   // Also add any unknown keys
   Object.keys(reactionBreakdown).forEach(function(key) {
     if (REACTION_ORDER.indexOf(key) === -1) {
-      data.push({ label: key, value: reactionBreakdown[key], color: '#94a3b8' });
+      // Unknown reaction type — neutral grey rather than inventing a colour.
+      data.push({ label: key, value: reactionBreakdown[key], color: cssVar('--color-neutral', '#94a3b8') });
     }
   });
 
@@ -1546,9 +1802,9 @@ function renderSentimentPie(canvas, sentimentBreakdown) {
   if (total === 0) return;
 
   var COLORS = [
-    { label: 'Positive', value: positive, color: '#22c55e' },
-    { label: 'Negative', value: negative, color: '#ef4444' },
-    { label: 'Neutral',  value: neutral,  color: '#94a3b8' }
+    { label: 'Positive', value: positive, color: cssVar('--color-positive', '#059669') },
+    { label: 'Negative', value: negative, color: cssVar('--color-negative', '#dc2626') },
+    { label: 'Neutral',  value: neutral,  color: cssVar('--color-neutral',  '#94a3b8') }
   ].filter(function(d) { return d.value > 0; });
 
   var cx = size / 2;
@@ -1574,11 +1830,11 @@ function renderSentimentPie(canvas, sentimentBreakdown) {
   ctx.beginPath();
   ctx.arc(cx, cy, innerR, 0, 2 * Math.PI);
   var isDark = window.matchMedia && window.matchMedia('(prefers-color-scheme: dark)').matches;
-  ctx.fillStyle = isDark ? '#1e293b' : '#ffffff';
+  ctx.fillStyle = chartPalette().card;
   ctx.fill();
 
   // Center text
-  ctx.fillStyle = isDark ? '#f1f5f9' : '#0f172a';
+  ctx.fillStyle = chartPalette().text;
   ctx.font = 'bold 14px -apple-system, BlinkMacSystemFont, sans-serif';
   ctx.textAlign = 'center';
   ctx.textBaseline = 'middle';
@@ -1699,12 +1955,13 @@ function renderJobsTable(jobs) {
 }
 
 /** Open an SSE stream for a job and invoke onEvent for each progress message. */
-function startJobStream(jobId, onEvent) {
+async function startJobStream(jobId, onEvent) {
   if (!jobId || typeof EventSource === 'undefined') return null;
   stopJobStream(jobId);
 
+  // Single-use ticket rather than the session credential — see sseQuery().
   var url = API_BASE + '/v1/analysis/' + encodeURIComponent(jobId)
-    + '/stream?api_key=' + sseCredential();
+    + '/stream' + (await sseQuery());
 
   var es;
   try {
@@ -1741,6 +1998,11 @@ function stopJobStream(jobId) {
     try { sseStreams[jobId].close(); } catch (e) { /* noop */ }
     delete sseStreams[jobId];
   }
+}
+
+/** Close every per-job stream — used when the session dies. */
+function stopAllJobStreams() {
+  Object.keys(sseStreams).forEach(stopJobStream);
 }
 
 function updateJobInCache(jobId, payload) {
@@ -2089,6 +2351,19 @@ async function search(query, semantic) {
       + (semantic ? ' • semantic search' : ' • keyword search')
       + (campaign ? ' • campaign ' + escHtml(campaign) : '')
       + '</p>';
+
+    // A stub vector is a hash of the text, so kNN over stub rows returns
+    // ARBITRARY neighbours — with scores that look exactly as plausible as real
+    // ones. Say so rather than letting the ranking imply meaning it lacks.
+    var stubHits = results.filter(function(r) { return r.embedding_is_stub; }).length;
+    if (semantic && stubHits) {
+      html += '<div class="alert alert-warning" style="margin-bottom:12px">'
+        + '<strong>' + stubHits + ' of ' + results.length + ' result(s) ranked on stub embeddings.</strong> '
+        + 'These vectors are deterministic hashes of the text, not semantic — the ordering '
+        + 'is arbitrary even though the scores look plausible. Load a real embedding model, '
+        + 'or set <code>EMBEDDING_ALLOW_STUB=false</code> to refuse writing them.'
+        + '</div>';
+    }
 
     results.forEach(function(r) {
       // SearchResult wraps the full analysis under .result
@@ -2679,12 +2954,12 @@ function setPipelineLiveStatus(state) {
   el.className = 'tag tag-sm ' + m[1];
 }
 
-function connectPipelineLive() {
+async function connectPipelineLive() {
   if (pipelineES || pipelinePollTimer) return;  // already streaming
   setPipelineLiveStatus('connecting');
 
   if (typeof EventSource !== 'undefined') {
-    var url = API_BASE + '/v1/pipeline/stream?api_key=' + sseCredential();
+    var url = API_BASE + '/v1/pipeline/stream' + (await sseQuery());
     try {
       pipelineES = new EventSource(url);
     } catch (e) {
@@ -3673,13 +3948,13 @@ async function runTrace() {
   }
 }
 
-function openTraceStream(jobId) {
+async function openTraceStream(jobId) {
   if (typeof EventSource === 'undefined') {
     setTraceStatus('failed', 'no EventSource');
     return;
   }
   var url = API_BASE + '/v1/analysis/' + encodeURIComponent(jobId)
-    + '/stream?api_key=' + sseCredential();
+    + '/stream' + (await sseQuery());
 
   try {
     traceES = new EventSource(url);
@@ -3784,6 +4059,61 @@ function renderTraceMeta(resp) {
 }
 
 /** Pretty-print one detail value for the layer cards. */
+/** "N of M labels came from a model or LLM" — the one-line provenance summary.
+ *
+ * A sentiment chart that cannot say what produced its numbers is the §4 failure
+ * in miniature. Most comment labels are heuristic in the default configuration.
+ */
+function provenanceSummary(ca) {
+  var prov = (ca && ca.provenance) || {};
+  if (!prov.total) return '<span class="trace-null">—</span>';
+  var cls = prov.inferred_share >= 0.5 ? 'trace-str' : 'trace-warn';
+  return '<span class="' + cls + '">' + Math.round((prov.inferred_share || 0) * 100)
+       + '% model/LLM</span> <span class="text-muted">(' + prov.inferred + ' of '
+       + prov.total + '; ' + prov.heuristic + ' heuristic)</span>';
+}
+
+/** Vision status — only `ok` licenses a claim about image sentiment.
+ *
+ * A failed fetch used to be indistinguishable from a genuine neutral verdict.
+ */
+function visionSummary(imageAnalysis) {
+  if (!imageAnalysis) return '<span class="trace-null">no image</span>';
+  var st = imageAnalysis.vision_status;
+  if (st === 'ok') {
+    return '<span class="trace-str">ok</span> <span class="text-muted">'
+         + escHtml(String(imageAnalysis.vision_model || '')) + ' · '
+         + (imageAnalysis.analyzed_images || 0) + ' of '
+         + (imageAnalysis.image_count || 0) + ' image(s) analysed</span>';
+  }
+  return '<span class="trace-warn">' + escHtml(String(st || 'unknown'))
+       + '</span> <span class="text-muted">no image verdict — not a neutral one</span>';
+}
+
+/** Which real-mode components fell back to a heuristic.
+ *
+ * `nlp_engine: "models"` says which path was INTENDED. This says what ran. A
+ * non-empty list means no latency or accuracy figure from the run is quotable.
+ */
+function degradedSummary(proc) {
+  proc = proc || {};
+  // ABSENT is not the same as EMPTY. While the assembler was dropping this key
+  // the row rendered a confident "none" on every run — a false reassurance,
+  // which is worse than rendering nothing. Distinguish the three states.
+  if (!('degraded_components' in proc)) {
+    return '<span class="trace-null">not reported — this result predates the field</span>';
+  }
+  var d = proc.degraded_components || [];
+  if (!d.length) {
+    return proc.stub_mode
+      ? '<span class="text-muted">n/a — stub mode (a chosen configuration, not a degradation)</span>'
+      : '<span class="trace-str">none</span>';
+  }
+  return '<span class="trace-warn">' + escHtml(d.join(', ')) + '</span>'
+       + '<div class="text-muted" style="font-size:.7rem">fell back to heuristics — '
+       + 'no accuracy or latency figure from this run is quotable</div>';
+}
+
 function traceValue(key, v) {
   if (v === null || v === undefined) return '<span class="trace-null">null</span>';
   if (typeof v === 'boolean') {
@@ -3901,6 +4231,9 @@ async function loadTraceResult() {
       + '<dt>grounding</dt><dd>' + traceValue('a', r.post_summary_grounding) + '</dd>'
       + '<dt>confidence</dt><dd>' + traceValue('o', (conf && typeof conf === 'object') ? conf : { overall: conf }) + '</dd>'
       + '<dt>comments</dt><dd>' + traceValue('n', ca.analyzed) + ' analyzed, coverage ' + traceValue('n', ca.coverage) + '</dd>'
+      + '<dt>label mix</dt><dd>' + provenanceSummary(ca) + '</dd>'
+      + '<dt>vision</dt><dd>' + visionSummary(r.image_analysis) + '</dd>'
+      + '<dt>degraded</dt><dd>' + degradedSummary(proc) + '</dd>'
       + '<dt>processing</dt><dd>' + traceValue('o', proc) + '</dd>'
       + '</dl>';
 
@@ -4026,11 +4359,11 @@ function setLogStreamStatus(state) {
 }
 
 /** Open (or reopen) the server log tail. */
-function connectLogStream() {
+async function connectLogStream() {
   if (logES || typeof EventSource === 'undefined') return;
   setLogStreamStatus('connecting');
 
-  var qs = '?api_key=' + sseCredential() + '&backfill=120';
+  var qs = await sseQuery('backfill=120');
   if (logFilters.level) qs += '&min_level=' + encodeURIComponent(logFilters.level);
 
   try {
@@ -4263,13 +4596,36 @@ function initLogsTab() {
    ============================================================ */
 document.addEventListener('DOMContentLoaded', init);
 
+/** Ask the server who we are, so "no token" and "expired token" look different.
+ *
+ * Without this the dashboard could only discover an expired session by making a
+ * request that happened to 401 — and until then it showed a logged-in header
+ * while every call failed. §6.6 defect 4.
+ */
+async function verifySession() {
+  if (!authToken && !apiKey) {
+    updateAuthStatus(false);
+    return;
+  }
+  try {
+    var me = await apiCall('/v1/auth/me');
+    updateAuthStatus(true);
+    if (me && me.sub) console.info('session:', me.sub, '· tenant:', me.tenant_id || 'default');
+  } catch (err) {
+    // apiCall already cleared the token and tore down streams on a 401.
+    console.warn('session verification failed:', err.message);
+  }
+}
+
 function init() {
   // Status bar API base display
   var apiBaseEl = document.getElementById('status-api-base');
   if (apiBaseEl) apiBaseEl.textContent = API_BASE;
 
   updateApiStatus('connecting');
+  // Optimistic, then corrected by verifySession() below.
   updateAuthStatus(!!(authToken || apiKey));
+  verifySession();
 
   // Set up nav tab click handlers
   document.querySelectorAll('.nav-tab').forEach(function(btn) {

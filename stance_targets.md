@@ -1,9 +1,24 @@
 # Watchlist-Driven Target Stance
 
-**Status: SPECIFIED, NOT BUILT.** Nothing described here exists in the repository
-yet. This document is the design, the decisions that have to be made before
-coding, and the validation plan — written first precisely because one of those
-decisions (§2) shapes the output schema and is hard to change afterwards.
+**Status: BUILT (5 August 2026). Validation and the watchlist contents are not.**
+
+| Part | State |
+| ---- | ----- |
+| `libs/stance_targets.py` — loader + alias matcher | **done**, 36 tests |
+| `libs/stance_scoring.py` — deterministic scorer + aggregation | **done** |
+| Stage-1 matching on every comment of every post | **done** |
+| Stage-2 LLM target stance, inside the existing stance call | **done** — adds **no** LLM calls |
+| Output: per-comment `target_stances` + per-post rollup, own field | **done**, in the schema and the API |
+| `config/stance_targets.yml` | **placeholder only** — one example entity, `neutral:` bucket, no real politics |
+| §2's bias framing | **decided** — see below; the `neutral:` bucket is the default |
+| §7's ~150-comment validation | **not done** — this is what makes the novelty claim measurable |
+
+Two things remain, and neither is code: fill in the watchlist (an editorial
+choice, §2) and run the validation (§7).
+
+This document was written before the implementation, deliberately — §2's decision
+shapes the output schema and is hard to change afterwards. It has been updated to
+match what was built.
 
 This is the project's **novelty item**. Everything else in the system is sound
 engineering over established methods; this is the one piece that does something
@@ -19,11 +34,12 @@ the literature has not covered well for this language setting. It is scoped for 
 that talk *against* the listed entities scores negative and talk *for* them
 scores positive.
 
-**What exists today:** nothing like it. Sentiment is document-level, and the
-Stage-2 stance prompt judges stance *toward the post*
+**What existed before this:** nothing like it. Sentiment was document-level, and
+the Stage-2 stance prompt judged stance *toward the post*
 ([prompts.py](services/workers/stage2_llm/prompts.py)) — never toward a named
-entity. The system can tell you a comment is angry. It cannot tell you **who it
-is angry at**, which for political monitoring is the entire question.
+entity. The system could tell you a comment was angry. It could not tell you
+**who it was angry at**, which for political monitoring is the entire question.
+That is what this adds.
 
 **Be precise about the novelty claim, because it will be probed:**
 
@@ -40,14 +56,13 @@ capstone.
 
 ---
 
-## 2. Decide this before writing any code
+## 2. The bias framing — decided, and built into the schema
 
 > **A file that declares "support for X is positive" encodes a political stance
 > into the labels.** On a corpus of Bangladeshi political content this is not a
 > footnote — it is the first thing a sharp examiner will ask about.
 
-The position to take, and to build into the schema rather than bolt on
-afterwards:
+The position taken, and now enforced by the schema rather than by convention:
 
 1. **Name it a _stated bias model_, not a measurement.** It is entirely
    legitimate for a monitoring product to encode "our client is X, tell us who is
@@ -77,8 +92,14 @@ visible and auditable rather than baked invisibly into one number."*
 
 ## 3. The config file
 
-`config/stance_targets.yml`. `pyyaml 6.0.3` is already in the venv — no new
-dependency.
+`config/stance_targets.yml` — **shipped, with a placeholder entity only.**
+`pyyaml 6.0.3` was already in the venv, so no new dependency was added. The real
+file is an editorial artefact; what ships is the mechanism plus one example under
+`neutral:`, so the repository states no politics of its own.
+
+Absent file = feature off, and the pipeline behaves exactly as before. A
+*malformed* file fails loudly at load — a target with no aliases could never
+match, and a silently-disabled watchlist would be §5.1's failure all over again.
 
 ```yaml
 # STATED BIAS MODEL — see stance_targets.md §2.
@@ -321,13 +342,27 @@ result on its own.
 
 ---
 
-## 10. Effort
+## 10. Effort — and what it actually cost
 
-~1 day for config + matcher + prompt path + deterministic fallback + tests, plus
-roughly half a day for the ~150-comment validation. The §2 decisions should be
-settled **before** any of it, because they determine the output schema.
+Estimated ~1 day for config + matcher + prompt path + deterministic fallback +
+tests. That was about right; the matcher took most of it, and the two bugs worth
+recording were both found by tests rather than by reading:
 
-Not on the critical path but worth sequencing after: the real-mode smoke test
-(`MODEL_STUB_MODE=false` has never been run end to end) and
-[PROJECT_ASSESSMENT.md](PROJECT_ASSESSMENT.md) §5.6, the one remaining §5 finding
-that is still claimed in the pitch.
+1. **Overlapping aliases double-counted.** `"alpha party"` and `"alpha"` both fire
+   on the same words, so every cue in the surrounding clause was counted twice.
+   Fixed by collapsing overlapping matches per target, keeping the longest.
+2. **A flat character window does not work on short comments.** With a ±60-char
+   window, *"B is the best but A is corrupt"* scored both entities identically,
+   because the window spanned the whole comment. Replaced with **clause
+   segmentation** — cues attach to the mention in their own clause — which is
+   also the version that is explainable in a defense.
+
+Both are the kind of thing that would have passed a manual smoke test and been
+wrong on the corpus.
+
+**Still outstanding:** §7's ~150-comment validation (half a day), and filling in
+`config/stance_targets.yml`. Neither is code.
+
+Related sequencing, now resolved: the real-mode smoke test found and fixed two
+defects of its own ([PROJECT_ASSESSMENT.md](PROJECT_ASSESSMENT.md) §9.10), and
+§5.6's tenant enforcement is implemented — what remains there is provisioning.

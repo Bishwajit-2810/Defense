@@ -268,6 +268,15 @@ pools, data-layer scale-out, hybrid local+groq burst, continuous fine-tuning).
       tenant policy enforced (**still open** — see PROJECT_ASSESSMENT §5.6).
 - [ ] Comment labels carry honest provenance (`method`, `provenance`); coverage
       clamped to 1.0 with `coverage_anomaly` for upstream mismatches.
+- [ ] Auth: a JWT-shaped credential is verified as a token on **every** transport;
+      `tenant_id` comes from `api_keys`/verified claims, never a token body; the
+      tenant-policy check fails **closed**; streams use `/v1/auth/sse-ticket`.
+- [ ] Real-mode runs report `processing.degraded_components`, and it is **empty**
+      before any latency or accuracy number is recorded.
+- [ ] Semantic-search results carry `embedding_is_stub`, and no demo of semantic
+      search runs on stub vectors without saying so.
+- [ ] If the watchlist is configured: `target_stances` is a **separate field**
+      from `sentiment`, and the file is described as a stated bias model.
 - [ ] Dashboard is plain HTML/CSS/JS; backend is FastAPI.
 - [ ] Eval gates green on the per-language gold set ([evaluation.md](evaluation.md)).
 - [ ] (Phase 2) Agents corpus-tier only; MCP servers internal + read-mostly;

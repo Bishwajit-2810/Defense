@@ -26,14 +26,27 @@ _REPO_ROOT = os.path.abspath(os.path.join(os.path.dirname(__file__), "..", "..")
 if _REPO_ROOT not in sys.path:
     sys.path.insert(0, _REPO_ROOT)
 
+from libs.auth import hash_api_key, redeem_sse_ticket  # noqa: E402
 from libs.common.config import (  # noqa: E402
     JWT_ALGORITHM,
+    app_env,
     get_jwt_secret,
     jwt_secret_fingerprint,
     jwt_secret_is_default,
     require_jwt_secret,
 )
 from libs.ratelimit import check_rate_limit  # noqa: E402
+
+# MVP escape hatch: accept any non-empty API key, as the system did before
+# `api_keys` existed. Defaults to ON only in a dev environment, so a production
+# deployment that forgets to provision keys fails closed instead of open.
+_ALLOW_UNKNOWN_API_KEYS = (
+    os.getenv(
+        "ALLOW_UNKNOWN_API_KEYS",
+        "true" if app_env() in ("dev", "development", "local", "test", "ci") else "false",
+    ).lower()
+    == "true"
+)
 
 log = structlog.get_logger(__name__)
 
@@ -185,6 +198,65 @@ def _principal_from_claims(payload: dict) -> dict:
 
 _bearer_scheme = HTTPBearer(auto_error=False)
 
+#: Flipped false the first time the api_keys lookup fails, so a missing table
+#: costs one warning rather than one per request. Reset by a process restart.
+_API_KEY_TABLE_USABLE = True
+
+
+async def _principal_from_api_key(db: AsyncSession, raw_key: str) -> dict | None:
+    """Look up an API key by hash. The tenant comes from the ROW, not the client.
+
+    Returns None when the key is unknown — the caller decides whether that is a
+    401 or, in dev, a fall-through to the permissive MVP behaviour.
+    """
+    global _API_KEY_TABLE_USABLE
+    if not _API_KEY_TABLE_USABLE:
+        # A previous lookup failed hard (no table on a fresh checkout, most
+        # likely). Do not re-query and re-log on every single request — that was
+        # one warning per authenticated call, which buries real problems.
+        return None
+
+    key_hash = hash_api_key(raw_key)
+    try:
+        row = (
+            await db.execute(
+                text(
+                    "SELECT tenant_id, role, label FROM api_keys "
+                    "WHERE key_hash = :h AND active = TRUE"
+                ),
+                {"h": key_hash},
+            )
+        ).first()
+    except Exception as exc:
+        # No table yet, or the DB is down. Log ONCE and let the caller apply its
+        # own policy rather than 500-ing every request.
+        _API_KEY_TABLE_USABLE = False
+        log.warning(
+            "api_key_lookup_failed_disabling_lookup",
+            error=str(exc),
+            detail=(
+                "api_keys is unreadable — falling back to the ALLOW_UNKNOWN_API_KEYS "
+                "policy for the rest of this process. Run deploy/init-db.sql to "
+                "create the table, then restart."
+            ),
+        )
+        return None
+    if row is None:
+        return None
+    try:
+        await db.execute(
+            text("UPDATE api_keys SET last_used = NOW() WHERE key_hash = :h"),
+            {"h": key_hash},
+        )
+    except Exception:
+        pass  # last_used is telemetry, not authorization
+    return {
+        "sub": f"api_key:{row[2] or 'unnamed'}",
+        "auth_method": "api_key",
+        "tenant_id": row[0],
+        "role": row[1] or "user",
+    }
+
 
 async def get_current_user(
     credentials: HTTPAuthorizationCredentials | None = Security(_bearer_scheme),
@@ -192,6 +264,9 @@ async def get_current_user(
     api_key_query: str | None = Query(
         None, alias="api_key", include_in_schema=False
     ),
+    sse_ticket: str | None = Query(None, alias="ticket", include_in_schema=False),
+    db: AsyncSession = Depends(get_db),
+    redis: aioredis.Redis = Depends(get_redis),
 ) -> dict:
     """Authenticate via Bearer JWT, X-API-Key header, or ``?api_key=`` query param.
 
@@ -217,6 +292,18 @@ async def get_current_user(
     Raises:
         HTTPException 401 if no credential is present or valid.
     """
+    # --- SSE ticket (preferred for EventSource) ---
+    # Single-use and ~60s, so a URL that leaks into a proxy log or browser
+    # history is worthless. Checked first because it is the narrowest credential.
+    if sse_ticket:
+        principal = await redeem_sse_ticket(redis, sse_ticket.strip())
+        if principal is None:
+            raise HTTPException(
+                status_code=status.HTTP_401_UNAUTHORIZED,
+                detail="Invalid or already-used stream ticket",
+            )
+        return principal
+
     # --- Bearer JWT path ---
     if credentials is not None:
         return _principal_from_claims(verify_token(credentials.credentials))
@@ -230,9 +317,30 @@ async def get_current_user(
         # API-key path.
         if _looks_like_jwt(effective_key):
             return _principal_from_claims(verify_token(effective_key))
-        # MVP: accept any non-empty key; Phase 2 will look up in DB
-        log.debug("api_key_auth", key_prefix=effective_key[:8] + "…")
-        return {"sub": "api_key_user", "auth_method": "api_key", "api_key": effective_key}
+
+        # Real key storage (§5.6 / P1.1): the tenant comes from the api_keys row,
+        # never from anything the client supplied. This is what makes the
+        # privacy-locked-tenant policy bind to API-key callers at all.
+        principal = await _principal_from_api_key(db, effective_key)
+        if principal is not None:
+            return principal
+
+        # Unknown key. Dev keeps the permissive MVP behaviour so a fresh
+        # checkout still works; anywhere else this is a 401, so a deployment
+        # that forgot to provision keys fails CLOSED.
+        if _ALLOW_UNKNOWN_API_KEYS:
+            log.debug("api_key_auth_unregistered", key_prefix=effective_key[:8] + "…")
+            return {
+                "sub": "api_key_user",
+                "auth_method": "api_key",
+                "tenant_id": "default",
+                "api_key_registered": False,
+            }
+        log.warning("api_key_rejected", key_prefix=effective_key[:8] + "…")
+        raise HTTPException(
+            status_code=status.HTTP_401_UNAUTHORIZED,
+            detail="Unknown API key",
+        )
 
     raise HTTPException(
         status_code=status.HTTP_401_UNAUTHORIZED,
@@ -295,6 +403,9 @@ async def check_llm_backend_policy(
     requested = (options or {}).get("llm_backend")
     if requested != "groq":
         return
+    # `tenant_id` now originates from the api_keys row or from verified,
+    # allowlisted JWT claims — never merged wholesale from a token body, which
+    # used to let a self-signed token name any tenant it liked.
     tenant_id = current_user.get("tenant_id") or "default"
     try:
         row = (
@@ -306,8 +417,20 @@ async def check_llm_backend_policy(
             )
         ).first()
     except Exception as exc:
-        log.warning("tenant_policy_lookup_failed", tenant_id=tenant_id, error=str(exc))
-        return
+        # FAIL CLOSED. This used to `return`, i.e. permit egress to Groq whenever
+        # the policy table was unreachable — so the one failure mode where you
+        # most want the guarantee to hold was exactly where it did not. A
+        # privacy guarantee that evaporates when the database hiccups is not a
+        # guarantee.
+        log.error("tenant_policy_lookup_failed_denying", tenant_id=tenant_id, error=str(exc))
+        raise HTTPException(
+            status_code=status.HTTP_503_SERVICE_UNAVAILABLE,
+            detail=(
+                "Cannot verify the tenant's LLM-backend policy right now, so the "
+                "requested 'groq' backend is refused. Retry, or omit llm_backend "
+                "to use the default local backend."
+            ),
+        ) from exc
     if row and row[0]:
         raise HTTPException(
             status_code=status.HTTP_403_FORBIDDEN,

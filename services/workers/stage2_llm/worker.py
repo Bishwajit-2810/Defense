@@ -29,6 +29,11 @@ if _LIBS_PATH not in sys.path:
 
 from libs import streams  # noqa: E402
 from libs.labels import label_provenance  # noqa: E402
+from libs.stance_scoring import (  # noqa: E402
+    aggregate_target_stances,
+    normalize_llm_target_stances,
+)
+from libs.stance_targets import load_targets  # noqa: E402
 from libs.llm import LLMClient  # noqa: E402
 from libs.progress import publish_stage  # noqa: E402
 
@@ -585,12 +590,35 @@ async def _run_insight(
     return result
 
 
-def _normalize_stance(parsed: Any, n: int) -> list:
-    """Map an LLM response to a list[n] of {"s","e"} dicts (or None per slot).
+# Watchlist for the Stage-2 target-stance upgrade (stance_targets.md). Loaded
+# once per process; an absent file means the feature is simply off.
+_STANCE_TARGETS_PATH = os.environ.get("STANCE_TARGETS_FILE", "config/stance_targets.yml")
+_TARGETS = None
+
+
+def _targets():
+    """The loaded watchlist, cached. Failure is logged, never fatal."""
+    global _TARGETS
+    if _TARGETS is None:
+        try:
+            _TARGETS = load_targets(_STANCE_TARGETS_PATH)
+        except Exception as exc:
+            logger.error("stance_targets_load_failed", path=_STANCE_TARGETS_PATH, error=str(exc))
+            from libs.stance_targets import Targets  # noqa: PLC0415
+            _TARGETS = Targets()
+    return _TARGETS
+
+
+def _normalize_stance(parsed: Any, n: int, valid_target_ids: set[str] | None = None) -> list:
+    """Map an LLM response to a list[n] of {"s","e","t"} dicts (or None per slot).
 
     Each slot carries the stance ("s") and emotion ("e") the LLM returned for
-    that comment number. Either field may be None when the model omits it or
-    returns an out-of-taxonomy value, so the caller keeps the Stage-1 fallback.
+    that comment number, and — when a watchlist is active — "t", the per-entity
+    stances. Any field may be None when the model omits it or returns an
+    out-of-taxonomy value, so the caller keeps the Stage-1 fallback.
+
+    Target ids the model invents are dropped, not passed through: a hallucinated
+    entity in a stance table is worse than a missing one.
     """
     out: list = [None] * n
     labels = parsed.get("labels") if isinstance(parsed, dict) else parsed
@@ -608,10 +636,17 @@ def _normalize_stance(parsed: Any, n: int) -> list:
             continue
         if not (1 <= idx <= n):
             continue
-        out[idx - 1] = {
+        slot = {
             "s": s if s in _STANCE_LABELS else None,
             "e": e if e in _EMOTION_LABELS else None,
         }
+        if valid_target_ids:
+            targets = normalize_llm_target_stances(
+                item.get("t", item.get("target_stances")), valid_target_ids
+            )
+            if targets:
+                slot["t"] = targets
+        out[idx - 1] = slot
     return out
 
 
@@ -667,6 +702,12 @@ async def _run_comment_stance(
         targets[i : i + _STANCE_BATCH] for i in range(0, len(targets), _STANCE_BATCH)
     ]
     total_batches = len(batches)
+
+    # Watchlist for the target-stance upgrade. Only entities a batch actually
+    # mentions go into its prompt — sending the whole list on every batch would
+    # waste tokens and invite the model to invent mentions.
+    watchlist = _targets()
+    watchlist_ids = {t.id for t in watchlist.targets} if watchlist else set()
     semaphore = asyncio.Semaphore(_STANCE_CONCURRENCY)
     lock = asyncio.Lock()
     done = 0
@@ -683,7 +724,22 @@ async def _run_comment_stance(
             await _track_usage(redis, cache_hit=True, lane=LANE_COMMENT, task="comment_stance")
             return cached["labels"]
 
-        messages = build_comment_stance_messages(post_context, batch, _STANCE_MAX_TEXT)
+        # Which watchlist entities this batch mentions, if any. Riding inside the
+        # call that is already being made is what makes target stance free
+        # against the cost model (stance_targets.md §6).
+        batch_targets: list[dict] = []
+        if watchlist:
+            mentioned: set[str] = set()
+            for c in batch:
+                mentioned.update(watchlist.matched_ids(c.get("text") or ""))
+            batch_targets = [
+                {"id": t.id, "display": t.display, "aliases": list(t.aliases)}
+                for t in watchlist.targets if t.id in mentioned
+            ]
+
+        messages = build_comment_stance_messages(
+            post_context, batch, _STANCE_MAX_TEXT, targets=batch_targets or None
+        )
         for attempt in range(_STANCE_BATCH_RETRIES + 1):
             try:
                 resp = await llm.chat(
@@ -691,12 +747,18 @@ async def _run_comment_stance(
                     messages=messages,
                     backend_override=backend_override,
                     response_format={"type": "json_object"},
-                    # ~56 tokens/comment covers {"i":N,"s":"...","e":"..."}.
-                    max_tokens=min(4096, 56 * len(batch) + 64),
+                    # ~56 tokens/comment covers {"i":N,"s":"...","e":"..."};
+                    # target stances add roughly another 40 per entity mentioned.
+                    max_tokens=min(
+                        4096,
+                        (56 + 40 * len(batch_targets)) * len(batch) + 64,
+                    ),
                     temperature=0.0,
                 )
                 await _track_usage(redis, resp, lane=LANE_COMMENT, task="comment_stance")
-                results = _normalize_stance(_safe_json_parse(resp["content"], {}), len(batch))
+                results = _normalize_stance(
+                    _safe_json_parse(resp["content"], {}), len(batch), watchlist_ids
+                )
                 await set_cached(redis, backend, stance_model, "comment_stance", content_hash, {"labels": results})
                 return results
             except Exception as exc:
@@ -741,8 +803,24 @@ async def _run_comment_stance(
                 c["method"] = "llm"
                 applied += 1
             if emotion in _EMOTION_LABELS:
-                # Context-aware emotion overwrites the Stage-1 heuristic guess.
+                # Context-aware emotion overwrites the Stage-1 heuristic guess —
+                # and says so, so emotion_breakdown can report its own mix.
                 c["emotion"] = emotion
+                c["emotion_method"] = "llm"
+            # The LLM's target verdicts replace Stage-1's deterministic ones —
+            # but only for targets it actually judged. A target the model stayed
+            # silent on keeps its deterministic verdict rather than vanishing.
+            llm_targets = label.get("t")
+            if llm_targets:
+                existing = {e["target"]: e for e in (c.get("target_stances") or [])}
+                for entry in llm_targets:
+                    # Carry the matched alias forward — the LLM does not report
+                    # it, and it is what makes a miss debuggable.
+                    prior = existing.get(entry["target"])
+                    if prior and prior.get("alias"):
+                        entry["alias"] = prior["alias"]
+                    existing[entry["target"]] = entry
+                c["target_stances"] = list(existing.values())
             # else: keep the Stage-1 standalone values as a fallback
 
         async with lock:
@@ -791,6 +869,11 @@ async def _run_comment_stance(
     # the provenance summary here or the chart reports Stage-1's mix for a set of
     # labels Stage 2 has since changed.
     ca["provenance"] = label_provenance(mb)
+    # Recompute the per-target rollup too: Stage 2 replaced a subset of the
+    # deterministic verdicts, so Stage-1's aggregate now describes labels that
+    # have since changed.
+    if watchlist:
+        ca["target_stances"] = aggregate_target_stances(comments, watchlist)
     return labeled
 
 

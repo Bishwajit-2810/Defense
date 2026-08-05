@@ -562,6 +562,44 @@ and cost than the router threshold does ([PROJECT_ASSESSMENT.md](PROJECT_ASSESSM
 > ~100% of non-emoji comments carry an LLM label; at `60`/`40` it is ~29%, and
 > `comment_analysis.provenance.inferred_share` will show it.
 
+### Auth & tenancy
+
+| Variable | Purpose | Required? | Example / default |
+| --- | --- | --- | --- |
+| `APP_ENV` | Environment name. Outside `dev`/`test`/`ci` the API refuses a placeholder `JWT_SECRET`, rejects unknown API keys, and refuses unverified logins — i.e. it fails **closed**. | default `dev` | `dev` |
+| `JWT_EXPIRE_HOURS` | Token lifetime. Shortened from 24 to 1 now that `/v1/auth/refresh` exists. | default `1` | `1` |
+| `ALLOW_UNKNOWN_API_KEYS` | Accept any non-empty API key (the old MVP behaviour). Defaults ON only for a dev `APP_ENV`. | default: on in dev | `false` |
+| `ALLOW_ANY_LOGIN` | Issue a token without verifying credentials when no `users` rows exist. Defaults ON only for a dev `APP_ENV`, and logs loudly every time it fires. | default: on in dev | `false` |
+| `SSE_TICKET_TTL` | Lifetime of a single-use `EventSource` ticket, in seconds. | default `60` | `60` |
+
+> **To leave dev behaviour behind**, seed the tables and set `APP_ENV`:
+>
+> ```sql
+> -- api_keys stores only the SHA-256 hash; see libs.auth.generate_api_key()
+> INSERT INTO api_keys (key_hash, tenant_id, label) VALUES ('<sha256>', 'acme', 'dashboard');
+> -- users stores pbkdf2_sha256$…; see libs.auth.hash_password()
+> INSERT INTO users (username, password_hash, tenant_id) VALUES ('alice', '<hash>', 'acme');
+> ```
+>
+> `tenant_id` then comes from those rows rather than from anything a client sends,
+> which is what makes the privacy-locked-tenant policy enforceable.
+
+### Target stance (watchlist)
+
+| Variable | Purpose | Required? | Example / default |
+| --- | --- | --- | --- |
+| `STANCE_TARGETS_FILE` | Watchlist path. **Absent file = feature off**, and the pipeline behaves exactly as before. A malformed file fails loudly at load. | default `config/stance_targets.yml` | — |
+
+See [stance_targets.md](stance_targets.md). The shipped file contains one
+placeholder entity under `neutral:` — its contents are an editorial choice, and
+the watchlist is a **stated bias model**, not a measurement.
+
+### Embeddings & semantic search
+
+| Variable | Purpose | Required? | Example / default |
+| --- | --- | --- | --- |
+| `EMBEDDING_ALLOW_STUB` | Permit persisting the deterministic hash-seeded stub vector. **Set `false` before demoing semantic search or cluster reports** — kNN over stub rows returns arbitrary neighbours with scores that look exactly as plausible as real ones. Rows are marked `embedding_is_stub` either way. | default `true` | `false` |
+
 ### Token budgets & truncation
 
 | Variable | Purpose | Required? | Example / default |

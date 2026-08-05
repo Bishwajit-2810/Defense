@@ -709,6 +709,7 @@ async def get_post_comments(
         "sentiment_breakdown": ca.get("sentiment_breakdown", {}),
         "sentiment_breakdown_substantive": ca.get("sentiment_breakdown_substantive", {}),
         "reaction_only": ca.get("reaction_only", 0),
+        "target_stances": ca.get("target_stances", {}),
         "emotion_breakdown": ca.get("emotion_breakdown", {}),
         "method_breakdown": ca.get("method_breakdown", {}),
         # Recomputed from the stored breakdown rather than trusting a persisted
@@ -782,6 +783,7 @@ def _row_to_result(row: Any) -> AnalysisResultResponse:
         post_summary_source=r.get("post_summary_source"),
         post_summary_grounding=r.get("post_summary_grounding"),
         post_summary_truncated=r.get("post_summary_truncated"),
+        language_method=r.get("language_method"),
         overall_sentiment=r.get("overall_sentiment", "neutral"),
         sentiment_score=r.get("sentiment_score", 0.0),
         text_sentiment=r.get("text_sentiment"),

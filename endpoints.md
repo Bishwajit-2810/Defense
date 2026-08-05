@@ -86,6 +86,14 @@ This is the JSON the whole system exists to produce:
     "sentiment_breakdown_substantive": { "positive": 2, "negative": 13, "neutral": 6 },  // written comments only
     "reaction_only": 4,                             // emoji-only reactions — kept as signal, never sent to an LLM
     "method_breakdown": { "llm": 21, "emoji": 4 },  // only the methods that actually ran
+    "target_stances": {                             // NEW — watchlist entities (stance_targets.md)
+      "entity_a": {                                 // absent entirely if nobody mentioned it
+        "display": "Entity A", "polarity": "neutral",
+        "mentions": 12, "supportive": 3, "opposing": 8, "neutral": 1,
+        "method": "llm",
+        "aliases_matched": { "এন্টিটি এ": 9, "entity a": 3 }
+      }
+    },
     "provenance": {                                 // where these labels came from
       "total": 25, "inferred": 21, "heuristic": 4, "inferred_share": 0.84,
       "by_method": { "llm": 21, "emoji": 4 }
@@ -125,6 +133,10 @@ Field-level rules worth knowing when consuming this JSON:
 | `comment_analysis.kind` (per comment) | `substantive` \| `short` \| `emoji`. Emoji-only comments keep a sentiment but never enter an LLM batch. |
 | `image_analysis.vision_status` | `ok` is the only value that licenses a claim about image sentiment; `stub` / `fetch_failed` / `model_unavailable` / `model_failed` are absences, not neutral verdicts. |
 | `processing.role_models` | `{role: resolved model id}` — summarization and classification can run on different models, so a single `llm_model` cannot attribute the summary. |
+| `processing.degraded_components` | Real-mode components that fell back to a heuristic because their model would not load. `nlp_engine` says which path was *intended*; this says what **ran**. **A non-empty list means no latency or accuracy figure from that run is quotable.** |
+| `comment_analysis.target_stances` | Per-watchlist-entity stance rollup. A **separate measurement** from `sentiment_breakdown` — a comment can be positive in tone while opposing a listed entity, so the two must never be summed or merged. Entities nobody mentioned are **absent**, not zero-filled. |
+| `comment_analysis.comments[].emotion_method` | `heuristic` \| `llm`. Comment emotion is the free emoji+lexicon heuristic at Stage 1 **even in real mode**; only comments Stage 2 re-labelled carry a model emotion. |
+| `language_method` | `fasttext` \| `script_heuristic` \| `stub`. fastText is optional; without it the pipeline degrades to script detection rather than failing the post. |
 | `processing.llm_used` | Only routed posts ([router rules](services/workers/router/rules.py)) carry Stage-2 latency/cost. Note this is **not** the whole cost lever any more: comment labelling runs for every post and is 85–96% of LLM calls (PROJECT_ASSESSMENT §6.8). |
 
 ---
@@ -214,15 +226,70 @@ curl -s -H "$KEY" "$API/v1/analysis/latest?limit=200" \
 ```bash
 curl -s $API/v1/health                       # {"status":"ok"} — no auth needed
 curl -s $API/v1/ready                        # checks Postgres + Redis
-curl -s -X POST $API/v1/auth/token -H "Content-Type: application/json" \
-  -d '{"username":"demo","password":"demo"}' # → {"access_token": "<jwt>"}
+
+# Log in. Credentials are verified against the `users` table when rows exist;
+# with none, dev accepts anything and logs a loud warning (ALLOW_ANY_LOGIN).
+TOKEN=$(curl -s -X POST $API/v1/auth/token -H "Content-Type: application/json" \
+  -d '{"username":"demo","password":"demo"}' | python -c 'import sys,json;print(json.load(sys.stdin)["access_token"])')
+
+# Who am I — lets a client tell "no token" from "expired token".
+curl -s -H "Authorization: Bearer $TOKEN" $API/v1/auth/me | python -m json.tool
+# → {"sub":"demo","tenant_id":"default","role":"user","auth_method":"jwt", ...}
+
+# Sliding session: exchange a valid token for a fresh one. `exp` is 1 hour
+# (not 24) precisely because this exists.
+curl -s -X POST -H "Authorization: Bearer $TOKEN" $API/v1/auth/refresh
 ```
+
+#### Streaming: use a ticket, not your session credential
+
+`EventSource` cannot set headers, so a streaming client needs *something* in the
+URL. Putting the session credential there is the wrong something — URLs land in
+proxy logs, browser history and `Referer` headers, and that credential is good
+for an hour. A **ticket** is single-use, ~60 seconds, and stored hashed:
+
+```bash
+TICKET=$(curl -s -X POST -H "Authorization: Bearer $TOKEN" $API/v1/auth/sse-ticket \
+  | python -c 'import sys,json;print(json.load(sys.stdin)["ticket"])')
+curl -Ns "$API/v1/analysis/<job-id>/stream?ticket=$TICKET"
+```
+
+Redeeming deletes the ticket, so a leaked URL is worthless immediately after
+first use. The legacy `?api_key=` parameter still works — but note that **any
+JWT-shaped credential sent that way is now verified as a token**, including its
+signature and expiry. An expired token there is a 401, which is the fix working.
+
+### Authenticating with an API key
+
+Keys live in `api_keys` as SHA-256 hashes, and the **tenant comes from the row** —
+never from anything the client sends. That is what makes the privacy-locked-tenant
+policy bind to API-key callers at all.
+
+```bash
+# Provision one (the raw key is shown once and never stored):
+python - <<'EOF'
+from libs.auth import generate_api_key
+raw, digest = generate_api_key()
+print("give this to the client:", raw)
+print("INSERT INTO api_keys (key_hash, tenant_id, label) VALUES "
+      f"('{digest}', 'acme', 'dashboard');")
+EOF
+```
+
+An **unknown** key is accepted only in dev (`ALLOW_UNKNOWN_API_KEYS`, which
+defaults on for `APP_ENV=dev` and off everywhere else) — so a deployment that
+forgot to provision keys fails **closed** rather than open.
 
 ### Search (keyword & semantic)
 
 ```bash
 curl -s -H "$KEY" "$API/v1/search?q=politics&semantic=false&limit=10" | python -m json.tool
 curl -s -H "$KEY" "$API/v1/search?q=fuel%20price%20anger&semantic=true&limit=10"
+# Each result carries `embedding_is_stub`. When true, the stored vector (or the
+# query's) is a deterministic hash — kNN returns ARBITRARY neighbours with scores
+# that look exactly as plausible as real ones. Do not render that as a semantic
+# match. Set EMBEDDING_ALLOW_STUB=false to refuse the write outright, or load a
+# real embedding model. (PROJECT_ASSESSMENT §5.9)
 # → {"query":"…","semantic":true,"total":N,"results":[{"post_id","score","snippet","result":{<full §1 JSON>}}]}
 ```
 
@@ -362,6 +429,23 @@ curl -s -X POST $API/v1/analysis/run -H "$KEY" -H "Content-Type: application/jso
   -d '{"campaign_id":"<cid>","options":{"llm_backend":"groq"}}'
 # → 403 {"detail":"Tenant 'default' is privacy-locked: llm_backend='groq' is not permitted …"}
 ```
+
+**Two things make this actually enforceable**, and neither was true before:
+
+- `tenant_id` comes from the `api_keys` row (or from allowlisted, verified JWT
+  claims) — **not** merged from a token body, which used to let a self-signed
+  token name any tenant it liked.
+- The check **fails closed**. It used to `return` on any database error, i.e.
+  permit egress to Groq precisely when it could not verify the policy. An
+  unreadable policy table is now a **503**, not a silent allow:
+
+```bash
+# With the policy table unreachable:
+# → 503 {"detail":"Cannot verify the tenant's LLM-backend policy right now, so the
+#         requested 'groq' backend is refused. Retry, or omit llm_backend …"}
+```
+
+A privacy guarantee that evaporates when the database hiccups is not a guarantee.
 
 ---
 

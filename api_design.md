@@ -507,7 +507,10 @@ egresses to Groq.
 
 | Endpoint                           | Purpose                                                                                |
 | ---------------------------------- | -------------------------------------------------------------------------------------- |
-| `POST /v1/auth/token`              | Exchange credentials/API key for a JWT                                                 |
+| `POST /v1/auth/token`              | Verify credentials against the `users` table → JWT (`exp` 1h). `tenant_id`/`role` come from the row, never the request |
+| `POST /v1/auth/refresh`            | Sliding session — exchange a valid token for a fresh one. What makes a 1-hour `exp` practical |
+| `GET /v1/auth/me`                  | The authenticated principal. Lets a client distinguish "no token" from "expired token" |
+| `POST /v1/auth/sse-ticket`         | Single-use, ~60s, hash-stored ticket for `EventSource` — which cannot send headers      |
 | `GET /v1/health` / `GET /v1/ready` | Liveness / readiness probes                                                            |
 | `GET /v1/usage`                    | Per-tenant usage + cost metering (posts, LLM calls, by backend incl. Groq tokens/cost) |
 | `GET /v1/search?q=&semantic=true`  | Semantic/keyword search over analyzed posts (pgvector + ClickHouse)                    |
@@ -521,6 +524,19 @@ egresses to Groq.
 > [architecture.md](architecture.md) §11) are **internal** tool interfaces consumed
 > by the agent orchestrator, not part of this public REST surface. They speak MCP
 > (stdio/HTTP) and enforce the same auth/tenant scoping.
+
+### Authentication, in one paragraph
+
+Three credential types, and **a JWT-shaped credential is verified as a token on
+every transport** — `Authorization`, `X-API-Key`, or the `?api_key=` query
+parameter. Only the header used to be parsed as a token, so an expired or forged
+token authenticated on all four SSE streams. **API keys** are looked up by
+SHA-256 hash in `api_keys`, and `tenant_id` comes from that row rather than from
+anything the client sent — which is what lets the privacy-locked-tenant policy
+bind to API-key callers at all. **SSE tickets** are the preferred streaming
+credential. Claims taken from a token body are allowlisted (`sub`, `tenant_id`,
+`role`, `exp`, `iat`, `scope`) and `auth_method` is set server-side afterwards,
+because the payload used to be spread last and any claim in the token won.
 
 ---
 

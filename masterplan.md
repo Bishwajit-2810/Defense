@@ -1,5 +1,24 @@
 # Master Plan — Social Media "Smart Layer" Microservice
 
+> ## ⚠ Read the implementation status first
+>
+> This is the **consolidated design document**. Several things it describes have
+> since been measured, scoped down, or replaced — and where the two disagree, the
+> measurement wins:
+>
+> - **[PROJECT_ASSESSMENT.md](PROJECT_ASSESSMENT.md)** — every finding, what was
+>   fixed, and what is still open. Read its status header first.
+> - **[FEATURES.md](FEATURES.md)** — every capability marked measured /
+>   unmeasured / unexercised / planned.
+> - **[stance_targets.md](stance_targets.md)** — target-dependent stance, the one
+>   component with a claim to novelty. Not described below; it postdates this doc.
+>
+> The three biggest divergences: the routing rate is **16% measured** (not
+> "single digits"); the image modality is **implemented but unexercised** (no
+> image bytes are reachable, so post sentiment is a text measurement); and cost is
+> **comment-dominated** (85–96% of LLM calls), so the routing gate is no longer
+> the dominant lever.
+
 A single, self-contained master document for the social-media analysis smart
 layer. It consolidates the whole design — overview, architecture, alternatives,
 models, infrastructure, cost, API, worked examples, deployment, and the phased

@@ -196,6 +196,20 @@ block). Full reference in [run.md](run.md).
   in flight). Emoji-only comments (2.8%) are always skipped — no text to read.
 - **Rate limiting** (on by default, 120 req/min per API key on analysis/report/agent
   calls): `RATE_LIMIT_ENABLED=false` to turn off in dev, or `RATE_LIMIT_PER_MIN=…`.
+- **Target stance / watchlist** (off unless configured): edit
+  `config/stance_targets.yml` to list entities and the pipeline reports stance
+  *toward each of them* in a separate `target_stances` field. Costs **no extra LLM
+  calls** — matched entities ride inside the Stage-2 stance call that already
+  runs. Absent file = feature off. See [stance_targets.md](stance_targets.md).
+- **Auth is permissive in dev, closed elsewhere.** With `APP_ENV=dev` (the
+  default) any non-empty API key works and any login succeeds, exactly as before.
+  Set `APP_ENV=production` and the API refuses unknown keys, unverified logins and
+  a placeholder `JWT_SECRET` — so seed `api_keys`/`users` first (see
+  [run.md](run.md) §"Auth & tenancy"). Streams should use
+  `POST /v1/auth/sse-ticket` rather than putting a credential in the URL.
+- **Semantic search is stub-backed in stub mode.** Every result carries
+  `embedding_is_stub`; a stub vector is a hash, so kNN returns arbitrary
+  neighbours. `EMBEDDING_ALLOW_STUB=false` refuses the write instead.
 - **Near-duplicate reuse** (on by default): a post within cosine `NEAR_DUP_THRESHOLD`
   (0.97) of an already-analyzed one reuses that result and skips Stage-1/2.
   `NEAR_DUP_DEDUP=false` to disable. (In stub mode only *identical* captions match.)
@@ -272,7 +286,7 @@ export LLM_BACKEND=local LOCAL_LLM_BASE_URL=http://localhost:11434/v1 LOCAL_LLM_
 # Stage 1 and Stage 2 run on different models; STAGE1_LLM=true puts Stage-1 NLP on the LLM.
 export STAGE1_LLM=true STAGE1_LOCAL_MODEL=gemma3:4b STAGE2_LOCAL_MODEL=qwen2.5:7b
 export LLM_A_LOCAL_MODEL=qwen2.5:7b VLM_LOCAL_MODEL=qwen3-vl:4b
-export MODEL_STUB_MODE=true JWT_SECRET=demo PYTHONPATH=$REPO
+export MODEL_STUB_MODE=true JWT_SECRET=demo APP_ENV=dev PYTHONPATH=$REPO
 ```
 
 **C) Workers + API**

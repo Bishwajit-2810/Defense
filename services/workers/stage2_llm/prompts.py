@@ -103,10 +103,46 @@ Return ONLY JSON of this exact shape, one entry per comment number:
 {{"labels":[{{"i":1,"s":"positive","e":"joy"}},{{"i":2,"s":"negative","e":"anger"}}]}}"""
 
 
+# Appended to the stance prompt only when a batch mentions watchlist targets.
+# It rides inside the call that is already being made, so target stance costs no
+# additional LLM calls (stance_targets.md §6).
+#
+# "t" is deliberately a SEPARATE label from "s": stance toward the POST and
+# stance toward a named ENTITY are different judgements and a comment can differ
+# on them — praising a post that criticises an entity, for instance. Merging them
+# would destroy exactly the distinction the feature exists to make.
+TARGET_STANCE_BLOCK = """
+
+3. "t" = STANCE TOWARD NAMED ENTITIES, when the comment mentions any of them.
+
+Entities to watch (a comment may mention none, one, or several):
+{targets}
+
+For each entity the comment actually refers to, judge whether the commenter is:
+- "supportive": defends, praises, agrees with, or sides with that entity
+- "opposing": criticizes, mocks, insults, blames, or attacks that entity
+- "neutral": mentions it without taking a side
+
+Judge stance toward the ENTITY, not toward the post — they can differ. Omit "t"
+entirely for a comment that mentions no listed entity; do not guess, and never
+name an entity that is not in the list above.
+
+With entities, an entry looks like:
+{{"i":1,"s":"negative","e":"anger","t":[{{"target":"entity_id","stance":"opposing","evidence":"the phrase you judged from"}}]}}"""
+
+
 def build_comment_stance_messages(
-    post: str, batch: list[dict], max_text: int = 200
+    post: str,
+    batch: list[dict],
+    max_text: int = 200,
+    targets: list[dict] | None = None,
 ) -> list[dict]:
-    """Messages for one batch of comments → per-comment stance toward the post."""
+    """Messages for one batch of comments → per-comment stance toward the post.
+
+    When ``targets`` is supplied (``[{"id","display","aliases"}]``), the prompt
+    also asks for stance toward each named entity — reusing this one call rather
+    than issuing a second (stance_targets.md §6).
+    """
     lines = []
     for idx, c in enumerate(batch, 1):
         text = (c.get("text") or "").replace("\n", " ").strip()[:max_text] or "(no text)"
@@ -115,6 +151,16 @@ def build_comment_stance_messages(
         post=(post or "(no post text)")[:800],
         comments="\n".join(lines),
     )
+    if targets:
+        # Aliases go in the prompt too: the model should recognise the entity
+        # under the spellings the corpus actually uses, not only its display name.
+        listed = "\n".join(
+            f'- id "{t["id"]}" = {t.get("display") or t["id"]}'
+            + (f' (also written: {", ".join(t.get("aliases") or [])})'
+               if t.get("aliases") else "")
+            for t in targets
+        )
+        content += TARGET_STANCE_BLOCK.format(targets=listed)
     return [{"role": "user", "content": content}]
 
 

@@ -26,6 +26,11 @@ CREATE TABLE IF NOT EXISTS analysis_results (
     campaign_id     VARCHAR,
     result          JSONB NOT NULL,
     embedding       vector(768),   -- pgvector: semantic-search vector (was Qdrant)
+    -- TRUE when `embedding` is the deterministic hash-seeded stub rather than a
+    -- semantic vector (PROJECT_ASSESSMENT §5.9). kNN over stub rows returns
+    -- arbitrary neighbours, and the row is otherwise indistinguishable from a
+    -- real one — so search and report paths must be able to disclose it.
+    embedding_is_stub BOOLEAN DEFAULT FALSE,
     schema_version  VARCHAR,
     created_at      TIMESTAMPTZ DEFAULT NOW(),
     updated_at      TIMESTAMPTZ DEFAULT NOW(),
@@ -74,6 +79,42 @@ CREATE TABLE IF NOT EXISTS tenant_policies (
     privacy_locked BOOLEAN DEFAULT FALSE,
     created_at     TIMESTAMPTZ DEFAULT NOW()
 );
+
+-- API keys, stored as SHA-256 hashes (PROJECT_ASSESSMENT §5.6 / P1.1).
+--
+-- Previously ANY non-empty key authenticated and carried no tenant, so
+-- check_llm_backend_policy resolved every API-key caller to tenant "default" —
+-- a tenant with no policy row, i.e. no privacy lock. The privacy-locked-tenant
+-- guarantee, which is the best design decision in the project, was therefore
+-- unenforceable for the entire API-key surface.
+--
+-- The tenant now comes from THIS TABLE, never from a client-supplied token body.
+-- Only the hash is stored: a leaked database does not yield usable credentials.
+CREATE TABLE IF NOT EXISTS api_keys (
+    key_hash   VARCHAR PRIMARY KEY,          -- sha256 hex of the raw key
+    tenant_id  VARCHAR NOT NULL,
+    label      VARCHAR,                      -- human note: who holds this key
+    role       VARCHAR DEFAULT 'user',
+    active     BOOLEAN DEFAULT TRUE,
+    created_at TIMESTAMPTZ DEFAULT NOW(),
+    last_used  TIMESTAMPTZ
+);
+
+CREATE INDEX IF NOT EXISTS idx_api_keys_tenant ON api_keys (tenant_id);
+
+-- Users, for the login endpoint that currently authenticates anybody
+-- (PROJECT_ASSESSMENT §6.6 defect 3). Passwords are salted-hash only.
+CREATE TABLE IF NOT EXISTS users (
+    username      VARCHAR PRIMARY KEY,
+    password_hash VARCHAR NOT NULL,          -- pbkdf2_sha256$iterations$salt$hash
+    tenant_id     VARCHAR NOT NULL DEFAULT 'default',
+    role          VARCHAR DEFAULT 'user',
+    active        BOOLEAN DEFAULT TRUE,
+    created_at    TIMESTAMPTZ DEFAULT NOW()
+);
+
+-- Backfill for databases created before embedding_is_stub existed.
+ALTER TABLE analysis_results ADD COLUMN IF NOT EXISTS embedding_is_stub BOOLEAN DEFAULT FALSE;
 
 -- Indexes
 CREATE INDEX IF NOT EXISTS idx_posts_campaign_id      ON posts (campaign_id);

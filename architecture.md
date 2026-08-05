@@ -23,7 +23,8 @@ that sits on top of that platform and:
   vs. an LLM — this routing is the "smart" part), and
 - returns one **structured JSON** object per thread (summary in the post's own
   language, sentiment, topics, intents, entities, brand mentions, comment
-  analysis — see §6) that downstream projects consume directly.
+  analysis, and optional per-entity **target stance** — see §6) that downstream
+  projects consume directly.
 
 The upstream stores a coarse post `sentiment` and `viralPotential`; we keep those
 as a **baseline** and **recompute** our own richer sentiment. **Comment sentiment is
@@ -570,12 +571,40 @@ Rationale for each data-layer pick and the alternatives rejected is in
 - **Transport:** TLS everywhere (ingress + mTLS between services if a mesh is
   used).
 - **AuthN/Z:** API keys for machine clients, JWT + RBAC for users; per-tenant
-  isolation and quotas in the Auth service.
+  isolation and quotas in the Auth service. **As implemented (5 Aug 2026):**
+  - a JWT-shaped credential is verified as a token on **every** transport —
+    header, `X-API-Key`, or the `?api_key=` query parameter `EventSource` needs.
+    Only the header used to be parsed as one, so an expired or forged token
+    authenticated on all four SSE streams;
+  - API keys are stored as SHA-256 hashes in `api_keys`, and **`tenant_id` comes
+    from that row**, never from a client-supplied token body. This is what makes
+    the privacy-locked-tenant pin below enforceable for API-key callers;
+  - claims taken from a token are allowlisted and `auth_method` is set
+    server-side — the payload used to be spread last, so any claim in the token
+    won, including the one distinguishing a human session from a service call;
+  - `POST /v1/auth/sse-ticket` issues a single-use ~60-second ticket, so a
+    streaming URL in a proxy log is harmless;
+  - `JWT_SECRET` is read per call from one place by both issuer and verifier, so
+    it can be rotated without a restart and cannot drift; a placeholder value is
+    refused outside dev.
+- **Fail closed, not open.** The tenant-policy check used to `return` on any
+  database error — permitting egress to Groq precisely when it could not verify
+  the policy. It now returns 503. A privacy guarantee that evaporates when the
+  database hiccups is not a guarantee, and this is the failure mode where you
+  most want it to hold.
 - **Rate limiting & quotas** at the gateway (per key/tenant) to prevent abuse and
   runaway cost.
 - **Input hardening:** size caps, schema validation, content sanitization;
   treat post text as untrusted (prompt-injection-aware when building LLM prompts
-  — never let post content alter system instructions).
+  — never let post content alter system instructions). **As implemented:** MCP
+  tool results — which carry Facebook comment text verbatim — are wrapped in
+  `<tool_data trust="untrusted">` delimiters with forged-delimiter
+  neutralisation, and the agent system prompt states that content inside them is
+  data and must never be obeyed. On a corpus of political content with
+  adversarial participants this is a realistic threat, not a hypothetical. **No
+  general solution to prompt injection exists**; these are the standard
+  mitigations, and they should be described as risk reduction rather than a fix
+  ([FEATURES.md](FEATURES.md) §13).
 - **PII handling:** social content contains personal data. Encrypt at rest
   (DB + object storage), encrypt in transit, support per-tenant data retention /
   deletion (GDPR-style), and access logging.
@@ -592,6 +621,46 @@ Rationale for each data-layer pick and the alternatives rejected is in
   internet-facing. NetworkPolicies in K8s.
 - **Audit logging** of admin and data-access actions.
 - **Supply chain:** pinned dependencies, image scanning, signed images.
+
+---
+
+## 9a. Watchlist-driven target stance
+
+An optional layer that answers a question document-level sentiment cannot:
+**not "is this comment angry?" but "who is it angry at?"** Full design in
+[stance_targets.md](stance_targets.md).
+
+```text
+config/stance_targets.yml                (operator-supplied, versioned)
+        │
+        ▼
+libs/stance_targets.py    alias matcher — Bangla script · romanized Banglish · English
+        │
+        ├──▶ STAGE 1: match every comment of EVERY post (pure string work, free)
+        │            + deterministic clause-based scorer  → target_stances
+        │
+        └──▶ STAGE 2: matched entities are injected into the comment-stance
+                     prompt THAT ALREADY RUNS  → target_stances (method="llm")
+                     ⇒ zero additional LLM calls
+        │
+        ▼
+per-post rollup: {entity: {mentions, supportive, opposing, neutral, method}}
+```
+
+Three design decisions worth knowing:
+
+1. **Aliases are the feature.** This corpus writes the same entity in three
+   scripts. A watchlist matching one spelling silently matches almost nothing —
+   the §5.1 failure mode again — so a target that matches *zero* comments across
+   a run is logged as the alias-coverage bug it almost certainly is.
+2. **Target stance lives in its own output field**, never merged into
+   `sentiment`. A comment can be positive in tone while opposing a listed entity;
+   conflating the two destroys the only distinction the feature exists to make.
+3. **It is a stated bias model, not a measurement.** A file declaring "support
+   for X is positive" encodes a political stance into the labels — legitimate for
+   a monitoring product, indefensible presented as neutral analysis. The file is
+   versioned with a named owner per entry, and the `neutral:` bucket exists for
+   when monitoring rather than advocacy is wanted.
 
 ---
 

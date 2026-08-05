@@ -35,6 +35,16 @@ class ModelRegistry:
         self._llm_client: Any = None
         # Cached model handles (None until first use)
         self._lang_detector: Any = None
+        # One flag per component: a 10k-post batch must not emit 10k copies
+        # of the same import error.
+        self._lang_detector_failed = False
+        self._failed_sentiment_models: set[str] = set()
+        self._emotion_failed = False
+        self._toxicity_failed = False
+        self._clip_failed = False
+        self._ner_failed = False
+        self._keyword_failed = False
+        self._embedding_failed = False
         # Sentiment models are cached per HF checkpoint name so the language-aware
         # router (libs/sentiment_models.py) can switch between them at runtime.
         self._sentiment_models: dict[str, tuple[Any, Any]] = {}
@@ -83,15 +93,61 @@ class ModelRegistry:
                 return None
         return self._llm_client
 
+    def degraded_components(self) -> list[str]:
+        """Components that fell back because their model could not be loaded.
+
+        Real mode reports ``engine: "models"`` because MODEL_STUB_MODE is false —
+        but that says which path was *intended*, not which ran. With every
+        optional dependency missing, a run can report `engine: "models"` while
+        producing entirely heuristic output, which is the §5.2 failure
+        (provenance recording the intended code path rather than the executed
+        one) reappearing one layer over.
+
+        This list is the executed truth. Empty means nothing degraded.
+        """
+        degraded: list[str] = []
+        if self._lang_detector_failed:
+            degraded.append("language")
+        if self._failed_sentiment_models:
+            degraded.append("sentiment")
+        if self._emotion_failed:
+            degraded.append("emotion")
+        if self._toxicity_failed:
+            degraded.append("toxicity")
+        if self._clip_failed:
+            degraded.append("vision")
+        if self._ner_failed:
+            degraded.append("ner")
+        if self._keyword_failed:
+            degraded.append("keywords")
+        if self._embedding_failed:
+            degraded.append("embedding")
+        return degraded
+
     # ------------------------------------------------------------------
     # Language detection
     # ------------------------------------------------------------------
 
     def get_lang_detector(self) -> Any:
-        """Return a fastText language-identification model or None in stub mode."""
+        """Return a fastText language-identification model, or None if unavailable.
+
+        Returns None — it does not raise. This used to re-raise, which made it
+        the ONLY model getter that could kill a post: every sibling
+        (`get_sentiment_model`, `get_emotion_pipeline`, the CLIP pair) returns
+        None and lets the caller degrade. So a single missing optional
+        dependency took down the whole real-mode pipeline at the first post,
+        which is what blocks §9.8 from even starting on a fresh checkout.
+
+        Degrading is safe here because the fallback is genuinely reasonable:
+        language detection for this corpus is script-based (`detect_script` /
+        `is_banglish`), and fastText's contribution is mostly confidence
+        calibration. The caller records that the deterministic detector ran, so
+        the degradation is reported rather than hidden — the standard this
+        codebase is held to elsewhere (§5.2, §5.3).
+        """
         if self._stub_mode:
             return None
-        if self._lang_detector is None:
+        if self._lang_detector is None and not self._lang_detector_failed:
             try:
                 import fasttext  # type: ignore
 
@@ -104,8 +160,15 @@ class ModelRegistry:
                 self._lang_detector = fasttext.load_model(model_path)
                 logger.info("fastText language model loaded from %s", model_path)
             except Exception as exc:
-                logger.error("Failed to load fastText model: %s", exc)
-                raise
+                # Log ONCE, not once per post — a 10k-post batch must not emit
+                # 10k identical errors.
+                self._lang_detector_failed = True
+                logger.error(
+                    "fastText unavailable (%s) — falling back to deterministic "
+                    "script detection for language. Install fasttext and set "
+                    "FASTTEXT_LANG_MODEL to restore model-based detection.",
+                    exc,
+                )
         return self._lang_detector
 
     # ------------------------------------------------------------------
@@ -128,6 +191,10 @@ class ModelRegistry:
             "SENTIMENT_MODEL",
             "cardiffnlp/twitter-xlm-roberta-base-sentiment",
         )
+        # Already known-unloadable: return without re-logging. A 10k-post batch
+        # must not emit 10k copies of the same import error.
+        if name in self._failed_sentiment_models:
+            return None
         cached = self._sentiment_models.get(name)
         if cached is not None:
             return cached
@@ -144,13 +211,21 @@ class ModelRegistry:
             self._sentiment_models[name] = (tokenizer, model)
             logger.info("Sentiment model loaded: %s", name)
         except Exception as exc:
-            logger.error("Failed to load sentiment model %s: %s", name, exc)
-            raise
+            logger.error(
+                "Failed to load sentiment model %s: %s — falling back to the "
+                "deterministic stub for this model. The result reports "
+                "method='stub' so the fallback is visible (\u00a75.3).",
+                name, exc,
+            )
+            self._failed_sentiment_models.add(name)
+            return None
         return self._sentiment_models[name]
 
     def get_emotion_pipeline(self) -> Any:
         """Return a HuggingFace pipeline for emotion detection or None in stub mode."""
         if self._stub_mode:
+            return None
+        if self._emotion_failed:
             return None
         if self._emotion_pipeline is None:
             try:
@@ -167,13 +242,19 @@ class ModelRegistry:
                 )
                 logger.info("Emotion pipeline loaded: %s", model_name)
             except Exception as exc:
-                logger.error("Failed to load emotion pipeline: %s", exc)
-                raise
+                logger.error(
+                    "Failed to load emotion pipeline: %s — emotion falls back "
+                    "to the emoji/lexicon heuristic.", exc,
+                )
+                self._emotion_failed = True
+                return None
         return self._emotion_pipeline
 
     def get_toxicity_pipeline(self) -> Any:
         """Return a HuggingFace pipeline for toxicity detection or None in stub mode."""
         if self._stub_mode:
+            return None
+        if self._toxicity_failed:
             return None
         if self._toxicity_pipeline is None:
             try:
@@ -190,8 +271,13 @@ class ModelRegistry:
                 )
                 logger.info("Toxicity pipeline loaded: %s", model_name)
             except Exception as exc:
-                logger.error("Failed to load toxicity pipeline: %s", exc)
-                raise
+                logger.error(
+                    "Failed to load toxicity pipeline: %s — toxicity falls back "
+                    "to the keyword heuristic, which never exceeded 0.2 on this "
+                    "corpus (§4.6). Router rule 5 will effectively be inert.", exc,
+                )
+                self._toxicity_failed = True
+                return None
         return self._toxicity_pipeline
 
     # ------------------------------------------------------------------
@@ -202,6 +288,8 @@ class ModelRegistry:
         """Return a CLIP/SigLIP processor or None in stub mode."""
         if self._stub_mode:
             return None
+        if self._clip_failed:
+            return None
         if self._clip_processor is None:
             self._load_clip()
         return self._clip_processor
@@ -209,6 +297,8 @@ class ModelRegistry:
     def get_clip_model(self) -> Any:
         """Return a CLIP/SigLIP model or None in stub mode."""
         if self._stub_mode:
+            return None
+        if self._clip_failed:
             return None
         if self._clip_model is None:
             self._load_clip()
@@ -230,8 +320,13 @@ class ModelRegistry:
             self._clip_model.eval()
             logger.info("CLIP/SigLIP model loaded: %s", model_name)
         except Exception as exc:
-            logger.error("Failed to load CLIP model: %s", exc)
-            raise
+            logger.error(
+                "Failed to load CLIP model: %s — image sentiment reports "
+                "vision_status=model_unavailable rather than a fake neutral "
+                "(§5.2).", exc,
+            )
+            self._clip_failed = True
+            return None
 
     # ------------------------------------------------------------------
     # NER (GLiNER / spaCy)
@@ -240,6 +335,8 @@ class ModelRegistry:
     def get_ner_model(self) -> Any:
         """Return a NER model instance or None in stub mode."""
         if self._stub_mode:
+            return None
+        if self._ner_failed:
             return None
         if self._ner_model is None:
             try:
@@ -257,8 +354,12 @@ class ModelRegistry:
                     self._ner_model = spacy.load(model_name)
                 logger.info("NER model loaded: %s", model_name)
             except Exception as exc:
-                logger.error("Failed to load NER model: %s", exc)
-                raise
+                logger.error(
+                    "Failed to load NER model: %s — entities fall back to the "
+                    "seed-list heuristic.", exc,
+                )
+                self._ner_failed = True
+                return None
         return self._ner_model
 
     # ------------------------------------------------------------------
@@ -269,6 +370,8 @@ class ModelRegistry:
         """Return a KeyBERT instance or None in stub mode."""
         if self._stub_mode:
             return None
+        if self._keyword_failed:
+            return None
         if self._keyword_model is None:
             try:
                 from keybert import KeyBERT  # type: ignore
@@ -276,8 +379,12 @@ class ModelRegistry:
                 self._keyword_model = KeyBERT()
                 logger.info("KeyBERT model loaded")
             except Exception as exc:
-                logger.error("Failed to load KeyBERT: %s", exc)
-                raise
+                logger.error(
+                    "Failed to load KeyBERT: %s — keywords fall back to the "
+                    "longest-token heuristic.", exc,
+                )
+                self._keyword_failed = True
+                return None
         return self._keyword_model
 
     # ------------------------------------------------------------------
@@ -287,6 +394,8 @@ class ModelRegistry:
     def get_embedding_model(self) -> Any:
         """Return a SentenceTransformer embedding model or None in stub mode."""
         if self._stub_mode:
+            return None
+        if self._embedding_failed:
             return None
         if self._embedding_model is None:
             try:
@@ -302,6 +411,11 @@ class ModelRegistry:
                 self._embedding_model = SentenceTransformer(model_name)
                 logger.info("Embedding model loaded: %s", model_name)
             except Exception as exc:
-                logger.error("Failed to load embedding model: %s", exc)
-                raise
+                logger.error(
+                    "Failed to load embedding model: %s — embeddings fall back "
+                    "to the hash stub, which is NOT semantic. Rows are marked "
+                    "embedding_is_stub so search can disclose it (§5.9).", exc,
+                )
+                self._embedding_failed = True
+                return None
         return self._embedding_model

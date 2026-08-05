@@ -40,21 +40,47 @@ log = logging.getLogger(__name__)
 # Helpers
 # ---------------------------------------------------------------------------
 
-def _resolve_embedding(embedding: list | None, post_id: str) -> list[float]:
-    """Return the semantic-search vector to persist.
+#: Refuse to persist a non-semantic vector unless explicitly allowed.
+#: Default ON (permissive) because offline/CI runs depend on the column being
+#: populated — but set EMBEDDING_ALLOW_STUB=false before demoing semantic search
+#: or cluster reports, and the write fails loudly instead of quietly seeding the
+#: index with noise (PROJECT_ASSESSMENT §5.9).
+_ALLOW_STUB_EMBEDDING = os.environ.get("EMBEDDING_ALLOW_STUB", "true").lower() == "true"
+
+
+class StubEmbeddingRefused(RuntimeError):
+    """Raised when a stub vector would be persisted but stubs are disallowed."""
+
+
+def _resolve_embedding(embedding: list | None, post_id: str) -> tuple[list[float], bool]:
+    """Return ``(vector, is_stub)`` for the semantic-search column.
 
     Uses the Stage-1 embedding when present and of the expected dimension;
     otherwise falls back to the shared deterministic stub (seeded from the
     post_id) so the column is always populated and round-trips still work.
+
+    **The second element is the point.** A stub vector is "deterministic unit
+    vector seeded from the text hash (not semantic)" — kNN over a table of them
+    returns arbitrary neighbours, and nothing downstream could previously tell,
+    because the row looked identical to a real one. The flag travels with the
+    row so search and report paths can say so.
     """
     if embedding and len(embedding) == EMBEDDING_DIM:
-        return [float(v) for v in embedding]
+        # A real Stage-1 vector — unless Stage 1 itself was in stub mode, which
+        # the caller reports separately via processing.stub_mode.
+        return [float(v) for v in embedding], False
     if embedding:
         log.warning(
             "stage1 embedding dim %d != EMBEDDING_DIM %d for post %s — using stub",
             len(embedding), EMBEDDING_DIM, post_id,
         )
-    return stub_embedding(post_id)
+    if not _ALLOW_STUB_EMBEDDING:
+        raise StubEmbeddingRefused(
+            f"post {post_id}: refusing to persist a non-semantic stub embedding "
+            "(EMBEDDING_ALLOW_STUB=false). Load a real embedding model, or "
+            "re-enable stubs knowing that semantic search will return noise."
+        )
+    return stub_embedding(post_id), True
 
 
 def _iso_to_dt(ts: str | None) -> datetime | None:
@@ -119,21 +145,28 @@ async def persist_postgres(result: dict, engine, embedding: list | None = None) 
     campaign_id: str = result["campaign_id"]
     schema_version: str = (result.get("processing") or {}).get("schema_version", "")
     result_json: str = json.dumps(result, ensure_ascii=False)
-    embedding_lit: str = to_pgvector_literal(_resolve_embedding(embedding, post_id))
+    embedding_vec, embedding_is_stub = _resolve_embedding(embedding, post_id)
+    embedding_lit: str = to_pgvector_literal(embedding_vec)
+    if embedding_is_stub:
+        # Not a warning per post (that would be every post in stub mode), but the
+        # row is marked so search and report paths can disclose it.
+        log.debug("persisting stub (non-semantic) embedding for post %s", post_id)
 
     upsert_sql = text(
         """
         INSERT INTO analysis_results
-            (post_id, campaign_id, result, embedding, schema_version, created_at, updated_at)
+            (post_id, campaign_id, result, embedding, embedding_is_stub,
+             schema_version, created_at, updated_at)
         VALUES
             (:post_id, :campaign_id, CAST(:result AS jsonb), CAST(:embedding AS vector),
-             :schema_version, NOW(), NOW())
+             :embedding_is_stub, :schema_version, NOW(), NOW())
         ON CONFLICT (post_id)
         DO UPDATE SET
-            result         = EXCLUDED.result,
-            embedding      = EXCLUDED.embedding,
-            schema_version = EXCLUDED.schema_version,
-            updated_at     = NOW()
+            result            = EXCLUDED.result,
+            embedding         = EXCLUDED.embedding,
+            embedding_is_stub = EXCLUDED.embedding_is_stub,
+            schema_version    = EXCLUDED.schema_version,
+            updated_at        = NOW()
         """
     )
 
@@ -145,6 +178,7 @@ async def persist_postgres(result: dict, engine, embedding: list | None = None) 
                 "campaign_id": campaign_id,
                 "result": result_json,
                 "embedding": embedding_lit,
+                "embedding_is_stub": embedding_is_stub,
                 "schema_version": schema_version,
             },
         )

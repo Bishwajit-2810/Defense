@@ -12,15 +12,18 @@ from __future__ import annotations
 
 import asyncio
 import logging
+import math
 import os
 import re
 from collections import Counter
 from typing import TYPE_CHECKING, Any
 
 from libs.labels import label_provenance
+from libs.stance_scoring import aggregate_target_stances, score_comment_deterministic
+from libs.stance_targets import Targets, load_targets, unmatched_targets
 
 from .llm_analyzer import classify_comments_llm
-from .text_analyzer import analyze_sentiment_engine
+from .text_analyzer import analyze_sentiment_batch, analyze_sentiment_engine
 
 if TYPE_CHECKING:
     from .models import ModelRegistry
@@ -45,6 +48,41 @@ _LLM_COMMENT_BATCH = int(os.getenv("STAGE1_LLM_BATCH", os.getenv("STAGE1_LLM_COM
 _LLM_CONCURRENCY = max(1, int(os.getenv("STAGE1_LLM_CONCURRENCY", "3")))
 #: Retries per batch, so one bad batch does not lose the rest.
 _LLM_BATCH_RETRIES = max(0, int(os.getenv("STAGE1_LLM_BATCH_RETRIES", "1")))
+
+# Watchlist-driven target stance (stance_targets.md). Matching is pure string
+# work, so it runs in Stage 1 on EVERY comment of every post — including
+# bypassed posts, which means mention *volume* is available even where the
+# premium stance pass never runs. Absent config file => feature off, and the
+# pipeline behaves exactly as before.
+_STANCE_TARGETS_PATH = os.getenv("STANCE_TARGETS_FILE", "config/stance_targets.yml")
+_TARGETS_CACHE: Targets | None = None
+
+
+def get_targets() -> Targets:
+    """The loaded watchlist, cached per process. Empty when no file is present."""
+    global _TARGETS_CACHE
+    if _TARGETS_CACHE is None:
+        try:
+            _TARGETS_CACHE = load_targets(_STANCE_TARGETS_PATH)
+            if _TARGETS_CACHE:
+                logger.info(
+                    "stance watchlist loaded: %s targets from %s (version=%s)",
+                    len(_TARGETS_CACHE.targets), _STANCE_TARGETS_PATH,
+                    _TARGETS_CACHE.version,
+                )
+        except Exception as exc:
+            # A malformed watchlist must not take down analysis, but it must be
+            # loud — a silently-disabled watchlist is the §5.1 failure again.
+            logger.error("stance watchlist failed to load from %s: %s",
+                         _STANCE_TARGETS_PATH, exc)
+            _TARGETS_CACHE = Targets()
+    return _TARGETS_CACHE
+
+
+def reset_targets_cache() -> None:
+    """Drop the cached watchlist — for tests and for a config reload."""
+    global _TARGETS_CACHE
+    _TARGETS_CACHE = None
 
 
 # ---------------------------------------------------------------------------
@@ -230,13 +268,25 @@ def _fast_classify(text: str, tokens: list[str]) -> tuple[str, float]:
 
 
 async def classify_comment(
-    text: str, registry: Any, sentiment_override: str | None = None
+    text: str,
+    registry: Any,
+    sentiment_override: str | None = None,
+    _precomputed: tuple | None = None,
 ) -> dict:
     """Classify one comment's sentiment + emotion via the hybrid router.
 
-    Returns {"sentiment", "sentiment_score", "emotion", "method", "keywords"}.
-    The emotion label is always derived from the free emoji+lexicon heuristic
-    here; Stage-2 upgrades the top-N comments' emotion via the LLM later.
+    Returns {"sentiment", "sentiment_score", "emotion", "method", "kind",
+    "keywords", "emotion_method"}.
+
+    **Emotion is the free emoji+lexicon heuristic for every comment**, even in
+    real mode where an emotion pipeline is loaded and used for the *post*
+    (§5.13). That is a deliberate cost decision — running a transformer emotion
+    head over 10k comments per post would dominate Stage 1 — but it was
+    invisible: `emotion_breakdown` looked like model output. `emotion_method`
+    now says which it is, so the chart can disclose it the way
+    `method`/`provenance` do for sentiment. Stage 2 upgrades the emotion of the
+    comments it re-labels, inside the stance call it already makes.
+
     ``sentiment_override`` forces a specific sentiment model on the model path
     (the fast emoji/lexicon path is model-independent).
     """
@@ -256,12 +306,18 @@ async def classify_comment(
             # batch — there is no text in them for an LLM to read.
             "method": "emoji" if kind == KIND_EMOJI else "fast",
             "kind": kind,
+            # Emotion is always the free heuristic at Stage 1 — never a model.
+            "emotion_method": "heuristic",
             "keywords": [],
         }
 
-    label, score, _conf, engine = await analyze_sentiment_engine(
-        text, registry, sentiment_override
-    )
+    if _precomputed is not None:
+        # Already scored in a batched forward pass by analyze_comments (§5.11).
+        label, score, _conf, engine = _precomputed
+    else:
+        label, score, _conf, engine = await analyze_sentiment_engine(
+            text, registry, sentiment_override
+        )
     # Cheap keyword extraction (longest unique tokens) — no model needed.
     uniq: list[str] = []
     seen: set[str] = set()
@@ -279,6 +335,8 @@ async def classify_comment(
         # 8,513 model inferences in runs where zero models were loaded.
         "method": engine,
         "kind": kind,
+        # Sentiment may be a model; emotion is the heuristic either way (§5.13).
+        "emotion_method": "heuristic",
         "keywords": uniq[:5],
     }
 
@@ -320,14 +378,23 @@ def _select_representative(
 # ---------------------------------------------------------------------------
 
 def _extract_themes(analyzed_comments: list[dict]) -> list[str]:
-    """Aggregate keywords across all comments, weight by likes.
+    """Aggregate keywords across all comments, weighted by likes (§5.13).
 
-    The top-5 keywords (by weighted frequency) become the themes.
+    Weighting is **sub-linear** (``1 + log10(1 + likes)``), not raw likes. With
+    raw likes a single 946-like comment outweighed 946 ordinary ones, so
+    "themes" was effectively the keyword list of the most-liked comment wearing
+    the label of a cross-comment aggregate. This corpus is heavily skewed — 64%
+    of comments have zero likes, the mean is 4.0 and the max is 946 — which is
+    exactly the shape where a linear weight collapses to a top-1 selector.
+
+    Log weighting keeps engagement meaningful (a popular comment still counts
+    for more) without letting one comment dictate the answer: 946 likes is worth
+    ~4x an unliked comment, not 946x.
     """
     counter: Counter[str] = Counter()
     for item in analyzed_comments:
-        likes = item.get("likes", 0)
-        weight = max(1, likes)  # every comment contributes at least 1
+        likes = max(0, int(item.get("likes") or 0))
+        weight = 1.0 + math.log10(1 + likes)
         for kw in item.get("keywords", []):
             counter[kw] += weight
 
@@ -528,11 +595,33 @@ async def analyze_comments(
 
     # 1. Baseline pass — every comment gets an instant heuristic/stub label
     #    (full coverage), holding all fields in one record per comment.
+    #
+    # Substantive comments are sentiment-scored in BATCHES (§5.11): one forward
+    # pass per model instead of one per comment. Short/emoji comments never
+    # touch a model, so they are excluded from the batch entirely.
+    kinds = [_comment_kind(c.get("text") or "") for c in comments]
+    substantive_idx = [i for i, k in enumerate(kinds) if k == KIND_SUBSTANTIVE]
+    batched: dict[int, tuple] = {}
+    if substantive_idx:
+        try:
+            scored = await analyze_sentiment_batch(
+                [comments[i].get("text") or "" for i in substantive_idx],
+                registry,
+                sentiment_override,
+            )
+            batched = dict(zip(substantive_idx, scored))
+        except Exception as exc:
+            # Fall back to the per-comment path; slower, same answers.
+            logger.warning("batched comment sentiment failed, falling back: %s", exc)
+
     records: list[dict] = []
     for comment in comments:
         text = comment.get("text") or ""
         try:
-            nlp = await classify_comment(text, registry, sentiment_override)
+            nlp = await classify_comment(
+                text, registry, sentiment_override,
+                _precomputed=batched.get(len(records)),
+            )
         except Exception as exc:
             logger.warning("Comment NLP failed for id=%s: %s", comment.get("id"), exc)
             nlp = {
@@ -543,6 +632,7 @@ async def analyze_comments(
                 # failure as a heuristic hides it inside a legitimate bucket.
                 "method": "failed",
                 "kind": _comment_kind(text),
+                "emotion_method": "heuristic",
                 "keywords": [],
             }
         records.append(
@@ -558,8 +648,36 @@ async def analyze_comments(
                 "keywords": nlp.get("keywords", []),
                 "method": nlp.get("method", "fast"),
                 "kind": nlp.get("kind") or _comment_kind(text),
+                "emotion_method": nlp.get("emotion_method", "heuristic"),
             }
         )
+
+    # 1b. Watchlist matching — free string work, every comment, every post.
+    # The deterministic scorer fills in now; Stage 2 overwrites with LLM verdicts
+    # for routed posts. Target stance lives in its OWN field and is never merged
+    # into `sentiment` — a comment can be positive in tone while opposing a
+    # listed target (stance_targets.md §2).
+    targets = get_targets()
+    if targets:
+        matched_any: set[str] = set()
+        for r in records:
+            matches = targets.match(r["text"])
+            if not matches:
+                continue
+            matched_any.update(m.target_id for m in matches)
+            alias_by_target = {m.target_id: m.alias for m in matches}
+            scored = score_comment_deterministic(r["text"], matches)
+            for entry in scored:
+                entry["alias"] = alias_by_target.get(entry["target"])
+            r["target_stances"] = scored
+        missing = unmatched_targets(targets, matched_any)
+        if missing:
+            # Almost certainly alias coverage, not absence of discussion.
+            logger.info(
+                "stance_targets_unmatched: %s matched nothing in this post — "
+                "check alias coverage before reading it as silence",
+                ", ".join(missing),
+            )
 
     # 2. LLM upgrade pass (STAGE1_LLM=true) — re-label the top-N substantive
     #    comments via the stage1 LLM so they match the LLM engine. No-op otherwise.
@@ -610,6 +728,13 @@ async def analyze_comments(
             "emotion": r["emotion"],
             "method": r["method"],
             "kind": r["kind"],
+            # Emotion is the free heuristic at Stage 1 even in real mode; Stage 2
+            # upgrades only the comments it re-labels (§5.13).
+            "emotion_method": r.get("emotion_method", "heuristic"),
+            # Own field, never folded into `sentiment` — see stance_targets.md §2.
+            # Absent (not empty) when the comment mentions no listed target, so
+            # "nobody discussed X" stays distinguishable from "all neutral on X".
+            **({"target_stances": r["target_stances"]} if r.get("target_stances") else {}),
         }
         for r in records
     ]
@@ -631,6 +756,12 @@ async def analyze_comments(
         # the comment count, so "what produced these labels?" is answerable from
         # the same object that carries the labels.
         "provenance": label_provenance(method_counts),
+        # Per-target rollup — the actual product output (stance_targets.md §4.3).
+        # Absent targets are omitted, not zero-filled.
+        **(
+            {"target_stances": aggregate_target_stances(per_comment, targets)}
+            if targets else {}
+        ),
         "themes": themes,
         "top_keywords": top_keywords,
         "representative_comments": representative,

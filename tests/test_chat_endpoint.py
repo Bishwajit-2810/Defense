@@ -30,6 +30,17 @@ class FakeRedis:
         return self._value
 
 
+class FakeDb:
+    """Answers the tenant-policy query with no row (= tenant is not locked)."""
+
+    async def execute(self, *args, **kwargs):
+        class _Result:
+            def first(self_inner):
+                return None
+
+        return _Result()
+
+
 def _make_client(toggle=None):
     """A TestClient with auth/redis/db/rate-limit dependencies overridden."""
     app = main.app
@@ -38,7 +49,10 @@ def _make_client(toggle=None):
         return FakeRedis(toggle)
 
     async def _db():
-        return object()  # policy check short-circuits before touching it
+        # The tenant-policy check now FAILS CLOSED (§5.6 / P1.1): an unreachable
+        # policy table denies a groq request rather than permitting it, so this
+        # stub has to answer the query. No row => no privacy lock => allowed.
+        return FakeDb()
 
     async def _user():
         return {"sub": "tester", "tenant_id": "default", "auth_method": "test"}

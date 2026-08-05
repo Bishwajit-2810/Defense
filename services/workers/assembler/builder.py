@@ -27,6 +27,23 @@ from schemas.validator import assert_valid_output
 # 1.2: text_sentiment / image_sentiment carry their own {label, score} object
 SCHEMA_VERSION = "1.2"
 
+#: Stage-1 provenance forwarded verbatim into `processing`. These answer "what
+#: actually produced this result?", which is the question every §5 finding in
+#: PROJECT_ASSESSMENT turned out to hinge on. Keep in sync with
+#: services/workers/stage1_nlp/worker._build_result — the test enforces it.
+_STAGE1_PROVENANCE_KEYS: tuple[str, ...] = (
+    "unit",
+    "nlp_engine",             # stub | models | llm
+    "llm_role",
+    "stub_mode",              # MODEL_STUB_MODE — read back by the assembler
+    "degraded_components",    # real-mode components that fell back (§9.10)
+    "vision_used",
+    "vision_produced_signal",
+    "vision_model",
+    "vision_status",
+    "model_versions",
+)
+
 
 def _norm_component_sentiment(value: object) -> dict | None:
     """Normalise a per-component sentiment to ``{"label", "score"}`` or ``None``.
@@ -214,6 +231,22 @@ def build_canonical_result(
     s1_proc: dict = stage1_result.get("processing", {})
     s2_proc: dict = (stage2_result or {}).get("processing", {})
 
+    # This dict used to be a hand-maintained whitelist, and it silently dropped
+    # TEN keys Stage 1 emits — including `stub_mode`, which §5.9 calls "the only
+    # signal that the vector is synthetic", and `nlp_engine`, which says whether
+    # the NLP came from a model at all. Neither reached the canonical result, so
+    # neither reached the API, the dashboard, or any consumer.
+    #
+    # That is the §5.1 failure a fifth time: one component writes a field, the
+    # next reads a different (shorter) set, and the mismatch degrades to a silent
+    # omission rather than an error. `assembler.py` even reads
+    # `result["processing"]["stub_mode"]` back out — a key this function had
+    # removed, so it was always None.
+    #
+    # Stage-1 provenance is now forwarded explicitly. `_STAGE1_PROVENANCE_KEYS`
+    # is asserted against Stage 1's real output by
+    # tests/test_provenance_survives.py, so adding a field there without adding
+    # it here breaks a test instead of vanishing.
     processing: dict = {
         "stage1_ms": s1_proc.get("stage1_ms"),
         "stage2_ms": s2_proc.get("stage2_ms") if stage2_result is not None else None,
@@ -225,6 +258,11 @@ def build_canonical_result(
         "role_models": s2_proc.get("role_models") if stage2_result is not None else None,
         "schema_version": SCHEMA_VERSION,
     }
+    # Forward every Stage-1 provenance field that exists, rather than naming a
+    # subset here and losing the rest.
+    for key in _STAGE1_PROVENANCE_KEYS:
+        if key in s1_proc:
+            processing[key] = s1_proc[key]
 
     # ------------------------------------------------------------------
     # Timestamps — from normalized_post
@@ -249,6 +287,10 @@ def build_canonical_result(
         "post_summary_source": post_summary_source,
         "post_summary_grounding": post_summary_grounding,
         "post_summary_truncated": post_summary_truncated,
+        # Which detector produced `language` — fastText or the deterministic
+        # script heuristic. Without it, `language_confidence` cannot be read in
+        # light of what produced it.
+        "language_method": stage1_result.get("language_method"),
         "overall_sentiment": overall_sentiment,
         "sentiment_score": sentiment_score,
         "text_sentiment": text_sentiment,

@@ -3,53 +3,104 @@
    Plain CSS, no framework, no build step.
    ============================================================ */
 
-/* ---- CSS Variables (light mode defaults) ---- */
+/* ---- Design tokens ---------------------------------------------------------
+   A WHITE + BLUE architecture. One blue ramp drives every piece of UI chrome —
+   header, nav, accents, focus rings, links, selected states — so the interface
+   reads as a single system rather than a collection of tinted boxes.
+
+   Two rules held throughout:
+
+   1. **Chrome is blue; data is not.** Sentiment, emotion and reaction colours
+      encode MEANING, so they stay categorically distinct rather than being
+      harmonised into the blue family. A negative sentiment that shaded toward
+      the accent would be pretty and unreadable. The one exception is
+      `--color-neutral`, which is a blue-grey precisely because "neutral" should
+      recede.
+   2. **No blue data colour collides with chrome.** `--color-like` and
+      `--color-sad` are legitimately blue (Facebook reactions), so they are
+      pushed to the ends of the ramp — cyan-leaning and deep — where they cannot
+      be mistaken for a button or a link.
+   --------------------------------------------------------------------------- */
 :root {
-  --color-positive: #22c55e;
-  --color-negative: #ef4444;
-  --color-neutral:  #94a3b8;
-  --color-mixed:    #f59e0b;
+  /* Blue ramp — the single source of every chrome colour below. */
+  --blue-50:  #eff6ff;
+  --blue-100: #dbeafe;
+  --blue-200: #bfdbfe;
+  --blue-300: #93c5fd;
+  --blue-400: #60a5fa;
+  --blue-500: #3b82f6;
+  --blue-600: #2563eb;
+  --blue-700: #1d4ed8;
+  --blue-800: #1e40af;
+  --blue-900: #1e3a8a;
+  --blue-950: #172554;
 
-  --color-like:   #3b82f6;
-  --color-love:   #ec4899;
-  --color-haha:   #f59e0b;
-  --color-wow:    #8b5cf6;
-  --color-sad:    #60a5fa;
-  --color-angry:  #ef4444;
-  --color-care:   #f97316;
+  /* ---- Data colours (meaning-bearing; deliberately NOT blue-harmonised) ---- */
+  --color-positive: #059669;   /* emerald 600 — readable on white, distinct from blue */
+  --color-negative: #dc2626;   /* red 600 */
+  --color-neutral:  #94a3b8;   /* blue-grey: neutral should recede */
+  --color-mixed:    #d97706;   /* amber 600 */
 
-  --bg-page:      #f8fafc;
+  /* Facebook reaction types — categorical, must stay mutually distinguishable. */
+  --color-like:   #1d4ed8;   /* deep blue: distinct from the 500-level accent */
+  --color-love:   #db2777;
+  --color-haha:   #d97706;
+  --color-wow:    #7c3aed;
+  --color-sad:    #0891b2;   /* cyan: the other blue, kept far from --accent */
+  --color-angry:  #dc2626;
+  --color-care:   #ea580c;
+
+  /* ---- Surfaces ---- */
+  --bg-page:      #f5f9ff;   /* white with the faintest blue cast */
   --bg-card:      #ffffff;
-  --bg-header:    #1e293b;
-  --bg-nav:       #0f172a;
-  --bg-table-row: #f1f5f9;
+  --bg-header:    var(--blue-800);
+  --bg-nav:       var(--blue-900);
+  --bg-table-row: #f0f6ff;
   --bg-modal:     #ffffff;
-  --bg-overlay:   rgba(0, 0, 0, 0.5);
+  --bg-overlay:   rgba(15, 37, 71, 0.55);   /* blue-tinted scrim, not neutral black */
   --bg-input:     #ffffff;
-  --bg-status-bar:#1e293b;
+  --bg-status-bar: var(--blue-900);
+  --bg-subtle:    var(--blue-50);
 
-  --text-primary:   #0f172a;
-  --text-secondary: #64748b;
-  --text-inverse:   #f8fafc;
-  --text-muted:     #94a3b8;
+  /* ---- Text ---- */
+  --text-primary:   #0f2547;   /* near-black with a blue cast */
+  --text-secondary: #47617f;
+  --text-inverse:   #f5f9ff;
+  /* The header, nav and status bar are blue in BOTH themes, so their text
+     must be light in both. --text-inverse cannot serve here: in dark mode it
+     is a dark navy (for use ON a light accent), which rendered the header
+     text invisible at 1.00:1 contrast. */
+  --text-on-chrome: #f5f9ff;
+  --text-muted:     #5f7796;   /* 4.6:1 on white — AA. The obvious lighter
+                                  blue-grey only reaches 2.6:1. */
+  --text-on-accent: #ffffff;
 
-  --border-color:   #e2e8f0;
+  /* ---- Lines & shape ---- */
+  --border-color:   #d9e6f7;   /* blue-tinted, so borders belong to the palette */
+  --border-strong:  #b9d0ec;
   --border-radius:  8px;
   --border-radius-lg: 12px;
 
-  --shadow-sm:  0 1px 2px 0 rgba(0,0,0,0.05);
-  --shadow-md:  0 4px 6px -1px rgba(0,0,0,0.1), 0 2px 4px -2px rgba(0,0,0,0.1);
-  --shadow-lg:  0 10px 15px -3px rgba(0,0,0,0.1), 0 4px 6px -4px rgba(0,0,0,0.1);
-  --shadow-xl:  0 20px 25px -5px rgba(0,0,0,0.15), 0 8px 10px -6px rgba(0,0,0,0.1);
+  /* Shadows carry a blue tint rather than neutral grey — on a white-blue page a
+     grey shadow reads as dirt. */
+  --shadow-sm:  0 1px 2px 0 rgba(23, 37, 84, 0.06);
+  --shadow-md:  0 4px 8px -2px rgba(23, 37, 84, 0.10), 0 2px 4px -2px rgba(23, 37, 84, 0.06);
+  --shadow-lg:  0 12px 20px -6px rgba(23, 37, 84, 0.14), 0 4px 8px -4px rgba(23, 37, 84, 0.08);
+  --shadow-xl:  0 24px 32px -8px rgba(23, 37, 84, 0.18), 0 8px 12px -6px rgba(23, 37, 84, 0.10);
+  --focus-ring: 0 0 0 3px rgba(37, 99, 235, 0.28);
 
-  --accent:         #6366f1;
-  --accent-hover:   #4f46e5;
-  --accent-light:   #eef2ff;
+  /* ---- Interaction ---- */
+  --accent:         var(--blue-600);
+  --accent-hover:   var(--blue-700);
+  --accent-active:  var(--blue-800);
+  --accent-light:   var(--blue-50);
+  --accent-border:  var(--blue-200);
 
-  --danger:         #ef4444;
-  --danger-hover:   #dc2626;
-  --success:        #22c55e;
-  --warning:        #f59e0b;
+  --danger:         #dc2626;
+  --danger-hover:   #b91c1c;
+  --success:        #059669;
+  --warning:        #d97706;
+  --info:           var(--blue-600);
 
   --font-sans: -apple-system, BlinkMacSystemFont, 'Segoe UI', Roboto, 'Helvetica Neue', Arial, sans-serif;
   --font-mono: 'SFMono-Regular', Consolas, 'Liberation Mono', Menlo, monospace;
@@ -57,30 +108,66 @@
   --transition: 150ms ease;
 }
 
-/* ---- Dark mode ---- */
+/* ---- Dark mode — a deep NAVY, not neutral slate --------------------------
+   The light theme's identity is blue, so the dark theme keeps it: surfaces are
+   desaturated navy and the accent lifts to blue-400 so it stays legible against
+   them (blue-600 on navy fails contrast). Data colours brighten for the same
+   reason — a 600-level green disappears on a dark surface.
+   ------------------------------------------------------------------------- */
 @media (prefers-color-scheme: dark) {
   :root {
-    --bg-page:      #0f172a;
-    --bg-card:      #1e293b;
-    --bg-header:    #0f172a;
-    --bg-nav:       #0f172a;
-    --bg-table-row: #162032;
-    --bg-modal:     #1e293b;
-    --bg-overlay:   rgba(0, 0, 0, 0.7);
-    --bg-input:     #0f172a;
-    --bg-status-bar:#0f172a;
+    --bg-page:      #0a1628;
+    --bg-card:      #0f2039;
+    --bg-header:    #0a1628;
+    --bg-nav:       #071020;
+    --bg-table-row: #14294a;
+    --bg-modal:     #0f2039;
+    --bg-overlay:   rgba(3, 8, 20, 0.75);
+    --bg-input:     #0a1628;
+    --bg-status-bar: #071020;
+    --bg-subtle:    #14294a;
 
-    --text-primary:   #f1f5f9;
-    --text-secondary: #94a3b8;
-    --text-inverse:   #0f172a;
-    --text-muted:     #64748b;
+    --text-primary:   #e8f0fc;
+    --text-secondary: #9db4d4;
+    --text-inverse:   #0a1628;
+    --text-on-chrome: #e8f0fc;   /* stays light — the chrome is dark here too */
+    --text-muted:     #6b85a8;
+    --text-on-accent: #06122a;
 
-    --border-color:   #334155;
-    --accent-light:   #1e1b4b;
-    --shadow-sm:  0 1px 2px 0 rgba(0,0,0,0.3);
-    --shadow-md:  0 4px 6px -1px rgba(0,0,0,0.4);
-    --shadow-lg:  0 10px 15px -3px rgba(0,0,0,0.4);
-    --shadow-xl:  0 20px 25px -5px rgba(0,0,0,0.5);
+    --border-color:   #1e3a5f;
+    --border-strong:  #2c5183;
+
+    --accent:         var(--blue-400);
+    --accent-hover:   var(--blue-300);
+    --accent-active:  var(--blue-200);
+    --accent-light:   #14294a;
+    --accent-border:  #2c5183;
+
+    /* Brightened so they hold up on navy. */
+    --color-positive: #34d399;
+    --color-negative: #f87171;
+    --color-neutral:  #7d95b5;
+    --color-mixed:    #fbbf24;
+
+    --color-like:   #60a5fa;
+    --color-love:   #f472b6;
+    --color-haha:   #fbbf24;
+    --color-wow:    #a78bfa;
+    --color-sad:    #22d3ee;
+    --color-angry:  #f87171;
+    --color-care:   #fb923c;
+
+    --danger:         #f87171;
+    --danger-hover:   #fca5a5;
+    --success:        #34d399;
+    --warning:        #fbbf24;
+    --info:           var(--blue-400);
+
+    --shadow-sm:  0 1px 2px 0 rgba(0, 0, 0, 0.35);
+    --shadow-md:  0 4px 8px -2px rgba(0, 0, 0, 0.45);
+    --shadow-lg:  0 12px 20px -6px rgba(0, 0, 0, 0.5);
+    --shadow-xl:  0 24px 32px -8px rgba(0, 0, 0, 0.55);
+    --focus-ring: 0 0 0 3px rgba(96, 165, 250, 0.35);
   }
 }
 
@@ -107,8 +194,10 @@ body {
 }
 
 .header {
-  background: var(--bg-header);
-  color: var(--text-inverse);
+  /* A short gradient down the ramp gives the header depth without a second
+     colour entering the palette. */
+  background: linear-gradient(180deg, var(--blue-700) 0%, var(--bg-header) 100%);
+  color: var(--text-on-chrome);
   padding: 0 24px;
   height: 60px;
   display: flex;
@@ -135,12 +224,12 @@ body {
   font-size: 1.1rem;
   font-weight: 700;
   letter-spacing: -0.01em;
-  color: #f8fafc;
+  color: var(--text-on-chrome);
 }
 
 .header-subtitle {
   font-size: 0.75rem;
-  color: #94a3b8;
+  color: var(--blue-300);
   margin-top: 1px;
 }
 
@@ -154,7 +243,7 @@ body {
 
 .auth-status {
   font-size: 0.75rem;
-  color: #94a3b8;
+  color: var(--blue-300);
 }
 
 .auth-status.connected { color: var(--color-positive); }
@@ -169,7 +258,7 @@ body {
   border: 1px solid rgba(255,255,255,0.15);
   border-radius: 999px;
   background: rgba(255,255,255,0.06);
-  color: #e2e8f0;
+  color: var(--blue-100);
   font-size: 0.75rem;
   font-weight: 600;
   font-family: var(--font-sans);
@@ -237,7 +326,8 @@ body {
   padding: 14px 20px;
   font-size: 0.875rem;
   font-weight: 500;
-  color: #94a3b8;
+  /* Blue-tinted inactive state — a neutral grey on a blue bar reads as dead. */
+  color: var(--blue-300);
   background: none;
   border: none;
   cursor: pointer;
@@ -250,11 +340,19 @@ body {
   gap: 6px;
 }
 
-.nav-tab:hover { color: #e2e8f0; }
+.nav-tab:hover { color: var(--blue-100); background: rgba(255, 255, 255, 0.04); }
 
 .nav-tab.active {
-  color: #f8fafc;
-  border-bottom-color: var(--accent);
+  color: #ffffff;
+  /* The accent underline is blue-600, which disappears against a blue-900 bar.
+     Use the light end of the ramp so the selected tab is unmistakable. */
+  border-bottom-color: var(--blue-300);
+  background: rgba(255, 255, 255, 0.06);
+}
+
+.nav-tab:focus-visible {
+  outline: none;
+  box-shadow: inset 0 0 0 2px var(--blue-300);
 }
 
 .nav-tab-icon {
@@ -354,10 +452,22 @@ body {
 .form-input:focus,
 .form-select:focus {
   border-color: var(--accent);
-  box-shadow: 0 0 0 3px rgba(99,102,241,0.15);
+  box-shadow: var(--focus-ring);
 }
 
 .form-input::placeholder { color: var(--text-muted); }
+
+/* Global keyboard-focus treatment. One ring, from the blue ramp, on everything
+   interactive — previously only inputs and the chat composer had one. */
+.btn:focus-visible,
+.tab-btn:focus-visible,
+a:focus-visible,
+[role="button"]:focus-visible,
+summary:focus-visible {
+  outline: none;
+  box-shadow: var(--focus-ring);
+  border-radius: var(--border-radius);
+}
 
 .form-row {
   display: flex;
@@ -576,37 +686,32 @@ tbody tr.expanded { background: var(--accent-light); }
   background: currentColor;
 }
 
+/* Sentiment badges derive from the data tokens, so the dark-mode overrides that
+   used to duplicate every hex are no longer needed — the tokens already shift. */
 .badge-positive {
-  background: rgba(34,197,94,0.15);
-  color: #16a34a;
+  background: color-mix(in srgb, var(--color-positive) 15%, transparent);
+  color: var(--color-positive);
 }
 
 .badge-negative {
-  background: rgba(239,68,68,0.15);
-  color: #dc2626;
+  background: color-mix(in srgb, var(--color-negative) 15%, transparent);
+  color: var(--color-negative);
 }
 
 .badge-neutral {
-  background: rgba(148,163,184,0.15);
-  color: #64748b;
+  background: color-mix(in srgb, var(--color-neutral) 18%, transparent);
+  color: var(--text-secondary);
 }
 
 .badge-mixed {
-  background: rgba(245,158,11,0.15);
-  color: #d97706;
+  background: color-mix(in srgb, var(--color-mixed) 15%, transparent);
+  color: var(--color-mixed);
 }
 
-.badge-status-queued    { background: rgba(99,102,241,0.12); color: var(--accent); }
-.badge-status-processing{ background: rgba(245,158,11,0.12); color: #d97706; }
-.badge-status-completed { background: rgba(34,197,94,0.12);  color: #16a34a; }
-.badge-status-failed    { background: rgba(239,68,68,0.12);  color: #dc2626; }
-
-@media (prefers-color-scheme: dark) {
-  .badge-positive { background: rgba(34,197,94,0.2);  color: #4ade80; }
-  .badge-negative { background: rgba(239,68,68,0.2);  color: #f87171; }
-  .badge-neutral  { background: rgba(148,163,184,0.2);color: #94a3b8; }
-  .badge-mixed    { background: rgba(245,158,11,0.2); color: #fbbf24; }
-}
+.badge-status-queued    { background: var(--accent-light); color: var(--accent); }
+.badge-status-processing{ background: color-mix(in srgb, var(--warning) 12%, transparent); color: var(--warning); }
+.badge-status-completed { background: color-mix(in srgb, var(--success) 12%, transparent); color: var(--success); }
+.badge-status-failed    { background: color-mix(in srgb, var(--danger) 12%, transparent);  color: var(--danger); }
 
 /* ---- Toxicity score bar ---- */
 .toxicity-bar {
@@ -890,7 +995,7 @@ canvas {
   gap: 10px;
   background: var(--accent-light);
   border: 1px solid rgba(99,102,241,0.2);
-  border-left: 3px solid var(--accent, #6366f1);
+  border-left: 3px solid var(--accent, #2563eb);
   border-radius: var(--border-radius);
   padding: 12px 14px;
 }
@@ -902,7 +1007,7 @@ canvas {
   text-transform: uppercase;
   letter-spacing: 0.06em;
   color: #fff;
-  background: var(--accent, #6366f1);
+  background: var(--accent, #2563eb);
   border-radius: 999px;
   padding: 2px 8px;
   margin-top: 1px;
@@ -990,13 +1095,13 @@ canvas {
 .alert-error {
   background: rgba(239,68,68,0.1);
   border: 1px solid rgba(239,68,68,0.3);
-  color: #dc2626;
+  color: var(--danger);
 }
 
 .alert-success {
   background: rgba(34,197,94,0.1);
   border: 1px solid rgba(34,197,94,0.3);
-  color: #16a34a;
+  color: var(--success);
 }
 
 .alert-info {
@@ -1008,7 +1113,7 @@ canvas {
 .alert-warning {
   background: rgba(245,158,11,0.1);
   border: 1px solid rgba(245,158,11,0.3);
-  color: #d97706;
+  color: var(--warning);
 }
 
 #toast-container {
@@ -1036,10 +1141,10 @@ canvas {
   to   { opacity: 1; transform: none; }
 }
 
-.toast-success { background: #16a34a; }
-.toast-error   { background: #dc2626; }
+.toast-success { background: var(--success); }
+.toast-error   { background: var(--danger); }
 .toast-info    { background: var(--accent); }
-.toast-warning { background: #d97706; }
+.toast-warning { background: var(--warning); }
 
 /* ---- Loading states ---- */
 .spinner {
@@ -1088,7 +1193,7 @@ canvas {
 /* ---- Status bar ---- */
 .status-bar {
   background: var(--bg-status-bar);
-  color: #94a3b8;
+  color: var(--blue-300);
   font-size: 0.75rem;
   padding: 0 24px;
   height: 28px;
@@ -1529,13 +1634,13 @@ canvas {
   transition: width 0.4s ease;
 }
 
-.progress-done .progress-fill { background: var(--color-positive, #22c55e); }
-.progress-warn .progress-fill { background: var(--color-mixed, #f59e0b); }
+.progress-done .progress-fill { background: var(--color-positive, #059669); }
+.progress-warn .progress-fill { background: var(--color-mixed, #d97706); }
 
 .progress-fill-failed {
   position: absolute;
   right: 0; top: 0; bottom: 0;
-  background: var(--color-negative, #ef4444);
+  background: var(--color-negative, #dc2626);
   border-radius: 5px;
 }
 
@@ -1549,9 +1654,9 @@ canvas {
    Job status badges (jobs use pending/queued/running/done)
    ============================================================ */
 .badge-status-pending  { background: rgba(148,163,184,0.15); color: var(--text-secondary); }
-.badge-status-running  { background: rgba(245,158,11,0.12);  color: #d97706; }
-.badge-status-done     { background: rgba(34,197,94,0.12);   color: #16a34a; }
-.badge-status-error    { background: rgba(239,68,68,0.12);   color: #dc2626; }
+.badge-status-running  { background: color-mix(in srgb, var(--warning) 12%, transparent); color: var(--warning); }
+.badge-status-done     { background: color-mix(in srgb, var(--success) 12%, transparent); color: var(--success); }
+.badge-status-error    { background: color-mix(in srgb, var(--danger) 12%, transparent);  color: var(--danger); }
 .badge-status-unknown  { background: rgba(148,163,184,0.15); color: var(--text-secondary); }
 
 /* ============================================================
@@ -1878,7 +1983,7 @@ canvas {
 .flow-node-label {
   font-size: 0.74rem;
   font-weight: 600;
-  color: var(--text-primary, #1e293b);
+  color: var(--text-primary, #0f2547);
   margin-bottom: 6px;
   white-space: nowrap;
 }
@@ -2036,8 +2141,8 @@ canvas {
   color: #fff;
 }
 .chat-avatar svg { width: 18px; height: 18px; }
-.chat-avatar.assistant { background: linear-gradient(135deg, var(--accent), #8b5cf6); box-shadow: var(--shadow-sm); }
-.chat-avatar.user      { background: linear-gradient(135deg, #0ea5e9, #3b82f6); }
+.chat-avatar.assistant { background: linear-gradient(135deg, var(--accent), var(--blue-800)); box-shadow: var(--shadow-sm); }
+.chat-avatar.user      { background: linear-gradient(135deg, var(--blue-400), var(--blue-600)); }
 
 /* ---- message list ---- */
 .chat-messages {
@@ -2114,7 +2219,7 @@ canvas {
   padding: 10px 12px;
   border-radius: 8px;
   background: var(--bg-nav);
-  color: #e2e8f0;
+  color: var(--blue-100);
   font-family: var(--font-mono);
   font-size: 0.8rem;
   line-height: 1.5;
@@ -2171,7 +2276,7 @@ canvas {
   width: 54px; height: 54px;
   border-radius: 16px;
   color: #fff;
-  background: linear-gradient(135deg, var(--accent), #8b5cf6);
+  background: linear-gradient(135deg, var(--accent), var(--blue-800));
   box-shadow: var(--shadow-md);
 }
 .chat-empty-icon svg { width: 28px; height: 28px; }
@@ -2268,26 +2373,37 @@ canvas {
 /* The print frame inherits prefers-color-scheme, so pin the light palette:
    a dark-mode dashboard must not print white text on white paper. */
 .pdf-doc {
+  /* Pinned to the light half of the blue architecture, and slightly flatter than
+     screen: printed paper is already white, so the page tint is dropped and the
+     surfaces are pure white. */
   --bg-page:      #ffffff;
   --bg-card:      #ffffff;
   --bg-modal:     #ffffff;
-  --bg-table-row: #f1f5f9;
+  --bg-table-row: #f2f7ff;
   --bg-input:     #ffffff;
-  --text-primary:   #0f172a;
-  --text-secondary: #475569;
-  --text-muted:     #64748b;
-  --border-color:   #e2e8f0;
-  --accent-light:   #eef2ff;
+  --bg-subtle:    #f2f7ff;
+  --text-primary:   #0f2547;
+  --text-secondary: #47617f;
+  --text-muted:     #7189a8;
+  --border-color:   #d9e6f7;
+  --border-strong:  #b9d0ec;
+  --accent:         #1d4ed8;   /* deepened: thin blue lines fade when printed */
+  --accent-light:   #eff6ff;
+  --accent-border:  #bfdbfe;
+  --color-positive: #047857;
+  --color-negative: #b91c1c;
+  --color-mixed:    #b45309;
+  --color-neutral:  #7189a8;
 
   display: block;
   min-height: 0;
   background: #ffffff;
-  color: #0f172a;
+  color: var(--text-primary);
   padding: 0 4px;
 }
 
 .pdf-head {
-  border-bottom: 2px solid #0f172a;
+  border-bottom: 2px solid var(--accent);
   padding-bottom: 10px;
   margin-bottom: 18px;
 }
@@ -2304,7 +2420,7 @@ canvas {
   margin-top: 5px;
   font-family: var(--font-mono);
   font-size: 0.72rem;
-  color: #475569;
+  color: var(--text-secondary);
 }
 
 .pdf-body .modal-section { break-inside: avoid; page-break-inside: avoid; }
@@ -2602,8 +2718,8 @@ canvas {
   min-width: 1.15rem;
   padding: 0 4px;
   border-radius: 9px;
-  background: #334155;
-  color: #cbd5e1;
+  background: var(--blue-800);
+  color: var(--blue-100);
   font-family: var(--font-mono);
   font-size: 0.66rem;
   text-align: center;
@@ -2772,3 +2888,85 @@ canvas {
   .log-card { height: calc(100vh - 26rem); }
   .log-controls-spacer { flex-basis: 100%; height: 0; }
 }
+
+/* ============================================================
+   Provenance & honesty surfaces
+   ------------------------------------------------------------
+   These exist so a chart can state what produced it. Most of the
+   findings in PROJECT_ASSESSMENT were outputs that reported
+   success regardless of what ran; these classes are where the
+   distinction becomes visible.
+   ============================================================ */
+
+/* Value tags inside the Trace tab's key/value list. */
+.trace-str  { color: var(--color-positive); font-family: var(--font-mono); font-size: 0.76rem; }
+.trace-warn { color: var(--warning); font-family: var(--font-mono); font-size: 0.76rem; font-weight: 600; }
+
+/* Semantic tag variants. Meaning-bearing, so they sit outside the blue ramp. */
+.tag-positive {
+  background: color-mix(in srgb, var(--color-positive) 14%, transparent);
+  color: var(--color-positive);
+}
+.tag-negative {
+  background: color-mix(in srgb, var(--color-negative) 14%, transparent);
+  color: var(--color-negative);
+}
+
+/* Corpus-coverage strip under the Overview stat grid. */
+.coverage-bar {
+  grid-column: 1 / -1;
+  margin-top: 10px;
+  padding: 9px 12px;
+  background: var(--bg-subtle);
+  border: 1px solid var(--accent-border);
+  border-radius: var(--border-radius);
+  font-size: 0.78rem;
+  display: flex;
+  align-items: center;
+  gap: 8px;
+  flex-wrap: wrap;
+}
+
+/* Per-model token/cost breakdown beneath the stat cards. */
+.stat-note {
+  margin-top: 10px;
+  padding: 10px 12px;
+  background: var(--bg-subtle);
+  border: 1px solid var(--border-color);
+  border-radius: var(--border-radius);
+}
+.stat-note-title {
+  font-size: 0.72rem;
+  font-weight: 600;
+  text-transform: uppercase;
+  letter-spacing: 0.04em;
+  color: var(--text-secondary);
+  margin-bottom: 6px;
+}
+
+/* ---- Target stance (watchlist) --------------------------------------------
+   Deliberately styled as its own block, not as another sentiment chart: it is a
+   separate measurement, and a comment can be positive in tone while opposing a
+   listed entity. Blending the two visually would undo the distinction the
+   feature exists to make. */
+.target-stance-block {
+  border-left: 3px solid var(--accent);
+  padding-left: 12px;
+}
+.target-stance-row {
+  padding: 9px 0;
+  border-bottom: 1px solid var(--border-color);
+}
+.target-stance-row:last-child { border-bottom: none; }
+.target-stance-head {
+  display: flex;
+  align-items: center;
+  gap: 6px;
+  margin-bottom: 5px;
+  flex-wrap: wrap;
+}
+.target-stance-name { font-weight: 600; font-size: 0.82rem; }
+.target-stance-bar { display: flex; margin-bottom: 4px; }
+.split-opposing   { display: block; height: 100%; background: var(--color-negative); }
+.split-supportive { display: block; height: 100%; background: var(--color-positive); }
+.split-neutral    { display: block; height: 100%; background: var(--color-neutral); }

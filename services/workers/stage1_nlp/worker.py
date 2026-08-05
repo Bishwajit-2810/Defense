@@ -109,6 +109,7 @@ def _build_result(
     overall_sentiment: str,
     sentiment_score: float,
     stage1_ms: float,
+    degraded_components: list[str] | None = None,
 ) -> dict:
     """Assemble the partial Stage-1 analysis dict.
 
@@ -152,6 +153,7 @@ def _build_result(
     # (small-model suite) or "stub". Drives the processing provenance below.
     engine = text_result.get("engine")
     stage1_llm_used = engine == "llm"
+    degraded_components = degraded_components or []
 
     # Confidence: average of language + sentiment confidences where available
     lang_conf = text_result.get("language_confidence") or 0.0
@@ -272,6 +274,12 @@ def _build_result(
         "post_type": text_result.get("post_type"),
         "post_type_confidence": text_result.get("post_type_confidence"),
 
+        # How language was detected: "fasttext" | "script_heuristic" | "stub".
+        # Added to the RESULT, not just to text_result — a field that exists only
+        # in an intermediate dict is a field no consumer can read (the same
+        # omission that lost `degraded_components` in the assembler).
+        "language_method": text_result.get("language_method"),
+
         # --- Stage-2 placeholders (filled by LLM worker) ---
         "post_summary": None,
         "post_summary_lang": None,
@@ -305,6 +313,11 @@ def _build_result(
             ),
             "vision_model": (image_analysis or {}).get("vision_model"),
             "vision_status": (image_analysis or {}).get("vision_status"),
+            # Which real-mode components fell back to a heuristic because their
+            # model would not load. `nlp_engine: "models"` says which path was
+            # INTENDED; this says what actually ran (§5.2's lesson, one layer
+            # over). Empty list = nothing degraded.
+            "degraded_components": degraded_components,
             "stub_mode": os.getenv("MODEL_STUB_MODE", "true").lower() == "true",
             # Which concrete models produced this result (reproducibility); the
             # sentiment model is the stage1 LLM in llm_mode, else language-routed.
@@ -613,6 +626,7 @@ async def run_worker() -> None:
                             overall_sentiment=overall_sentiment,
                             sentiment_score=sentiment_score,
                             stage1_ms=stage1_ms,
+                            degraded_components=registry.degraded_components(),
                         )
 
                         # Carry the envelope forward: drop the bulky raw_post,

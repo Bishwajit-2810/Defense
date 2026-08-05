@@ -19,9 +19,15 @@ in [data_contract.md](data_contract.md), and the API in [api_design.md](api_desi
 >   `image_sentiment` blocks below are aspirational.
 > - **`comment_analysis` now carries more fields** than these examples show:
 >   `sentiment_breakdown_substantive`, `reaction_only`, `provenance`,
->   `coverage_anomaly`, and a per-comment `kind`. `coverage` is **clamped to
->   1.0**. `method` can be `stub` — a deterministic hash, not sentiment — and the
->   `provenance` block is what tells you how many labels were real inferences.
+>   `coverage_anomaly`, and per-comment `kind` / `emotion_method`. `coverage` is
+>   **clamped to 1.0**. `method` can be `stub` — a deterministic hash, not
+>   sentiment — and the `provenance` block is what tells you how many labels were
+>   real inferences. With a watchlist configured there is also `target_stances`,
+>   a **separate** measurement from `sentiment_breakdown`.
+> - **`processing` carries `role_models` and `degraded_components`.** The second
+>   matters most: it lists real-mode components that fell back to a heuristic, so
+>   a run reporting `nlp_engine: "models"` can still be shown to have produced
+>   heuristic output. Check it is empty before quoting anything from a run.
 >
 > Everything else — the comment thread, the reaction cross-check, the recomputed
 > sentiment, the Bangla summaries — is current. Regenerate against a live run

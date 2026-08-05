@@ -240,9 +240,26 @@ The upstream stores one coarse post `sentiment` (and `viralPotential`); comment
    records which inputs informed it.
 5. **Comments (now live — embedded in the payload).** Run **our** per-comment
    sentiment over each of the `storedCommentRows` embedded comments, aggregate into
-   `comment_analysis.sentiment_breakdown` + themes (weighting by `likes`), and fold
-   the thread into the final summary/insight. Report **coverage**
-   (`analyzed / commentCount`) since we see only the stored sample.
+   `comment_analysis.sentiment_breakdown` + themes (weighted **sub-linearly** by
+   `likes`, so one 946-like comment cannot dictate the themes), and fold the thread
+   into the final summary/insight. Report **coverage** (`analyzed / commentCount`,
+   **clamped to 1.0**) since we see only the stored sample; when the stored rows
+   exceed the reported count the excess surfaces as `coverage_anomaly` rather than
+   as coverage above 100%.
+
+   Every label carries its provenance: per comment a `method`
+   (`llm`/`model`/`stub`/`fast`/`emoji`/`failed`) and a `kind`
+   (`substantive`/`short`/`emoji`), and per post a `provenance` block with
+   `inferred_share`. `stub` is a hash of the text — deterministic, reproducible,
+   and **not sentiment** — so a chart can state what produced its numbers.
+   Emoji-only comments (2.8% of the corpus) keep their sentiment but never enter
+   an LLM batch.
+
+6. **Target stance (optional).** When `config/stance_targets.yml` lists entities,
+   each comment also carries `target_stances` — its stance *toward each named
+   entity it mentions*, in a **separate field** from document-level sentiment. See
+   [stance_targets.md](stance_targets.md); the watchlist is a **stated bias
+   model**, not a measurement.
 
 Cheap models do the sentiment (steps 1–2, 5) on every post/comment; the LLM/VLM is
 selective for the summary (step 4), per the hybrid routing in

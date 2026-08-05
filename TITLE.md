@@ -25,8 +25,20 @@ pipeline** behind a pluggable (local Ollama/vLLM ⇄ Groq) backend.
 >
 > The honest distinctive claims are: **code-mixed Bangla/Banglish**, the
 > **post+thread** unit with per-comment coverage, the **confidence-gated
-> cascade** as a measured trade-off, and the **runtime-switchable local/cloud
-> backend**. Titles below are re-ordered accordingly.
+> cascade** as a measured trade-off, the **runtime-switchable local/cloud
+> backend**, and — since 5 August — **target-dependent stance over a
+> configurable, alias-aware watchlist** ([stance_targets.md](stance_targets.md)),
+> which is the one component with a plausible claim to novelty. Titles below are
+> re-ordered accordingly.
+>
+> **A title option that leads on the novelty**, now that it is built:
+>
+> > *Who Are They Angry At? Target-Dependent Stance Detection over a Configurable
+> > Watchlist for Code-Mixed Bangla–English–Banglish Social Media*
+>
+> Be ready to concede that aspect-based stance detection is established — the
+> defensible part is the **code-mixed, under-resourced setting and the
+> three-script alias problem**, not the method.
 
 ---
 

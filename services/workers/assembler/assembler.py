@@ -292,6 +292,9 @@ async def _process_message(
         "persist_fanout_start",
         targets=["postgres", "clickhouse", "object_storage"],
         embedding_dims=len(stage1_embedding or []),
+        embedding_is_stub=bool(
+            (result.get("processing") or {}).get("stub_mode") or not stage1_embedding
+        ),
         comment_rows=n_comments,
     )
     t_fan = time.monotonic()
@@ -352,6 +355,17 @@ async def _process_message(
             "stage1_ms": proc_now.get("stage1_ms"),
             "stage2_ms": proc_now.get("stage2_ms"),
             "embedding_stored": bool(stage1_embedding),
+            # `embedding_stored: true` + `embedding_dims: 768` both read as
+            # success even when the vector is the hash stub, which is why §5.9
+            # went unnoticed. Say which it is.
+            # Reads `processing.stub_mode`, which the builder used to DROP — so
+            # this fell through to `not stage1_embedding` and reported a stub
+            # vector as non-stub, exactly backwards. The key now survives
+            # (tests/test_provenance_survives.py pins it).
+            "embedding_is_stub": bool(
+                (result.get("processing") or {}).get("stub_mode")
+                or not stage1_embedding
+            ),
             "writes": ["postgres+pgvector", "clickhouse", "object storage"],
         },
         log=bound_log,

@@ -277,7 +277,8 @@ it and the repository.
 | | State |
 | --- | --- |
 | **Structural checks** | [eval/harness.py](eval/harness.py) — `run_input_validation`, `run_platform_detection`, `run_coverage_check`. These pass and are real. |
-| **System-property measurement** | [eval/measure_routing_rate.py](eval/measure_routing_rate.py) (routing rate, comment volume, post-vs-comment call split), [eval/make_text_corpus.py](eval/make_text_corpus.py) (corpus + what it dropped), [eval/bakeoff_summary.py](eval/bakeoff_summary.py) (per-model latency, truncation, language fidelity), `GET /v1/usage` (tokens + cost per backend/model). |
+| **System-property measurement** | [eval/measure_routing_rate.py](eval/measure_routing_rate.py) (routing rate, comment volume, post-vs-comment call split), [eval/make_text_corpus.py](eval/make_text_corpus.py) (corpus + what it dropped), [eval/bakeoff_summary.py](eval/bakeoff_summary.py) (per-model latency, truncation, language fidelity), [eval/sweep_threshold.py](eval/sweep_threshold.py) (cost-vs-threshold and cost-vs-comment-cap curves), `GET /v1/usage` (tokens + cost per backend/model). |
+| **Regression coverage** | **549 tests across 30 files.** Every finding in PROJECT_ASSESSMENT that was fixed has a test that fails if it regresses — which is the property that matters more than the count. |
 | **Accuracy metrics** | **None.** Zero gold labels, zero F1, no scorecard. |
 
 The third row is the decisive gap and the only remaining blocker on the research
@@ -312,7 +313,7 @@ correctly-matched mentions, how often the verdict matches a human). Do not fold
 either into the general sentiment scorecard; target stance is a separate field
 for the same reason it needs a separate metric.
 
-### 8.3 Metrics that became measurable in the 4 August pass
+### 8.3 Metrics that became measurable in the implementation passes
 
 Worth adding to the scorecard before the next round, because the data now exists
 and none of it needs labels:
@@ -326,4 +327,17 @@ and none of it needs labels:
 - **`coverage_anomaly`** count — upstream data-quality events, previously
   absorbed silently as >100% coverage.
 - **Post-level vs comment-level call split** — the cost axis any efficiency
-  claim has to be plotted against.
+  claim has to be plotted against. `eval/sweep_threshold.py` emits it per
+  threshold and per comment-cap.
+- **`processing.degraded_components`** — which real-mode components fell back to
+  a heuristic because their model would not load. **Check this is empty before
+  recording any accuracy or latency figure**: a run where every component
+  degraded still reports `engine: "models"`, and the two facts are deliberately
+  reported side by side (PROJECT_ASSESSMENT §9.10).
+- **`language_method`** — `fasttext` vs the script heuristic, so language
+  confidence can be read in light of what produced it.
+- **`emotion_method`** per comment — the per-comment emotion table is the free
+  heuristic even in real mode; only Stage-2-relabelled comments carry a model
+  emotion.
+- **Target-mention volume** per watchlist entity, available even for bypassed
+  posts because matching is free string work that runs in Stage 1.

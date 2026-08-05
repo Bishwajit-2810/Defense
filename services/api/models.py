@@ -5,7 +5,7 @@ from __future__ import annotations
 from datetime import datetime
 from typing import Any, Dict, List, Optional
 
-from pydantic import BaseModel, Field, field_validator
+from pydantic import BaseModel, ConfigDict, Field, field_validator
 
 
 # ---------------------------------------------------------------------------
@@ -155,7 +155,15 @@ class CommentAnalysisResult(BaseModel):
     # instead of blending 17% emoji reactions into one indistinguishable bar.
     sentiment_breakdown_substantive: Dict[str, int] = {}
     reaction_only: int = 0                       # emoji-only comment count
-    emotion_breakdown: Dict[str, int] = {}  # per-comment emotion counts (schema v1.1)
+    # Per-watchlist-entity stance rollup (stance_targets.md). A SEPARATE
+    # measurement from sentiment_breakdown: a comment can be positive in tone
+    # while opposing a listed entity. Never sum or merge the two. Entities
+    # nobody mentioned are absent rather than zero-filled.
+    target_stances: Dict[str, Any] = {}
+    # Per-comment emotion counts (schema v1.1). NOTE: emotion is the free
+    # emoji+lexicon heuristic for every comment at Stage 1 — see each comment's
+    # `emotion_method`. Only comments Stage 2 re-labelled carry a model emotion.
+    emotion_breakdown: Dict[str, int] = {}
     method_breakdown: Dict[str, int] = {}
     # Where the labels above came from: {total, inferred, heuristic,
     # inferred_share, by_method}. Surfaced alongside the breakdowns so a
@@ -178,12 +186,45 @@ class ConfidenceResult(BaseModel):
 
 
 class ProcessingResult(BaseModel):
+    """Run provenance — *what actually produced this result*.
+
+    This model was a whitelist of six fields, and Pydantic silently discarded
+    every other key in `processing`. Combined with the same pattern in the
+    assembler, that meant **eleven** provenance fields — including `stub_mode`,
+    `nlp_engine`, `degraded_components` and `role_models` — were computed by the
+    pipeline, persisted to Postgres, and then dropped on the way out of the API.
+    Consumers could not read them, so the dashboard rendered a confident
+    "nothing degraded" on every run.
+
+    `extra="allow"` is deliberate: a provenance model whose job is to answer
+    "what ran?" must not be the thing that decides which answers are permitted.
+    A new field added upstream now surfaces automatically instead of vanishing
+    (and `tests/test_provenance_survives.py` asserts the chain end to end).
+    """
+
+    model_config = ConfigDict(extra="allow")
+
     stage1_ms: Optional[float] = None
     stage2_ms: Optional[float] = None
     llm_used: bool = False
     llm_backend: Optional[str] = None
     llm_model: Optional[str] = None
     schema_version: str = "1.0"
+
+    # --- Stage-1 provenance (forwarded by the assembler) ---
+    nlp_engine: Optional[str] = None            # stub | models | llm — INTENDED path
+    stub_mode: Optional[bool] = None            # deterministic hashes, not model output
+    degraded_components: Optional[List[str]] = None  # what actually fell back (§9.10)
+    llm_role: Optional[str] = None
+    unit: Optional[str] = None
+    model_versions: Optional[Dict[str, Any]] = None
+    vision_used: Optional[bool] = None
+    vision_produced_signal: Optional[bool] = None   # only this licenses an image claim
+    vision_model: Optional[str] = None
+    vision_status: Optional[str] = None
+
+    # --- Stage-2 provenance ---
+    role_models: Optional[Dict[str, Any]] = None    # {role: resolved model id}
 
 
 class AnalysisResultResponse(BaseModel):
@@ -205,6 +246,9 @@ class AnalysisResultResponse(BaseModel):
     # True when the summary hit the model's token ceiling even after
     # auto-continuation and was trimmed to its last complete sentence (§6.1).
     post_summary_truncated: Optional[bool] = None
+    # Which detector produced `language` — fastText or the script heuristic.
+    # `language_confidence` cannot be interpreted without it.
+    language_method: Optional[str] = None
     overall_sentiment: str
     sentiment_score: float
     # Per-component sentiments, each its own {label, score} (caption / image).
@@ -345,6 +389,11 @@ class SearchResult(BaseModel):
     score: float = 1.0
     snippet: Optional[str] = None
     result: Optional[Dict[str, Any]] = None
+    # True when this row's stored vector (or the query's) is the deterministic
+    # hash stub rather than a semantic embedding. The `score` is then a distance
+    # between two random unit vectors — it looks exactly as plausible as a real
+    # one, so a UI must not render this as a semantic match (§5.9).
+    embedding_is_stub: bool = False
 
 
 class SearchResponse(BaseModel):

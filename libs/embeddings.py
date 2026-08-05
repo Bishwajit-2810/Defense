@@ -94,11 +94,29 @@ def fit_dim(vec: list[float]) -> list[float]:
 
 def embed_text(text: str) -> list[float]:
     """Embed text → list[float] of EMBEDDING_DIM (real model when available)."""
+    vec, _is_stub = embed_text_with_provenance(text)
+    return vec
+
+
+def embed_text_with_provenance(text: str) -> tuple[list[float], bool]:
+    """Embed text and report whether the vector is the deterministic STUB.
+
+    ``stub_embedding`` is explicitly "a deterministic unit vector seeded from the
+    text hash (not semantic)". With ``MODEL_STUB_MODE=true`` — the default —
+    every vector written to the pgvector column is one of those, so kNN
+    "semantic" search returns arbitrary neighbours and the embedding-cluster
+    summarisation that reports.py presents as the LLM cost lever clusters noise.
+
+    Nothing downstream could previously tell the difference: the assembler's
+    trace frame reported ``embedding_stored: true`` and ``embedding_dims: 768``,
+    both of which read as success. This is the signal that makes the distinction
+    available (PROJECT_ASSESSMENT §5.9).
+    """
     model = _get_model()
     if model is None:
-        return stub_embedding(text)
+        return stub_embedding(text), True
     vec = model.encode(text or "", normalize_embeddings=True)
-    return fit_dim([float(v) for v in vec])
+    return fit_dim([float(v) for v in vec]), False
 
 
 def to_pgvector_literal(vector: list[float]) -> str:

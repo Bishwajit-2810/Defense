@@ -1,0 +1,43 @@
+# ---------------------------------------------------------------------------
+# WATCHLIST — STATED BIAS MODEL, NOT A MEASUREMENT
+# ---------------------------------------------------------------------------
+# See stance_targets.md §2. The CONTENTS of this file are an editorial choice by
+# the operator: declaring an entity "favored" encodes a political stance into the
+# labels. That is legitimate for a monitoring product and indefensible presented
+# as neutral sentiment analysis, so:
+#
+#   * target stance is reported in its OWN output field, never merged into
+#     document-level sentiment;
+#   * every entry carries `notes:` naming who decided and why;
+#   * prefer the `neutral:` bucket unless advocacy semantics are actually wanted
+#     — it gives you target-dependent stance without imposing a polarity.
+#
+# ALIASES ARE THE LOAD-BEARING PART. This corpus writes the same entity in Bangla
+# script, in romanized Banglish (no standard spelling), and in English. A target
+# listing one spelling will silently match almost nothing. List every spelling
+# you have actually seen in the data, then check the `stance_targets_unmatched`
+# log line after a run — a target matching zero comments is an alias bug, not
+# evidence that nobody discussed it.
+#
+# This file ships with EXAMPLES ONLY. Replace them; the repository has no opinion
+# about who belongs on the list.
+# ---------------------------------------------------------------------------
+version: 1
+updated: 2026-08-05
+owner: "unset — name the person who signed off on these entries"
+
+# Tracked WITHOUT a polarity: stance is reported, no framing is imposed.
+# Start here. This keeps the output a measurement.
+neutral:
+  - id: example_entity
+    display: "Example Entity"
+    aliases:
+      - "উদাহরণ"            # Bangla script
+      - "example entity"     # English
+      - "example entiti"     # a Banglish romanization
+    notes: "EXAMPLE — replace. Tracked for mention volume and stance, not scored for favour."
+
+# Advocacy semantics. Leave empty unless the operator genuinely wants a side
+# encoded, and if you fill it in, say so out loud in the defense.
+favored: []
+opposed: []

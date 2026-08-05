@@ -1,5 +1,12 @@
 # Implementation Plan & Roadmap
 
+> **Status (5 August 2026):** Phase-1 pipeline items are built. What remains is
+> not code: install the ML extras for a real-mode run, label ~300 comments, seed
+> the auth tables, and fill in the watchlist. See
+> [PROJECT_ASSESSMENT.md](PROJECT_ASSESSMENT.md)'s status header for the
+> item-by-item state and [FEATURES.md](FEATURES.md) for what each capability
+> actually does.
+
 Phased plan to build the smart layer from [what.txt](what.txt) from MVP (1k) →
 Production (10k) → Enterprise (100k), plus best practices for processing 10,000+
 posts efficiently. Read alongside [architecture.md](architecture.md).

@@ -181,13 +181,23 @@ def _clip_sentiment(
         logits = (img_feat @ txt_feat.T).squeeze()
 
     probs = torch.softmax(logits, dim=-1).tolist()
-    idx = int(torch.tensor(probs).argmax())
-    label_raw = _SENTIMENT_LABELS[idx]
-    label = _LABEL_TO_KEY[label_raw]
-    # Signed score: positive → +prob, negative → -prob, neutral → 0
-    pos_prob = probs[0]
-    neg_prob = probs[1]
+    pos_prob, neg_prob = probs[0], probs[1]
+
+    # §5.13: the label used to come from argmax over three classes while the
+    # score came from `pos_prob - neg_prob`, so the two could disagree — a
+    # "neutral" verdict carrying a positive score, or vice versa. Derive BOTH
+    # from the same quantity so the pair is always consistent.
+    #
+    # The signed score is the primary quantity (it is what fusion consumes);
+    # the label is a banding of it, using the same ±0.1 neutral boundary the
+    # rest of the pipeline uses (fusion._score_to_label).
     score = round(pos_prob - neg_prob, 4)
+    if score > 0.1:
+        label = "positive"
+    elif score < -0.1:
+        label = "negative"
+    else:
+        label = "neutral"
     return label, score
 
 

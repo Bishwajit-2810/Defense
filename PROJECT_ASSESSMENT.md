@@ -38,10 +38,54 @@ Bangla / English / Banglish)
 >    not Stage-1 comment labelling, which runs for every post. **The better
 >    Stage 1 gets, the less the gate governs.** See §6.8.
 >
-> **Not yet built:** the P1 list (§9 P1.1–P1.8) apart from P1.2 (usage
-> dimension) and P1.8 (`libs/streams.py`), both of which were pulled forward
-> because §6.7 and §9.6 depend on them; §6.4 / E (watchlist); §9.8 (end-to-end
-> run); §9.9 (hand-labelling). §7's research gaps are unchanged.
+> ### Second implementation pass — 5 August 2026
+>
+> The **P1 list and §6.4 are now built too.** Test suite: **565 passing**, up
+> from 435.
+>
+> | Item | Status | Note |
+> | ---- | ------ | ---- |
+> | §6.4 / E — watchlist target stance | **done** | Full spec in [stance_targets.md](stance_targets.md). `libs/stance_targets.py` (alias matcher across Bangla/Banglish/English), `libs/stance_scoring.py` (deterministic + LLM scorers), `config/stance_targets.yml`. Rides inside the existing Stage-2 stance call, so it adds **no LLM calls**. Ships with a `neutral:`-only example — the repo states no politics. |
+> | P1.1 — tenant privacy enforcement | **done** | `api_keys` table (SHA-256 hashes); `tenant_id` comes from the **row**, never the token body; `users` table with PBKDF2 verification, so `/v1/auth/token` no longer issues a token to anybody. The policy check **fails closed** — it used to `return` on a DB error, i.e. permit egress exactly when it could not verify the policy. |
+> | §6.6 remainder | **done** | `POST /v1/auth/sse-ticket` (single-use, 60s, stored hashed), `/refresh`, `/me`, `/verify`. `exp` shortened 24h → 1h now that refresh exists. The dashboard uses tickets, tears down every stream on a 401, and calls `/me` on load — closing the split state where the UI said "logged out" while streams kept working. |
+> | P1.3 — stub embeddings | **done** | `embedding_is_stub` column + `EMBEDDING_ALLOW_STUB=false` to refuse the write outright. Search discloses it per row and logs when kNN ran over stub vectors. |
+> | P1.4 — batched inference | **done** (code) | `analyze_sentiment_batch` groups by resolved model, one forward pass per group, with per-group fallback. **Unverified against real weights** — see the blocked list below. |
+> | P1.5 — threshold sweep | **done** (cost axis) | `eval/sweep_threshold.py`, and it also sweeps `STAGE1_LLM_COMMENT_MAX`, which is the more interesting lever now. The **accuracy axis does not exist** and the script says so. |
+> | P1.7 — agent hardening | **done** | Tool results wrapped in `<tool_data trust="untrusted">` with forged-delimiter neutralisation, plus a system-prompt policy. "Must-not-say" probes implemented. Risk reduction, **not** a fix — no prompt-level defence can be. |
+> | §5.13 smaller items | **done** | Theme weighting is now sub-linear in likes (one 946-like comment no longer outweighs 946 ordinary ones); `emotion_method` discloses that comment emotion is always the heuristic; `_clip_sentiment` derives label and score from the same quantity so they cannot disagree. |
+>
+> ### Third pass — re-evaluation, 5 August 2026
+>
+> Re-checking the two implementation passes rather than trusting them found **a
+> sixth instance of §5.1, and I had committed two of its cases myself.** Details
+> in §9.11. In short: `processing` was a hand-maintained whitelist in **two**
+> places — the assembler and the API response model — and between them they
+> dropped eleven provenance fields, including `stub_mode` (which §5.9 calls "the
+> only signal that the vector is synthetic") and `degraded_components` (which
+> made the dashboard render a confident "nothing degraded" on every run).
+>
+> Also from this pass: **mutation testing** on ten of the fixes. Nine were caught
+> by the suite; one — the watchlist's alias de-duplication — was not, so that fix
+> had no coverage at all and is now tested. Test count **565**.
+>
+> **A new finding, from attempting §9.8.** Real mode (`MODEL_STUB_MODE=false`)
+> **could not run at all**: `get_lang_detector` re-raised where every sibling
+> getter returns `None`, so one missing optional dependency killed the pipeline
+> at the first post. Worse, once that was fixed, the result reported
+> `engine: "models"` while every component had silently fallen back to a
+> heuristic — **§5.2's defect exactly** (provenance recording the intended path
+> rather than the executed one), one layer over. Both fixed: every getter
+> degrades and logs once, and `processing.degraded_components` lists what
+> actually fell back. See §9.10.
+>
+> **Still not built, and why:**
+>
+> | Item | Blocker |
+> | ---- | ------- |
+> | §9.8 — end-to-end real-mode run | **Environment.** `torch`, `transformers`, `sentence_transformers`, `gliner`, `keybert` and `fasttext` are not installed, so no real model can load. The pipeline now *runs* in real mode (degrading loudly) but produces heuristic output. Install the `ml` extras and re-run; the code path is no longer the obstacle. |
+> | §9.9 — hand-label ~300 comments | **Human task.** Nothing to automate. Still the single decisive gap (§7.2). |
+> | P1.6 — ablate fusion weights | **Moot.** The image term was scoped out (§9.3), so there is nothing to ablate until the objects exist. |
+> | §5.6's remaining hardening | Provisioning, not code: `api_keys`/`users` rows have to be seeded, and `APP_ENV` set to something other than `dev`, for the fail-closed paths to engage. |
 
 - **Pass 1** found and fixed the routing defect and measured the routing rate (§4).
 - **Pass 2** was a full second review of everything §4 did _not_ touch — vision, comments,
@@ -101,7 +145,9 @@ governs 30–55% of it depending on how good Stage 1 is.
 
 ## 2. What the project actually is
 
-**19,557 lines of Python** across 99 modules in a genuine distributed system:
+**26,731 lines of Python** across 121 files in a genuine distributed system
+(**19,557 across 99** at first assessment — the growth is 3,273 lines of
+regression tests plus the §6 and P1 features):
 
 ```text
 upstream REST  →  ingestion  →  Redis Streams  →  Stage-1 NLP  →  router
@@ -110,12 +156,18 @@ upstream REST  →  ingestion  →  Redis Streams  →  Stage-1 NLP  →  router
                                         FastAPI API + dashboard + MCP servers + agent layer
 ```
 
-| Area                                    | LOC    |
-| --------------------------------------- | ------ |
-| `services/` (pipeline + API)            | 12,217 |
-| `tests/`                                | 2,748  |
-| `libs/` (shared)                        | 2,338  |
-| `eval/` + `mcp_servers/` + `run_all.py` | 2,253  |
+| Area                         | LOC at assessment | LOC now |
+| ---------------------------- | ----------------- | ------- |
+| `services/` (pipeline + API) | 12,217            | 14,379  |
+| `tests/`                     | 2,748             | 6,021   |
+| `libs/` (shared)             | 2,338             | 3,446   |
+| `eval/`                      | —                 | 1,109   |
+| `mcp_servers/`               | —                 | 1,105   |
+| `run_all.py`                 | —                 | 671     |
+
+Test code went from 14% to **23%** of the Python in the repository. That is the
+ratio worth quoting: the growth is regression tests pinning §5/§6 findings, and
+§9.12 records the mutation pass that verifies they bite.
 
 Largest single files:
 
@@ -1281,25 +1333,157 @@ is closed before two models are in play. A and G are bugs; the rest are new capa
 
 ### P1 — credibility, do if there is time
 
-1. **Enforce the tenant privacy policy** (§5.6): real API-key storage, `tenant_id` from the
-   database rather than the token body, no default `JWT_SECRET`, fail **closed**. This protects
-   the best design decision in the project.
+1. ~~**Enforce the tenant privacy policy** (§5.6).~~ **DONE** — `api_keys` table (SHA-256
+   hashes), `tenant_id` read from the row rather than the token body, `users` table with PBKDF2
+   verification, placeholder `JWT_SECRET` refused outside dev, and the policy check now fails
+   **closed** (it used to `return` on a DB error — permitting egress precisely when it could not
+   verify the policy). Remaining work is *provisioning*: seed `api_keys`/`users` and set
+   `APP_ENV` away from `dev` so the fail-closed paths engage.
 2. **Add the backend/model dimension to usage counters and stop charging for local tokens**
    (§5.8) — a cost-efficiency thesis needs one honest cost number per backend.
-3. **Mark or refuse stub embeddings** (§5.9) before demoing semantic search or cluster reports.
-4. **Batch per-comment inference** (§5.11) — the single biggest throughput lever in the pipeline.
-5. **Threshold-sweep plot** (accuracy vs cost) — now a loop over one env variable.
-6. **Ablate the fusion weights** (0.5/0.5 vs 0.6/0.4 vs 0.7/0.3) on the labeled subset. Answers
-   "why 0.6?" with data. Note that this is only meaningful once §5.2 makes the image term real.
-7. **Harden the agent tool loop** (§5.12) and implement the "must-not-say" probes that
-   `evaluation.md` already specifies.
+3. ~~**Mark or refuse stub embeddings** (§5.9).~~ **DONE** — `analysis_results.embedding_is_stub`
+   plus `EMBEDDING_ALLOW_STUB=false` to refuse the write outright; search returns the flag per
+   row and logs when kNN ran over stub vectors.
+4. ~~**Batch per-comment inference** (§5.11).~~ **DONE in code** — `analyze_sentiment_batch`
+   groups comments by resolved model and runs one forward pass per group, with per-group
+   fallback. **Not verified against real weights** (no `torch` in this environment), so the
+   throughput win is unmeasured — the contract is unit-tested, the speedup is not.
+5. ~~**Threshold-sweep plot**~~ — **cost axis DONE**, accuracy axis blocked on §9.9.
+   `eval/sweep_threshold.py` sweeps `ROUTER_CONFIDENCE_THRESHOLD` *and*
+   `STAGE1_LLM_COMMENT_MAX` (the more interesting lever now that cost is comment-dominated), and
+   emits a CSV to join with macro-F1 once labels exist. It prints that it is half a curve.
+6. ~~**Ablate the fusion weights**~~ — **moot.** The image term was scoped out (§9.3) and
+   fusion now renormalises over the terms that carry a verdict, so the text weight is 1.0 and
+   there is nothing to ablate until the image objects exist.
+7. ~~**Harden the agent tool loop** (§5.12) and implement the "must-not-say" probes.~~
+   **DONE** — tool results are wrapped in `<tool_data trust="untrusted">` with forged-delimiter
+   neutralisation, and the system prompt states that content inside them is data. Probes
+   implemented in `tests/test_agent_hardening.py`. **Risk reduction, not a fix**: no prompt-level
+   defence can promise resistance, and the tests deliberately do not claim it does.
 8. **Introduce one source of truth for stream/group/env identifiers** (§5.1) — a
    `libs/streams.py` imported by workers _and_ used to generate the KEDA manifests. This is the
    structural fix for the whole class of bug this document keeps finding.
 
+### 9.10 New finding — real mode could not run, and lied about it when it could
+
+Found while attempting §9.8. Two defects, both instances of patterns already in
+this document, which is why they are worth recording rather than just fixing.
+
+**1. One getter raised where every sibling degrades. [probed]**
+`ModelRegistry.get_lang_detector` caught its load failure, logged it, and then
+`raise`d — while `get_sentiment_model`, `get_emotion_pipeline`, the CLIP pair and
+the rest all return `None` and let the caller fall back. So a single missing
+optional dependency (`fasttext`) killed the whole real-mode pipeline at the
+**first post**, and it presented as a pipeline bug rather than a missing package.
+That is why §9.8 had never been run: the blocker was three lines, not a day of
+work.
+
+Every getter now returns `None`, logs **once** per process (a 10k-post batch must
+not emit 10k identical import errors), and names the specific fallback in the
+message — e.g. *"toxicity falls back to the keyword heuristic, which never
+exceeded 0.2 on this corpus, so router rule 5 will effectively be inert."*
+
+**2. `engine: "models"` reported the intended path, not the executed one. [measured]**
+Once the crash was fixed, a real-mode run on this machine produced:
+
+```text
+nlp_engine='models'  degraded=['language','sentiment','emotion','toxicity','ner','keywords','embedding']
+```
+
+Before the fix, only the first half of that line existed — a run in which
+**every** component had fallen back to a heuristic still described itself as
+`engine: "models"`. This is §5.2's defect precisely (provenance recording the
+code path that *was intended* rather than the one that executed), reappearing one
+layer up, and it would have made any §9.8 latency or accuracy number
+uninterpretable.
+
+`processing.degraded_components` now lists what actually fell back, and
+`language_method` distinguishes fastText from the script heuristic. The two facts
+are reported side by side and are allowed to disagree, because the disagreement
+*is* the honest state.
+
+**The lesson, for the fourth time in this document:** a fallback that does not
+name itself is indistinguishable from success. §5.1 counted four
+cross-component identifier mismatches; this is the same failure in a different
+costume — one component degrading while another reports on its behalf.
+
+---
+
+### 9.11 Re-evaluation finding — provenance was dropped twice on the way out
+
+The most useful result of re-checking the earlier work: **`processing` was a
+hand-maintained whitelist in two separate places**, and between them they
+discarded eleven fields the pipeline computes. Neither failed. Neither logged.
+Both silently shortened the output.
+
+| Layer | What it dropped |
+| ----- | --------------- |
+| `assembler/builder.py` — `processing` dict | `unit`, `nlp_engine`, `llm_role`, `stub_mode`, `degraded_components`, `vision_used`, `vision_produced_signal`, `vision_model`, `vision_status`, `model_versions` |
+| `services/api/models.py` — `ProcessingResult` | all of the above **plus `role_models`**, because Pydantic silently discards unmodelled keys |
+
+**Three consequences, each worse than a missing field:**
+
+1. **`assembler.py` reads back a key the builder had removed.** It computes
+   `embedding_is_stub` from `result["processing"]["stub_mode"]`, which was always
+   `None`, so the expression fell through to `not stage1_embedding` — and a stub
+   embedding *is* a non-empty vector. It therefore reported stub vectors as **not
+   stubs**, exactly inverting the §5.9 fix.
+2. **The dashboard's "degraded" row rendered a confident `none` on every run.**
+   `degraded_components` never arrived, and the renderer treated absent as empty.
+   A false reassurance is worse than a blank.
+3. **`language_method` never existed downstream at all** — it was added to
+   `analyze_text`'s return value and never copied into the result dict, so it
+   lived only in an intermediate that no consumer sees.
+
+**Fixes.** Stage-1 provenance is forwarded through an explicit
+`_STAGE1_PROVENANCE_KEYS` tuple; `ProcessingResult` uses `extra="allow"` (a model
+whose job is to answer *"what ran?"* must not be the thing deciding which answers
+are permitted); and the dashboard now distinguishes *absent* from *empty*.
+[tests/test_provenance_survives.py](tests/test_provenance_survives.py) asserts
+the chain **end to end** — Stage 1 → assembler → API — because a per-hop test
+would have caught only half of this.
+
+**Why this kept happening.** §5.1 identified the pattern as *cross-component
+identifiers with no single source of truth* and prescribed named readers plus a
+test asserting the reader sees the producer's real output. That was applied to the
+router (§4) and the stream names (§9.6) but **not to the result envelope**, which
+is the largest cross-component contract in the system. The lesson generalises
+past identifiers: any place one component enumerates another's fields is the same
+bug waiting.
+
+### 9.12 Mutation testing the fixes
+
+Ten fixes were deliberately reverted to check the suite notices. **Nine of ten
+failed as they should.** The exception is worth recording:
+
+| Reverted | Caught? |
+| -------- | ------- |
+| Provenance forwarding (§9.11) | yes — 7 failures |
+| JWT verification on the query param (§6.6) | yes — 5 failures |
+| Tenant policy failing open (§5.6) | yes |
+| Summary auto-continuation (§6.1) | yes — 2 failures |
+| `method: "model"` hardcoding (§5.3) | yes — 4 failures |
+| KEDA consumer-group mismatch (§5.5) | yes |
+| Coverage clamping (§5.4) | yes |
+| Fusion renormalisation (§9.3) | yes — 4 failures |
+| Tool-delimiter neutralisation (§5.12) | yes |
+| **Watchlist alias de-duplication (§6.4)** | **NO — the whole suite still passed** |
+
+The alias-dedupe gap was real. Removing it double-counts a clause when two
+aliases of the same entity overlap ("alpha party" and "alpha"), which on a
+single-clause comment only doubles a score and leaves the label unchanged — thus
+invisible. But when the same entity is **praised in one clause and attacked in
+another**, the two should cancel; double-counting the first tips the verdict to
+`supportive`. That case is now a test.
+
+Worth stating plainly: a passing suite of 565 tests did not prove the fixes
+worked. Reverting them one at a time did.
+
+---
+
 ### Reproducibility
 
-The test suite runs: `uv sync --extra dev`, then **435 tests across 22 files pass** (up from 323 —
+The test suite runs: `uv sync --extra dev`, then **565 tests across 31 files pass** (up from 323 —
 the new files pin every fix in the 4 August implementation pass: summary truncation, JWT
 transport, vision status + fusion renormalisation, comment provenance, coverage clamping,
 KEDA/stream identifiers, DLQ job accounting, comment kinds, the batch queue, and the LLM cache
@@ -1315,7 +1499,21 @@ python -m eval.make_text_corpus                      # → posts_text_only.json 
 python -m eval.measure_routing_rate                  # 74% stub; call split; comment volume
 STAGE1_LLM=true MAX_COMMENTS=3 python -m eval.measure_routing_rate   # 16% as shipped
 python -m eval.bakeoff_summary --posts 10            # summary-model bake-off (needs Ollama)
+python -m eval.sweep_threshold                       # cost-vs-threshold curve (P1.5)
+python -m eval.sweep_threshold --sweep comment-cap    # the comment-cap lever
 ```
+
+**Real mode (§9.8) needs the ML extras**, which are not installed here:
+
+```bash
+uv sync --extra ml     # torch, transformers, sentence-transformers, gliner, keybert, fasttext
+MODEL_STUB_MODE=false python -m eval.measure_routing_rate
+```
+
+Without them the pipeline still runs — it degrades component by component and
+reports `processing.degraded_components` (§9.10) — but every label is heuristic,
+so **no accuracy or latency number from such a run is quotable.** Check that
+list is empty before recording anything from a real-mode run.
 
 ### Framing advice
 
@@ -1376,10 +1574,20 @@ provenance, coverage, KEDA, DLQ)~~ → ~~the comment-path rebuild in dependency 
 end (§9.8) → label a little data (§9.9) → then, if a paper is wanted, the watchlist (§6.4)
 annotated at scale (§8 Step 1).**
 
-**What is left, in order:** finish §6.6 (SSE tickets, `/auth/refresh`, `/auth/me`) and §5.6
-(real API-key storage, `tenant_id` from the database, fail closed) — they are the same root
-cause and the privacy claim depends on both; then §9.8's end-to-end run, which is now
-unblocked because §5.8's cost dimension and §6.3's batching are in place; then §9.9's 300
-labels, which is the first thing that turns "it runs" into "here is how well it works". §6.4
-(the watchlist) is still the most publishable idea in the repository and still needs the
-annotation/bias framing settled before any of it is coded.
+**What is left, in order — and it is now short:**
+
+1. **`uv sync --extra ml`, then §9.8's real-mode run.** Every code blocker is
+   cleared (§9.10); what remains is installing the weights and checking
+   `degraded_components` is empty before recording a number.
+2. **§9.9 — label ~300 comments.** The single decisive gap (§7.2), and the only
+   remaining item that is human hours rather than code. Nothing else turns "it
+   runs" into "here is how well it works".
+3. **Provision the auth tables.** `api_keys` and `users` rows, and `APP_ENV` set
+   away from `dev`, so P1.1's fail-closed paths actually engage. The code is
+   done; the deployment is not.
+4. **Fill in `config/stance_targets.yml`.** §6.4 is built and tested, but it
+   ships with a placeholder entity — the watchlist's contents are an editorial
+   choice, and its ~150-comment validation ([stance_targets.md](stance_targets.md)
+   §7) is what makes the novelty claim measurable rather than asserted.
+
+Everything else in this document is implemented.
