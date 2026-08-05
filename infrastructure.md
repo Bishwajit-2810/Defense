@@ -23,9 +23,22 @@ hundreds of short texts — Stage-1 throughput is better measured in **texts
   the payload no longer ships OCR text. Most posts have an image, so size for ~one
   image embed + OCR per post on top of the text load. Image **description/summary**
   uses the VLM and runs only on the **selective** Stage-2 slice, not every image.
+  **Currently unexercised** — no image bytes are reachable, so this line is
+  sizing for a capability that does not run today
+  ([PROJECT_ASSESSMENT.md](PROJECT_ASSESSMENT.md) §5.2). Exclude it from an MVP
+  GPU budget and restore it when the objects are uploaded.
+> **Size the LLM for COMMENTS, not posts.** Since every non-emoji comment gets an
+> LLM label, **85–96% of Stage-2 LLM calls are comment-level** — ~350 calls for a
+> 43-post corpus against ~20 post-level ones
+> ([PROJECT_ASSESSMENT.md](PROJECT_ASSESSMENT.md) §6.8). The throughput figure
+> that matters is *comment batches per second* (25 comments per call, 3 batches
+> in flight per post), not posts per second. Capping it is a config choice
+> (`STAGE1_LLM_COMMENT_MAX`, `COMMENT_STANCE_MAX_PER_POST`) that trades coverage
+> for cost — quote whichever you chose alongside the coverage number.
+
 - **Stage-2 LLMs** (two roles — **LLM-A** 7B/8B for per-post refinement, **LLM-B**
   14B/32B for cluster/report generation): order of **thousands of output
-  tokens/sec** aggregate; but they only see the **selective slice** (single-digit
+  tokens/sec** aggregate; but they only see the **selective slice** (16% of posts,
   % of posts) and mostly **cluster-level** calls. This throughput is delivered by
   the configured backend: `local` (vLLM continuous batching on our GPUs — sized
   below) or `groq` (Groq LPU — throughput is Groq's to scale, bounded by your

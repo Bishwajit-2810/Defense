@@ -706,6 +706,11 @@ function renderPostModal(r) {
     } else if (r.post_summary_source) {
       srcBadge = ' <span class="tag tag-sm">' + escHtml(r.post_summary_source) + '</span>';
     }
+    // A summary that hit the model's token ceiling even after auto-continuation
+    // is shown as incomplete rather than passed off as the whole answer (§6.1).
+    if (r.post_summary_truncated) {
+      srcBadge += ' <span class="tag tag-sm tag-warning" title="the model hit its token limit; this summary was trimmed to its last complete sentence">truncated</span>';
+    }
     html += '<div class="modal-section">'
       + '<div class="modal-section-title">Post Summary' + srcBadge + '</div>'
       + '<div class="summary-box">' + escHtml(r.post_summary) + '</div>'
@@ -814,7 +819,7 @@ function renderPostModal(r) {
   var skip = new Set(['post_summary','text_sentiment','image_sentiment','overall_sentiment',
     'reaction_breakdown','comment_analysis','engagement','processing','entities','keywords',
     'topics','intents','brand_mentions','language_mix','post_summary_grounding','post_summary_source',
-    'image_analysis','emotion','confidence']);
+    'post_summary_truncated','image_analysis','emotion','confidence']);
 
   var metaFields = [];
   Object.keys(r).forEach(function(k) {
@@ -1067,10 +1072,22 @@ function commentInsightsHtml(prefix, r) {
   var ca = (r && r.comment_analysis) || {};
   var coverage = ca.coverage_label || '—';
   var sb = ca.sentiment_breakdown || {};
+  // "Text opinion" vs "emoji reactions" as two series (§6.2): an emoji-only
+  // reaction is real crowd signal but it is not a written opinion, and blending
+  // the two into one bar makes the chart unable to say which it is showing.
+  var sub = ca.sentiment_breakdown_substantive || {};
+  var reactionOnly = ca.reaction_only || 0;
+  var hasSplit = reactionOnly > 0 && (sub.positive || sub.negative || sub.neutral);
 
   var html = '<div class="comment-insights">'
     + '<div class="modal-section-title">Comment Sentiment <span class="text-muted">(' + escHtml(coverage) + ')</span></div>'
     + '<div id="cs-summary-' + prefix + '">' + commentSummaryBox(ca.summary) + '</div>'
+    + (ca.coverage_anomaly
+        ? '<div class="text-muted" style="font-size:.75rem;margin-top:4px">⚠ '
+          + escHtml(String(ca.coverage_anomaly.analyzed)) + ' stored comments against '
+          + escHtml(String(ca.coverage_anomaly.reported_comment_count))
+          + ' reported by the platform — upstream mismatch, coverage capped at 100%.</div>'
+        : '')
     + '<div class="charts-row" style="margin-top:12px">'
     + '<div>'
     + '<p class="chart-title">Stance toward post</p>'
@@ -1080,6 +1097,15 @@ function commentInsightsHtml(prefix, r) {
     + makeLegendItem('Positive', sb.positive || 0, 'var(--color-positive)')
     + makeLegendItem('Negative', sb.negative || 0, 'var(--color-negative)')
     + makeLegendItem('Neutral',  sb.neutral  || 0, 'var(--color-neutral)')
+    + (hasSplit
+        ? '<div class="text-muted" style="font-size:.72rem;margin-top:6px">'
+          + 'Written comments only: '
+          + escHtml(String(sub.positive || 0)) + ' / '
+          + escHtml(String(sub.negative || 0)) + ' / '
+          + escHtml(String(sub.neutral || 0))
+          + ' · ' + escHtml(String(reactionOnly)) + ' emoji-only reaction'
+          + (reactionOnly === 1 ? '' : 's') + ' included above.</div>'
+        : '')
     + '</div></div>'
     + '</div>'
     + '<div>'
@@ -1211,15 +1237,28 @@ function renderComments(prefix, data) {
           + '<span class="text-muted">' + a.count + '× · ♥ ' + formatNumber(a.likes) + '</span></div>';
       }).join('') + '</div>';
     } else { analyticsHtml += '<div class="text-muted">—</div>'; }
-    // Engine mix (llm = context-aware stance; fast/model = standalone fallback)
+    // Label provenance — what actually produced these labels.
+    //   llm/model = inferred;  fast = emoji+lexicon heuristic;
+    //   stub = the deterministic hash fallback (reproducible, NOT sentiment).
+    // Shown as a share so the sentiment chart above can never be read as "the
+    // models said this" when most of it came from a keyword list.
     if (mbTotal > 0) {
-      var llmPct = Math.round((mb.llm || 0) / mbTotal * 100);
+      var prov = data.provenance || {};
+      var inferred = typeof prov.inferred === 'number'
+        ? prov.inferred : ((mb.llm || 0) + (mb.model || 0));
+      var infPct = Math.round(inferred / mbTotal * 100);
       var mixParts = Object.keys(mb).filter(function(k){ return mb[k]; })
         .map(function(k){ return k + ' ' + mb[k]; });
-      analyticsHtml += '<p class="chart-title" style="margin-top:10px">Engine mix '
-        + '<span class="text-muted">(' + llmPct + '% LLM-stance)</span></p>'
-        + '<div class="split-bar"><span class="split-fast" style="width:' + llmPct + '%"></span></div>'
+      analyticsHtml += '<p class="chart-title" style="margin-top:10px">Label provenance '
+        + '<span class="text-muted" title="share of comment labels produced by a model or the LLM; the rest come from an emoji+lexicon heuristic or the deterministic stub">('
+        + infPct + '% model/LLM)</span></p>'
+        + '<div class="split-bar"><span class="split-fast" style="width:' + infPct + '%"></span></div>'
         + '<div class="text-muted" style="font-size:.72rem;margin-top:2px">' + escHtml(mixParts.join(' · ')) + '</div>';
+      if (mb.stub) {
+        analyticsHtml += '<div class="text-muted" style="font-size:.72rem;margin-top:2px">'
+          + escHtml(String(mb.stub)) + ' label' + (mb.stub === 1 ? '' : 's')
+          + ' from the deterministic stub — reproducible, but not sentiment.</div>';
+      }
     }
     analyticsHtml += '</div>';
 

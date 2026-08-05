@@ -18,10 +18,27 @@ Usage
     # Sweep the gate — the accuracy-vs-cost curve starts here
     ROUTER_CONFIDENCE_THRESHOLD=0.8 python -m eval.measure_routing_rate
 
+It also reports the **post-level vs comment-level LLM call split** (§6.7), which
+is the number that decides what the routing rate means. Before §6.3, Stage 2 was
+a handful of per-post calls, so post-level routing was the dominant cost lever
+and the routing rate roughly *was* the cost story. With every non-emoji comment
+reaching the LLM, comment labelling outnumbers post-level calls several-fold and
+the gate governs a minority of total spend. The honest claim becomes *"cheap NLP
+filters which comments and which posts deserve an LLM"* rather than *"only N% of
+posts reach the LLM"* — and this script is what supports it.
+
 Env
 ---
-    MAX_COMMENTS   Comments analysed per post (default 40). No routing rule reads
-                   a comment field, so this only affects runtime.
+    CORPUS         Corpus path (default posts_text_only.json — the 43 captioned
+                   posts; see eval/make_text_corpus.py and §5.2 for why the 7
+                   image-only posts are excluded).
+    MAX_COMMENTS   Comments analysed per post. Default 0 = ALL of them, matching
+                   the shipped configuration since §6.3 lifted the caps. No
+                   routing rule reads a comment field, so this affects the
+                   comment-lane cost estimate and runtime, **not** the routing
+                   rate — set it low (e.g. 3) with STAGE1_LLM=true to get the
+                   routing rate in minutes rather than hours, and take the
+                   comment-lane figures from a MAX_COMMENTS=0 run.
     OUT            Write the per-post rows as JSON to this path.
 """
 
@@ -51,14 +68,25 @@ from services.workers.stage1_nlp import worker as stage1  # noqa: E402
 from services.workers.stage1_nlp.models import ModelRegistry  # noqa: E402
 from services.workers.stage1_nlp.text_analyzer import analyze_text  # noqa: E402
 
-CORPUS = ROOT / "posts_with_details.json"
-MAX_COMMENTS = int(os.getenv("MAX_COMMENTS", "40"))
+from services.workers.stage1_nlp.comment_analyzer import (  # noqa: E402
+    KIND_EMOJI,
+    _comment_kind,
+)
+
+CORPUS = Path(os.getenv("CORPUS", ROOT / "posts_text_only.json"))
+#: 0 = every comment, which is the shipped configuration since §6.3.
+MAX_COMMENTS = int(os.getenv("MAX_COMMENTS", "0"))
+
+# Batch sizes the workers use, so the call estimate matches what would run.
+STAGE1_BATCH = int(os.getenv("STAGE1_LLM_BATCH", "25"))
+STANCE_BATCH = int(os.getenv("COMMENT_STANCE_BATCH", "25"))
 
 
 async def _stage1_result(raw_post: dict, registry: ModelRegistry) -> dict:
     """Run Stage 1 exactly as the worker does and return its result dict."""
     post = dict(raw_post)
-    post["comments"] = (raw_post.get("comments") or [])[:MAX_COMMENTS]
+    all_comments = raw_post.get("comments") or []
+    post["comments"] = all_comments if MAX_COMMENTS <= 0 else all_comments[:MAX_COMMENTS]
     (
         text_result,
         image_result,
@@ -88,8 +116,20 @@ async def main() -> None:
         result = await _stage1_result(raw_post, registry)
         use_llm, reasons = should_use_llm(result, {})
         flags = get_task_flags(result, {}) if use_llm else {}
+
+        # Comment-lane volume. Emoji-only comments never enter an LLM batch
+        # (§6.2), so they are excluded from the count that drives cost.
+        comments = raw_post.get("comments") or []
+        if MAX_COMMENTS > 0:
+            comments = comments[:MAX_COMMENTS]
+        non_emoji = sum(
+            1 for c in comments if _comment_kind(c.get("text") or "") != KIND_EMOJI
+        )
         rows.append(
             {
+                "stored_comments": len(comments),
+                "non_emoji_comments": non_emoji,
+                "emoji_comments": len(comments) - non_emoji,
                 "post_id": result.get("post_id"),
                 "media_type": result.get("media_type"),
                 "confidence": result.get("confidence"),
@@ -131,6 +171,7 @@ async def main() -> None:
     else:
         engine = "small-model suite"
     print(
+        f"\nCorpus:         {CORPUS.name}"
         f"\nStage-1 engine: {engine}"
         f"\nROUTING RATE:   {len(routed)}/{len(rows)} = {len(routed) / len(rows):.0%}"
         f"   (bypassed Stage 2: {len(rows) - len(routed)})"
@@ -138,6 +179,75 @@ async def main() -> None:
         f"\nStage-1 typed:  {sum(1 for r in rows if r['post_type'])}/{len(rows)} posts"
         f"\nStage-2 post_type calls needed: {sum(1 for r in routed if r['want_post_type'])}"
     )
+
+    # -----------------------------------------------------------------------
+    # §6.7 — post-level vs comment-level LLM calls
+    # -----------------------------------------------------------------------
+    # What the routing gate actually governs. It decides which POSTS reach
+    # Stage 2; it does not decide whether comments get an LLM, because Stage-1
+    # comment labelling runs for every post.
+    def _batches(n: int, size: int) -> int:
+        return -(-n // size) if n > 0 else 0
+
+    # Post-level: summary + insight for every routed post, post_type only when
+    # Stage 1 was not confident enough. Comment summary is one call per routed
+    # post with comments.
+    post_calls = (
+        2 * len(routed)
+        + sum(1 for r in routed if r["want_post_type"])
+        + sum(1 for r in routed if r["stored_comments"])
+    )
+
+    # Comment-level, Stage 1: EVERY post, routed or not (§6.3 step 4).
+    stage1_comment_calls = sum(
+        _batches(r["non_emoji_comments"], STAGE1_BATCH) for r in rows
+    )
+    # Comment-level, Stage 2 stance: routed posts only — this is the part the
+    # gate still governs.
+    stance_calls = sum(
+        _batches(r["non_emoji_comments"], STANCE_BATCH) for r in routed
+    )
+    comment_calls = stage1_comment_calls + stance_calls
+    total_calls = post_calls + comment_calls
+
+    total_comments = sum(r["stored_comments"] for r in rows)
+    total_non_emoji = sum(r["non_emoji_comments"] for r in rows)
+
+    print(
+        f"\nCOMMENT VOLUME"
+        f"\n  stored comments:      {total_comments:,}"
+        f"\n  emoji-only (skipped): {total_comments - total_non_emoji:,}"
+        f" ({(total_comments - total_non_emoji) / total_comments:.1%})"
+        if total_comments else "\nCOMMENT VOLUME\n  (no comments)"
+    )
+    if total_comments:
+        print(f"  reaching the LLM:     {total_non_emoji:,}")
+
+    print(
+        f"\nLLM CALL SPLIT (per corpus run, cold cache)"
+        f"\n  post-level:            {post_calls:>6,}  "
+        f"({post_calls / total_calls:.1%})   summary + insight + post_type + comment-summary"
+        f"\n  comment-level:         {comment_calls:>6,}  "
+        f"({comment_calls / total_calls:.1%})"
+        f"\n      Stage-1 labelling: {stage1_comment_calls:>6,}   all {len(rows)} posts"
+        f" @ {STAGE1_BATCH}/batch"
+        f"\n      Stage-2 stance:    {stance_calls:>6,}   {len(routed)} routed posts"
+        f" @ {STANCE_BATCH}/batch"
+        f"\n  TOTAL:                 {total_calls:>6,}"
+        if total_calls else "\n(no LLM calls)"
+    )
+    if total_calls:
+        gate_governed = post_calls + stance_calls
+        print(
+            f"\nWHAT THE ROUTING GATE GOVERNS"
+            f"\n  Calls the gate decides:  {gate_governed:,}/{total_calls:,}"
+            f" = {gate_governed / total_calls:.1%}"
+            f"\n  (Stage-1 comment labelling runs for EVERY post, routed or not,"
+            f"\n   so the gate cannot reduce it.)"
+            f"\n\n  Read the routing rate as a measure of Stage-1 quality, and the"
+            f"\n  cost story as: cheap NLP filters which COMMENTS and which POSTS"
+            f"\n  deserve an LLM — not 'only N% of posts reach the LLM'."
+        )
 
     out = os.getenv("OUT")
     if out:

@@ -6,14 +6,38 @@ showing the exact input and the structured JSON the service returns. These match
 the canonical schema in [architecture.md](architecture.md) §6, the input contract
 in [data_contract.md](data_contract.md), and the API in [api_design.md](api_design.md).
 
+> ## ⚠ These examples show the DESIGNED output, not a current run
+>
+> They were written to illustrate the full contract, and two parts of them are
+> **not what the pipeline produces today** (4 August 2026 —
+> [PROJECT_ASSESSMENT.md](PROJECT_ASSESSMENT.md)):
+>
+> - **`image_sentiment` is always `null`** and `vision_model` reports a *status*
+>   (`fetch_failed` / `stub` / `model_unavailable`), not a model name. No image
+>   bytes are reachable, so `post_summary_source` is always `"llm"`, never
+>   `"vlm"`, and `post_summary_grounding` is `"caption"` (§5.2). The non-null
+>   `image_sentiment` blocks below are aspirational.
+> - **`comment_analysis` now carries more fields** than these examples show:
+>   `sentiment_breakdown_substantive`, `reaction_only`, `provenance`,
+>   `coverage_anomaly`, and a per-comment `kind`. `coverage` is **clamped to
+>   1.0**. `method` can be `stub` — a deterministic hash, not sentiment — and the
+>   `provenance` block is what tells you how many labels were real inferences.
+>
+> Everything else — the comment thread, the reaction cross-check, the recomputed
+> sentiment, the Bangla summaries — is current. Regenerate against a live run
+> before quoting any of this in a defense.
+
 Three things to keep in mind:
 
-- **Multimodal, in order** ([data_contract.md](data_contract.md) §4): (1) text
+- **Pipeline order** ([data_contract.md](data_contract.md) §4): (1) text
   sentiment on the caption, (2) **`image_sentiment`** from a visual model on the
-  photo (we also **OCR it ourselves** — the payload no longer ships OCR), (3) fuse
-  into `overall_sentiment`/`sentiment_score`, cross-checked against
-  **`reaction_breakdown`**, (4) a `post_summary` **grounded on caption + OCR +
-  image**, (5) **per-comment sentiment** over the **embedded** comment thread.
+  photo (we also **OCR it ourselves** — the payload no longer ships OCR)
+  *— implemented but currently producing no signal, see the note above*, (3)
+  fuse into `overall_sentiment`/`sentiment_score` **over the terms that carry a
+  real verdict**, cross-checked against **`reaction_breakdown`**, (4) a
+  `post_summary` **grounded on caption (+ OCR + image when available)**, (5)
+  **per-comment sentiment** over the **embedded** comment thread — since the
+  caps were lifted, that means *every non-emoji comment*, not the top 60.
 - **Comments are live and embedded.** Each post ships a stored sample of its
   comments (`engagement.storedCommentRows` of `commentCount`), with `sentiment:
 null` — **we compute it**. `comment_analysis.coverage` reports the sample size;

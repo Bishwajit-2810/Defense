@@ -27,6 +27,8 @@ _LIBS_PATH = os.path.join(os.path.dirname(__file__), "..", "..", "..", "..", "li
 if _LIBS_PATH not in sys.path:
     sys.path.insert(0, os.path.abspath(_LIBS_PATH))
 
+from libs import streams  # noqa: E402
+from libs.labels import label_provenance  # noqa: E402
 from libs.llm import LLMClient  # noqa: E402
 from libs.progress import publish_stage  # noqa: E402
 
@@ -44,20 +46,54 @@ from .prompts import (  # noqa: E402
 # runs on the `stage2` model (qwen2.5:7b by default), a different, larger model
 # than the Stage-1 NLP model (`stage1` = gemma3:4b). Override with
 # STAGE2_LOCAL_MODEL, or per-task via COMMENT_STANCE_ROLE.
+# Summarization runs on its own role, separate from classification (§6.5).
+# Classification (post_type, insight, comment stance) wants a cheap, constrained
+# model — it picks from a fixed vocabulary. Summarization wants a fluent one —
+# it writes Bangla prose. Keeping them on separate roles is also the honest
+# version of the cost story: the expensive model is spent on the one task that
+# needs it, once per post, instead of on every classification call.
+# `summary` defaults to the same model as `stage2`, so nothing changes until
+# SUMMARY_LOCAL_MODEL / SUMMARY_GROQ_MODEL points it somewhere else.
+_SUMMARY_ROLE = os.environ.get("SUMMARY_ROLE", "summary")
+
 _STANCE_ENABLED = os.environ.get("COMMENT_STANCE", "true").lower() == "true"
 _STANCE_ROLE = os.environ.get("COMMENT_STANCE_ROLE", "stage2")
-_STANCE_BATCH = int(os.environ.get("COMMENT_STANCE_BATCH", "40"))
+_STANCE_BATCH = int(os.environ.get("COMMENT_STANCE_BATCH", "25"))
 _STANCE_MAX_TEXT = 140
-# Cap how many comments per post get the (slow) context-aware LLM stance: the
-# top-N by likes. The rest keep their instant Stage-1 heuristic label, so EVERY
-# comment is still analysed (full coverage) — the cap only bounds the premium LLM
-# pass so a post with thousands of comments doesn't stall the pipeline.
-#   COMMENT_STANCE_MAX_PER_POST=0  → LLM-label every comment (full LLM coverage;
-#   only practical on Groq / a GPU — on local CPU Ollama this takes ages).
-_STANCE_MAX_PER_POST = int(os.environ.get("COMMENT_STANCE_MAX_PER_POST", "40"))
+# 0 = no cap: EVERY non-emoji comment on a routed post gets the context-aware
+# stance pass (§6.3). This used to default to 40, so Stage 2 re-labelled only
+# the 40 most-liked comments per post while `sentiment_breakdown` mixed those
+# with Stage-1 heuristic labels and could not say which was which.
+#
+# Note the reach question §6.3 step 4 raises and answers here: Stage-1 comment
+# labelling runs for EVERY post, but this Stage-2 stance pass only runs for
+# posts the router sent to Stage 2. So "every comment is analysed by an LLM" is
+# delivered by the Stage-1 half; the context-aware STANCE upgrade still reaches
+# only routed posts. That is deliberate — stance-toward-the-post is the premium
+# signal and the gate is what decides which posts earn it.
+#
+# Set a positive value for a fast demo run.
+_STANCE_MAX_PER_POST = int(os.environ.get("COMMENT_STANCE_MAX_PER_POST", "0"))
+# Batches in flight at once. The loop used to be strictly sequential, so
+# lifting the cap simply stalled the post.
+_STANCE_CONCURRENCY = max(1, int(os.environ.get("COMMENT_STANCE_CONCURRENCY", "3")))
+# Retries per batch, so one bad batch does not lose the rest.
+_STANCE_BATCH_RETRIES = max(0, int(os.environ.get("COMMENT_STANCE_BATCH_RETRIES", "1")))
 # Natural-language summary of the comment reactions (one short LLM call per post
 # that has comments). Set COMMENT_SUMMARY=false to disable.
 _COMMENT_SUMMARY_ENABLED = os.environ.get("COMMENT_SUMMARY", "true").lower() == "true"
+# Per-task token ceilings. These used to be hardcoded literals (512 summary,
+# 512 insight, 256 comment summary, 128 post_type) and nothing checked whether a
+# reply had actually stopped at them. Bangla costs far more tokens per character
+# than English under these tokenizers, so a fixed ceiling truncates Bangla and
+# Banglish posts while sparing English ones — the wrong bias for this project.
+# Defaults are raised; `LLMClient.chat` now auto-continues a length-truncated
+# free-text reply and reports whatever state it ends in.
+_SUMMARY_MAX_TOKENS = int(os.environ.get("SUMMARY_MAX_TOKENS", "1024"))
+_COMMENT_SUMMARY_MAX_TOKENS = int(os.environ.get("COMMENT_SUMMARY_MAX_TOKENS", "640"))
+_INSIGHT_MAX_TOKENS = int(os.environ.get("INSIGHT_MAX_TOKENS", "768"))
+_POST_TYPE_MAX_TOKENS = int(os.environ.get("POST_TYPE_MAX_TOKENS", "128"))
+
 _STANCE_LABELS = {"positive", "negative", "neutral"}
 _STANCE_SCORE = {"positive": 0.6, "negative": -0.6, "neutral": 0.0}
 # Emotion taxonomy must match libs/schemas/output_schema.json and the Stage-1
@@ -73,9 +109,13 @@ logger = structlog.get_logger(__name__)
 
 REDIS_URL: str = os.environ.get("REDIS_URL", "redis://localhost:6379/0")
 
-STAGE2_QUEUE: str = "llm:stage2:queue"
-ASSEMBLER_QUEUE: str = "assembler:queue"
-CONSUMER_GROUP: str = "stage2-llm-workers"
+# Names come from libs/streams.py so the KEDA manifests cannot drift from the
+# group this worker actually creates — see §5.1 / §5.5. Stage 2 is the only
+# stage where scaling changes cost or latency, and its scaler pointed at a
+# group name that never existed.
+STAGE2_QUEUE: str = streams.STAGE2_LLM.name
+ASSEMBLER_QUEUE: str = streams.ASSEMBLER.name
+CONSUMER_GROUP: str = streams.STAGE2_LLM.group
 CONSUMER_NAME: str = os.environ.get("HOSTNAME", "stage2-llm-0")
 
 BLOCK_MS: int = 5_000
@@ -88,6 +128,22 @@ STAGE2_MAX_RETRIES: int = int(os.environ.get("STAGE2_MAX_RETRIES", "3"))
 # ---------------------------------------------------------------------------
 # Helpers
 # ---------------------------------------------------------------------------
+
+def _cache_model(llm: LLMClient, role: str, backend: str) -> str:
+    """Resolve the concrete model id for a (role, backend) pair, for the cache key.
+
+    §5.10: the cache key's `model` slot used to carry the ROLE LABEL ("stage2",
+    "vlm"), so the actual model id never entered the key and a 7-day entry
+    written by one model was served to another. Falls back to the role label
+    only if resolution fails — a degraded key is better than a failed task, but
+    it must not be the normal path.
+    """
+    try:
+        return llm.default_model(role, backend)
+    except Exception as exc:
+        logger.warning("cache_model_resolve_failed", role=role, backend=backend, error=str(exc))
+        return role
+
 
 def _task_content_hash(partial_result: dict, task: str, task_flags: dict) -> str:
     """Deterministic hash for (content + task) used as cache key."""
@@ -137,23 +193,85 @@ async def _fetch_images_as_data_urls(urls: list[str]) -> list[str]:
     return data_urls
 
 
-async def _track_usage(redis, response: dict | None = None, cache_hit: bool = False) -> None:
+#: Which lane a call belongs to: "post" (summary/post_type/insight, once per
+#: post) or "comment" (stance/comment summary, many per post). §6.7: once every
+#: comment reaches the LLM the cost becomes comment-dominated and the routing
+#: gate stops being the main lever — but that can only be *shown* if the
+#: counters record which lane spent the tokens.
+LANE_POST = "post"
+LANE_COMMENT = "comment"
+
+
+async def _track_usage(
+    redis,
+    response: dict | None = None,
+    cache_hit: bool = False,
+    *,
+    lane: str = LANE_POST,
+    task: str = "unknown",
+) -> None:
     """Increment the Redis usage counters GET /v1/usage reads.
 
-    Counters: usage:llm_calls (fresh calls), usage:cache_hits,
-    usage:tokens:total (sum of total_tokens across fresh calls).
+    Global counters (unchanged): usage:llm_calls, usage:cache_hits,
+    usage:tokens:total.
+
+    Dimensioned counters (§5.8), because the global ones cannot answer the
+    question a cost-efficiency thesis asks:
+
+        usage:tokens:{backend}:{model}   — the local backend's marginal token
+            cost is ZERO and Groq's per-model prices differ by more than an
+            order of magnitude, so one blended price is wrong for both, in
+            opposite directions. Without this dimension there is nothing to fix
+            it with.
+        usage:tokens:lane:{lane}         — post-level vs comment-level split.
+        usage:calls:lane:{lane}
+        usage:calls:task:{task}
+
+    Add the dimension BEFORE a measurement run, or the run has to be repeated.
     """
     try:
         if cache_hit:
             await redis.incr("usage:cache_hits")
+            await redis.incr(f"usage:cache_hits:lane:{lane}")
             return
         await redis.incr("usage:llm_calls")
+        await redis.incr(f"usage:calls:lane:{lane}")
+        await redis.incr(f"usage:calls:task:{task}")
+
         usage = (response or {}).get("usage") or {}
         total = int(usage.get("total_tokens") or 0)
-        if total:
-            await redis.incrby("usage:tokens:total", total)
+        if not total:
+            return
+        await redis.incrby("usage:tokens:total", total)
+        await redis.incrby(f"usage:tokens:lane:{lane}", total)
+        backend = (response or {}).get("backend") or "unknown"
+        model = (response or {}).get("model") or "unknown"
+        await redis.incrby(f"usage:tokens:{backend}:{model}", total)
+        await redis.sadd("usage:models", f"{backend}:{model}")
     except Exception as exc:
         logger.warning("usage_tracking_failed", error=str(exc))
+
+
+# Sentence terminators across the three scripts this corpus writes in: the
+# Bangla danda/double-danda, and Latin punctuation for English/Banglish.
+_SENTENCE_ENDS = ("।", "॥", ".", "!", "?", "…")
+
+
+def _trim_to_sentence(text: str, min_keep_ratio: float = 0.5) -> str:
+    """Cut a still-truncated reply back to its last complete sentence.
+
+    Last resort after auto-continuation has been exhausted: a summary that ends
+    mid-word reads as a bug, one that ends a sentence early merely reads as
+    short. Refuses to trim when doing so would discard more than half the text
+    (a long reply with no terminator at all is better kept whole than gutted).
+    """
+    stripped = text.rstrip()
+    if not stripped or stripped.endswith(_SENTENCE_ENDS):
+        return stripped
+    cut = max(stripped.rfind(end) for end in _SENTENCE_ENDS)
+    if cut < 0 or (cut + 1) < len(stripped) * min_keep_ratio:
+        return stripped
+    return stripped[: cut + 1]
 
 
 def _safe_json_parse(text: str, fallback: dict) -> dict:
@@ -189,23 +307,35 @@ async def _run_summary(
     content_hash = _task_content_hash(partial_result, task, task_flags)
     backend = backend_override or os.environ.get("LLM_BACKEND", "local")
 
-    # Resolve model id for cache key (best-effort; use role label as fallback)
-    model_label = role
-
-    cached = await get_cached(redis, backend, model_label, task, content_hash)
-    if cached is not None:
-        await _track_usage(redis, cache_hit=True)
-        return {**cached, "_cache_hit": True}
-
     target_lang = task_flags.get("target_lang") or partial_result.get("language") or "the post's language"
     # Image-grounded summary: the VLM gets the actual image bytes (base64
     # data URLs — local servers like Ollama can't fetch remote URLs) alongside
     # caption/OCR. Expired CDN links or a VLM failure degrade to a text-only
     # summary instead of failing the task.
+    #
+    # This runs BEFORE the cache lookup on purpose: the model that will write
+    # the summary depends on whether an image was actually fetched, and the
+    # model id is part of the cache key (§5.10). Keying on the requested role
+    # instead would file a text-model summary under the VLM's id. The cost is
+    # one wasted fetch on a cache hit for an image post — and image bytes are
+    # unreachable today anyway (§5.2), so this branch does not currently run.
     image_urls: list[str] | None = None
     if role == "vlm" and partial_result.get("photo_urls"):
         image_urls = await _fetch_images_as_data_urls(partial_result["photo_urls"]) or None
     grounded_on_image = bool(image_urls)
+
+    # The CONCRETE model id, not the role label — §5.10. Without it, switching
+    # SUMMARY_LOCAL_MODEL would serve the previous model's summaries for 7 days,
+    # and the moment summarization and classification run on different models
+    # the key stops distinguishing them at all.
+    cache_role = role if grounded_on_image else _SUMMARY_ROLE
+    model_label = _cache_model(llm, cache_role, backend)
+
+    cached = await get_cached(redis, backend, model_label, task, content_hash)
+    if cached is not None:
+        await _track_usage(redis, cache_hit=True, lane=LANE_POST, task="summary")
+        return {**cached, "_cache_hit": True}
+
     messages = build_summary_messages(
         caption=partial_result.get("caption") or "",
         ocr_text=partial_result.get("ocr_text") or "",
@@ -228,7 +358,7 @@ async def _run_summary(
             role=chat_role,
             messages=msgs,
             backend_override=backend_override,
-            max_tokens=512,
+            max_tokens=_SUMMARY_MAX_TOKENS,
             temperature=0.2,
         )
 
@@ -240,7 +370,7 @@ async def _run_summary(
     # ground on, summarise on the `stage2` model from caption + OCR directly
     # instead of burning a doomed VLM call that strands the post with a blank
     # summary.
-    effective_role = role if grounded_on_image else "stage2"
+    effective_role = role if grounded_on_image else _SUMMARY_ROLE
     chat_messages = messages if grounded_on_image else text_only_messages
 
     try:
@@ -250,20 +380,34 @@ async def _run_summary(
             raise
         logger.warning("vlm_summary_failed_falling_back_to_text", error=str(exc))
         grounded_on_image = False
-        response = await _chat("stage2", text_only_messages)
+        response = await _chat(_SUMMARY_ROLE, text_only_messages)
 
     # Local VLMs (qwen3-vl) frequently return EMPTY content without raising — that
     # left image posts with a blank summary. Whenever the VLM was actually used
-    # and produced nothing, redo the summary text-only on the `stage2` model so the
+    # and produced nothing, redo the summary text-only on the summary model so the
     # caption + OCR still yield a summary.
     if effective_role == "vlm" and not (response.get("content") or "").strip():
         logger.warning("vlm_summary_empty_falling_back_to_text", post_id=partial_result.get("post_id"))
         grounded_on_image = False
-        response = await _chat("stage2", text_only_messages)
+        response = await _chat(_SUMMARY_ROLE, text_only_messages)
 
-    await _track_usage(redis, response)
+    await _track_usage(redis, response, lane=LANE_POST, task="summary")
 
     summary_text = (response.get("content") or "").strip()
+    # `truncated` means the reply STILL ended at the token ceiling after
+    # LLMClient exhausted its continuation budget. Trim back to the last
+    # complete sentence so the text never ends mid-word, and record the fact —
+    # a short summary that says it was cut is defensible; a silent half is not.
+    truncated = bool(response.get("truncated"))
+    if truncated:
+        summary_text = _trim_to_sentence(summary_text)
+        logger.warning(
+            "stage2_summary_truncated",
+            post_id=partial_result.get("post_id"),
+            chars=len(summary_text),
+            max_tokens=_SUMMARY_MAX_TOKENS,
+            continuations=response.get("continuations", 0),
+        )
 
     grounding_parts = []
     if partial_result.get("caption"):
@@ -281,13 +425,34 @@ async def _run_summary(
         # Golden rule 10: "vlm" only when the image actually grounded it.
         "post_summary_source": "vlm" if grounded_on_image else "llm",
         "post_summary_grounding": grounding_parts,
+        "post_summary_truncated": truncated,
         "_llm_model": response.get("model", model_label),
         "_llm_backend": response.get("backend", backend),
     }
 
     # Never cache an empty summary — otherwise the blank result is served back on
-    # every retry for the same content and the post can never recover.
-    if summary_text:
+    # every retry for the same content and the post can never recover. The same
+    # argument applies to a truncated one, and more forcefully: the cache TTL is
+    # 7 days, so a half summary written once is served back on every subsequent
+    # request for that content instead of being retried with a bigger budget.
+    #
+    # Nor cache when the role changed mid-flight: the VLM fallbacks above can
+    # leave a summary-model answer that would be filed under the VLM's model id,
+    # which is precisely the §5.10 defect (one model's output served for
+    # another's request) reintroduced from the other direction. Recomputing is
+    # not an option either — the next run looks up under the pre-fallback key —
+    # so take the miss.
+    # `effective_role` is not updated by the fallbacks above; `grounded_on_image`
+    # is, so it is the reliable signal that the VLM path was abandoned after the
+    # cache key had already been computed from it.
+    role_changed = cache_role == "vlm" and not grounded_on_image
+    if role_changed:
+        logger.info(
+            "summary_not_cached_role_changed",
+            post_id=partial_result.get("post_id"),
+            requested=cache_role, actual=effective_role,
+        )
+    if summary_text and not truncated and not role_changed:
         await set_cached(redis, backend, model_label, task, content_hash, result)
     return result
 
@@ -304,11 +469,12 @@ async def _run_post_type(
     task = "post_type"
     content_hash = _task_content_hash(partial_result, task, task_flags)
     backend = backend_override or os.environ.get("LLM_BACKEND", "local")
-    model_label = role
+    # Concrete model id, not the role label — §5.10.
+    model_label = _cache_model(llm, role, backend)
 
     cached = await get_cached(redis, backend, model_label, task, content_hash)
     if cached is not None:
-        await _track_usage(redis, cache_hit=True)
+        await _track_usage(redis, cache_hit=True, lane=LANE_POST, task="post_type")
         return {**cached, "_cache_hit": True}
 
     text = partial_result.get("caption") or partial_result.get("ocr_text") or ""
@@ -322,11 +488,21 @@ async def _run_post_type(
         messages=messages,
         backend_override=backend_override,
         response_format={"type": "json_object"},
-        max_tokens=128,
+        max_tokens=_POST_TYPE_MAX_TOKENS,
         temperature=0.0,
     )
 
-    await _track_usage(redis, response)
+    await _track_usage(redis, response, lane=LANE_POST, task="post_type")
+
+    # JSON replies can't be continued token-wise into valid JSON, so a truncated
+    # one falls through to the caller's fallback — but it must say so rather than
+    # letting the fallback masquerade as the model's judgement.
+    if response.get("truncated"):
+        logger.warning(
+            "stage2_post_type_truncated",
+            post_id=partial_result.get("post_id"),
+            max_tokens=_POST_TYPE_MAX_TOKENS,
+        )
 
     parsed = _safe_json_parse(
         response["content"],
@@ -340,7 +516,8 @@ async def _run_post_type(
         "_llm_backend": response.get("backend", backend),
     }
 
-    await set_cached(redis, backend, model_label, task, content_hash, result)
+    if not response.get("truncated"):
+        await set_cached(redis, backend, model_label, task, content_hash, result)
     return result
 
 
@@ -356,11 +533,12 @@ async def _run_insight(
     task = "insight"
     content_hash = _task_content_hash(partial_result, task, task_flags)
     backend = backend_override or os.environ.get("LLM_BACKEND", "local")
-    model_label = role
+    # Concrete model id, not the role label — §5.10.
+    model_label = _cache_model(llm, role, backend)
 
     cached = await get_cached(redis, backend, model_label, task, content_hash)
     if cached is not None:
-        await _track_usage(redis, cache_hit=True)
+        await _track_usage(redis, cache_hit=True, lane=LANE_POST, task="insight")
         return {**cached, "_cache_hit": True}
 
     text = partial_result.get("caption") or partial_result.get("ocr_text") or ""
@@ -376,11 +554,18 @@ async def _run_insight(
         messages=messages,
         backend_override=backend_override,
         response_format={"type": "json_object"},
-        max_tokens=512,
+        max_tokens=_INSIGHT_MAX_TOKENS,
         temperature=0.1,
     )
 
-    await _track_usage(redis, response)
+    await _track_usage(redis, response, lane=LANE_POST, task="insight")
+
+    if response.get("truncated"):
+        logger.warning(
+            "stage2_insight_truncated",
+            post_id=partial_result.get("post_id"),
+            max_tokens=_INSIGHT_MAX_TOKENS,
+        )
 
     parsed = _safe_json_parse(
         response["content"],
@@ -395,7 +580,8 @@ async def _run_insight(
         "_llm_backend": response.get("backend", backend),
     }
 
-    await set_cached(redis, backend, model_label, task, content_hash, result)
+    if not response.get("truncated"):
+        await set_cached(redis, backend, model_label, task, content_hash, result)
     return result
 
 
@@ -435,6 +621,7 @@ async def _run_comment_stance(
     stage1_result: dict,
     post_context: str,
     backend_override: str | None,
+    progress_cb: Any = None,
 ) -> int:
     """Re-label every embedded comment with its STANCE TOWARD THE POST via the LLM.
 
@@ -443,6 +630,13 @@ async def _run_comment_stance(
     ``stage1_result["comment_analysis"]`` in place — including a recomputed
     sentiment_breakdown / method_breakdown — so the assembler persists the
     context-aware labels to Postgres + ClickHouse. Returns #comments re-labelled.
+
+    Batches run through a bounded-concurrency queue with per-batch retry, so
+    lifting COMMENT_STANCE_MAX_PER_POST to 0 (the default) does not stall the
+    post: a 2,857-comment thread is ~115 batches, and running them strictly in
+    sequence is what made the cap necessary in the first place.
+
+    ``progress_cb(done, total)`` is awaited after each batch for the Trace tab.
     """
     ca = stage1_result.get("comment_analysis") or {}
     comments = ca.get("comments") or []
@@ -450,29 +644,47 @@ async def _run_comment_stance(
         return 0
 
     backend = backend_override or os.environ.get("LLM_BACKEND", "local")
+    # Concrete model id for the cache key — §5.10.
+    stance_model = _cache_model(llm, _STANCE_ROLE, backend)
     labeled = 0
+
+    # Emoji-only reactions never enter an LLM batch: there is no text in them to
+    # judge stance from, so they are the cheapest possible tokens to waste. They
+    # keep their Stage-1 emoji label (❤️/🤬 are real signal — see §6.2).
+    eligible = [c for c in comments if c.get("kind") != "emoji"]
+    if not eligible:
+        return 0
 
     # Only the most-engaged comments get the premium context-aware LLM stance;
     # the rest keep their instant Stage-1 label (coverage stays 100%). These are
     # the same dict objects as in ``comments``, so mutating them updates the list.
-    if 0 < _STANCE_MAX_PER_POST < len(comments):
-        targets = sorted(comments, key=lambda c: int(c.get("likes") or 0), reverse=True)[:_STANCE_MAX_PER_POST]
+    if 0 < _STANCE_MAX_PER_POST < len(eligible):
+        targets = sorted(eligible, key=lambda c: int(c.get("likes") or 0), reverse=True)[:_STANCE_MAX_PER_POST]
     else:
-        targets = comments
+        targets = eligible
 
-    for start in range(0, len(targets), _STANCE_BATCH):
-        batch = targets[start : start + _STANCE_BATCH]
+    batches = [
+        targets[i : i + _STANCE_BATCH] for i in range(0, len(targets), _STANCE_BATCH)
+    ]
+    total_batches = len(batches)
+    semaphore = asyncio.Semaphore(_STANCE_CONCURRENCY)
+    lock = asyncio.Lock()
+    done = 0
+
+    async def _fetch_batch(index: int, batch: list[dict]) -> list:
+        """Return this batch's labels (cached, fresh, or all-None on failure)."""
         raw_key = post_context[:1500] + "||" + "|".join(
             (c.get("text") or "")[:_STANCE_MAX_TEXT] for c in batch
         )
         content_hash = hashlib.sha256(raw_key.encode("utf-8")).hexdigest()
 
-        cached = await get_cached(redis, backend, _STANCE_ROLE, "comment_stance", content_hash)
+        cached = await get_cached(redis, backend, stance_model, "comment_stance", content_hash)
         if cached is not None and isinstance(cached.get("labels"), list) and len(cached["labels"]) == len(batch):
-            results = cached["labels"]
-            await _track_usage(redis, cache_hit=True)
-        else:
-            messages = build_comment_stance_messages(post_context, batch, _STANCE_MAX_TEXT)
+            await _track_usage(redis, cache_hit=True, lane=LANE_COMMENT, task="comment_stance")
+            return cached["labels"]
+
+        messages = build_comment_stance_messages(post_context, batch, _STANCE_MAX_TEXT)
+        for attempt in range(_STANCE_BATCH_RETRIES + 1):
             try:
                 resp = await llm.chat(
                     role=_STANCE_ROLE,
@@ -483,13 +695,41 @@ async def _run_comment_stance(
                     max_tokens=min(4096, 56 * len(batch) + 64),
                     temperature=0.0,
                 )
-                await _track_usage(redis, resp)
+                await _track_usage(redis, resp, lane=LANE_COMMENT, task="comment_stance")
                 results = _normalize_stance(_safe_json_parse(resp["content"], {}), len(batch))
-                await set_cached(redis, backend, _STANCE_ROLE, "comment_stance", content_hash, {"labels": results})
+                await set_cached(redis, backend, stance_model, "comment_stance", content_hash, {"labels": results})
+                return results
             except Exception as exc:
-                logger.warning("comment_stance_batch_failed", start=start, error=str(exc))
-                results = [None] * len(batch)
+                if attempt < _STANCE_BATCH_RETRIES:
+                    logger.warning(
+                        "comment_stance_batch_retrying",
+                        batch=index + 1, of=total_batches, attempt=attempt + 1, error=str(exc),
+                    )
+                    continue
+                # Per-batch isolation: these comments keep their Stage-1 label
+                # rather than costing the rest of the post its stance pass.
+                logger.warning(
+                    "comment_stance_batch_failed",
+                    batch=index + 1, of=total_batches, comments=len(batch), error=str(exc),
+                )
+                return [None] * len(batch)
+        return [None] * len(batch)
 
+    async def _run_batch(index: int, batch: list[dict]) -> int:
+        nonlocal done
+        async with semaphore:
+            results = await _fetch_batch(index, batch)
+
+        applied = 0
+        # `_normalize_stance` returns one slot per input comment, in order — the
+        # merge is index-aligned and a length mismatch would attach each
+        # comment's stance to its neighbour.
+        if len(results) != len(batch):
+            logger.warning(
+                "comment_stance_length_mismatch",
+                batch=index + 1, got=len(results), expected=len(batch),
+            )
+            results = [None] * len(batch)
         for c, label in zip(batch, results):
             if not isinstance(label, dict):
                 continue
@@ -499,14 +739,31 @@ async def _run_comment_stance(
                 c["sentiment"] = stance
                 c["sentiment_score"] = _STANCE_SCORE[stance]
                 c["method"] = "llm"
-                labeled += 1
+                applied += 1
             if emotion in _EMOTION_LABELS:
                 # Context-aware emotion overwrites the Stage-1 heuristic guess.
                 c["emotion"] = emotion
             # else: keep the Stage-1 standalone values as a fallback
 
+        async with lock:
+            done += 1
+            current = done
+        if progress_cb is not None:
+            try:
+                await progress_cb(current, total_batches)
+            except Exception as exc:  # progress must never break analysis
+                logger.debug("stance_progress_failed", error=str(exc))
+        return applied
+
+    applied_counts = await asyncio.gather(
+        *(_run_batch(i, b) for i, b in enumerate(batches)), return_exceptions=True
+    )
+    labeled = sum(n for n in applied_counts if isinstance(n, int))
+
     # Recompute aggregates from the (mutated) per-comment list.
     sb = {"positive": 0, "negative": 0, "neutral": 0}
+    sb_sub = {"positive": 0, "negative": 0, "neutral": 0}
+    reaction_only = 0
     eb = {k: 0 for k in _EMOTION_KEYS}
     mb: dict = {}
     for c in comments:
@@ -514,15 +771,26 @@ async def _run_comment_stance(
         if s not in sb:
             s = "neutral"
         sb[s] += 1
+        if c.get("kind") == "emoji":
+            reaction_only += 1
+        else:
+            sb_sub[s] += 1
         e = c.get("emotion") or "neutral"
         if e not in eb:
             e = "neutral"
         eb[e] += 1
         m = c.get("method") or "fast"
         mb[m] = mb.get(m, 0) + 1
+    ca["sentiment_breakdown_substantive"] = sb_sub
+    ca["reaction_only"] = reaction_only
     ca["sentiment_breakdown"] = sb
     ca["emotion_breakdown"] = eb
     ca["method_breakdown"] = mb
+    # Stage 2 re-labels only the top-N comments, so a single sentiment_breakdown
+    # can mix Stage-1 heuristic, Stage-1 LLM and Stage-2 stance labels. Recompute
+    # the provenance summary here or the chart reports Stage-1's mix for a set of
+    # labels Stage 2 has since changed.
+    ca["provenance"] = label_provenance(mb)
     return labeled
 
 
@@ -545,6 +813,9 @@ async def _run_comment_summary(
         return None
 
     backend = backend_override or os.environ.get("LLM_BACKEND", "local")
+    # The comment summary is SUMMARIZATION, so it runs on the summary role —
+    # the same split as the post summary (§6.5). Concrete model id in the key.
+    summary_model = _cache_model(llm, _SUMMARY_ROLE, backend)
     sb = ca.get("sentiment_breakdown") or {}
     eb = ca.get("emotion_breakdown") or {}
     reps = ca.get("representative_comments") or []
@@ -558,25 +829,37 @@ async def _run_comment_summary(
     )
     content_hash = hashlib.sha256(raw_key.encode("utf-8")).hexdigest()
 
-    cached = await get_cached(redis, backend, _STANCE_ROLE, "comment_summary", content_hash)
+    cached = await get_cached(redis, backend, summary_model, "comment_summary", content_hash)
     if cached is not None:
-        await _track_usage(redis, cache_hit=True)
+        await _track_usage(redis, cache_hit=True, lane=LANE_COMMENT, task="comment_summary")
         return cached.get("summary")
 
     messages = build_comment_summary_messages(post_context, sb, eb, reps, target_lang)
     resp = await llm.chat(
-        role=_STANCE_ROLE,
+        # Summarization, not classification — the summary role (§6.5).
+        role=_SUMMARY_ROLE,
         messages=messages,
         backend_override=backend_override,
-        max_tokens=256,
+        max_tokens=_COMMENT_SUMMARY_MAX_TOKENS,
         temperature=0.3,
     )
-    await _track_usage(redis, resp)
+    await _track_usage(redis, resp, lane=LANE_COMMENT, task="comment_summary")
 
     summary = (resp.get("content") or "").strip()
-    if summary:
+    truncated = bool(resp.get("truncated"))
+    if truncated:
+        summary = _trim_to_sentence(summary)
+        logger.warning(
+            "stage2_comment_summary_truncated",
+            chars=len(summary),
+            max_tokens=_COMMENT_SUMMARY_MAX_TOKENS,
+            continuations=resp.get("continuations", 0),
+        )
+    # Same rule as the post summary: a truncated answer must not be cached for
+    # 7 days, or the half summary is what every later request gets back.
+    if summary and not truncated:
         await set_cached(
-            redis, backend, _STANCE_ROLE, "comment_summary", content_hash, {"summary": summary}
+            redis, backend, summary_model, "comment_summary", content_hash, {"summary": summary}
         )
     return summary or None
 
@@ -646,14 +929,26 @@ async def _process_message(
     }
 
     # Choose the summary role: VLM for image posts (photo_urls present), the
-    # text `stage2` model otherwise. Set VLM_SUMMARY=false to skip image grounding
+    # `summary` model otherwise. Set VLM_SUMMARY=false to skip image grounding
     # entirely — useful when the local VLM is weak/unavailable (e.g. returns
     # empty), so every post still gets a text+OCR-grounded summary without burning
-    # a wasted VLM call first. Post-type/insight are text tasks and always use
-    # `stage2` (never the VLM).
+    # a wasted VLM call first. Post-type/insight are CLASSIFICATION tasks and
+    # always use `stage2` (never the VLM, never the summary model) — that split
+    # is the point of §6.5.
     has_photos = bool(normalized_post.get("photo_urls"))
     vlm_enabled = os.environ.get("VLM_SUMMARY", "true").lower() == "true"
-    role = "vlm" if (has_photos and vlm_enabled) else "stage2"
+    role = "vlm" if (has_photos and vlm_enabled) else _SUMMARY_ROLE
+
+    # Which concrete model each role resolves to on this backend. Recorded so a
+    # summary can always be attributed to the model that wrote it — necessary
+    # once summarization and classification are no longer the same model.
+    _backend_now = backend_override or os.environ.get("LLM_BACKEND", "local")
+    role_models = {
+        r: _cache_model(llm, r, _backend_now)
+        for r in (_SUMMARY_ROLE, "stage2", _STANCE_ROLE)
+    }
+    if role == "vlm":
+        role_models["vlm"] = _cache_model(llm, "vlm", _backend_now)
 
     stage2_result: dict = {}
 
@@ -691,6 +986,7 @@ async def _process_message(
                 if isinstance(grounding, (list, tuple)):
                     grounding = "+".join(grounding) if grounding else None
                 out["post_summary_grounding"] = grounding
+                out["post_summary_truncated"] = bool(summary_data.get("post_summary_truncated"))
                 backend = backend or summary_data.get("_llm_backend")
                 model = model or summary_data.get("_llm_model")
                 log.info(
@@ -700,6 +996,7 @@ async def _process_message(
                     lang=out.get("post_summary_lang"),
                     source=out.get("post_summary_source"),
                     grounding=grounding,
+                    truncated=out["post_summary_truncated"],
                     cache_hit=bool(summary_data.get("_cache_hit")),
                     ms=round((time.monotonic() - t) * 1000, 1),
                 )
@@ -773,11 +1070,27 @@ async def _process_message(
             return out
 
         try:
+            # With the cap lifted a large thread is ~115 batches — minutes on one
+            # post. A frame per batch keeps the Trace tab from looking hung.
+            async def _stance_progress(batch_done: int, batch_total: int) -> None:
+                await publish_stage(
+                    redis, "stage2", "running",
+                    job_id=job_id, post_id=post_id,
+                    detail={
+                        "phase": "comment_stance",
+                        "batch": batch_done,
+                        "batches": batch_total,
+                    },
+                    log=log,
+                )
+
             n_labeled = await _run_comment_stance(
-                llm, redis, stage1_result, post_context, backend_override
+                llm, redis, stage1_result, post_context, backend_override,
+                _stance_progress,
             )
             log.info("stage2_comment_stance", labeled=n_labeled,
-                     total=len(ca.get("comments") or []))
+                     total=len(ca.get("comments") or []),
+                     reaction_only=ca.get("reaction_only"))
             out["_llm_backend"] = backend_override or os.environ.get("LLM_BACKEND", "local")
         except Exception as exc:
             log.error("stage2_comment_stance_error", error=str(exc))
@@ -811,6 +1124,9 @@ async def _process_message(
         "stage2_ms": elapsed_ms,
         "llm_backend": llm_backend,
         "llm_model": llm_model,
+        # Per-role model resolution, so "which model wrote this summary?" is
+        # answerable from the result rather than from the environment (§6.5).
+        "role_models": role_models,
     }
 
     payload["stage2_result"] = stage2_result
@@ -834,9 +1150,12 @@ async def _process_message(
             "post_summary_lang": stage2_result.get("post_summary_lang"),
             "post_summary_source": stage2_result.get("post_summary_source"),
             "grounding": stage2_result.get("post_summary_grounding"),
+            "post_summary_truncated": bool(stage2_result.get("post_summary_truncated")),
             "role": role,
             "llm_backend": llm_backend,
             "llm_model": llm_model,
+            # Visible in the Trace tab: which model each role resolved to.
+            "role_models": role_models,
             "comment_summary_added": bool(ca_out.get("summary")),
             "next_stream": ASSEMBLER_QUEUE,
         },

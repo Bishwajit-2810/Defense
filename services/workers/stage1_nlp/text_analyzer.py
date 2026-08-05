@@ -633,14 +633,39 @@ async def analyze_sentiment(
     comment's own language (BanglaBERT/BanglishBERT/XLM-R via the shared router),
     honouring ``sentiment_override``; falls back to the deterministic stub when
     ``MODEL_STUB_MODE=true`` or the model is unavailable.
+
+    Thin wrapper over :func:`analyze_sentiment_engine`, which additionally
+    reports *which* engine produced the label.
+    """
+    label, score, conf, _engine = await analyze_sentiment_engine(
+        text, registry, sentiment_override
+    )
+    return label, score, conf
+
+
+async def analyze_sentiment_engine(
+    text: str | None,
+    registry: ModelRegistry,
+    sentiment_override: str | None = None,
+) -> tuple[str, float, float, str]:
+    """Like :func:`analyze_sentiment`, plus the engine that produced the label.
+
+    The engine is ``"model"`` only when a transformer actually ran. It is
+    ``"stub"`` both in ``MODEL_STUB_MODE`` and when a real-mode model turned out
+    to be unavailable — the two cases are indistinguishable in the output
+    otherwise, and callers were tagging both as model inferences. Callers must
+    report this rather than assume, because ``_stub_sentiment`` derives its
+    label from ``sum(ord(c) for c in text[:50]) % 100`` — deterministic and
+    reproducible, and not sentiment.
     """
     if not text or not text.strip():
-        return "neutral", 0.0, 0.0
+        return "neutral", 0.0, 0.0, "empty"
 
     text = text.strip()
 
     if registry.stub_mode:
-        return _stub_sentiment(text)
+        label, score, conf = _stub_sentiment(text)
+        return label, score, conf, "stub"
 
     _key, hf_name = _resolve_sentiment(
         detect_script(text), is_banglish(text), None, sentiment_override
@@ -648,8 +673,10 @@ async def analyze_sentiment(
     sent_pair = registry.get_sentiment_model(hf_name)
     if sent_pair is not None:
         tokenizer, sent_model = sent_pair
-        return _real_sentiment(text, tokenizer, sent_model)
-    return _stub_sentiment(text)
+        label, score, conf = _real_sentiment(text, tokenizer, sent_model)
+        return label, score, conf, "model"
+    label, score, conf = _stub_sentiment(text)
+    return label, score, conf, "stub"
 
 
 async def _analyze_text_llm_path(

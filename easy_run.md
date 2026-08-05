@@ -181,9 +181,19 @@ block). Full reference in [run.md](run.md).
 
 - **Stage-1 LLM** (on by default): `STAGE1_LLM=true` makes the Fast-NLP workers
   compute their NLP on the `stage1` model (`STAGE1_LOCAL_MODEL`, default
-  `gemma3:4b`); Stage 2 uses `STAGE2_LOCAL_MODEL` (default `qwen2.5:7b`). Set
-  `STAGE1_LLM=false` to fall back to the small-model suite (or its stub). Cap the
-  premium per-comment LLM pass with `STAGE1_LLM_COMMENT_MAX` (default 60).
+  `gemma3:4b`); Stage-2 classification uses `STAGE2_LOCAL_MODEL` (default
+  `qwen2.5:7b`) and Stage-2 **summarization** uses `SUMMARY_LOCAL_MODEL` (also
+  `qwen2.5:7b` until a bake-off picks a winner — `python -m eval.bakeoff_summary`).
+  Set `STAGE1_LLM=false` to fall back to the small-model suite (or its stub).
+- **Comment LLM coverage** — ⚠ **this is the big runtime knob.**
+  `STAGE1_LLM_COMMENT_MAX` and `COMMENT_STANCE_MAX_PER_POST` both default to **0
+  = every non-emoji comment gets an LLM label**. That is ~350 LLM calls for the
+  43-post corpus and is the honest setting, but on local CPU Ollama it is slow.
+  For a quick demo set both to something small (e.g. `60` / `40`, the old
+  defaults) — and if you do, say so when quoting coverage, because it drops the
+  LLM-labelled share from ~100% to ~29%. Tune throughput with
+  `STAGE1_LLM_BATCH` (25 comments/call) and `STAGE1_LLM_CONCURRENCY` (3 batches
+  in flight). Emoji-only comments (2.8%) are always skipped — no text to read.
 - **Rate limiting** (on by default, 120 req/min per API key on analysis/report/agent
   calls): `RATE_LIMIT_ENABLED=false` to turn off in dev, or `RATE_LIMIT_PER_MIN=…`.
 - **Near-duplicate reuse** (on by default): a post within cosine `NEAR_DUP_THRESHOLD`

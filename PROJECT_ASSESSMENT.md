@@ -5,6 +5,44 @@ Bangla / English / Banglish)
 **Assessed:** 2 August 2026, branch `testing` (working tree, 14 commits)
 **Revised:** 3 August 2026 — three passes:
 
+> ## Implementation status — 4 August 2026
+>
+> The **P0 list (§9.1–§9.7) and the comment-path rebuild (§9 P0′ A–G) are
+> implemented**, in the order §10 prescribes. Test suite: **435 passing**, up
+> from 323. What changed, and the numbers that moved:
+>
+> | Item | Status | Note |
+> | ---- | ------ | ---- |
+> | §6.1 / A — silent truncation | **done** | `chat()` returns `finish_reason` + `truncated`; auto-continuation (`LLM_MAX_CONTINUATIONS=2`); per-task env budgets; sentence-boundary trim; truncated answers are never cached. Verified firing on a real Bangla post during the §6.5 bake-off. |
+> | §6.6 / G — JWT | **done** (loud-failure half) | Any JWT-shaped credential is verified as a token on **every** transport, so an expired or forged token no longer authenticates via `?api_key=`. Claim precedence fixed (allowlist, `auth_method` server-set). One secret via `libs/common/config.py`, read per call, fingerprint logged at boot, placeholder refused outside dev. **Not yet built:** SSE tickets, `/auth/refresh`, `/auth/me`. |
+> | §9.3 — image story | **done** (scoped to text) | Option (a) was impossible: no image bytes exist in the repo. Vision failures now report `vision_status` instead of a fake neutral verdict; fusion weights **renormalise over present terms**; working corpus is `posts_text_only.json` (43 captioned posts). OCR retained behind `STAGE1_OCR_SENTIMENT=false`. |
+> | §9.4 — comment provenance | **done** | `method` reports `stub` when no model ran; `provenance` block next to every breakdown; no phantom zeroed `model` bucket. |
+> | §9.5 — coverage | **done** | Clamped to 1.0 + `coverage_anomaly`; corpus-level coverage added to `/v1/analysis/overview`. |
+> | §9.6 — KEDA | **done** | Names moved to `libs/streams.py`; **two stream names were also wrong** (`stage1_nlp:queue`, `stage2_llm:queue`), not just the three groups. `pendingEntriesCount` → `lagCount`. `tests/test_streams.py` asserts the manifests match the workers. |
+> | §9.7 — DLQ'd posts | **done** | `libs/dlq` counts a dead-lettered post against its job and publishes the progress event; the job-status endpoint reconciles a stale row. |
+> | §6.2 / B — emoji filter | **done** | Three-way `emoji`/`short`/`substantive` kind; emoji excluded from LLM batches, kept as `reaction_only` + `sentiment_breakdown_substantive`. Laughter polarity is now a documented switch consistent across both tables. |
+> | §6.5 / C — summary model | **done** | New `summary` role; §5.10 cache key now carries the **resolved model id**; `role_models` in the output. `eval/bakeoff_summary.py` added — a first run is in §6.5 below. |
+> | §6.3 / D — batch queue | **done** | Both caps default to **0**; bounded-concurrency queue (`STAGE1_LLM_CONCURRENCY=3`, batch 25) with per-batch retry, index-alignment assertion, and a progress frame per batch. |
+> | §6.7 / F — cost story | **done** | §5.8's backend/model/lane dimension added **first**, then re-measured. See the corrected table below. |
+>
+> **Two numbers in this document are wrong and are corrected below:**
+>
+> 1. **§6.2's "~17%"** — emoji-only comments are **2.8%** of the corpus (252 of
+>    8,965), not 17%. The 17.1% figure was the *fast path*, which conflated
+>    emoji-only reactions with short text comments. Filtering emoji therefore
+>    saves ~3% of the comment-LLM bill, not ~17%.
+> 2. **§6.7's premise holds, and the split is now measured:** comment-level calls
+>    are **85%** of the total under the keyword stub and **96%** under the shipped
+>    Stage-1 LLM. The routing gate governs **55%** and **30%** of all LLM calls
+>    respectively — it decides post-level work *and* the Stage-2 stance pass, but
+>    not Stage-1 comment labelling, which runs for every post. **The better
+>    Stage 1 gets, the less the gate governs.** See §6.8.
+>
+> **Not yet built:** the P1 list (§9 P1.1–P1.8) apart from P1.2 (usage
+> dimension) and P1.8 (`libs/streams.py`), both of which were pulled forward
+> because §6.7 and §9.6 depend on them; §6.4 / E (watchlist); §9.8 (end-to-end
+> run); §9.9 (hand-labelling). §7's research gaps are unchanged.
+
 - **Pass 1** found and fixed the routing defect and measured the routing rate (§4).
 - **Pass 2** was a full second review of everything §4 did _not_ touch — vision, comments,
   coverage arithmetic, persistence, cost telemetry, autoscaling, auth, agents. Findings are in
@@ -27,26 +65,37 @@ manifests, dashboard, MCP/agent layer.
 
 | Question                                        | Verdict                                                                                                                                                                     |
 | ----------------------------------------------- | --------------------------------------------------------------------------------------------------------------------------------------------------------------------------- |
-| **Viable as a university final-year capstone?** | **Yes — comfortably above the bar,** defended as a _systems/engineering_ project. The blocking routing defect is fixed and measured (§4). §5 is fixable in days, not weeks. |
-| **Viable as a research paper as it stands?**    | **No.** No methodological novelty, no accuracy evaluation, and — new in pass 2 — a sampling-validity problem in the corpus itself (§5.4, §7.3).                             |
-| **Could it become a paper?**                    | **Yes,** re-centred on the _dataset and benchmark_ rather than the architecture. Roughly 3–4 weeks, dominated by annotation. See §8.                                        |
+| **Viable as a university final-year capstone?** | **Yes — comfortably above the bar,** defended as a _systems/engineering_ project. The blocking routing defect is fixed and measured (§4); the §5 findings and the §6 comment-path rebuild are implemented (see the status header above). |
+| **Viable as a research paper as it stands?**    | **Still no — but for one reason now, not three.** ~~No methodological novelty~~ (unchanged, §7.1), ~~a sampling-validity problem~~ (**resolved** — the frame is stated in [evaluation.md](evaluation.md) §1), and **no accuracy evaluation** — which is the one that remains and the only one that blocks. Zero gold labels exist. |
+| **Could it become a paper?**                    | **Yes,** re-centred on the _dataset and benchmark_ rather than the architecture. Still roughly 3–4 weeks, still dominated by annotation — but everything that used to sit *in front of* the annotation is now cleared (§8.0). See §8, and §8.5 for the higher-ceiling reordering. |
 
 The one-sentence summary of pass 1 was that the headline claim was contradicted by the running
-code. That is fixed: the gate gates, at **28% measured** on the shipped configuration.
+code. That is fixed: the gate gates, at **16% measured** on the shipped configuration (§4.6) —
+though since the comment caps were lifted, the routing rate is no longer the cost story on its
+own (§6.8).
 
-The one-sentence summary of pass 2 is different and more uncomfortable: **several
-prominently-claimed capabilities do not execute in any configuration that can be run today,
-and each one fails silently while the output keeps reporting success.** The image modality
-(§5.2), autoscaling (§5.5), and the enforcement of the privacy-locked-tenant policy (§5.6) are
-the three clearest cases. None is hard to fix. All three will be asked about, because all three
-are in the pitch.
+The one-sentence summary of pass 2 was different and more uncomfortable: **several
+prominently-claimed capabilities did not execute in any configuration that could be run, and
+each failed silently while the output kept reporting success.** The image modality (§5.2),
+autoscaling (§5.5), and the enforcement of the privacy-locked-tenant policy (§5.6) were the
+three clearest cases.
 
-Pass 3 (§6) is a different kind of list: six owner-reported requirements, of which two are
-straight bugs — summaries truncate silently (§6.1) and JWT auth is bypassed on every SSE stream,
-where an expired or wrongly-signed token still authenticates (§6.6) — and four are capability
-changes to the comment path. They are specified but **not built**. Their combined effect on the
-cost model is large enough that §4.6's headline number needs restating once they land — §6.7
-explains why, and it is the paragraph to read before starting any of them.
+Two of the three are now resolved, in opposite ways — and the difference is the
+lesson. **Autoscaling was fixed** (§9.6): the identifiers were wrong, they now
+live in one module, and a test asserts the manifests match. **The image modality
+was withdrawn** (§9.3): the bytes do not exist, so rather than leave a capability
+in the pitch that cannot be shown, the claim was removed from the documents and
+the failure paths were made to *report* an absence instead of fabricating a
+neutral verdict. Both are defensible answers; what was not defensible was the
+third state they had both been in. **Tenant policy enforcement (§5.6) is the one
+still open** — it remains in the pitch and is not yet enforceable.
+
+Pass 3 (§6) was a different kind of list: six owner-reported requirements, two straight bugs and
+four capability changes to the comment path. **Five of the six are built** (§6.4, the watchlist,
+is not — and it is the one with a research angle). Their combined effect on the cost model was
+large enough that §4.6's headline number needed restating, which §6.8 now does with measurements
+rather than predictions: post-level calls are a **minority** of LLM spend, and the routing gate
+governs 30–55% of it depending on how good Stage 1 is.
 
 ---
 
@@ -235,6 +284,27 @@ STAGE1_LLM=true python -m eval.measure_routing_rate    # as shipped (needs Ollam
 | --------------------------------------------------------- | ----------------- | ------- | -------- | ------------------------- |
 | Keyword stub (`MODEL_STUB_MODE=true`, `STAGE1_LLM=false`) | 39 / 50           | **78%** | 11       | 35                        |
 | Stage-1 LLM (`STAGE1_LLM=true`, `gemma3:4b`, as shipped)  | 14 / 50           | **28%** | 36       | 8                         |
+
+> **Re-measured 4 August 2026** on the 43-post working corpus
+> (`posts_text_only.json` — the 7 null-caption `PHOTO` posts are excluded, see
+> §9.3):
+>
+> | Stage-1 engine | Routed | Rate | Stage-1 typed | Rules fired |
+> | -------------- | ------ | ---- | ------------- | ----------- |
+> | Keyword stub | 32 / 43 | **74%** | 27 / 43 | `post_type` 16, `low_post_type_confidence` 12, `long_mixed_text` 4 |
+> | Stage-1 LLM (`gemma3:4b`, as shipped) | 7 / 43 | **16%** | 42 / 43 | `long_mixed_text` 4, `high_toxicity` 3, `post_type` 1 |
+>
+> The shipped rate fell from 28% to **16%**, and the mechanism is the one §4.6
+> already identified: **the routing rate measures how good Stage 1 is.** The 7
+> excluded posts were image-only — no text, so `confidence: 0.0` and no
+> post-type, so they routed unconditionally and inflated the old figure.
+> `low_confidence` now fires on **zero** posts, which is the correct outcome: it
+> was firing on posts that had no text to be confident about, not on posts the
+> model was genuinely unsure of. With those gone, `gemma3:4b` types 42 of 43
+> posts and only genuinely ambiguous or toxic posts escalate.
+>
+> **16% is the number to present**, with the engine named — and, since §6.3, it
+> should be presented alongside the call split in §6.8 rather than on its own.
 
 Rules fired (Stage-1 LLM): `post_type:None` 8, `low_confidence` 7, `long_mixed_text` 4,
 `high_toxicity` 3 — overlapping, hence 14 posts. Under the keyword stub the run is dominated by
@@ -684,6 +754,12 @@ batching.
 
 ### 6.4 A watchlist file: named topics/entities treated as positive, attacks on them as negative
 
+> **Full specification: [stance_targets.md](stance_targets.md).** That document
+> supersedes the plan below — it settles the bias framing (which shapes the
+> output schema and is hard to change later), specifies the alias matcher in
+> detail, and scopes the validation for a **capstone defense** rather than a
+> paper (~150 labelled comments, two metrics). Read it before starting.
+
 **Report:** a file where names/topics can be listed as positive, so talk against them scores
 negative. "Use langchain / langgraph / anything."
 
@@ -909,6 +985,47 @@ The claim that survives contact with these five features is the first one.
 together) → 6.3 (the expensive one, now correctly attributed) → 6.4 (new capability, needs the
 annotation decision first).
 
+### 6.8 The measured cost split — **[measured] 4 August 2026**
+
+Everything above except 6.4 is now built, so §6.7's prediction can be replaced
+with a measurement. 43-post corpus, cold cache, 25 comments/batch,
+`python -m eval.measure_routing_rate`:
+
+| Lane                                                             | Keyword stub | Stage-1 LLM (shipped) |
+| ---------------------------------------------------------------- | ------------ | --------------------- |
+| Posts routed to Stage 2                                          | 32 / 43 (74%) | 7 / 43 (16%)         |
+| **Post-level** (summary + insight + post_type + comment summary) | 124 (15.3%)  | 22 (4.2%)             |
+| **Comment-level**                                                | 689 (84.7%)  | 507 (95.8%)           |
+| — Stage-1 labelling (all 43 posts) — **gate cannot reduce this** | 368          | 368                   |
+| — Stage-2 stance (routed posts only)                             | 321          | 139                   |
+| **Total calls per corpus run**                                   | **813**      | **529**               |
+| **Share the routing gate governs**                               | **54.7%**    | **30.4%**             |
+
+Comment volume: 8,965 stored, 252 emoji-only (**2.8%**) skipped, **8,713**
+reaching the LLM. The 7 routed posts under the shipped configuration hold 3,404
+of those 8,713 comments — the gate is selecting the *large, contentious* threads,
+which is the behaviour you want and worth saying out loud.
+
+Three things follow, and all three are defense material:
+
+1. **§6.7 was right that the cost becomes comment-dominated** — 85–96% of calls
+   are comment-level — **and the better Stage 1 gets, the less the gate
+   governs.** Under the keyword stub it decides 55% of all LLM calls; under the
+   shipped `gemma3:4b` it decides **30%**, because fewer posts route while
+   Stage-1 comment labelling (368 calls) runs for every post regardless. That is
+   the single most important number in the cost story and it points the opposite
+   way from intuition: *improving Stage 1 shrinks the gate's importance, not the
+   bill.* The bill is set by how many comments exist.
+2. **§6.2's "~17% saving" was overstated by 6×.** Emoji-only comments are 2.8%
+   of the corpus. The 17.1% in §6.2 is the *fast path*, which mixes emoji-only
+   reactions with short text comments — and short comments still have text worth
+   reading. Filtering emoji is still correct (they are pure waste) but it is not
+   a cost lever.
+3. **The claim that survives is the one §6.7 predicted:** _"cheap NLP filters
+   which comments and which posts deserve an LLM."_ That is now a measured
+   statement with a table behind it, which the single "28% of posts" figure
+   never was.
+
 ---
 
 ## 7. Why it is not a research paper in its current form
@@ -918,11 +1035,16 @@ annotation decision first).
 | Claimed contribution                            | Prior art                                                                                                                                                                                                                    |
 | ----------------------------------------------- | ---------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- |
 | Confidence-gated NLP→LLM cascade                | Model cascades; FrugalGPT; RouteLLM; HybridLLM — an established line of work                                                                                                                                                 |
-| Multimodal text+image sentiment fusion          | Standard — and per §5.2 the image term has never contributed a non-zero value, so there is currently nothing to report                                                                                                       |
+| ~~Multimodal text+image sentiment fusion~~      | **Withdrawn** — scoped out of the system entirely (§9.3). There is nothing to report and it is no longer claimed.                                                                                                            |
 | Embedding-prototype topic/intent classification | Zero-shot classification by label-embedding similarity; floors of 0.28 / 0.30 are guessed, and [the code comment concedes they should come from a labeled validation set](services/workers/stage1_nlp/text_analyzer.py#L401) |
 | Pluggable local/cloud LLM backend               | Sound engineering; not a research contribution                                                                                                                                                                               |
+| **Target-dependent stance on code-mixed Bangla/Banglish** (§6.4, unbuilt) | **The one genuine candidate.** Aspect-based stance detection is established for English/product reviews; doing it over a configurable entity list on romanized Banglish, where the same entity is written three ways, is under-served. See §8. |
 
-A paper cannot be built on the architecture. Nobody publishes "we built a microservice."
+A paper cannot be built on the architecture. Nobody publishes "we built a
+microservice." **But note what changed in the first four rows:** the cascade is
+now *measured* rather than asserted, which does not make it novel — it makes it
+a usable **experimental subject** (§8 Step 3). The novelty, if it comes, comes
+from the data and the last row.
 
 ### 7.2 No evaluation — still the decisive gap
 
@@ -933,66 +1055,193 @@ agreement, ship gates, drift proxies.
 [eval/harness.py](eval/harness.py) still implements exactly three structural checks —
 `run_input_validation`, `run_platform_detection`, `run_coverage_check`. **Zero accuracy metrics.
 Zero F1. Zero gold labels.** Nothing in the codebase can produce a results table, and a paper
-_is_ its results table. (`eval/measure_routing_rate.py`, added in pass 1, is the first script in
-the repository that reports a real measured system property — it is a template for the rest.)
+_is_ its results table.
+
+**This is now the only decisive gap.** The measurement *infrastructure* has caught
+up around it — there are four scripts that report real system properties, and
+they are the template the accuracy work should follow:
+
+| Script | Reports |
+| ------ | ------- |
+| [eval/measure_routing_rate.py](eval/measure_routing_rate.py) | Routing rate per Stage-1 engine, comment volume, post-vs-comment call split |
+| [eval/make_text_corpus.py](eval/make_text_corpus.py) | The working corpus, with what it dropped and why |
+| [eval/bakeoff_summary.py](eval/bakeoff_summary.py) | Per-model latency, truncation rate, language fidelity, grounding proxy |
+| `GET /v1/usage` | Tokens and cost per backend and model; post-vs-comment lane split |
+
+What none of them do is compare an output to a **label**. Everything in §8 Step 1
+exists to close that.
 
 ### 7.3 Scale and sampling
 
-50 posts is a demonstration, not a study. The 10,272 comments are the usable unit and they are
-unlabeled — and per §5.4 they are a **3.75%, engagement-ordered** slice of the 274,126 comments
-the platform reports, with five posts whose stored count exceeds the reported total. A reviewer
-will ask what the sampling frame is. The answer has to be written down before the labels are
-collected, because it determines what the labels can support: claims about _the most-engaged
-comments on a post_ are defensible; claims about _public sentiment on a post_ are not.
+50 posts is a demonstration, not a study — and the working corpus is now **43**
+(the 7 image-only posts were dropped in §9.3, taking 1,307 comments with them).
+The **8,965** remaining comments are the usable unit and they are unlabeled — and
+per §5.4 they are an engagement-ordered slice of the 274,126 comments the
+platform reports, with five posts whose stored count exceeds the reported total.
+
+**The sampling frame is now written down** — [evaluation.md](evaluation.md) §1
+states it in full: corpus coverage, the engagement ordering, which claims it
+supports (*"the sentiment of the most-engaged N comments per post"*) and which it
+does not (*"public sentiment on this post"*). That was Step 0's real deliverable
+and it is done. What remains is to **hold the paper's claims to it**, which is a
+writing discipline, not a code task.
 
 ### 7.4 Untuned constants throughout
 
-Confidence threshold 0.65, post-type confidence 0.65, toxicity 0.7, caption length 1500, fusion
-weights 0.6/0.4 and 0.7/0.3, negative-reaction threshold 0.40, prototype floors 0.28/0.30,
-margin 0.05, comment caps 60/40, cost 0.002/1k. Every one is a guess. Since pass 1 the router's
-four are env-overridable, which makes them sweepable rather than merely arbitrary — do the sweep
-and the answer to "why 0.65?" becomes a curve.
+Confidence threshold 0.65, post-type confidence 0.65, toxicity 0.7, caption length 1500,
+negative-reaction threshold 0.40, prototype floors 0.28/0.30, margin 0.05. Every one is a guess.
+The router's four are env-overridable, which makes them **sweepable rather than merely
+arbitrary** — do the sweep and the answer to "why 0.65?" becomes a curve (§8 Step 3).
+
+Four constants from the original list are no longer guesses:
+
+- **Fusion weights 0.6/0.4 and 0.7/0.3** — now renormalised over the terms that
+  actually carry a signal (§9.3), and with the image term scoped out the text
+  weight is 1.0. There is nothing left to ablate until images return.
+- **Comment caps 60/40** — now **0** (no cap). They stopped being a tuning
+  parameter and became a stated coverage/cost trade with a documented default.
+- **Cost 0.002/1k** — replaced by per-backend, per-model pricing with `local` at
+  zero (§5.8).
+
+That leaves the seven above, of which the four router thresholds are the ones a
+paper would actually plot.
 
 ---
 
 ## 8. Path to a publishable paper
 
 Re-centre the contribution on the **data and the benchmark**, not the system. Bangla and
-especially romanized Banglish are genuinely under-resourced, and the repository already holds
-10,272 real code-mixed comments with crowd reaction signals attached — that is the publishable
-asset.
+especially romanized Banglish are genuinely under-resourced, and the repository holds
+**8,965 real code-mixed comments** across 43 posts with crowd reaction signals attached — that
+is the publishable asset.
 
-**Step 0 (new, half a day) — write down the sampling frame and fix the cache key.**
-§5.4 and §5.10. Without the first, the labels support a weaker claim than intended; without the
-second, Step 2's model comparison silently compares cached answers from the wrong model.
+> **Status, 5 August 2026.** Step 0 is **done**. Steps 2 and 3 are **unblocked**
+> — the things that would have invalidated them are fixed. Step 1 (annotation) is
+> the only real bottleneck, and it is unchanged: it is human hours, not compute.
 
-**Step 1 — Annotate (the bottleneck; everything else is fast).**
-Label 2,000–3,000 comments for sentiment. Two annotators on a ≥500-comment subset, report
-Cohen's κ. Write the transliteration-aware Banglish guideline [evaluation.md](evaluation.md)
-already calls for. Stratify by language bucket (`bn` / `en` / `banglish`) and by `postType`.
+### 8.0 What is already done — and what it unblocked
+
+| Was blocking | Status | Why it mattered |
+| ------------ | ------ | --------------- |
+| Sampling frame unstated (§5.4, §7.3) | **done** — [evaluation.md](evaluation.md) §1 | Labels now support a claim that is stated in advance instead of one assumed afterwards |
+| Cache key omitted the model (§5.10) | **done** | Step 2's benchmark would have compared each model **against its own cached output** and reported it as agreement |
+| Cost axis was one blended price (§5.8) | **done** | Step 3's x-axis is now real: local tokens are free, Groq is per-model |
+| Comment caps hid 71% of the corpus (§6.3) | **done** — caps are 0 | The 8,713 non-emoji comments are all reachable in one run, so a gold set can be drawn from anywhere, not just the top-60 by likes |
+| Labels could not say what produced them (§5.3) | **done** — `provenance` | A gold-vs-prediction table can now exclude heuristic labels instead of silently scoring a hash |
+| Truncated summaries cached as complete (§6.1) | **done** | Any summary-quality evaluation would have scored half-summaries as the model's real output |
+
+### 8.1 Step 1 — Annotate (the bottleneck; everything else is fast)
+
+**Deliverable:** 2,000–3,000 comments labelled for sentiment, with a documented
+guideline and a reported agreement figure.
+
+- Two annotators on a **≥500-comment overlap**, report **Cohen's κ**. If κ < 0.6
+  the guideline is the problem, not the annotators — fix it and re-label the
+  overlap before doing the other 2,000.
+- Write the **transliteration-aware Banglish guideline** [evaluation.md](evaluation.md)
+  already calls for. The hard cases to rule on explicitly, all of which occur in
+  this corpus: sarcasm marked only by 🤣 (the system reads it as negative — say
+  whether the humans should); political epithets that are literal insults but
+  conventional in this register; comments that are a single Bangla word plus an
+  emoji; and code-switching mid-sentence.
+- **Stratify** by language bucket (`bn` / `en` / `banglish`) and by comment
+  `kind` (`substantive` / `short` / `emoji`). Sample *within* strata at random —
+  do not take the top-N by likes, or the gold set inherits the same engagement
+  bias the corpus already has (§5.4) and the benchmark measures the easy half.
+- **Draw from `posts_text_only.json`**, and record which posts each label came
+  from so per-post effects can be separated from per-comment ones.
+
 Without this step there is no paper; with it, the rest is mostly compute.
 
-**Step 2 — Benchmark rather than build.**
-Run BanglaBERT, BanglishBERT, XLM-R, `gemma3:4b`, `qwen2.5:7b`, and `llama-3.3-70b` against
-those labels, reporting macro-F1 **broken out per language bucket**. The finding _"multilingual
-models degrade by X points on romanized Banglish relative to native-script Bangla"_ is a real,
-citable result and the code to produce every prediction already exists.
+### 8.2 Step 2 — Benchmark rather than build
 
-**Step 3 — Make the cascade a measured trade-off.**
-The router works and its thresholds are env knobs. Sweep `ROUTER_CONFIDENCE_THRESHOLD` and plot
-accuracy against cost/latency, with NLP-only and LLM-only as the endpoints. This converts the
-architecture from an assertion into an empirical curve — the only framing in which the routing
-work reads as a contribution rather than a re-implementation. Fix §5.8 first so the cost axis is
-real.
+**Deliverable:** one macro-F1 table, broken out per language bucket.
 
-**Step 4 (optional, cheap, mildly original) — Reactions as weak supervision.**
-`reactionBreakdown` (LIKE/LOVE/HAHA/WOW/SAD/ANGRY/CARE) is a free crowd signal. Measuring how
-well it substitutes for human labels in a low-resource code-mixed setting is a small original
-angle, and the data is already in hand.
+Run BanglaBERT, BanglishBERT, XLM-R, `gemma3:4b`, `qwen2.5:7b`, and
+`llama-3.3-70b` against those labels. The finding _"multilingual models degrade
+by X points on romanized Banglish relative to native-script Bangla"_ is a real,
+citable result, and the code to produce every prediction already exists.
 
-**Realistic venue:** a regional or workshop track — ICCIT, or an EMNLP/ACL workshop on
-code-switching or low-resource NLP. Not a top-tier main conference. That is a reasonable and
-achievable target.
+Two things to get right, both now cheap:
+
+- **`LLM_CACHE_DISABLED=1` for every run.** The cache key carries the resolved
+  model id now, so a model switch correctly misses — but disable it anyway; it
+  costs nothing on a 3,000-comment set and removes the failure mode entirely.
+- **Report `provenance` alongside every row.** A model that fell back to the stub
+  on 12% of inputs has not scored 0.71 macro-F1; it has scored 0.71 on 88% of the
+  set and a hash on the rest. `method` distinguishes them.
+
+### 8.3 Step 3 — Make the cascade a measured trade-off
+
+**Deliverable:** an accuracy-vs-cost curve with NLP-only and LLM-only as endpoints.
+
+The router works and its thresholds are env knobs, so this is a loop over one
+variable:
+
+```bash
+for t in 0.5 0.55 0.6 0.65 0.7 0.75 0.8 0.85 0.9; do
+  ROUTER_CONFIDENCE_THRESHOLD=$t OUT="sweep_$t.json" \
+    python -m eval.measure_routing_rate
+done
+```
+
+Plot macro-F1 (from Step 2's labels) against **cost and latency** at each
+threshold. This converts the architecture from an assertion into an empirical
+curve — the only framing in which the routing work reads as a contribution rather
+than a re-implementation.
+
+**One caveat that is new since §6.3 and changes what this plot means.** The gate
+now governs only **30–55%** of LLM calls (§6.8), because Stage-1 comment
+labelling runs for every post. So a threshold sweep moves a minority of the cost
+axis. Either plot **two** curves — threshold vs cost, and comment-cap vs cost —
+or state plainly that the sweep covers post-level spend only. The second lever
+(`STAGE1_LLM_COMMENT_MAX`) is arguably the more interesting one now, and nobody
+has plotted it.
+
+### 8.4 Step 4 (optional, cheap, mildly original) — Reactions as weak supervision
+
+`reactionBreakdown` (LIKE/LOVE/HAHA/WOW/SAD/ANGRY/CARE) is a free crowd signal on
+every post. Measuring how well it substitutes for human labels in a low-resource
+code-mixed setting is a small original angle, and the data is already in hand.
+Note it is a **post-level** signal against **comment-level** labels, so the
+honest question is "does the reaction mix predict the thread's sentiment
+distribution?", not "does it predict this comment".
+
+### 8.5 The higher-ceiling alternative — build §6.4 first
+
+**If the goal is a paper rather than a passing defense, consider reordering.**
+§6.4 (the watchlist / target-dependent stance — specified in full in
+[stance_targets.md](stance_targets.md)) is the one item in this document
+with a plausible claim to novelty, and it makes the annotation **more valuable
+rather than more expensive**: the same 2,000 comments carry both a sentiment
+label *and* a stance-toward-target label, from one annotation pass.
+
+Doing it in the other order — annotate for sentiment now, discover you want
+stance later — means paying for the annotation twice. The cost of reordering is
+~1 day of implementation (§6.4's plan) plus settling the bias framing, against a
+contribution that is genuinely under-served rather than a re-benchmark.
+
+**The two warnings from §6.4 apply and must be in the paper, not just the code:**
+a file declaring "support for X is positive" is a **stated bias model**, not a
+neutral measurement; and target-dependent stance must live in a **separate
+field** from document-level sentiment so the two are never conflated in a results
+table. A reviewer who spots that conflation will reject the paper on it.
+
+### 8.6 Realistic venue and timeline
+
+A regional or workshop track — **ICCIT**, or an **EMNLP/ACL workshop** on
+code-switching or low-resource NLP. Not a top-tier main conference. That is a
+reasonable and achievable target.
+
+| Week | Work | Gate before moving on |
+| ---- | ---- | --------------------- |
+| 1 | Guideline + 500-comment overlap + κ | κ ≥ 0.6, else fix the guideline |
+| 2–3 | Annotate to 2,000–3,000 (+ stance labels if §8.5) | Strata filled, not just the easy ones |
+| 3 | Step 2 benchmark (compute-bound, ~1 day) | Per-bucket table exists |
+| 4 | Step 3 sweep + write-up | Curve exists; claims match the sampling frame |
+
+The 3–4 week estimate holds and is still **dominated by annotation**. Everything
+that used to sit in front of it is now cleared.
 
 ---
 
@@ -1007,11 +1256,11 @@ so the two lists cannot be confused.
 | --- | ----------------------------------------------------------------------------------------------------------------------------------------------------------- | ------- | -------------------------------------------------------------------------------------------------------------------- |
 | 1   | ~~Fix the router field-name bugs; align the confidence field; report the routing rate.~~                                                                    | ~1 h    | **DONE** (§4.5). Measured **28%** shipped / 78% stub (§4.6).                                                         |
 | 2   | ~~Decide what Rule 2 means; give Stage 1 a real `post_type` with a confidence.~~                                                                            | ~2 h    | **DONE** (§4.5).                                                                                                     |
-| 3   | **Decide the image story** (§5.2): upload the 69 images + fix the `.env` scheme and report vision numbers, **or** scope to text+OCR and delete the weights. | ~4 h    | 88% of posts are image posts and the 0.4 image term has never been non-zero. This is the §4 problem, one layer over. |
-| 4   | **Report comment-label provenance** (§5.3): `method: "stub"` in stub mode, and the provenance mix next to the sentiment chart.                              | ~1 h    | 71.3% of labels are heuristic today, and `method_breakdown` claims 8,513 model inferences that never happened.       |
-| 5   | **Clamp coverage and flag anomalies** (§5.4); report the 3.75% corpus figure alongside the per-post one.                                                    | ~1 h    | A dashboard showing "267% coverage" ends a slide.                                                                    |
-| 6   | **Fix the KEDA consumer groups + scale-from-zero metric** (§5.5).                                                                                           | ~30 min | Two one-line edits turn an unsupported claim into a graph you can show.                                              |
-| 7   | **Count DLQ'd posts against the job** (§5.7).                                                                                                               | ~1 h    | Otherwise one LLM timeout leaves the live demo's progress bar stuck forever.                                         |
+| 3   | ~~Decide the image story (§5.2).~~ | ~4 h | **DONE** — scoped to text. No image bytes exist in the repo, so option (a) was not available. Vision failures report `vision_status` instead of a fake neutral; fusion renormalises; working corpus is `posts_text_only.json` (43 posts). |
+| 4   | ~~Report comment-label provenance (§5.3).~~ | ~1 h | **DONE** — `method` reports the engine that ran; `provenance` block beside every breakdown; the phantom zeroed `model` bucket is gone. |
+| 5   | ~~Clamp coverage and flag anomalies (§5.4).~~ | ~1 h | **DONE** — clamped to 1.0 + `coverage_anomaly`; corpus-level coverage added to `/v1/analysis/overview`. |
+| 6   | ~~Fix the KEDA consumer groups + scale-from-zero metric (§5.5).~~ | ~30 min | **DONE** — and **two stream names were wrong too**, not just three groups. Names now live in `libs/streams.py`; `tests/test_streams.py` asserts the manifests match. `lagCount` replaces `pendingEntriesCount`. |
+| 7   | ~~Count DLQ'd posts against the job (§5.7).~~ | ~1 h | **DONE** — `libs/dlq` counts the post and publishes the progress event; the job-status endpoint reconciles a stale row. |
 | 8   | Run once end-to-end with `MODEL_STUB_MODE=false`; report per-stage p50/p95, throughput, cost-per-1k on **both** backends.                                   | ~1 day  | Open — but do §5.8 (cost dimension) and §5.11 (batching) **first**, or the numbers are not reusable.                 |
 | 9   | Hand-label ~300 comments and report one honest macro-F1 with a confidence interval and the small-n caveat.                                                  | ~1 day  | Open. "No metrics at all" is what turns a strong demo into "how do you know it works?"                               |
 
@@ -1022,13 +1271,13 @@ is closed before two models are in play. A and G are bugs; the rest are new capa
 
 | #   | Action                                                                                                                                                                                                                      | Effort                           | Depends on / why now                                                                                                                                            |
 | --- | --------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- | -------------------------------- | --------------------------------------------------------------------------------------------------------------------------------------------------------------- |
-| A   | **Stop summaries truncating silently** (§6.1): surface `finish_reason`, per-task budgets, auto-continuation, never cache a truncated summary.                                                                               | ~3 h                             | None. Straight bug, language-correlated (hits Bangla, spares English), and the bad output is cached for 7 days.                                                 |
-| B   | **Filter emoji-only comments** (§6.2): `emoji`/`short`/`substantive` kinds, excluded from LLM batches, counted as `reaction_only`.                                                                                          | ~2 h                             | Do before D — removes ~17% of the batch volume D would otherwise pay for.                                                                                       |
-| C   | **Summary on its own stronger model** (§6.5) — new `summary` role — **plus the §5.10 cache-key fix in the same change.**                                                                                                    | ~2 h + bake-off                  | The cache key carries only the role label; two models for two tasks turns §5.10 from latent into active.                                                        |
-| D   | **Batch-queue every filtered comment to the LLM** (§6.3): caps → 0, bounded-concurrency queue, per-batch retry, progress events.                                                                                            | ~4 h                             | After B and C. Raises corpus LLM calls ~50 → ~340; decide the bypassed-post stance question first.                                                              |
-| E   | **Watchlist-driven target stance** (§6.4): `config/stance_targets.yml` + matcher + prompt path + deterministic fallback.                                                                                                    | ~1 day                           | Largest and most valuable. Settle the annotation/bias framing (§6.4 warnings) before coding.                                                                    |
-| F   | **Restate the cost story** (§6.7): re-run `eval/measure_routing_rate.py` with a post-level vs comment-level call/token split.                                                                                               | ~2 h                             | After D. The 28% headline stops being the main cost lever once comments dominate.                                                                               |
-| G   | **Fix JWT auth** (§6.6): verify a query/header credential as a JWT before falling back to the API-key path, fix the claim-precedence spread, one source of truth for the secret — then SSE tickets, refresh and `/auth/me`. | ~1 day (2 h for the first three) | Independent of A–F, so it can run in parallel. An expired or forged token authenticates on all four SSE streams today, and this is the same root cause as §5.6. |
+| A   | ~~Stop summaries truncating silently (§6.1).~~ | ~3 h | **DONE** — `finish_reason` + `truncated` surfaced, auto-continuation (`LLM_MAX_CONTINUATIONS=2`), per-task env budgets, sentence-boundary trim, truncated answers never cached. Observed recovering a real Bangla summary during the §6.5 bake-off. |
+| B   | ~~Filter emoji-only comments (§6.2).~~ | ~2 h | **DONE** — but the saving is **2.8%, not ~17%**: the 17.1% was the fast path, which mixes emoji-only with short text. Emoji excluded from LLM batches, kept as `reaction_only` + `sentiment_breakdown_substantive`. Laughter polarity is now a documented switch consistent across both tables. |
+| C   | ~~Summary on its own stronger model (§6.5) + the §5.10 cache-key fix.~~ | ~2 h + bake-off | **DONE** — new `summary` role; cache key carries the **resolved model id**; `role_models` in the output. `eval/bakeoff_summary.py` added; a first run is in §6.5. |
+| D   | ~~Batch-queue every filtered comment to the LLM (§6.3).~~ | ~4 h | **DONE** — both caps default to 0; bounded-concurrency queue (batch 25, concurrency 3) with per-batch retry, an index-alignment assertion, and a progress frame per batch. Corpus LLM calls: ~50 → **813** measured. |
+| E   | **Watchlist-driven target stance** ([stance_targets.md](stance_targets.md), §6.4): `config/stance_targets.yml` + matcher + prompt path + deterministic fallback.                                                                                                    | ~1 day                           | Largest and most valuable. Settle the annotation/bias framing (§6.4 warnings) before coding.                                                                    |
+| F   | ~~Restate the cost story (§6.7).~~ | ~2 h | **DONE** — §5.8's backend/model/lane dimension added first, then re-measured. See §6.8: post-level **15%**, comment-level **85%**, gate governs **55%**. |
+| G   | **Fix JWT auth** (§6.6) — *partly done*. | ~1 day (2 h for the first three) | **DONE:** JWT-shaped credentials verified as tokens on every transport (expired/forged no longer authenticate via `?api_key=`), claim precedence allowlisted, one secret via `libs/common/config.py` with a boot fingerprint and a placeholder refusal outside dev. **OPEN:** SSE tickets, `/auth/refresh`, `/auth/me`. |
 
 ### P1 — credibility, do if there is time
 
@@ -1050,11 +1299,23 @@ is closed before two models are in play. A and G are bugs; the rest are new capa
 
 ### Reproducibility
 
-The test suite runs: `uv sync --extra dev`, then **323 tests across 16 files pass** (including
-the pass-1 routing regression tests), and `compileall` is clean across all 99 modules. Two notes
-for a clean checkout: the `dev` extra was missing `pytest-asyncio` (fixed here), and the working
-venv has no `pip` or `ruff`, so `uv` is the install path. Document that step — a demo that cannot
-be reproduced from `README` instructions is a live risk.
+The test suite runs: `uv sync --extra dev`, then **435 tests across 22 files pass** (up from 323 —
+the new files pin every fix in the 4 August implementation pass: summary truncation, JWT
+transport, vision status + fusion renormalisation, comment provenance, coverage clamping,
+KEDA/stream identifiers, DLQ job accounting, comment kinds, the batch queue, and the LLM cache
+key), and `compileall` is clean. Two notes for a clean checkout: the `dev` extra was missing
+`pytest-asyncio` (fixed here), and the working venv has no `pip` or `ruff`, so `uv` is the install
+path. Document that step — a demo that cannot be reproduced from `README` instructions is a live
+risk.
+
+Reproduce the headline numbers:
+
+```bash
+python -m eval.make_text_corpus                      # → posts_text_only.json (43 posts)
+python -m eval.measure_routing_rate                  # 74% stub; call split; comment volume
+STAGE1_LLM=true MAX_COMMENTS=3 python -m eval.measure_routing_rate   # 16% as shipped
+python -m eval.bakeoff_summary --posts 10            # summary-model bake-off (needs Ollama)
+```
 
 ### Framing advice
 
@@ -1108,8 +1369,17 @@ The research framing is otherwise unchanged and is still the weaker half: the me
 there is no accuracy evaluation, and the corpus is a 3.75% engagement-biased sample that needs
 its sampling frame stated before it is annotated.
 
-**Priority order: ~~fix the router (§4)~~ done → the two silent-failure bugs (§6.1 truncation,
-3 h; §6.6 JWT-on-SSE, 2 h for the loud-failure half) → close the P0 list (§9, especially the image
-story, comment provenance, and KEDA) → the comment-path rebuild in dependency order
-(§9 P0′: B → C+§5.10 → D → F) → measure the system end to end (§9.8) → label a little data
-(§9.9) → then, if a paper is wanted, the watchlist (§6.4) annotated at scale (§8 Step 1).**
+**Priority order: ~~fix the router (§4)~~ → ~~the two silent-failure bugs (§6.1 truncation,
+§6.6 JWT-on-SSE loud-failure half)~~ → ~~close the P0 list (§9: image story, comment
+provenance, coverage, KEDA, DLQ)~~ → ~~the comment-path rebuild in dependency order
+(§9 P0′: B → C+§5.10 → D → F)~~ — all done as of 4 August 2026 — → measure the system end to
+end (§9.8) → label a little data (§9.9) → then, if a paper is wanted, the watchlist (§6.4)
+annotated at scale (§8 Step 1).**
+
+**What is left, in order:** finish §6.6 (SSE tickets, `/auth/refresh`, `/auth/me`) and §5.6
+(real API-key storage, `tenant_id` from the database, fail closed) — they are the same root
+cause and the privacy claim depends on both; then §9.8's end-to-end run, which is now
+unblocked because §5.8's cost dimension and §6.3's batching are in place; then §9.9's 300
+labels, which is the first thing that turns "it runs" into "here is how well it works". §6.4
+(the watchlist) is still the most publishable idea in the repository and still needs the
+annotation/bias framing settled before any of it is coded.

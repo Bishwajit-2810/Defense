@@ -23,6 +23,7 @@ from sqlalchemy import text
 from sqlalchemy.ext.asyncio import AsyncSession
 
 import redis.asyncio as aioredis
+from libs.labels import label_provenance
 from libs.progress import publish_stage, replay_events
 from deps import check_llm_backend_policy, get_current_user, get_db, get_redis, rate_limit
 from models import (
@@ -30,6 +31,7 @@ from models import (
     AnalysisResultResponse,
     AnalysisRunRequest,
     AnalysisRunResponse,
+    CorpusCoverage,
     LabelCount,
     LlmPanel,
     OverviewResponse,
@@ -38,6 +40,9 @@ from models import (
 log = structlog.get_logger(__name__)
 
 router = APIRouter(prefix="/v1/analysis", tags=["analysis"])
+
+# Job statuses that are final; anything else is reconcilable from the counters.
+_TERMINAL_JOB_STATUSES = frozenset({"done", "failed"})
 
 # Re-analysis jobs feed the same Stage-1 stream the ingestion service uses —
 # there is no separate analysis worker; the normal pipeline does the work and
@@ -393,9 +398,43 @@ async def analysis_overview(
         )
     ]
 
+    # --- Corpus-level comment coverage --------------------------------------
+    # The per-post coverage the dashboard shows has a median of 26.7%, but the
+    # aggregate — 10,272 stored against 274,126 reported by the platform, i.e.
+    # 3.75% — appeared nowhere. It is the number that bounds what any
+    # thread-level sentiment claim can support, so it is reported here next to
+    # the distributions it qualifies.
+    cov_row = (
+        await db.execute(
+            text(
+                f"""
+                SELECT
+                    SUM(COALESCE((result->'comment_analysis'->>'analyzed')::bigint, 0))
+                        AS analyzed,
+                    SUM(COALESCE((result->'engagement'->>'comment_count')::bigint, 0))
+                        AS reported,
+                    SUM(CASE WHEN result->'comment_analysis'->'coverage_anomaly'
+                             IS NOT NULL THEN 1 ELSE 0 END) AS anomalies
+                FROM analysis_results
+                {where}
+                """
+            ),
+            params,
+        )
+    ).mappings().first()
+    analyzed_total = int((cov_row or {}).get("analyzed") or 0)
+    reported_total = int((cov_row or {}).get("reported") or 0)
+    corpus_coverage = CorpusCoverage(
+        analyzed=analyzed_total,
+        reported=reported_total,
+        coverage=round(analyzed_total / reported_total, 4) if reported_total else 0.0,
+        posts_with_anomaly=int((cov_row or {}).get("anomalies") or 0),
+    )
+
     return OverviewResponse(
         total_posts=total_posts,
         campaign_id=campaign_id,
+        corpus_coverage=corpus_coverage,
         sentiment_distribution=sentiment_distribution,
         language_distribution=language_distribution,
         top_topics=top_topics,
@@ -494,18 +533,46 @@ async def get_analysis(
     campaign_id: str | None = selector.get("campaign_id")
     post_ids: list[str] = selector.get("post_ids") or []
 
-    # Per-job progress counters maintained by the assembler/ingestion workers.
+    # Per-job progress counters maintained by the assembler + the dead-letter
+    # path (libs/dlq counts a DLQ'd post against the job, which is what lets a
+    # job whose posts died before the assembler still finish).
+    job_status: str = job_row["status"]
     progress: dict[str, Any] | None = None
     try:
         raw_total = await redis.get(f"job:{analysis_id}:total")
         completed = int(await redis.get(f"job:{analysis_id}:completed") or 0)
         failed = int(await redis.get(f"job:{analysis_id}:failed") or 0)
         if raw_total is not None or completed or failed:
+            total = int(raw_total) if raw_total is not None else None
             progress = {
-                "total": int(raw_total) if raw_total is not None else None,
+                "total": total,
                 "completed": completed,
                 "failed": failed,
             }
+            # Reconcile a stale row: only the assembler writes the terminal
+            # status, so a job whose LAST post was dead-lettered leaves the row
+            # sitting at "running" even though the counters are complete.
+            if (
+                total is not None
+                and (completed + failed) >= total
+                and job_status not in _TERMINAL_JOB_STATUSES
+            ):
+                job_status = "done" if completed > 0 else "failed"
+                await db.execute(
+                    text(
+                        "UPDATE jobs SET status = :s, updated_at = NOW() "
+                        "WHERE id = :id AND status NOT IN ('done', 'failed')"
+                    ),
+                    {"s": job_status, "id": analysis_id},
+                )
+                log.info(
+                    "job_status_reconciled_from_counters",
+                    analysis_id=analysis_id,
+                    status=job_status,
+                    completed=completed,
+                    failed=failed,
+                    total=total,
+                )
     except Exception as exc:
         log.warning("job_progress_read_failed", analysis_id=analysis_id, error=str(exc))
 
@@ -555,7 +622,8 @@ async def get_analysis(
 
     return AnalysisDetailResponse(
         analysis_id=analysis_id,
-        status=job_row["status"],
+        # Reconciled above when the counters are complete but the row is stale.
+        status=job_status,
         campaign_id=campaign_id,
         post_ids=post_ids,
         results=results,
@@ -639,8 +707,14 @@ async def get_post_comments(
         "summary": ca.get("summary"),
         "summary_source": ca.get("summary_source"),
         "sentiment_breakdown": ca.get("sentiment_breakdown", {}),
+        "sentiment_breakdown_substantive": ca.get("sentiment_breakdown_substantive", {}),
+        "reaction_only": ca.get("reaction_only", 0),
         "emotion_breakdown": ca.get("emotion_breakdown", {}),
         "method_breakdown": ca.get("method_breakdown", {}),
+        # Recomputed from the stored breakdown rather than trusting a persisted
+        # `provenance` block, so rows written before the field existed still
+        # report an honest mix instead of an empty one.
+        "provenance": label_provenance(ca.get("method_breakdown") or {}),
         "coverage": ca.get("coverage", 0.0),
         "coverage_label": _coverage_label(ca, (row["result"] or {}).get("engagement") or {}),
         "avg_sentiment_score": avg_score,
@@ -668,6 +742,11 @@ def _coverage_label(ca: dict, engagement: dict) -> str:
     head = ("✓ all " if full else "") + f"{analyzed} analyzed"
     if total > 0 and total > analyzed:
         head += f" · {round(analyzed / total * 100)}% of {total}"
+    elif total > 0 and analyzed > total:
+        # Storing more comments than the platform says exist is an upstream
+        # inconsistency. The old label just omitted the tail, which read as
+        # "we have everything" — say what actually happened instead.
+        head += f" · more than the {total} reported (upstream mismatch)"
     return head
 
 
@@ -702,6 +781,7 @@ def _row_to_result(row: Any) -> AnalysisResultResponse:
         post_summary_lang=r.get("post_summary_lang"),
         post_summary_source=r.get("post_summary_source"),
         post_summary_grounding=r.get("post_summary_grounding"),
+        post_summary_truncated=r.get("post_summary_truncated"),
         overall_sentiment=r.get("overall_sentiment", "neutral"),
         sentiment_score=r.get("sentiment_score", 0.0),
         text_sentiment=r.get("text_sentiment"),

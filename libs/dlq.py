@@ -21,6 +21,76 @@ from typing import Any
 
 ATTEMPTS_FIELD = "_dlq_attempts"
 
+# Job counters live for a day, matching the TTL the API's producer sets on
+# `job:{id}:total`.
+_JOB_COUNTER_TTL = 86_400
+
+
+def _job_id_from_payload(payload: dict[str, str]) -> str | None:
+    """Best-effort extraction of the job id from a stream entry's `data` blob.
+
+    Every stage's message carries `job_id` at the top level of `data`; a message
+    that predates it, or one that failed to parse in the first place, simply has
+    no job to account against.
+    """
+    raw = payload.get("data")
+    if not raw:
+        return None
+    try:
+        decoded = json.loads(raw)
+    except (TypeError, ValueError):
+        return None
+    if not isinstance(decoded, dict):
+        return None
+    job_id = decoded.get("job_id")
+    return job_id if isinstance(job_id, str) and job_id else None
+
+
+async def _count_against_job(redis: Any, payload: dict[str, str], error: Any) -> None:
+    """Charge a dead-lettered post to its job's `failed` counter.
+
+    ``job:{id}:total`` is written by the producer, but ``:completed``/``:failed``
+    were incremented **only** by the assembler's ``_track_job_progress`` — and a
+    post that dies in Stage 1, the router or Stage 2 never reaches the assembler.
+    So ``completed + failed`` could never reach ``total``: the terminal ``done``
+    event on ``analysis:progress:{job_id}`` never fired, the jobs row never
+    reached a terminal status, and the dashboard progress bar sat at 49/50
+    forever. One LLM timeout during a live demo produced exactly that.
+
+    Counting here, at the point of no return, is what lets the job finish. Best
+    effort throughout: a failure to account for a failure must not itself raise
+    and cost the caller its ACK.
+    """
+    job_id = _job_id_from_payload(payload)
+    if not job_id:
+        return
+    try:
+        failed_n = await redis.incr(f"job:{job_id}:failed")
+        await redis.expire(f"job:{job_id}:failed", _JOB_COUNTER_TTL)
+        completed = int(await redis.get(f"job:{job_id}:completed") or 0)
+        raw_total = await redis.get(f"job:{job_id}:total")
+        total = int(raw_total) if raw_total else None
+        finished = total is not None and (completed + int(failed_n)) >= total
+        await redis.publish(
+            f"analysis:progress:{job_id}",
+            json.dumps(
+                {
+                    "event": "done" if finished else "progress",
+                    "job_id": job_id,
+                    "post_id": (json.loads(payload.get("data") or "{}") or {}).get("post_id"),
+                    "completed": completed,
+                    "failed": int(failed_n),
+                    "total": total,
+                    "error": str(error)[:500],
+                    "dead_lettered": True,
+                },
+                ensure_ascii=False,
+            ),
+        )
+    except Exception:
+        # The DLQ write and the ACK matter more than the bookkeeping.
+        return
+
 
 def _norm(fields: dict | None) -> dict[str, str]:
     """Normalize a Redis stream entry's fields to str→str (bytes or str input)."""
@@ -53,6 +123,10 @@ async def record_failure(
 
     Returns ``"retried"`` or ``"dead_lettered"``. Always ACKs the original
     message (``stream``/``group``/``msg_id``).
+
+    Dead-lettering also charges the post to its job's ``failed`` counter and
+    publishes a progress event — see :func:`_count_against_job`. A retry does
+    not: the post is still in flight and may yet succeed.
     """
     payload = _norm(fields)
     attempts = int(payload.get(ATTEMPTS_FIELD, "0")) + 1
@@ -73,6 +147,9 @@ async def record_failure(
         },
     )
     await redis.xack(stream, group, msg_id)
+    # The post will never reach the assembler, so nothing else will ever count
+    # it — without this the job can never reach a terminal state.
+    await _count_against_job(redis, payload, error)
     return "dead_lettered"
 
 

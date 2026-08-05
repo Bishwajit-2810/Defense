@@ -6,9 +6,11 @@ revisit a decision if constraints change.
 
 Context for every choice below: the service is a **self-hosted microservice** that
 **pulls** the upstream **post-with-details** payload (posts **with comments
-embedded**, Bangla/English/Banglish, Facebook in the sample) — **multimodal: caption
-text _and_ images (we run our own OCR), so it runs both text and vision models**
-([data_contract.md](data_contract.md) §4) — into
+embedded**, Bangla/English/Banglish, Facebook in the sample) — designed as
+**multimodal: caption text _and_ images (we run our own OCR), so it carries both
+text and vision models** ([data_contract.md](data_contract.md) §4; the vision half
+is implemented but currently unexercised — no image bytes are reachable, see
+[PROJECT_ASSESSMENT.md](PROJECT_ASSESSMENT.md) §5.2) — into
 **its own database** and emits structured JSON, under hard constraints — fast,
 cheap, Bangla-accurate (input contract: [data_contract.md](data_contract.md)). The
 data stores and NLP fleet are self-hosted (no data egress there). The **Stage-2 LLM is

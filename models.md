@@ -20,18 +20,24 @@ the current sample (others by URL host)
 English in one sentence, e.g. "Green garden e vat 25 taka baire 10 taka"). Every
 model choice below is judged on how well it handles **bn + en + code-mixed
 Banglish**, because that — not clean Bangla or clean English — is the real traffic
-(see [examples.md](examples.md)). The input is also **multimodal**: most posts
-carry an **image** and the comment thread arrives **embedded**
-([data_contract.md](data_contract.md)), so the image and comments are not optional.
-Small models run **post first — text (caption + OCR) sentiment _and_ a visual
-`image_sentiment` on the photo, fused — then each comment**; a selective
-LLM/**VLM** summarizes the **thread** grounded on caption + OCR + image, in the
-post's original language. **OCR is our job** — the payload no longer ships OCR
-text, so we run it on `photoUrls`. **Comment sentiment is also ours** — the
-upstream leaves it empty. The crowd `reactionBreakdown`
-(LIKE/LOVE/HAHA/WOW/SAD/ANGRY/CARE) is a free **emotion prior** we cross-check
-against. The text+image+summary→comments pipeline order is the **first target** —
-see [data_contract.md](data_contract.md) §4.
+(see [examples.md](examples.md)). The comment thread arrives **embedded**
+([data_contract.md](data_contract.md)), so the comments are not optional. Small
+models run **post first — caption sentiment — then each comment**; a selective
+LLM summarizes the **thread**, in the post's original language. **Comment
+sentiment is ours** — the upstream leaves it empty. The crowd
+`reactionBreakdown` (LIKE/LOVE/HAHA/WOW/SAD/ANGRY/CARE) is a free **emotion
+prior** we cross-check against.
+
+> **The image modality is implemented but unexercised (4 August 2026).** Most
+> posts do carry an image, but the corpus's 69 `photoUrls` are relative
+> object-storage keys and the objects are not in MinIO, so **no image bytes are
+> reachable in any runnable configuration** — the image term has never
+> contributed a non-zero value ([PROJECT_ASSESSMENT.md](PROJECT_ASSESSMENT.md)
+> §5.2). OCR is consequently off by default (`STAGE1_OCR_SENTIMENT=false`), the
+> working corpus is `posts_text_only.json` (43 captioned posts), and post
+> sentiment is a **text** measurement. The vision rows below are kept because
+> the code path is retained and the models are the right ones — they are
+> labelled ⚠ so nothing here reads as a measured capability.
 
 ---
 
@@ -41,16 +47,16 @@ see [data_contract.md](data_contract.md) §4.
 | ------------------------------------------ | ------------------------------------------------------------------------------------------------- | ----------------------- | ------- | ---------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- |
 | **Language + Banglish detection**          | `fastText lid.176` + CLD3 + transliteration heuristic                                             | ✅                      | ✅      | <1 ms/item; flags `banglish` (romanized bn) → multilingual path                                                                                                                                                                                                        |
 | **Text sentiment** (caption + per comment) | `XLM-RoBERTa`/`mBERT` fine-tuned; BanglaBERT for bn                                               | ✅                      | ✅      | **Recompute** ours (caption first, then each embedded comment) → `text_sentiment` + `sentiment_breakdown`. Post `sentiment` kept as `baseline_sentiment`; **comment sentiment is entirely ours** (upstream leaves it `null`) — [data_contract.md](data_contract.md) §4 |
-| **Image sentiment** (visual)               | `SigLIP 2` / `CLIP` zero-shot (positive/negative/neutral prompts), or a fine-tuned ViT            | n/a (language-agnostic) | n/a     | Cheap Stage-1 model on **every image post** → `image_sentiment` (per image + aggregate). Visual, independent of caption/OCR. Fused with text sentiment                                                                                                                 |
+| **Image sentiment** (visual) — ⚠ **unexercised** | `SigLIP 2` / `CLIP` zero-shot (positive/negative/neutral prompts), or a fine-tuned ViT            | n/a (language-agnostic) | n/a     | Implemented, but **has never produced a signal**: the corpus's `photoUrls` are relative object-storage keys and the objects are not in MinIO, so no image bytes are reachable (PROJECT_ASSESSMENT §5.2). A failure now reports `vision_status` (`fetch_failed` / `model_unavailable` / `stub`) instead of a fake `neutral`, and fusion **excludes the absent term** rather than letting it consume its weight |
 | **Image description / caption**            | small **VLM** (`Qwen2.5-VL-3B/7B`) or `BLIP-2`                                                    | ✅                      | ✅      | Short description of the image → grounds `post_summary` (esp. `null`-caption photo posts); feeds `image_analysis.description`                                                                                                                                          |
-| **OCR (image text)**                       | **ours** — `PaddleOCR` / `Tesseract` (bn+en), or the VLM                                          | ✅                      | ✅      | The payload no longer ships OCR text, so we **run OCR ourselves** on `photoUrls`; result folded into the text path + `image_analysis.ocr_text`                                                                                                                         |
+| **OCR (image text)** — ⚠ **off by default**  | **ours** — `PaddleOCR` / `Tesseract` (bn+en), or the VLM                                          | ✅                      | ✅      | The payload no longer ships OCR text, so we **run OCR ourselves** on `photoUrls`; result folded into the text path + `image_analysis.ocr_text`. Gated behind `STAGE1_OCR_SENTIMENT=false` while no image bytes are reachable — the code path is retained, not deleted |
 | **Emotion**                                | XLM-R fine-tuned (joy/anger/sadness/fear/…); GoEmotions heads for en                              | ✅                      | ✅      | Shares encoder with sentiment to save GPU; **cross-checked against `reactionBreakdown`** (SAD/ANGRY/HAHA/LOVE crowd signal)                                                                                                                                            |
 | **Topic classification**                   | XLM-R / embedding + classifier head; or zero-shot via small NLI model                             | ✅                      | ✅      | Use embeddings + lightweight classifier; reduces per-label models                                                                                                                                                                                                      |
 | **Intent**                                 | XLM-R fine-tuned (inform/promote/complain/request/…)                                              | ✅                      | ✅      | Per comment too (price/availability/location inquiries)                                                                                                                                                                                                                |
 | **Toxicity / hate / offensive**            | `XLM-R`/`mBERT` fine-tuned; Detoxify (en) + Bangla hate datasets                                  | ✅                      | ✅      | Bangla hate-speech corpora exist (e.g. Bengali Hate Speech); fine-tune                                                                                                                                                                                                 |
 | **NER (person/org/location/brand)**        | `GLiNER` (multilingual, zero/few-shot), `spaCy` (en), BanglaBERT-NER (bn)                         | ✅                      | ✅      | GLiNER gives flexible entity types without per-type models                                                                                                                                                                                                             |
 | **Embeddings**                             | Default `paraphrase-multilingual-mpnet-base-v2` (768-dim); `BAAI/bge-m3` (1024-dim) or `intfloat/multilingual-e5` are options — **but must match the `analysis_results.embedding vector(768)` column** (a 1024-dim model means resizing the column) | ✅                      | ✅      | Powers dedup, comment clustering, semantic search, RAG; 768-dim default keeps the pgvector column as-is                                                                                                                                                                                                                 |
-| **Summarization** (multimodal)             | text: **LLM-A**/**LLM-B**; image posts: a **VLM** (`Qwen2.5-VL` local ⇄ a Groq vision model) — §2 | ✅                      | ✅      | Selective; **grounded on caption + OCR + image**; summary in the post's original language                                                                                                                                                                              |
+| **Summarization**                          | the **`summary`** role (§2); image posts would use a **VLM** (`Qwen2.5-VL` local ⇄ a Groq vision model) when an image is actually fetchable | ✅                      | ✅      | Selective; grounded on caption (+ OCR + image when available — `post_summary_grounding` records which); summary in the post's original language. A reply that hits the token ceiling is auto-continued, then flagged `post_summary_truncated` and never cached          |
 | **Insight / report generation**            | **LLM-B** role + RAG, on the active backend (see §2)                                              | ✅                      | ✅      | Cluster summaries → corpus-level insight                                                                                                                                                                                                                               |
 | **Keyword extraction**                     | KeyBERT (on embeddings) / YAKE                                                                    | ✅                      | ✅      | Cheap, no extra GPU model                                                                                                                                                                                                                                              |
 
@@ -111,21 +117,54 @@ report bursts, or fail over local→Groq under load.
 > placeholders and pin the current IDs in config. The prompts and JSON output
 > schema are identical across backends, so a switch needs no prompt changes.
 
-### Pipeline roles `stage1` / `stage2` (implementation)
+### Pipeline roles `stage1` / `stage2` / `summary` (implementation)
 
-The per-post pipeline binds two concrete roles in `libs/llm/client.py`, each with
-its own model id so the **two stages run on different models**:
+The per-post pipeline binds three concrete roles in `libs/llm/client.py`, each
+with its own model id so the stages and tasks run on **different models**:
 
 | Role | env (`local` / `groq`) | default (Ollama / Groq) | Serves |
 | --- | --- | --- | --- |
 | `stage1` | `STAGE1_LOCAL_MODEL` / `STAGE1_GROQ_MODEL` | `gemma3:4b` / `llama-3.1-8b-instant` | **Stage-1 Fast NLP** — sentiment/emotion/topic/intent/toxicity/NER/keywords over caption + comments (`STAGE1_LLM=true`) |
-| `stage2` | `STAGE2_LOCAL_MODEL` / `STAGE2_GROQ_MODEL` | `qwen2.5:7b` / `llama-3.3-70b-versatile` | **Stage-2** — summary, post-type, insight, context-aware comment stance/summary |
+| `stage2` | `STAGE2_LOCAL_MODEL` / `STAGE2_GROQ_MODEL` | `qwen2.5:7b` / `llama-3.3-70b-versatile` | **Stage-2 classification** — post-type, insight, context-aware comment stance |
+| `summary` | `SUMMARY_LOCAL_MODEL` / `SUMMARY_GROQ_MODEL` | `qwen2.5:7b` / `llama-3.3-70b-versatile` | **Stage-2 summarization** — post summary and comment summary |
 
 `stage1` is the LLM realization of the small-model suite in §1 (a small fast model
-carries the high-volume per-post + per-comment NLP); `stage2` is the larger quality
-model. `llm_a` / `llm_b` remain the architectural fast / quality roles for the
-agents + report layer (§5), and the VLM role is unchanged. On local Ollama all of
-these can be time-sliced on one GPU; on Groq they are just distinct model IDs.
+carries the high-volume per-post + per-comment NLP). `llm_a` / `llm_b` remain the
+architectural fast / quality roles for the agents + report layer (§5), and the VLM
+role is unchanged. On local Ollama all of these can be time-sliced on one GPU; on
+Groq they are just distinct model IDs.
+
+**Why `summary` is separate from `stage2`.** The two Stage-2 jobs have opposite
+requirements: classification picks from a **fixed vocabulary** and wants a cheap,
+constrained model; summarization writes **Bangla prose** and wants a fluent one.
+Keeping them on one role forced a single compromise, and it is also the honest
+version of the cost story — the expensive model is spent on the one task that
+needs it, **once per post**, rather than on every classification call (which,
+since comment stance runs per batch, would multiply straight through the
+comment lane). `summary` defaults to the same model as `stage2`, so nothing
+changes until you point it elsewhere.
+
+**Pick the summary model by measurement, not reputation:**
+
+```bash
+python -m eval.bakeoff_summary --posts 10 --models qwen2.5:7b gemma4:26b gemma4:31b
+```
+
+It scores each candidate on real Bangla posts for latency (p50/p95), summary
+length, **truncation rate**, whether the summary stayed in the post's own script,
+and a crude grounding proxy — then prints the summaries so faithfulness and
+fluency can be judged by eye. Record the table: it is the ablation
+[PROJECT_ASSESSMENT.md](PROJECT_ASSESSMENT.md) §7.4 keeps asking for, and
+"we chose it because it scored X" is defensible in a way "it is bigger" is not.
+
+**Two implementation notes that matter when changing a model:**
+
+- The Stage-2 response cache keys on the **resolved model id**, not the role
+  label. Before that fix, switching models re-served the previous model's answers
+  for 7 days — which would have silently invalidated any model comparison
+  (§5.10). Set `LLM_CACHE_DISABLED=1` for evaluation runs anyway.
+- `processing.role_models` in the output records which model each role resolved
+  to, so a summary can always be attributed to the model that wrote it.
 
 Why two roles and not one: the two jobs have opposite profiles. Per-post refinement
 is **high-volume, low-difficulty** (favor a small fast model); cluster/report

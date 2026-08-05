@@ -28,6 +28,7 @@ from .rules import (
     read_text_length,
     should_use_llm,
 )
+from libs import streams
 from libs.common.logging import setup_logging
 from libs.dlq import record_failure
 from libs.progress import publish_stage
@@ -40,11 +41,12 @@ REDIS_URL: str = os.environ.get("REDIS_URL", "redis://localhost:6379/0")
 # Bounded retry before a failed message is dead-lettered to router:queue:dlq (§8).
 ROUTER_MAX_RETRIES: int = int(os.environ.get("ROUTER_MAX_RETRIES", "3"))
 
-# Stream / consumer-group names
-ROUTER_QUEUE: str = "router:queue"
-STAGE2_QUEUE: str = "llm:stage2:queue"
-ASSEMBLER_QUEUE: str = "assembler:queue"
-CONSUMER_GROUP: str = "router-workers"
+# Stream / consumer-group names — from libs/streams.py, the single source of
+# truth the KEDA manifests are checked against (§5.1 / §5.5).
+ROUTER_QUEUE: str = streams.ROUTER.name
+STAGE2_QUEUE: str = streams.STAGE2_LLM.name
+ASSEMBLER_QUEUE: str = streams.ASSEMBLER.name
+CONSUMER_GROUP: str = streams.ROUTER.group
 CONSUMER_NAME: str = os.environ.get("HOSTNAME", "router-0")
 
 # Redis stat keys

@@ -4,12 +4,28 @@ Redis-backed cache for Stage-2 LLM responses.
 Keys follow the pattern:
     llm_cache:{backend}:{model}:{task}:{content_hash}
 
-Default TTL: 7 days (604 800 seconds).
+**The `model` slot must be the resolved model id, not a role label.** It used to
+be called with the role ("stage2", "vlm") — the concrete model id
+(STAGE2_LOCAL_MODEL, STAGE2_GROQ_MODEL) was not in the key at all, and entries
+live 7 days. Changing the model and re-running the same posts therefore returned
+the *previous* model's answers. That was already a correctness bug, and it is a
+direct threat to any model comparison: a benchmark across BanglaBERT, XLM-R,
+gemma3:4b, qwen2.5:7b and llama-3.3-70b would silently compare each model
+against its own cached output.
+
+Splitting summarization onto its own `summary` role turns that latent bug
+active, because two different models are then in play for two different tasks
+under the same key. Callers resolve the model id via
+``LLMClient.default_model(role, backend)`` and pass it here.
+
+Default TTL: 7 days (604 800 seconds). Set LLM_CACHE_DISABLED=1 to bypass the
+cache entirely for an evaluation run.
 """
 
 from __future__ import annotations
 
 import json
+import os
 import re
 
 import structlog
@@ -17,6 +33,11 @@ import structlog
 logger = structlog.get_logger(__name__)
 
 _DEFAULT_TTL: int = 86_400 * 7  # 7 days in seconds
+
+
+def _disabled() -> bool:
+    """True when LLM_CACHE_DISABLED is set — the escape hatch for eval runs."""
+    return os.environ.get("LLM_CACHE_DISABLED", "").lower() in ("1", "true", "yes")
 
 # Sanitise model IDs that contain '/' (e.g. "Qwen/Qwen2.5-7B-Instruct")
 # so Redis key segments don't get ambiguous.
@@ -57,6 +78,8 @@ async def get_cached(
     -------
     Cached response dict, or ``None`` on cache miss.
     """
+    if _disabled():
+        return None
     key = _build_key(backend, model, task, content_hash)
     try:
         raw = await redis.get(key)
@@ -98,6 +121,8 @@ async def set_cached(
     ttl:
         Expiry in seconds (default 7 days).
     """
+    if _disabled():
+        return
     key = _build_key(backend, model, task, content_hash)
     try:
         await redis.set(key, json.dumps(response), ex=ttl)

@@ -47,13 +47,19 @@ Postgres → `GET /analysis/{id}`, with valid JSON.
 
 Goal: prove the hybrid pipeline and output quality end-to-end, cheaply.
 
-> **First target (priority order)** — the multimodal post-and-thread pipeline,
-> shippable on the data we have today (comments are **embedded** in the payload):
+> **First target (priority order)** — the post-and-thread pipeline, shippable on
+> the data we have today (comments are **embedded** in the payload):
 > **(1) post text sentiment** (caption) → **(2) image sentiment** (visual model on
 > the photo, when present; we also OCR it) → **(3) fuse** into post
 > `overall_sentiment` (cross-check `reactionBreakdown`) → **(4) post summary
-> grounded on caption + image/OCR** → **(5) per-comment sentiment** over the
-> embedded thread. See [data_contract.md](data_contract.md) §4.
+> grounded on caption (+ image/OCR when available)** → **(5) per-comment
+> sentiment** over the embedded thread. See [data_contract.md](data_contract.md) §4.
+>
+> **Step 2 is implemented but unexercised:** no image bytes are reachable in any
+> runnable configuration ([PROJECT_ASSESSMENT.md](PROJECT_ASSESSMENT.md) §5.2), so
+> the working corpus is `posts_text_only.json` (43 captioned posts) and post
+> sentiment is a **text** measurement. Steps 1, 3, 4 and 5 are live — and step 5
+> now covers *every non-emoji comment*, not a top-N sample.
 
 - **Ingestion service:** **pull the post-with-details payload** (comments embedded),
   derive `platform` from URL host, keep upstream `sentiment`/`viralPotential` as
@@ -96,7 +102,7 @@ Goal: prove the hybrid pipeline and output quality end-to-end, cheaply.
 - **Monitoring:** Prometheus + Grafana + Loki; track LLM-routing rate + cache hits.
 
 **Exit criteria:** process 1,000-post batches reliably; measured LLM slice in
-single digits %; per-task accuracy baselined on the eval set; cost-per-1k
+**measured** (16% shipped, engine named) and reported beside the post-vs-comment call split; per-task accuracy baselined on the eval set; cost-per-1k **per backend and model**
 recorded.
 
 ---
@@ -136,7 +142,7 @@ Goal: scale, reliability, and the move to Kubernetes.
   it beats baseline on the eval set ([models.md](models.md) §4).
 
 **Exit criteria:** 10,000-post batches within target latency; autoscaling proven
-under burst; DLQ < threshold; LLM slice held in single digits %; per-language
+under burst; DLQ < threshold; LLM slice **measured and reported with its Stage-1 engine named** (16% shipped) rather than held to a target; per-language
 accuracy improved over MVP baseline.
 
 ---

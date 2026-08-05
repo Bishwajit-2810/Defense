@@ -10,14 +10,17 @@ analyze_comments():
 
 from __future__ import annotations
 
+import asyncio
 import logging
 import os
 import re
 from collections import Counter
 from typing import TYPE_CHECKING, Any
 
+from libs.labels import label_provenance
+
 from .llm_analyzer import classify_comments_llm
-from .text_analyzer import analyze_sentiment
+from .text_analyzer import analyze_sentiment_engine
 
 if TYPE_CHECKING:
     from .models import ModelRegistry
@@ -28,8 +31,20 @@ logger = logging.getLogger(__name__)
 # *substantive* comments get the LLM (batched) so a post with thousands of
 # comments can't stall Stage 1; the rest keep their instant heuristic/stub label,
 # so coverage stays 100%. Mirrors the Stage-2 stance cap (COMMENT_STANCE_*).
-_LLM_COMMENT_MAX = int(os.getenv("STAGE1_LLM_COMMENT_MAX", "60"))
-_LLM_COMMENT_BATCH = int(os.getenv("STAGE1_LLM_COMMENT_BATCH", "40"))
+#: 0 = no cap — EVERY non-emoji comment reaches the LLM (§6.3). This used to
+#: default to 60, which meant only 28.7% of comments ever got an LLM label
+#: while the output still described itself as full per-comment coverage. Full
+#: coverage over speed is the trade being chosen deliberately; set a positive
+#: value for a fast demo run.
+_LLM_COMMENT_MAX = int(os.getenv("STAGE1_LLM_COMMENT_MAX", "0"))
+#: Smaller batches than before (was 40): a failed batch loses less work, and
+#: concurrency now supplies the throughput that batch size used to.
+_LLM_COMMENT_BATCH = int(os.getenv("STAGE1_LLM_BATCH", os.getenv("STAGE1_LLM_COMMENT_BATCH", "25")))
+#: Batches in flight at once. The old loop was strictly sequential, so raising
+#: the cap simply stalled the post.
+_LLM_CONCURRENCY = max(1, int(os.getenv("STAGE1_LLM_CONCURRENCY", "3")))
+#: Retries per batch, so one bad batch does not lose the rest.
+_LLM_BATCH_RETRIES = max(0, int(os.getenv("STAGE1_LLM_BATCH_RETRIES", "1")))
 
 
 # ---------------------------------------------------------------------------
@@ -38,11 +53,17 @@ _LLM_COMMENT_BATCH = int(os.getenv("STAGE1_LLM_COMMENT_BATCH", "40"))
 # Strategy (chosen for full per-comment coverage at scale):
 #   * "fast"  — emoji-only / very short comments are scored by an emoji +
 #               tiny multilingual lexicon heuristic. No model call.
-#   * "model" — substantive comments go through analyze_sentiment(), which uses
-#               the XLM-R sentiment model in real mode (the deterministic stub
-#               when MODEL_STUB_MODE is on).
+#   * "model" — substantive comments go through analyze_sentiment_engine(),
+#               which uses the XLM-R sentiment model in real mode.
+#   * "stub"  — the same substantive path when MODEL_STUB_MODE is on (or the
+#               model is unavailable). Reported honestly rather than as "model":
+#               `_stub_sentiment` derives its label from a hash of the text, so
+#               counting it as a model inference overstated the model's reach by
+#               thousands of comments per run.
 # This keeps thousands of low-signal emoji reactions off the heavy path while
-# every comment still receives a sentiment label.
+# every comment still receives a sentiment label. `label_provenance` (in
+# libs/labels.py) turns the resulting method_breakdown into the mix a chart can
+# report about itself.
 
 # Emoji are matched as substrings (variation selectors / ZWJ make per-char
 # membership unreliable). Laughing/clown emoji read as mocking in this corpus,
@@ -54,8 +75,29 @@ _POS_EMOJI: tuple[str, ...] = (
 )
 _NEG_EMOJI: tuple[str, ...] = (
     "😡", "🤬", "👎", "💩", "🤮", "🤢", "😠", "😤", "🖕", "🤡", "😒", "🙄",
-    "😞", "😢", "😭", "💔", "⚠", "🚫", "❌", "🤣", "😂", "😆",
+    "😞", "😢", "😭", "💔", "⚠", "🚫", "❌",
 )
+
+# Laughing emoji are a *named decision*, not an accident. On this corpus of
+# political content they overwhelmingly read as mockery, so they count as
+# negative — but they used to count as negative for SENTIMENT while mapping to
+# no emotion at all, so a mocking comment came out `negative` / `neutral` and
+# the two tables silently disagreed. Both now follow this one switch.
+#   COMMENT_LAUGH_SENTIMENT=negative (default) | positive | neutral
+_LAUGH_EMOJI: tuple[str, ...] = ("🤣", "😂", "😆", "😹")
+_LAUGH_SENTIMENT = os.getenv("COMMENT_LAUGH_SENTIMENT", "negative").lower()
+if _LAUGH_SENTIMENT not in ("negative", "positive", "neutral"):
+    _LAUGH_SENTIMENT = "negative"
+#: The emotion laughter maps to, kept consistent with the sentiment reading:
+#: mockery is disgust, genuine laughter is joy.
+_LAUGH_EMOTION = {"negative": "disgust", "positive": "joy", "neutral": None}[
+    _LAUGH_SENTIMENT
+]
+
+if _LAUGH_SENTIMENT == "negative":
+    _NEG_EMOJI = _NEG_EMOJI + _LAUGH_EMOJI
+elif _LAUGH_SENTIMENT == "positive":
+    _POS_EMOJI = _POS_EMOJI + _LAUGH_EMOJI
 
 # Tiny multilingual seed lexicon for short Banglish/English/Bangla comments.
 _POS_LEX: frozenset[str] = frozenset(
@@ -106,6 +148,12 @@ _EMOTION_LEX: dict[str, frozenset[str]] = {
                            "অবাক", "আশ্চর্য", "তাজ্জব"}),
 }
 
+# Laughter joins the emotion table under the same switch that decides its
+# sentiment, so `sentiment_breakdown` and `emotion_breakdown` can no longer
+# disagree about what a 🤣 means.
+if _LAUGH_EMOTION is not None:
+    _EMOTION_EMOJI[_LAUGH_EMOTION] = _EMOTION_EMOJI[_LAUGH_EMOTION] + _LAUGH_EMOJI
+
 _EMOTIONS: tuple[str, ...] = ("anger", "sadness", "joy", "fear", "disgust", "surprise")
 
 # All labels that may appear in emotion_breakdown (heuristic + LLM never emit
@@ -140,10 +188,31 @@ def _emoji_counts(text: str) -> tuple[int, int]:
     return pos, neg
 
 
+#: Comment kinds. The old code had one boolean (`_is_short`) that conflated two
+#: genuinely different things — an emoji-only reaction and a one-word text
+#: comment — and labelled both with the emoji+lexicon heuristic. They differ in
+#: exactly the way that matters for cost: an emoji-only comment has no text for
+#: an LLM to read, so sending it is the cheapest possible way to waste tokens.
+KIND_EMOJI = "emoji"              # no word tokens at all
+KIND_SHORT = "short"              # 1-2 word tokens, or < 4 textual characters
+KIND_SUBSTANTIVE = "substantive"  # enough text to be worth a model
+
+
+def _comment_kind(text: str, tokens: list[str] | None = None) -> str:
+    """Classify a comment by how much text it actually contains."""
+    if tokens is None:
+        tokens = _WORD_RE.findall(text or "")
+    if not tokens:
+        # Only emoji, punctuation and whitespace (or nothing at all).
+        return KIND_EMOJI
+    if len(tokens) <= 2 or sum(len(t) for t in tokens) < 4:
+        return KIND_SHORT
+    return KIND_SUBSTANTIVE
+
+
 def _is_short(text: str, tokens: list[str]) -> bool:
-    stripped = _WORD_RE.sub("", text)  # what remains is emoji/punctuation
-    textual_chars = sum(len(t) for t in tokens)
-    return len(tokens) <= 2 or textual_chars < 4 or (not tokens and stripped)
+    """Back-compat predicate: everything that skips the model path."""
+    return _comment_kind(text, tokens) != KIND_SUBSTANTIVE
 
 
 def _fast_classify(text: str, tokens: list[str]) -> tuple[str, float]:
@@ -173,18 +242,26 @@ async def classify_comment(
     """
     tokens = _WORD_RE.findall(text or "")
     emotion = _fast_emotion(text or "", tokens)
+    kind = _comment_kind(text or "", tokens)
 
-    if _is_short(text or "", tokens):
+    if kind != KIND_SUBSTANTIVE:
         label, score = _fast_classify(text or "", tokens)
         return {
             "sentiment": label,
             "sentiment_score": score,
             "emotion": emotion,
-            "method": "fast",
+            # Emoji-only reactions are tagged distinctly from short text
+            # comments: they carry real crowd signal (❤️ and 🤬 both mean
+            # something) so they are kept, but they are excluded from every LLM
+            # batch — there is no text in them for an LLM to read.
+            "method": "emoji" if kind == KIND_EMOJI else "fast",
+            "kind": kind,
             "keywords": [],
         }
 
-    label, score, _conf = await analyze_sentiment(text, registry, sentiment_override)
+    label, score, _conf, engine = await analyze_sentiment_engine(
+        text, registry, sentiment_override
+    )
     # Cheap keyword extraction (longest unique tokens) — no model needed.
     uniq: list[str] = []
     seen: set[str] = set()
@@ -197,7 +274,11 @@ async def classify_comment(
         "sentiment": label,
         "sentiment_score": score,
         "emotion": emotion,
-        "method": "model",
+        # "model" only when a transformer actually ran. This used to be
+        # hardcoded regardless of MODEL_STUB_MODE, so `method_breakdown` claimed
+        # 8,513 model inferences in runs where zero models were loaded.
+        "method": engine,
+        "kind": kind,
         "keywords": uniq[:5],
     }
 
@@ -269,51 +350,132 @@ def _aggregate_top_keywords(analyzed_comments: list[dict]) -> list[str]:
 # Public entry-point
 # ---------------------------------------------------------------------------
 
+def _apply_labels(batch: list[dict], labels: list) -> int:
+    """Merge a batch's LLM labels back onto its records, index-aligned.
+
+    ``classify_comments_llm`` returns one label per input in order, and the
+    whole merge rests on that alignment — a shifted list would attach every
+    comment's sentiment to its neighbour, silently and unrecoverably. Assert it
+    rather than trusting ``zip`` to truncate the mismatch away.
+    """
+    if len(labels) != len(batch):
+        raise ValueError(
+            f"LLM returned {len(labels)} labels for {len(batch)} comments — "
+            "index alignment is the merge contract; refusing to mislabel"
+        )
+    applied = 0
+    for r, label in zip(batch, labels):
+        if not isinstance(label, dict):
+            continue
+        r["sentiment"] = label["sentiment"]
+        r["sentiment_score"] = label["sentiment_score"]
+        r["emotion"] = label["emotion"]
+        if label.get("keywords"):
+            r["keywords"] = label["keywords"]
+        r["method"] = "llm"
+        applied += 1
+    return applied
+
+
 async def _llm_upgrade_comments(
     records: list[dict],
     registry: Any,
     backend_override: str | None,
-) -> None:
-    """Re-label the top-N substantive comments via the `stage1` LLM (in place).
+    progress_cb: Any = None,
+) -> int:
+    """Re-label substantive comments via the `stage1` LLM (in place). Returns #labelled.
 
-    Short/emoji comments (method="fast") keep their free heuristic label; only
-    the most-liked substantive comments are sent to the LLM, batched and capped
-    by STAGE1_LLM_COMMENT_MAX. Each LLM failure leaves that batch on its
-    heuristic/stub label. Mutates ``records`` (sentiment/score/emotion/keywords/
-    method) so coverage stays 100% while the premium pass stays bounded.
+    **Every non-emoji comment reaches the LLM by default** (§6.3): the cap is 0.
+    Emoji-only reactions are excluded — there is no text in them to read — and
+    short comments keep the free heuristic. Coverage of the LLM pass is
+    therefore "all substantive comments", not "the top 60 by likes".
+
+    Batches run through a bounded-concurrency queue rather than the old strictly
+    sequential loop, which is what made raising the cap impractical: with the
+    caps lifted, a 2,857-comment thread is ~115 batches, and running those one
+    after another stalls the post for minutes.
+
+    Each batch retries independently, so one bad batch does not cost the rest.
+    A batch that exhausts its retries leaves its comments on the Stage-1
+    heuristic/stub label — degraded, but labelled and counted as such.
+
+    ``progress_cb(done, total)`` is awaited after each batch so the Trace tab can
+    show ``batch k/N`` instead of appearing hung.
     """
     llm = registry.get_llm_client()
     if llm is None:
-        return
+        return 0
 
-    substantive = [r for r in records if r.get("method") != "fast"]
+    substantive = [r for r in records if r.get("kind") == KIND_SUBSTANTIVE]
     if not substantive:
-        return
+        return 0
     if 0 < _LLM_COMMENT_MAX < len(substantive):
+        # A positive cap still selects the most-engaged comments — a demo knob,
+        # not the default.
         targets = sorted(
             substantive, key=lambda r: int(r.get("likes") or 0), reverse=True
         )[:_LLM_COMMENT_MAX]
+        logger.info(
+            "stage1 LLM comment cap active: %s of %s substantive comments "
+            "(STAGE1_LLM_COMMENT_MAX=%s; 0 means no cap)",
+            len(targets), len(substantive), _LLM_COMMENT_MAX,
+        )
     else:
         targets = substantive
 
-    for start in range(0, len(targets), _LLM_COMMENT_BATCH):
-        batch = targets[start : start + _LLM_COMMENT_BATCH]
-        try:
-            labels = await classify_comments_llm(
-                [r["text"] for r in batch], llm, backend_override
-            )
-        except Exception as exc:
-            logger.warning("stage1 LLM comment batch failed (start=%s): %s", start, exc)
-            continue
-        for r, label in zip(batch, labels):
-            if not isinstance(label, dict):
-                continue
-            r["sentiment"] = label["sentiment"]
-            r["sentiment_score"] = label["sentiment_score"]
-            r["emotion"] = label["emotion"]
-            if label.get("keywords"):
-                r["keywords"] = label["keywords"]
-            r["method"] = "llm"
+    batches = [
+        targets[i : i + _LLM_COMMENT_BATCH]
+        for i in range(0, len(targets), _LLM_COMMENT_BATCH)
+    ]
+    total = len(batches)
+    semaphore = asyncio.Semaphore(_LLM_CONCURRENCY)
+    done = 0
+    labelled = 0
+    lock = asyncio.Lock()
+
+    async def _run_batch(index: int, batch: list[dict]) -> int:
+        nonlocal done, labelled
+        async with semaphore:
+            for attempt in range(_LLM_BATCH_RETRIES + 1):
+                try:
+                    labels = await classify_comments_llm(
+                        [r["text"] for r in batch], llm, backend_override
+                    )
+                    applied = _apply_labels(batch, labels)
+                    break
+                except Exception as exc:
+                    if attempt < _LLM_BATCH_RETRIES:
+                        logger.warning(
+                            "stage1 LLM batch %s/%s failed (attempt %s), retrying: %s",
+                            index + 1, total, attempt + 1, exc,
+                        )
+                        continue
+                    logger.warning(
+                        "stage1 LLM batch %s/%s failed after %s attempts, "
+                        "leaving %s comments on their heuristic label: %s",
+                        index + 1, total, attempt + 1, len(batch), exc,
+                    )
+                    applied = 0
+        async with lock:
+            done += 1
+            labelled += applied
+            current = done
+        if progress_cb is not None:
+            try:
+                await progress_cb(current, total)
+            except Exception as exc:  # progress must never break analysis
+                logger.debug("comment batch progress callback failed: %s", exc)
+        return applied
+
+    await asyncio.gather(
+        *(_run_batch(i, b) for i, b in enumerate(batches)), return_exceptions=True
+    )
+    logger.info(
+        "stage1 LLM comment pass: %s/%s comments labelled across %s batches "
+        "(batch=%s, concurrency=%s)",
+        labelled, len(targets), total, _LLM_COMMENT_BATCH, _LLM_CONCURRENCY,
+    )
+    return labelled
 
 
 async def analyze_comments(
@@ -321,6 +483,7 @@ async def analyze_comments(
     registry: Any,  # ModelRegistry — avoid circular import
     sentiment_override: str | None = None,
     backend_override: str | None = None,
+    progress_cb: Any = None,
 ) -> dict:
     """Analyse all embedded comments and return a comment_analysis dict.
 
@@ -331,6 +494,10 @@ async def analyze_comments(
         "id", "text", "likes", and optionally "authorUsername").
     registry:
         The shared ModelRegistry instance.
+    progress_cb:
+        Optional ``async (done, total) -> None`` called after each LLM batch, so
+        a caller with a Redis handle can publish ``batch k/N`` to the trace
+        without this module needing to know about Redis.
 
     Returns
     -------
@@ -348,8 +515,11 @@ async def analyze_comments(
             "analyzed": 0,
             "coverage": 0.0,
             "sentiment_breakdown": {"positive": 0, "negative": 0, "neutral": 0},
+            "sentiment_breakdown_substantive": {"positive": 0, "negative": 0, "neutral": 0},
+            "reaction_only": 0,
             "emotion_breakdown": _empty_emotion_breakdown(),
-            "method_breakdown": {"fast": 0, "model": 0},
+            "method_breakdown": {},
+            "provenance": label_provenance({}),
             "themes": [],
             "top_keywords": [],
             "representative_comments": [],
@@ -369,7 +539,10 @@ async def analyze_comments(
                 "sentiment": "neutral",
                 "sentiment_score": 0.0,
                 "emotion": "neutral",
-                "method": "fast",
+                # Not "fast" — nothing classified this comment. Tagging a
+                # failure as a heuristic hides it inside a legitimate bucket.
+                "method": "failed",
+                "kind": _comment_kind(text),
                 "keywords": [],
             }
         records.append(
@@ -384,26 +557,40 @@ async def analyze_comments(
                 "emotion": nlp.get("emotion") or "neutral",
                 "keywords": nlp.get("keywords", []),
                 "method": nlp.get("method", "fast"),
+                "kind": nlp.get("kind") or _comment_kind(text),
             }
         )
 
     # 2. LLM upgrade pass (STAGE1_LLM=true) — re-label the top-N substantive
     #    comments via the stage1 LLM so they match the LLM engine. No-op otherwise.
     if registry.llm_mode:
-        await _llm_upgrade_comments(records, registry, backend_override)
+        await _llm_upgrade_comments(records, registry, backend_override, progress_cb)
 
     # 3. Aggregate from the (possibly upgraded) records.
     sentiment_counts: dict[str, int] = {"positive": 0, "negative": 0, "neutral": 0}
     emotion_counts: dict[str, int] = _empty_emotion_breakdown()
-    method_counts: dict[str, int] = {"fast": 0, "model": 0}
+    # Seeded empty, not with a zeroed "model" bucket: the breakdown should
+    # report the methods that ran, not imply one that did not.
+    method_counts: dict[str, int] = {}
+    # Emoji-only reactions are real crowd signal (❤️ and 🤬 both mean something)
+    # and are kept — but they are a different thing from a written opinion, so
+    # they get their own count and the substantive comments get their own
+    # series. A chart can then show "text opinion" and "emoji reactions"
+    # separately instead of blending them into one indistinguishable bar.
+    substantive_counts: dict[str, int] = {"positive": 0, "negative": 0, "neutral": 0}
+    reaction_only = 0
     for r in records:
         s = r["sentiment"] if r["sentiment"] in sentiment_counts else "neutral"
         r["sentiment"] = s
         sentiment_counts[s] += 1
+        if r.get("kind") == KIND_EMOJI:
+            reaction_only += 1
+        else:
+            substantive_counts[s] += 1
         e = r["emotion"] if r["emotion"] in emotion_counts else "neutral"
         r["emotion"] = e
         emotion_counts[e] += 1
-        m = r.get("method", "fast")
+        m = r.get("method") or "fast"
         method_counts[m] = method_counts.get(m, 0) + 1
 
     themes = _extract_themes(records)
@@ -422,6 +609,7 @@ async def analyze_comments(
             "sentiment_score": r["sentiment_score"],
             "emotion": r["emotion"],
             "method": r["method"],
+            "kind": r["kind"],
         }
         for r in records
     ]
@@ -432,8 +620,17 @@ async def analyze_comments(
         # engagement.commentCount after this function returns.
         "coverage": 0.0,
         "sentiment_breakdown": sentiment_counts,
+        # The same counts over written comments only — emoji-only reactions
+        # excluded. This is the series to chart when the question is "what did
+        # people SAY", as opposed to "how did the crowd react".
+        "sentiment_breakdown_substantive": substantive_counts,
+        "reaction_only": reaction_only,
         "emotion_breakdown": emotion_counts,
         "method_breakdown": method_counts,
+        # Surfaced next to the breakdowns the way `coverage` is surfaced next to
+        # the comment count, so "what produced these labels?" is answerable from
+        # the same object that carries the labels.
+        "provenance": label_provenance(method_counts),
         "themes": themes,
         "top_keywords": top_keywords,
         "representative_comments": representative,

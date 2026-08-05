@@ -47,14 +47,18 @@ from common.logging import setup_logging  # noqa: E402
 from dlq import record_failure  # noqa: E402
 from progress import publish_stage  # noqa: E402
 
+from libs import streams  # noqa: E402
+
 setup_logging("assembler")
 log: structlog.BoundLogger = structlog.get_logger(__name__)
 
 # ---------------------------------------------------------------------------
 # Redis stream constants
 # ---------------------------------------------------------------------------
-STREAM_KEY = "assembler:queue"
-CONSUMER_GROUP = "assembler-group"
+# From libs/streams.py — the single source of truth the KEDA manifests are
+# checked against (§5.1 / §5.5).
+STREAM_KEY = streams.ASSEMBLER.name
+CONSUMER_GROUP = streams.ASSEMBLER.group
 
 # Bounded retry before a failed message is dead-lettered to assembler:queue:dlq.
 ASSEMBLER_MAX_RETRIES = int(os.getenv("ASSEMBLER_MAX_RETRIES", "3"))

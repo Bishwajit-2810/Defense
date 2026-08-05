@@ -207,8 +207,14 @@ for i in $(seq 1 40); do
 done
 ```
 
-Auth note: any non-empty `X-API-Key` header is accepted in dev. A signed JWT
-(HS256 with `JWT_SECRET`) also works.
+Auth note: any non-empty `X-API-Key` header is accepted in dev (real key storage
+is still open — PROJECT_ASSESSMENT §5.6). A signed JWT (HS256 with `JWT_SECRET`)
+also works, on **every** transport: a credential that looks like a JWT is
+verified as one whether it arrives in `Authorization`, `X-API-Key`, or the
+`?api_key=` query parameter that `EventSource` needs for SSE. It used to be that
+only the `Authorization` header was parsed as a token, so an **expired or forged**
+token authenticated on all four SSE streams. Expect a 401 on a stale token now —
+that is the fix working.
 
 ---
 
@@ -499,12 +505,13 @@ back to if unset.
 | `DATABASE_URL`     | Postgres DSN (asyncpg). Also holds the pgvector embeddings. | **required**            | `postgresql+asyncpg://defense:defense@<pg-ip>:5432/defense` |
 | `REDIS_URL`        | Redis streams + pub/sub + caches.                           | **required**            | `redis://<redis-ip>:6379/0`                                 |
 | `CLICKHOUSE_URL`   | ClickHouse DSN (assembler analytics writes).                | **required**            | `clickhouse://defense:defense@<ch-ip>:9000/defense`         |
-| `MINIO_ENDPOINT`   | MinIO/S3 endpoint URL (raw-result blobs).                   | **required**            | `http://<minio-ip>:9000`                                    |
+| `MINIO_ENDPOINT`   | MinIO/S3 endpoint URL (raw-result blobs, and the base for resolving relative `photoUrls`). **Must include the scheme** — the root `.env` shipped `minio:9000` with none, and httpx raised `UnsupportedProtocol` before a byte was fetched, which the vision path then reported as a neutral verdict. A missing scheme is now logged and `http://` assumed. | **required**            | `http://<minio-ip>:9000`                                    |
 | `MINIO_ACCESS_KEY` | MinIO access key.                                           | **required**            | `minioadmin`                                                |
 | `MINIO_SECRET_KEY` | MinIO secret key.                                           | **required**            | `minioadmin`                                                |
 | `MINIO_BUCKET`     | Object bucket (auto-created).                               | default `defense`       | `defense`                                                   |
 | `PYTHONPATH`       | Must include the repo root so `libs`/`services` import.     | **required (host run)** | `/home/bk/code/defense`                                     |
-| `JWT_SECRET`       | HS256 secret for JWT auth.                                  | default `change-me`     | `demo`                                                      |
+| `JWT_SECRET`       | HS256 secret, read per call by **both** the issuer and the verifier via `libs/common/config.py` (so it can be rotated without a restart, and issuer/verifier cannot drift). A fingerprint is logged at boot in each. | default `change-me`     | `demo`                                                      |
+| `APP_ENV`          | Deployment environment. Outside `dev`/`test`/`ci` the API **refuses to start** while `JWT_SECRET` is still a placeholder that ships in this repo. | default `dev`           | `dev`                                                       |
 | `LOG_LEVEL`        | Log verbosity.                                              | default `INFO`          | `INFO`                                                      |
 
 ### Vector search (pgvector)
@@ -522,8 +529,12 @@ back to if unset.
 | `LOCAL_LLM_API_KEY`  | Key for the local endpoint (any string for Ollama). | default `ollama`                                    | `ollama`                    |
 | `LLM_A_LOCAL_MODEL`  | Text model — classify / summarize / insight.        | default `qwen2.5:7b`                                | `qwen2.5:7b`                |
 | `LLM_B_LOCAL_MODEL`  | Heavier text role (unused by this pipeline).        | default `qwen2.5:7b`                                | `qwen2.5:7b`                |
-| `VLM_LOCAL_MODEL`    | Vision model for image posts (`role=vlm`).          | default `qwen3-vl:4b`                               | `qwen3-vl:4b`               |
+| `STAGE1_LOCAL_MODEL` | Stage-1 Fast-NLP model (`role=stage1`).             | default `gemma3:4b`                                 | `gemma3:4b`                 |
+| `STAGE2_LOCAL_MODEL` | Stage-2 **classification** (post-type, insight, comment stance). | default `qwen2.5:7b`                   | `qwen2.5:7b`                |
+| `SUMMARY_LOCAL_MODEL`| Stage-2 **summarization** (post + comment summary). Separate from `stage2` because classification wants a cheap constrained model and summarization wants a fluent one. Pick it with `python -m eval.bakeoff_summary`. | default `qwen2.5:7b` | `gemma4:26b`                |
+| `VLM_LOCAL_MODEL`    | Vision model for image posts (`role=vlm`). Only used when an image is actually fetched — currently never (§5.2). | default `qwen3-vl:4b`     | `qwen3-vl:4b`               |
 | `GROQ_API_KEY`       | Groq Cloud key — only when `LLM_BACKEND=groq`.      | required for groq                                   | `gsk_…`                     |
+| `SUMMARY_GROQ_MODEL` | Groq summarization model.                           | default `llama-3.3-70b-versatile`                   | —                           |
 | `LLM_A_GROQ_MODEL`   | Groq text-A model.                                  | default `llama-3.1-8b-instant`                      | —                           |
 | `LLM_B_GROQ_MODEL`   | Groq text-B model.                                  | default `llama-3.3-70b-versatile`                   | —                           |
 | `VLM_GROQ_MODEL`     | Groq vision model.                                  | default `meta-llama/llama-4-scout-17b-16e-instruct` | —                           |
@@ -531,6 +542,35 @@ back to if unset.
 > The LLM client reads the `LOCAL_LLM_*` and `LLM_*_LOCAL_MODEL` vars **directly**
 > with the Ollama defaults above. Set them explicitly (as §4 does) rather than
 > relying on defaults if you've changed models.
+
+### Comment LLM coverage & cost (the dominant runtime knob)
+
+85–96% of LLM calls are **comment-level**, so these matter more for wall-clock
+and cost than the router threshold does ([PROJECT_ASSESSMENT.md](PROJECT_ASSESSMENT.md) §6.8).
+
+| Variable | Purpose | Required? | Example / default |
+| --- | --- | --- | --- |
+| `STAGE1_LLM_COMMENT_MAX` | Cap on comments per post given a Stage-1 LLM label. **0 = no cap** (every non-emoji comment). | default `0` | `60` for a fast demo |
+| `COMMENT_STANCE_MAX_PER_POST` | Same cap for the Stage-2 context-aware stance pass (routed posts only). | default `0` | `40` for a fast demo |
+| `STAGE1_LLM_BATCH` | Comments per LLM call. Bigger = fewer calls, longer prompts, coarser retries. | default `25` | `25` |
+| `STAGE1_LLM_CONCURRENCY` | Batches in flight per post. The loop used to be sequential, which is why the caps existed. | default `3` | `3` |
+| `COMMENT_STANCE_BATCH` / `COMMENT_STANCE_CONCURRENCY` | The same two knobs for Stage 2. | default `25` / `3` | — |
+| `COMMENT_LAUGH_SENTIMENT` | How 🤣😂😆 score: `negative` (mockery — right for this corpus), `positive`, or `neutral`. Drives **both** the sentiment and emotion tables, which used to disagree. | default `negative` | `negative` |
+| `STAGE1_OCR_SENTIMENT` | Sentiment-analyse OCR text on null-caption image posts. Off while no image bytes are reachable (§5.2). | default `false` | `false` |
+
+> **If you set the caps above 0, say so when quoting coverage.** At the defaults
+> ~100% of non-emoji comments carry an LLM label; at `60`/`40` it is ~29%, and
+> `comment_analysis.provenance.inferred_share` will show it.
+
+### Token budgets & truncation
+
+| Variable | Purpose | Required? | Example / default |
+| --- | --- | --- | --- |
+| `SUMMARY_MAX_TOKENS` | Post-summary ceiling. Bangla costs far more tokens per character than English, so a low ceiling truncates Bangla and spares English. | default `1024` | `1024` |
+| `COMMENT_SUMMARY_MAX_TOKENS` | Comment-summary ceiling. | default `640` | `640` |
+| `INSIGHT_MAX_TOKENS` | Insight-task ceiling. | default `768` | `768` |
+| `LLM_MAX_CONTINUATIONS` | How many times a reply that stopped at the ceiling is re-asked and concatenated. Whatever state it ends in is reported as `truncated`, flagged in the output, and never cached. | default `2` | `2` |
+| `LLM_CACHE_DISABLED` | Bypass the 7-day Stage-2 response cache. **Set this for evaluation runs** so a model comparison cannot read back cached answers. | unset | `1` |
 
 ### Stage-1 NLP / vision models
 

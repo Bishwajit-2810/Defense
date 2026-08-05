@@ -39,13 +39,16 @@ This is the JSON the whole system exists to produce:
   "post_summary":           "পোস্টটি জ্বালানি তেলের মূল্যবৃদ্ধি নিয়ে সরকারের সমালোচনা করছে…",
   "post_summary_lang":      "bn",                   // language the summary was written in
   "post_summary_source":    "vlm",                  // "vlm" = image-grounded, "llm" = text-only, null = no summary
-  "post_summary_grounding": "caption+ocr+image",    // which inputs grounded the summary
+  "post_summary_grounding": "caption",              // which inputs grounded the summary
+  "post_summary_truncated": false,                  // true = hit the token ceiling even after auto-continuation; text trimmed to its last complete sentence
 
-  // ---- sentiment (multimodal) ------------------------------------------
+  // ---- sentiment -------------------------------------------------------
+  // Fusion weights renormalise over the terms that carry a real model verdict,
+  // so an absent image term does NOT shrink the text signal toward neutral.
   "overall_sentiment":  "negative",                 // positive | negative | neutral | mixed
   "sentiment_score":    -0.62,                      // -1.0 … 1.0
   "text_sentiment":     "negative",
-  "image_sentiment":    "neutral",                  // null for text-only posts
+  "image_sentiment":    null,                       // null for text-only posts AND whenever no vision model produced a verdict
   "baseline_sentiment": -0.5,                       // upstream platform's own score (for comparison)
 
   // ---- classification ---------------------------------------------------
@@ -77,8 +80,16 @@ This is the JSON the whole system exists to produce:
   // ---- per-comment rollup ------------------------------------------------
   "comment_analysis": {
     "analyzed": 25,                                 // comments we actually analyzed
-    "coverage": 0.0136,                             // analyzed / comment_count
-    "sentiment_breakdown": { "positive": 3, "negative": 14, "neutral": 8 },
+    "coverage": 0.0136,                             // analyzed / comment_count, CLAMPED to 1.0
+    "coverage_anomaly": null,                       // set when stored rows exceed the platform's reported commentCount
+    "sentiment_breakdown": { "positive": 3, "negative": 14, "neutral": 8 },   // ALL comments
+    "sentiment_breakdown_substantive": { "positive": 2, "negative": 13, "neutral": 6 },  // written comments only
+    "reaction_only": 4,                             // emoji-only reactions — kept as signal, never sent to an LLM
+    "method_breakdown": { "llm": 21, "emoji": 4 },  // only the methods that actually ran
+    "provenance": {                                 // where these labels came from
+      "total": 25, "inferred": 21, "heuristic": 4, "inferred_share": 0.84,
+      "by_method": { "llm": 21, "emoji": 4 }
+    },
     "themes": ["price hike", "sarcasm"],
     "top_keywords": ["dam", "taka"],
     "representative_comments": [
@@ -106,9 +117,15 @@ Field-level rules worth knowing when consuming this JSON:
 | Field | Rule |
 | --- | --- |
 | `post_summary*` | `null` when the router skipped Stage-2 (no LLM needed). Force a summary for every post with `options.want_summary: true` at upload/run time. |
-| `post_summary_source` | `"vlm"` only when the image actually grounded the summary; a VLM failure degrades to text-only and reports `"llm"`. |
-| `comment_analysis.coverage` | Honest fraction — we analyze the embedded sample (`stored_comments`), never pretend full coverage. |
-| `processing.llm_used` | The cost lever: only routed posts ([router rules](services/workers/router/rules.py)) carry Stage-2 latency/cost. |
+| `post_summary_source` | `"vlm"` only when the image actually grounded the summary; a VLM failure degrades to text-only and reports `"llm"`. Currently always `"llm"` — no image bytes are reachable (PROJECT_ASSESSMENT §5.2). |
+| `post_summary_truncated` | `true` when the model hit its token ceiling even after auto-continuation. The text is trimmed to its last complete sentence and **never cached**, so a later run can retry with a bigger budget. |
+| `comment_analysis.coverage` | Honest fraction — we analyze the embedded sample (`stored_comments`), never pretend full coverage. **Clamped to 1.0**: five posts store more comments than the platform reports, which used to render as "267% coverage". The excess surfaces in `coverage_anomaly`. |
+| `comment_analysis.provenance` | Where the labels came from. `inferred` = a model or LLM produced it; `heuristic` = the emoji/lexicon fast path or the deterministic stub. Quote this next to any sentiment chart — in stub mode most labels are not model output. |
+| `comment_analysis.method` (per comment) | `llm` \| `model` \| `stub` \| `fast` \| `emoji` \| `failed`. `stub` is a hash of the text — deterministic and reproducible, and *not* sentiment. |
+| `comment_analysis.kind` (per comment) | `substantive` \| `short` \| `emoji`. Emoji-only comments keep a sentiment but never enter an LLM batch. |
+| `image_analysis.vision_status` | `ok` is the only value that licenses a claim about image sentiment; `stub` / `fetch_failed` / `model_unavailable` / `model_failed` are absences, not neutral verdicts. |
+| `processing.role_models` | `{role: resolved model id}` — summarization and classification can run on different models, so a single `llm_model` cannot attribute the summary. |
+| `processing.llm_used` | Only routed posts ([router rules](services/workers/router/rules.py)) carry Stage-2 latency/cost. Note this is **not** the whole cost lever any more: comment labelling runs for every post and is 85–96% of LLM calls (PROJECT_ASSESSMENT §6.8). |
 
 ---
 
@@ -227,10 +244,25 @@ curl -s -H "$KEY" $API/v1/reports/<report_id>      # fetch one
 
 ```bash
 curl -s -H "$KEY" $API/v1/usage | python -m json.tool
-# → {"posts_analyzed":50,"llm_calls":50,"llm_routing_rate":1.0,
-#    "total_tokens":48211,"estimated_cost_usd":0.0964,
-#    "llm_api_calls":117,"cache_hits":33,"cache_hit_rate":0.22}
+# → {"posts_analyzed":43,"llm_calls":7,"llm_routing_rate":0.163,
+#    "total_tokens":48211,"estimated_cost_usd":0.0,
+#    "llm_api_calls":529,"cache_hits":33,"cache_hit_rate":0.06,
+#    "tokens_by_backend_model":{"local:qwen2.5:7b":41022,"local:gemma3:4b":7189},
+#    "cost_by_backend_model":{"local:qwen2.5:7b":0.0,"local:gemma3:4b":0.0},
+#    "lane_split":{"post":{"calls":22,"tokens":9100,"token_share":0.19,"call_share":0.04},
+#                  "comment":{"calls":507,"tokens":39111,"token_share":0.81,"call_share":0.96}},
+#    "scope_note":"All figures are system-wide."}
 ```
+
+Cost is priced **per backend and model**: `local` is 0.0/token by definition (the
+cost is GPU time, not tokens), Groq is per-model. One blended rate used to be
+applied to every token, which was wrong for both backends in opposite directions.
+
+`lane_split` is the number that bounds cost: **comment-level calls dominate**, so
+the routing rate alone is not the cost story (PROJECT_ASSESSMENT §6.8).
+
+`?campaign_id=` filters the **post counts only** — token, cost, cache and lane
+figures come from process-wide counters. `scope_note` says which is which.
 
 ### LLM backend (runtime switch)
 

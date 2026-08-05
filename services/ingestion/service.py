@@ -36,6 +36,7 @@ _REPO_ROOT = os.path.abspath(os.path.join(os.path.dirname(__file__), "..", "..",
 if _REPO_ROOT not in sys.path:
     sys.path.insert(0, _REPO_ROOT)
 
+from libs import streams
 from libs.common import content_hash, get_settings
 from libs.dlq import record_failure
 from libs.embeddings import embed_text, to_pgvector_literal
@@ -55,9 +56,11 @@ log = structlog.get_logger(__name__)
 # Constants
 # ---------------------------------------------------------------------------
 
-INGESTION_STREAM = "ingestion:queue"
-NLP_STREAM = "nlp:stage1:queue"
-CONSUMER_GROUP = "ingestion-workers"
+# From libs/streams.py — the single source of truth the KEDA manifests are
+# checked against (§5.1 / §5.5).
+INGESTION_STREAM = streams.INGESTION.name
+NLP_STREAM = streams.STAGE1_NLP.name
+CONSUMER_GROUP = streams.INGESTION.group
 CONSUMER_NAME = "ingestion-service-1"
 
 # XREAD block timeout in milliseconds (1 second).  This lets the loop wake up

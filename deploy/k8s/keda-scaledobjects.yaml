@@ -1,8 +1,26 @@
 # KEDA ScaledObjects — one per Redis stream consumer worker.
 # Prerequisites: KEDA operator installed in the cluster (https://keda.sh/docs/deploy/).
-# Each ScaledObject scales its target Deployment based on pendingEntriesCount in the
-# corresponding Redis stream consumer group. When the stream is empty (lag == 0) the
+# Each ScaledObject scales its target Deployment based on the consumer group's
+# LAG in the corresponding Redis stream. When the stream is drained the
 # deployment can scale down to 0 replicas, saving resources.
+#
+# Two things here were wrong and each failed silently (PROJECT_ASSESSMENT §5.5):
+#
+#   1. `consumerGroup` (and, for two scalers, `stream`) named groups no worker
+#      ever creates — `router-group` vs the real `router-workers`,
+#      `stage2_llm:queue` vs the real `llm:stage2:queue`. A redis-streams
+#      trigger pointed at a nonexistent group reports NO BACKLOG, so ingestion,
+#      the router and Stage 2 — the only stage where scaling changes cost or
+#      latency — never scaled, while these manifests looked correct.
+#      The names now come from libs/streams.py and tests/test_streams.py
+#      asserts this file agrees with it.
+#
+#   2. `pendingEntriesCount` cannot scale from zero. Pending entries are
+#      messages DELIVERED to a consumer and not yet ACKed; with
+#      `minReplicaCount: 0` there is no consumer, so nothing is ever delivered,
+#      the pending count stays 0, and KEDA never wakes the deployment. Scaling
+#      from zero on Redis Streams needs `lagCount` (stream length vs the
+#      group's last-delivered id), which is what every trigger below uses.
 
 ---
 # ── ingestion ─────────────────────────────────────────────────────────────────
@@ -28,8 +46,8 @@ spec:
       metadata:
         address: redis.defense.svc.cluster.local:6379
         stream: ingestion:queue
-        consumerGroup: ingestion-group
-        pendingEntriesCount: "10"
+        consumerGroup: ingestion-workers
+        lagCount: "10"
 
 ---
 # ── worker-router ─────────────────────────────────────────────────────────────
@@ -55,8 +73,8 @@ spec:
       metadata:
         address: redis.defense.svc.cluster.local:6379
         stream: router:queue
-        consumerGroup: router-group
-        pendingEntriesCount: "10"
+        consumerGroup: router-workers
+        lagCount: "10"
 
 ---
 # ── worker-stage1-nlp ─────────────────────────────────────────────────────────
@@ -82,9 +100,9 @@ spec:
     - type: redis-streams
       metadata:
         address: redis.defense.svc.cluster.local:6379
-        stream: stage1_nlp:queue
+        stream: nlp:stage1:queue
         consumerGroup: stage1-nlp-group
-        pendingEntriesCount: "10"
+        lagCount: "10"
 
 ---
 # ── worker-stage2-llm ─────────────────────────────────────────────────────────
@@ -109,9 +127,9 @@ spec:
     - type: redis-streams
       metadata:
         address: redis.defense.svc.cluster.local:6379
-        stream: stage2_llm:queue
-        consumerGroup: stage2-llm-group
-        pendingEntriesCount: "10"
+        stream: llm:stage2:queue
+        consumerGroup: stage2-llm-workers
+        lagCount: "10"
 
 ---
 # ── worker-assembler ──────────────────────────────────────────────────────────
@@ -138,4 +156,4 @@ spec:
         address: redis.defense.svc.cluster.local:6379
         stream: assembler:queue
         consumerGroup: assembler-group
-        pendingEntriesCount: "10"
+        lagCount: "10"

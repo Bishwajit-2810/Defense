@@ -202,15 +202,38 @@ The upstream stores one coarse post `sentiment` (and `viralPotential`); comment
 1. **Post text sentiment.** Normalize the `caption` (+ language/Banglish detection)
    → `text_sentiment` (+ emotion). Handle a **`null` caption** (7/50): skip text
    sentiment and let the image carry the post.
-2. **Image sentiment (image posts).** Run a **visual** model on the image itself →
-   `image_sentiment` (per image + aggregate), language-agnostic, on every image
-   post. **We also run OCR ourselves** on `photoUrls` (the payload no longer ships
-   `photoOcrTexts`) and fold the OCR text into the text path.
+2. **Image sentiment (image posts).** _Implemented, currently unexercised — see
+   the scoping note below._ Runs a **visual** model (SigLIP zero-shot) on the
+   image itself → `image_sentiment` (per image + aggregate), language-agnostic.
+   OCR over `photoUrls` (the payload no longer ships `photoOcrTexts`) folds the
+   extracted text into the text path when `STAGE1_OCR_SENTIMENT=true`.
 3. **Fuse → post sentiment.** Combine `text_sentiment` + `image_sentiment` into
-   post-level `overall_sentiment` / `sentiment_score` (caption present →
-   text-weighted; `null`-caption photo posts → image + OCR-weighted). Cross-check
-   against `reactionBreakdown` (e.g. `SAD`/`ANGRY`-dominant ⇒ expect negative);
-   fusion weighting is recorded (auditable/tunable).
+   post-level `overall_sentiment` / `sentiment_score`. Cross-check against
+   `reactionBreakdown` (e.g. `SAD`/`ANGRY`-dominant ⇒ expect negative); fusion
+   weighting is recorded (auditable/tunable).
+
+   **Weights apply only to terms that are actually present.** Golden rule 8's
+   weights are `text × 0.6 + image × 0.4` for a captioned image post and
+   `image × 0.7 + OCR-text × 0.3` for a `null`-caption one, but they are
+   renormalised over whichever terms carry a real model verdict. A term is
+   present only when a model produced it — for images that means
+   `image_analysis.vision_status == "ok"`, not merely "the post had a photo".
+   This matters because the weights used to be applied unconditionally: an
+   absent image term still consumed its 0.4, shrinking a real text signal by
+   40% toward neutral, and an image-only post's score was silently multiplied
+   by 0.7 because the OCR term was always 0.0.
+
+   > **Scoping note (current).** No image bytes are reachable in any runnable
+   > configuration: the 69 `photoUrls` are relative object-storage keys and the
+   > objects are not in MinIO. The image term therefore contributes nothing
+   > today, and OCR is off by default (`STAGE1_OCR_SENTIMENT=false`). The
+   > working corpus is [posts_text_only.json](posts_text_only.json) — the 43
+   > posts that carry a caption, produced by `python -m eval.make_text_corpus`.
+   > The 7 `null`-caption `PHOTO` posts are excluded because with no image and
+   > no OCR there is nothing left to analyse. Post sentiment is consequently a
+   > **text** measurement, and should be presented as one. The vision code path
+   > and these weights are retained, not deleted: restoring the objects plus
+   > `STAGE1_OCR_SENTIMENT=true` makes the rule above live again.
 4. **Post summary (grounded on caption + image/OCR).** Generate `post_summary` in
    the post's own language from caption + OCR + the **image** (a VLM or image
    description), so a photo-only post is still summarized. `post_summary_grounding`

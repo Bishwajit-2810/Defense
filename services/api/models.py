@@ -141,13 +141,27 @@ class EngagementResult(BaseModel):
 
 class CommentAnalysisResult(BaseModel):
     analyzed: int
-    coverage: float
+    coverage: float  # clamped to 1.0 — see coverage_anomaly
     coverage_label: Optional[str] = None  # server-rendered coverage string
+    # Set when the stored comment rows exceed the platform's reported
+    # commentCount (5 posts in the corpus, up to 112 stored against 42
+    # reported). An upstream inconsistency, surfaced rather than absorbed.
+    coverage_anomaly: Optional[Dict[str, Any]] = None
     summary: Optional[str] = None  # LLM-written natural-language mood of the comments
     summary_source: Optional[str] = None  # "llm" | None
-    sentiment_breakdown: Dict[str, int]
+    sentiment_breakdown: Dict[str, int]          # all comments
+    # Written comments only — emoji-only reactions excluded. Charting the two
+    # side by side separates "what people said" from "how the crowd reacted"
+    # instead of blending 17% emoji reactions into one indistinguishable bar.
+    sentiment_breakdown_substantive: Dict[str, int] = {}
+    reaction_only: int = 0                       # emoji-only comment count
     emotion_breakdown: Dict[str, int] = {}  # per-comment emotion counts (schema v1.1)
     method_breakdown: Dict[str, int] = {}
+    # Where the labels above came from: {total, inferred, heuristic,
+    # inferred_share, by_method}. Surfaced alongside the breakdowns so a
+    # sentiment chart can state its own provenance the way it states coverage —
+    # in the shipped configuration most comment labels are NOT model output.
+    provenance: Dict[str, Any] = {}
     themes: List[str] = []
     top_keywords: List[str] = []
     representative_comments: List[Any] = []
@@ -188,6 +202,9 @@ class AnalysisResultResponse(BaseModel):
     post_summary_lang: Optional[str] = None
     post_summary_source: Optional[str] = None  # "vlm" (image-grounded) | "llm" | null
     post_summary_grounding: Optional[str] = None  # e.g. "caption+ocr+image"
+    # True when the summary hit the model's token ceiling even after
+    # auto-continuation and was trimmed to its last complete sentence (§6.1).
+    post_summary_truncated: Optional[bool] = None
     overall_sentiment: str
     sentiment_score: float
     # Per-component sentiments, each its own {label, score} (caption / image).
@@ -246,12 +263,28 @@ class LlmPanel(BaseModel):
     backends_seen: List[LabelCount] = []
 
 
+class CorpusCoverage(BaseModel):
+    """Comment coverage across the whole result set, not per post.
+
+    Per-post coverage has a median of 26.7% and is what the dashboard shows;
+    the aggregate — every stored comment against every reported `commentCount`
+    — is a much smaller number and it is the one that bounds what a
+    thread-level sentiment claim can support. It previously appeared nowhere.
+    """
+
+    analyzed: int = 0
+    reported: int = 0
+    coverage: float = 0.0          # analyzed / reported, corpus-wide
+    posts_with_anomaly: int = 0    # posts storing more comments than reported
+
+
 class OverviewResponse(BaseModel):
     """Everything the Overview tab renders — fully aggregated server-side so the
     dashboard only fetches and displays it (no client-side counting)."""
 
     total_posts: int = 0
     campaign_id: Optional[str] = None
+    corpus_coverage: CorpusCoverage = CorpusCoverage()
     # Sentiment is a fixed taxonomy so the donut always has stable keys.
     sentiment_distribution: Dict[str, int] = Field(
         default_factory=lambda: {"positive": 0, "negative": 0, "neutral": 0, "mixed": 0}

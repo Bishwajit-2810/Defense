@@ -40,14 +40,21 @@ T = TypeVar("T")
 #   stage1 — the Stage-1 Fast-NLP model (sentiment/emotion/topic/intent/toxicity/
 #            NER/keywords over caption + comments). One fast, small model carries
 #            the high-volume per-post + per-comment work — see architecture.md §3.4.
-#   stage2 — the Stage-2 model (summary/post-type/insight + context-aware comment
-#            stance/summary). A larger, higher-quality model than stage1.
+#   stage2 — the Stage-2 CLASSIFICATION model (post-type, insight, context-aware
+#            comment stance). Wants a cheap, constrained model.
+#   summary — the Stage-2 SUMMARIZATION model (post summary + comment summary).
+#            Wants a fluent one, which is a different requirement: classification
+#            picks from a fixed vocabulary, summarization writes Bangla prose.
+#            Splitting them is also the honest version of the cost story — the
+#            expensive model is used for the one task that needs it, once per
+#            post, rather than for every classification call.
 #   llm_a / llm_b — the architectural LLM-A (fast) / LLM-B (quality) roles still
 #            used by the agents + report layer (services/agents, reports.py).
 #   vlm    — vision-language model for image-grounded summaries.
 _ROLE_LOCAL_ENV: dict[str, str] = {
     "stage1": "STAGE1_LOCAL_MODEL",
     "stage2": "STAGE2_LOCAL_MODEL",
+    "summary": "SUMMARY_LOCAL_MODEL",
     "llm_a": "LLM_A_LOCAL_MODEL",
     "llm_b": "LLM_B_LOCAL_MODEL",
     "vlm":   "VLM_LOCAL_MODEL",
@@ -56,6 +63,7 @@ _ROLE_LOCAL_ENV: dict[str, str] = {
 _ROLE_GROQ_ENV: dict[str, str] = {
     "stage1": "STAGE1_GROQ_MODEL",
     "stage2": "STAGE2_GROQ_MODEL",
+    "summary": "SUMMARY_GROQ_MODEL",
     "llm_a": "LLM_A_GROQ_MODEL",
     "llm_b": "LLM_B_GROQ_MODEL",
     "vlm":   "VLM_GROQ_MODEL",
@@ -68,6 +76,13 @@ _ROLE_GROQ_ENV: dict[str, str] = {
 _ROLE_LOCAL_DEFAULT: dict[str, str] = {
     "stage1": "gemma3:4b",
     "stage2": "qwen2.5:7b",
+    # `summary` defaults to the same model as `stage2` so nothing changes until
+    # a bake-off picks a winner — see eval/bakeoff_summary.py, which scores the
+    # candidates in `ollama list` (qwen2.5:7b, gemma4:26b, gemma4:31b) on real
+    # Bangla posts. Point SUMMARY_LOCAL_MODEL at the winner and record the
+    # numbers; "we chose it because it scored X" is defence material in a way
+    # that "we chose it because it is bigger" is not.
+    "summary": "qwen2.5:7b",
     "llm_a": "qwen2.5:7b",
     "llm_b": "qwen2.5:7b",
     "vlm":   "qwen3-vl:4b",
@@ -77,6 +92,7 @@ _ROLE_LOCAL_DEFAULT: dict[str, str] = {
 _ROLE_GROQ_DEFAULT: dict[str, str] = {
     "stage1": "llama-3.1-8b-instant",
     "stage2": "llama-3.3-70b-versatile",
+    "summary": "llama-3.3-70b-versatile",
     "llm_a": "llama-3.1-8b-instant",
     "llm_b": "llama-3.3-70b-versatile",
     "vlm":   "meta-llama/llama-4-scout-17b-16e-instruct",
@@ -100,6 +116,30 @@ def _is_degenerate_json(content: Optional[str]) -> bool:
     except ValueError:
         return False  # unparseable — the caller's own parser/fallback handles it
     return parsed is None or (isinstance(parsed, (dict, list)) and not parsed)
+
+
+def _max_continuations() -> int:
+    """How many times chat() may re-ask to recover a length-truncated answer.
+
+    Read per call (not captured at import) so a test or an eval run can change
+    the budget without re-importing the module.
+    """
+    try:
+        return max(0, int(os.environ.get("LLM_MAX_CONTINUATIONS", "2")))
+    except ValueError:
+        return 2
+
+
+# Appended as a user turn after the model's partial answer when continuing a
+# reply that stopped at the token ceiling. Deliberately language-neutral: the
+# truncation this recovers is language-correlated (Bangla costs far more tokens
+# per character than English), so the instruction must not nudge the model into
+# switching language mid-summary.
+_CONTINUE_INSTRUCTION = (
+    "Your previous message was cut off because it reached the length limit. "
+    "Continue from exactly where it stopped, in the same language and style. "
+    "Do not repeat any text you have already written and do not restate the task."
+)
 
 
 def _retryable(func):
@@ -229,7 +269,17 @@ class LLMClient:
             "usage": {"prompt_tokens": int, "completion_tokens": int, "total_tokens": int},
             "model": str,
             "backend": str,
+            "finish_reason": str,   # "stop" | "length" | ... as reported by the backend
+            "truncated": bool,      # True when the reply STILL ends at the token ceiling
+            "continuations": int,   # how many follow-up calls were spent recovering it
         }
+
+        A completion that stopped because it hit ``max_tokens`` used to be
+        returned exactly like a completed one, so no caller could tell a finished
+        summary from half of one. Free-text replies (``response_format is None``)
+        are now auto-continued up to ``LLM_MAX_CONTINUATIONS`` times; whatever
+        state the answer ends in is reported in ``truncated`` so the caller can
+        flag it and refuse to cache it.
 
         Raises
         ------
@@ -323,24 +373,81 @@ class LLMClient:
             )
             choice = completion.choices[0]
 
-        usage = completion.usage
-        total_tokens = usage.total_tokens if usage else 0
+        # Usage accumulates across continuations, so the cost counters see the
+        # true token spend of the recovered answer rather than only its first part.
+        totals = {"prompt_tokens": 0, "completion_tokens": 0, "total_tokens": 0}
+
+        def _accumulate(usage_obj) -> None:
+            if not usage_obj:
+                return
+            totals["prompt_tokens"] += usage_obj.prompt_tokens or 0
+            totals["completion_tokens"] += usage_obj.completion_tokens or 0
+            totals["total_tokens"] += usage_obj.total_tokens or 0
+
+        _accumulate(completion.usage)
+
+        content = choice.message.content or ""
+        finish_reason = getattr(choice, "finish_reason", None) or "stop"
+
+        # Auto-continuation: a reply that stopped at the token ceiling is half an
+        # answer, and nothing downstream could previously tell. Re-ask with the
+        # partial text as context and concatenate. Only for free-text — a
+        # JSON-mode reply cannot be continued token-wise into valid JSON, so
+        # those are reported as truncated and left to the caller's parser.
+        continuations = 0
+        if response_format is None and finish_reason == "length":
+            budget = _max_continuations()
+            while finish_reason == "length" and continuations < budget:
+                continuations += 1
+                log.warning(
+                    "llm_truncated_continuing backend={} role={} model={} attempt={}/{}",
+                    effective_backend, role, model_id, continuations, budget,
+                )
+                cont = await self._call_api(
+                    client=self._get_client(effective_backend),
+                    model=model_id,
+                    messages=[
+                        *messages,
+                        {"role": "assistant", "content": content},
+                        {"role": "user", "content": _CONTINUE_INSTRUCTION},
+                    ],
+                    response_format=None,
+                    max_tokens=max_tokens,
+                    temperature=temperature,
+                )
+                cont_choice = cont.choices[0]
+                _accumulate(cont.usage)
+                extra = (cont_choice.message.content or "").strip()
+                finish_reason = getattr(cont_choice, "finish_reason", None) or "stop"
+                if not extra:
+                    break
+                # Join without swallowing a word boundary; the model resumes
+                # mid-sentence as often as it resumes at one.
+                content = content.rstrip() + ("" if content.rstrip().endswith("-") else " ") + extra
+
+        truncated = finish_reason == "length"
         latency_ms = round((time.perf_counter() - t0) * 1000.0, 1)
 
         log.info(
-            "llm_call backend={} role={} model={} tokens={} latency_ms={}",
-            effective_backend, role, completion.model, total_tokens, latency_ms,
+            "llm_call backend={} role={} model={} tokens={} latency_ms={} "
+            "finish_reason={} truncated={} continuations={}",
+            effective_backend, role, completion.model, totals["total_tokens"], latency_ms,
+            finish_reason, truncated, continuations,
         )
+        if truncated:
+            log.warning(
+                "llm_response_truncated backend={} role={} model={} max_tokens={} chars={}",
+                effective_backend, role, model_id, max_tokens, len(content),
+            )
 
         return {
-            "content": choice.message.content or "",
-            "usage": {
-                "prompt_tokens": usage.prompt_tokens if usage else 0,
-                "completion_tokens": usage.completion_tokens if usage else 0,
-                "total_tokens": total_tokens,
-            },
+            "content": content,
+            "usage": totals,
             "model": completion.model,
             "backend": effective_backend,
+            "finish_reason": finish_reason,
+            "truncated": truncated,
+            "continuations": continuations,
         }
 
     async def chat_stream(

@@ -11,6 +11,7 @@ from libs.common.utils import (
     detect_script,
     content_hash,
     compute_coverage,
+    coverage_anomaly,
     is_banglish,
 )
 
@@ -179,9 +180,11 @@ class TestComputeCoverage:
     def test_standard_fraction(self):
         assert compute_coverage(100, 1000) == pytest.approx(0.1)
 
-    def test_can_exceed_one(self):
-        # storedCommentRows >= commentCount is a valid edge case
-        assert compute_coverage(500, 100) == pytest.approx(5.0)
+    def test_clamped_to_one(self):
+        # storedCommentRows > commentCount happens (5 posts in the corpus, up to
+        # 112 stored against 42 reported), but it is an upstream inconsistency,
+        # not 500% coverage. It used to validate and render as "266.7%".
+        assert compute_coverage(500, 100) == pytest.approx(1.0)
 
     def test_zero_total_returns_one(self):
         assert compute_coverage(0, 0) == pytest.approx(1.0)
@@ -191,6 +194,28 @@ class TestComputeCoverage:
 
     def test_zero_analyzed(self):
         assert compute_coverage(0, 100) == pytest.approx(0.0)
+
+
+class TestCoverageAnomaly:
+    """The clamp must not make the discrepancy disappear — it moves it here."""
+
+    def test_stored_exceeding_reported_is_flagged(self):
+        anomaly = coverage_anomaly(112, 42)
+        assert anomaly is not None
+        assert anomaly["kind"] == "stored_exceeds_reported"
+        assert anomaly["analyzed"] == 112
+        assert anomaly["reported_comment_count"] == 42
+        assert anomaly["raw_ratio"] == pytest.approx(2.6667, abs=1e-4)
+
+    def test_normal_coverage_is_not_an_anomaly(self):
+        assert coverage_anomaly(10, 100) is None
+
+    def test_exact_match_is_not_an_anomaly(self):
+        assert coverage_anomaly(50, 50) is None
+
+    def test_zero_reported_is_not_an_anomaly(self):
+        # Nothing to contradict — compute_coverage already calls this 1.0.
+        assert coverage_anomaly(10, 0) is None
 
 
 # ---------------------------------------------------------------------------

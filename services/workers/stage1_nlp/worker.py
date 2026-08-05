@@ -38,6 +38,7 @@ if _LIBS_PATH not in sys.path:
 
 from common.utils import (  # noqa: E402
     compute_coverage,
+    coverage_anomaly,
     platform_from_url,
     reaction_breakdown_to_dict,
 )
@@ -45,10 +46,13 @@ from common.utils import (  # noqa: E402
 from dlq import record_failure  # noqa: E402
 from progress import publish_stage  # noqa: E402
 
+from libs import streams  # noqa: E402
+
 from .comment_analyzer import analyze_comments  # noqa: E402
-from .fusion import fuse_sentiment  # noqa: E402
+from .fusion import fuse_sentiment, image_has_signal  # noqa: E402
 from .models import ModelRegistry  # noqa: E402
 from .text_analyzer import analyze_text  # noqa: E402
+from . import vision_analyzer as vision  # noqa: E402
 from .vision_analyzer import analyze_image  # noqa: E402
 
 # ---------------------------------------------------------------------------
@@ -64,9 +68,11 @@ log = structlog.get_logger(__name__)
 # Redis stream / consumer-group settings
 # ---------------------------------------------------------------------------
 
-INPUT_STREAM = os.getenv("NLP_STAGE1_STREAM", "nlp:stage1:queue")
-OUTPUT_STREAM = os.getenv("ROUTER_STREAM", "router:queue")
-CONSUMER_GROUP = os.getenv("NLP_STAGE1_GROUP", "stage1-nlp-group")
+# Names come from libs/streams.py so the KEDA manifests cannot drift from the
+# groups the workers actually create — see §5.1 / §5.5.
+INPUT_STREAM = streams.STAGE1_NLP.name
+OUTPUT_STREAM = streams.ROUTER.name
+CONSUMER_GROUP = streams.STAGE1_NLP.group
 CONSUMER_NAME = os.getenv(
     "NLP_STAGE1_CONSUMER",
     f"stage1-nlp-{os.getpid()}",
@@ -84,6 +90,11 @@ LLM_BACKEND_CONFIG_KEY = os.getenv("LLM_BACKEND_KEY", "config:llm_backend")
 
 # Bounded retry before a failed message is dead-lettered to nlp:stage1:queue:dlq.
 STAGE1_MAX_RETRIES = int(os.getenv("STAGE1_MAX_RETRIES", "3"))
+
+# Sentiment-analyse the OCR text of a null-caption image post (the OCR term of
+# golden rule 8). Off until image bytes are reachable again — see §5.2 and the
+# call site in `_analyze_post`. `STAGE1_OCR_SENTIMENT=true` turns it back on.
+_OCR_SENTIMENT = os.getenv("STAGE1_OCR_SENTIMENT", "false").lower() == "true"
 
 
 # ---------------------------------------------------------------------------
@@ -120,10 +131,22 @@ def _build_result(
     # upstream schema, but also store a lowercase copy for internal use.
     rb_normalised = {k.upper(): v for k, v in reaction_breakdown.items()}
 
-    # Fill comment coverage now that we have commentCount
+    # Fill comment coverage now that we have commentCount. Clamped to 1.0; when
+    # the stored rows exceed the reported count the discrepancy is recorded as a
+    # data-quality event rather than rendered as ">100% coverage".
     comment_count = engagement.get("commentCount", 0)
     analyzed_count = comment_analysis.get("analyzed", 0)
     comment_analysis["coverage"] = compute_coverage(analyzed_count, comment_count)
+    anomaly = coverage_anomaly(analyzed_count, comment_count)
+    if anomaly is not None:
+        comment_analysis["coverage_anomaly"] = anomaly
+        log.warning(
+            "coverage_anomaly",
+            post_id=post.get("id"),
+            analyzed=analyzed_count,
+            reported_comment_count=comment_count,
+            raw_ratio=anomaly["raw_ratio"],
+        )
 
     # Which engine produced the Stage-1 NLP: "llm" (the stage1 LLM), "models"
     # (small-model suite) or "stub". Drives the processing provenance below.
@@ -141,22 +164,35 @@ def _build_result(
     # Image analysis block
     image_analysis: dict | None = None
     if image_result is not None:
+        # `vision_model` used to be derived from MODEL_STUB_MODE, so a real-mode
+        # run reported `vision_model: "SigLIP"` for an image SigLIP never saw
+        # (the fetch had failed and the analyzer returned a neutral stub). Name
+        # the model only when a model actually ran; otherwise name the reason.
+        vision_status = image_result.get("status") or vision.STATUS_OK
+        vision_model = (
+            "SigLIP" if vision_status == vision.STATUS_OK else vision_status
+        )
         image_analysis = {
+            # MVP: only photoUrls[0] is analysed, but image_count reports the
+            # full count — the `analyzed_images` field says how many of them
+            # the sentiment above is actually based on.
             "image_count": len(photo_urls),
+            "analyzed_images": 1 if vision_status == vision.STATUS_OK else 0,
             "ocr_text": image_result.get("ocr_text", ""),
             "description": image_result.get("description"),
             "images": [
                 {
-                    "ref": f"photoUrls[0]",
+                    "ref": "photoUrls[0]",
                     "sentiment": {
-                        "label": image_result.get("image_sentiment", "neutral"),
-                        "score": image_result.get("image_sentiment_score", 0.0),
+                        "label": image_result.get("image_sentiment"),
+                        "score": image_result.get("image_sentiment_score"),
                     },
                     "ocr_text": image_result.get("ocr_text", ""),
                     "description": image_result.get("description"),
                 }
             ],
-            "vision_model": "stub" if os.getenv("MODEL_STUB_MODE", "true").lower() == "true" else "SigLIP",
+            "vision_model": vision_model,
+            "vision_status": vision_status,
         }
 
     # text_sentiment / image_sentiment in output schema
@@ -167,10 +203,13 @@ def _build_result(
             "score": text_result.get("sentiment_score", 0.0),
         }
 
+    # Only emit an image sentiment when a model produced one. A failed fetch
+    # used to surface here as {"label":"neutral","score":0.0}, which is
+    # indistinguishable from an image that genuinely reads neutral.
     image_sentiment_out: dict | None = None
-    if image_result is not None:
+    if image_result is not None and image_result.get("image_sentiment") is not None:
         image_sentiment_out = {
-            "label": image_result.get("image_sentiment", "neutral"),
+            "label": image_result["image_sentiment"],
             "score": image_result.get("image_sentiment_score", 0.0),
         }
 
@@ -257,8 +296,15 @@ def _build_result(
             "llm_role": "stage1" if stage1_llm_used else None,
             "llm_backend": text_result.get("llm_backend"),
             "llm_model": text_result.get("llm_model"),
+            # `vision_used` is "a photo post went down the vision path";
+            # `vision_produced_signal` is "a model actually returned a verdict".
+            # Only the second one licenses a claim about image sentiment.
             "vision_used": image_result is not None,
-            "vision_model": "stub" if os.getenv("MODEL_STUB_MODE", "true").lower() == "true" else "SigLIP",
+            "vision_produced_signal": bool(
+                image_result and image_result.get("image_sentiment") is not None
+            ),
+            "vision_model": (image_analysis or {}).get("vision_model"),
+            "vision_status": (image_analysis or {}).get("vision_status"),
             "stub_mode": os.getenv("MODEL_STUB_MODE", "true").lower() == "true",
             # Which concrete models produced this result (reproducibility); the
             # sentiment model is the stage1 LLM in llm_mode, else language-routed.
@@ -279,6 +325,8 @@ async def _process_message(
     registry: ModelRegistry,
     sentiment_override: str | None = None,
     backend_override: str | None = None,
+    redis: aioredis.Redis | None = None,
+    job_id: str | None = None,
 ) -> dict:
     """Run the full Stage-1 pipeline on a single post-with-details object.
 
@@ -322,6 +370,10 @@ async def _process_message(
             "stage1_vision_done",
             post_id=post_id,
             images=len(photo_urls),
+            # Why the image did or did not produce a verdict — a "neutral"
+            # here means something very different at status=ok than at
+            # status=fetch_failed, and that distinction used to be invisible.
+            status=(image_result or {}).get("status"),
             image_sentiment=(image_result or {}).get("image_sentiment"),
             ocr_chars=len((image_result or {}).get("ocr_text") or ""),
             ms=round((time.monotonic() - t) * 1000, 1),
@@ -329,10 +381,51 @@ async def _process_message(
     else:
         log.debug("stage1_vision_skipped", post_id=post_id, reason="no photoUrls")
 
+    # 2b. OCR-text NLP — the OCR term of golden rule 8.
+    # For a null-caption image post the documented fusion is
+    # `image × 0.7 + OCR-text × 0.3`, but the OCR term was always 0.0: the
+    # worker only ever ran analyze_text on the caption, which for these posts
+    # is empty, so `ocr_text` was produced by the vision stage and then consumed
+    # only by Stage-2 prompts — never sentiment-analysed. Analysing it here is
+    # what makes the documented rule the rule that actually runs.
+    #
+    # Off by default: no image bytes are reachable today (§5.2), so OCR yields
+    # nothing, and the working corpus (posts_text_only.json) has no null-caption
+    # posts left for this branch to fire on. Kept behind a flag rather than
+    # deleted because the images — and with them OCR — may come back.
+    ocr_text = ((image_result or {}).get("ocr_text") or "").strip()
+    if _OCR_SENTIMENT and not (caption or "").strip() and ocr_text:
+        t = time.monotonic()
+        text_result = await analyze_text(
+            ocr_text, registry, sentiment_override, backend_override
+        )
+        log.info(
+            "stage1_ocr_text_done",
+            post_id=post_id,
+            chars=len(ocr_text),
+            sentiment=text_result.get("sentiment"),
+            ms=round((time.monotonic() - t) * 1000, 1),
+        )
+
     # 3. Comment analysis
     t = time.monotonic()
+
+    # With the caps lifted (§6.3) a large thread is ~115 LLM batches, which is
+    # minutes of work on one post. Publish a frame per batch so the Trace tab
+    # shows `batch k/N` instead of appearing hung — the analyzer stays free of
+    # Redis, the callback carries it.
+    progress_cb = None
+    if redis is not None and job_id:
+        async def progress_cb(done: int, total: int) -> None:  # noqa: F811
+            await publish_stage(
+                redis, "stage1", "running",
+                job_id=job_id, post_id=post_id,
+                detail={"phase": "comment_llm", "batch": done, "batches": total},
+                log=log,
+            )
+
     comment_analysis = await analyze_comments(
-        comments, registry, sentiment_override, backend_override
+        comments, registry, sentiment_override, backend_override, progress_cb
     )
     log.info(
         "stage1_comments_done",
@@ -340,6 +433,7 @@ async def _process_message(
         analyzed=comment_analysis.get("analyzed"),
         breakdown=comment_analysis.get("sentiment_breakdown"),
         methods=comment_analysis.get("method_breakdown"),
+        reaction_only=comment_analysis.get("reaction_only"),
         ms=round((time.monotonic() - t) * 1000, 1),
     )
 
@@ -358,12 +452,19 @@ async def _process_message(
     log.info(
         "stage1_fusion_done",
         post_id=post_id,
-        # Which weighting branch fusion.py took, so a surprising score is traceable.
-        rule=("text-only" if not image_result
-              else "text0.6+image0.4" if (caption or "").strip()
-              else "image0.7+ocr0.3"),
+        # Which weighting branch fusion.py took, so a surprising score is
+        # traceable. Reports the branch AS TAKEN: weights renormalise over the
+        # terms that carry a real verdict, so an image post whose vision stage
+        # produced nothing fuses as text-only, and saying "text0.6+image0.4"
+        # here would misdescribe the arithmetic that actually ran.
+        rule=(
+            "text-only" if not image_has_signal(image_result)
+            else "text0.6+image0.4" if (caption or "").strip()
+            else "image0.7+ocr0.3"
+        ),
         text_sentiment=text_result.get("sentiment"),
         image_sentiment=(image_result or {}).get("image_sentiment"),
+        vision_status=(image_result or {}).get("status"),
         neg_reaction_ratio=round(neg_reactions / total_reactions, 4) if total_reactions else None,
         overall_sentiment=overall_sentiment,
         sentiment_score=sentiment_score,
@@ -498,7 +599,8 @@ async def run_worker() -> None:
                             overall_sentiment,
                             sentiment_score,
                         ) = await _process_message(
-                            post, registry, sentiment_override, backend_override
+                            post, registry, sentiment_override, backend_override,
+                            redis=redis, job_id=job_id,
                         )
 
                         stage1_ms = (time.monotonic() - t0) * 1000.0

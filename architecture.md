@@ -33,13 +33,33 @@ is a crowd emotion prior we cross-check against ([data_contract.md](data_contrac
 Platform is **derived from each post's URL host**, so the service stays
 platform-agnostic.
 
-**Posts are multimodal, and that is the first target** (in order, see
-[data_contract.md](data_contract.md) §4): (1) **text sentiment** on the caption,
-(2) **image sentiment** from a _visual_ model on the photo when one is present
-(we also OCR the image), (3) **fuse** the two into the post's overall sentiment,
-(4) a **post summary grounded on caption + image/OCR** (so a photo-only,
-`null`-caption post still gets a meaningful summary), then (5) **per-comment
-sentiment** over the embedded comments → thread breakdown + themes.
+**The pipeline order** (see [data_contract.md](data_contract.md) §4):
+(1) **text sentiment** on the caption, (2) **image sentiment** from a _visual_
+model on the photo when one is present (we also OCR the image), (3) **fuse** the
+signals into the post's overall sentiment, (4) a **post summary grounded on
+caption (+ image/OCR when available)**, then (5) **per-comment sentiment** over
+the embedded comments → thread breakdown + themes.
+
+> **Step 2 is implemented but unexercised (4 Aug 2026).** The corpus's 69
+> `photoUrls` are relative object-storage keys and the objects are not in MinIO,
+> so no image bytes are reachable in any runnable configuration and the image
+> term has never contributed a non-zero value
+> ([PROJECT_ASSESSMENT.md](PROJECT_ASSESSMENT.md) §5.2). Consequences now
+> visible in the output rather than hidden:
+>
+> - a failed fetch reports `image_analysis.vision_status` (`fetch_failed`,
+>   `model_unavailable`, `stub`) instead of a fabricated `neutral` verdict —
+>   previously a real-mode run claimed `vision_model: "SigLIP"` for an image
+>   SigLIP never saw;
+> - **fusion renormalises over the terms that carry a real verdict**, so an
+>   absent image term no longer consumes its 0.4 weight and shrink a genuine text
+>   signal 40% toward neutral;
+> - OCR is off by default (`STAGE1_OCR_SENTIMENT=false`) and the working corpus
+>   is `posts_text_only.json` (43 captioned posts).
+>
+> Post sentiment is therefore a **text** measurement today. Step 5 is the claim
+> that carries the most weight, and it is real: every non-emoji comment is
+> labelled.
 
 Hard product constraints from the owner: **fast**, **cost-effective**,
 **efficient**, and **accurate on Bangla and Banglish** (with fine-tuning hooks
@@ -287,8 +307,18 @@ at runtime per the routing rules in §5.
         │ confident, no LLM task        │ ambiguous mixed-lang          │ requested
         ▼                               ▼                               ▼
    COMPLETE (no LLM)            LLM verify/refine               LLM generate
-   ~90–95% of posts            small slice                     (summary/insight/report)
+   84% of posts (measured)     16% (measured)                  (summary/insight/report)
 ```
+
+> **Measured, 4 August 2026** ([PROJECT_ASSESSMENT.md](PROJECT_ASSESSMENT.md)
+> §4.6): **16%** of posts reach Stage 2 on the shipped configuration
+> (`STAGE1_LLM=true`, `gemma3:4b`), **74%** under the keyword stub. The "~90–95%
+> bypass" above was a design target, never a measurement; the gate in fact spent
+> a period routing **100%** of posts because of two field-name bugs (§4).
+>
+> Read the rate as **a measure of Stage-1 quality**: a Stage 1 that types a post
+> confidently bypasses Stage 2, so the rate *falls as Stage 1 improves*. Same
+> code, two Stage-1 engines, two rates.
 
 Levers that keep token usage and cost low:
 
@@ -311,9 +341,15 @@ Levers that keep token usage and cost low:
   (e.g. local LLM-A + Groq for LLM-B reports).
 - **LLM response cache** keyed by `(backend, model, task, content_hash)`.
 
-Expected outcome: LLM touches a single-digit-to-low-double-digit percentage of
-posts, and the per-batch LLM bill is dominated by _cluster-level_ generation,
-not per-post calls. Quantified in [cost_estimation.md](cost_estimation.md).
+Expected outcome, **revised against measurement**: the LLM touches **16%** of
+posts on the shipped configuration. The per-batch bill, however, is dominated by
+neither post-level nor cluster-level generation — it is dominated by **per-comment
+labelling** (85–96% of calls), because full per-comment coverage is a deliberate
+choice ([PROJECT_ASSESSMENT.md](PROJECT_ASSESSMENT.md) §6.3, §6.8). The lever
+that matters most is comments-per-thread and the batch size, not the confidence
+threshold. Cluster-level summarization is still a good idea but is not yet real:
+it currently clusters **stub embeddings** by default (§5.9). Quantified in
+[cost_estimation.md](cost_estimation.md).
 
 ---
 

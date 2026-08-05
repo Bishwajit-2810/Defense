@@ -26,6 +26,13 @@ _REPO_ROOT = os.path.abspath(os.path.join(os.path.dirname(__file__), "..", "..")
 if _REPO_ROOT not in sys.path:
     sys.path.insert(0, _REPO_ROOT)
 
+from libs.common.config import (  # noqa: E402
+    JWT_ALGORITHM,
+    get_jwt_secret,
+    jwt_secret_fingerprint,
+    jwt_secret_is_default,
+    require_jwt_secret,
+)
 from libs.ratelimit import check_rate_limit  # noqa: E402
 
 log = structlog.get_logger(__name__)
@@ -112,8 +119,21 @@ async def get_redis() -> AsyncGenerator[aioredis.Redis, None]:
 # JWT auth
 # ---------------------------------------------------------------------------
 
-_JWT_SECRET: str = os.environ.get("JWT_SECRET", "change-me")
-_JWT_ALGORITHM: str = "HS256"
+# The secret lives in libs/common/config.py and is read per call, so issuer and
+# verifier cannot drift and the value can be rotated without a restart.
+# Verified at import so a misconfigured deployment fails at startup rather than
+# on the first request.
+require_jwt_secret()
+log.info(
+    "jwt_verifier_ready",
+    secret_fingerprint=jwt_secret_fingerprint(),
+    is_default_secret=jwt_secret_is_default(),
+)
+
+# Claims the server is willing to take from a token body. `auth_method` is
+# deliberately absent: it is how downstream code tells a human session from a
+# service call, and it is set server-side after the merge, never by the client.
+_ALLOWED_JWT_CLAIMS = frozenset({"sub", "tenant_id", "role", "exp", "iat", "scope"})
 
 
 def verify_token(token: str) -> dict:
@@ -123,7 +143,7 @@ def verify_token(token: str) -> dict:
         HTTPException 401 if the token is invalid or expired.
     """
     try:
-        payload = jwt.decode(token, _JWT_SECRET, algorithms=[_JWT_ALGORITHM])
+        payload = jwt.decode(token, get_jwt_secret(), algorithms=[JWT_ALGORITHM])
         return payload
     except JWTError as exc:
         log.warning("jwt_validation_failed", error=str(exc))
@@ -132,6 +152,31 @@ def verify_token(token: str) -> dict:
             detail="Invalid or expired token",
             headers={"WWW-Authenticate": "Bearer"},
         ) from exc
+
+
+def _looks_like_jwt(credential: str) -> bool:
+    """True when a credential has the shape of a JWS compact serialization.
+
+    Used to decide whether an opaque-looking credential should be *verified* as
+    a token rather than waved through as an API key. Shape only — validity is
+    still decided by verify_token().
+    """
+    parts = credential.split(".")
+    return len(parts) == 3 and all(parts) and parts[0].startswith("ey")
+
+
+def _principal_from_claims(payload: dict) -> dict:
+    """Build the authenticated principal from verified token claims.
+
+    The payload used to be spread LAST over the server's own fields, so any
+    claim in the token won — a self-signed token could set `auth_method` to
+    "internal-service" or `tenant_id` to another tenant's. Server-controlled
+    fields are now written after an allowlisted copy of the claims.
+    """
+    principal = {k: v for k, v in payload.items() if k in _ALLOWED_JWT_CLAIMS}
+    principal["sub"] = payload.get("sub") or "unknown"
+    principal["auth_method"] = "jwt"
+    return principal
 
 
 # ---------------------------------------------------------------------------
@@ -153,10 +198,20 @@ async def get_current_user(
     The query-param form exists for browser EventSource (SSE) connections,
     which cannot set custom headers.
 
+    **Any credential that looks like a JWT is verified as one, on every
+    transport.** It used to be that only the `Authorization` header was parsed
+    as a token: a credential arriving via `?api_key=` or `X-API-Key` was treated
+    as an opaque API key and accepted merely for being non-empty. Since the
+    dashboard sends the session token that way on all four SSE streams, an
+    expired token — and a token signed with the wrong secret — both
+    authenticated, expiry was unenforceable on streams, and the user's identity
+    collapsed to the shared `api_key_user` principal (losing tenant claims and
+    bucketing all stream traffic into one rate-limit key).
+
     Returns a dict representing the authenticated principal.
 
     MVP behaviour:
-    - JWT: fully validated (HS256, JWT_SECRET).
+    - JWT: fully validated (HS256, JWT_SECRET) on every transport.
     - API key: accepted if non-empty (real key storage in Phase 2).
 
     Raises:
@@ -164,12 +219,17 @@ async def get_current_user(
     """
     # --- Bearer JWT path ---
     if credentials is not None:
-        payload = verify_token(credentials.credentials)
-        return {"sub": payload.get("sub", "unknown"), "auth_method": "jwt", **payload}
+        return _principal_from_claims(verify_token(credentials.credentials))
 
-    # --- API key path (header preferred, query param for EventSource) ---
+    # --- Header / query credential (header preferred, query for EventSource) ---
     effective_key = (api_key or "").strip() or (api_key_query or "").strip()
     if effective_key:
+        # A token presented here is still a token. Verify it as one — including
+        # its signature and expiry — instead of accepting it as an opaque
+        # string. Only a credential that is not JWT-shaped falls through to the
+        # API-key path.
+        if _looks_like_jwt(effective_key):
+            return _principal_from_claims(verify_token(effective_key))
         # MVP: accept any non-empty key; Phase 2 will look up in DB
         log.debug("api_key_auth", key_prefix=effective_key[:8] + "…")
         return {"sub": "api_key_user", "auth_method": "api_key", "api_key": effective_key}

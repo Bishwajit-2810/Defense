@@ -186,10 +186,14 @@ rejected with `forbidden`). See [models.md](models.md) §2.
 `options.tasks` selects analyses (e.g.
 `["text_sentiment","image_sentiment","comment_sentiment","ner","toxicity"]` or
 `["all"]`). `image_sentiment` runs the visual model on image posts (no-op for
-text-only); `comment_sentiment` scores the embedded comment thread (the upstream
-ships none); `want_summary`/`want_insight` opt into the LLM/VLM tasks (the summary
-is image-grounded for photo posts). Otherwise the router keeps work on the cheap
-path unless confidence is low.
+text-only) — **currently a no-op everywhere**, because no image bytes are
+reachable ([PROJECT_ASSESSMENT.md](PROJECT_ASSESSMENT.md) §5.2); the result
+reports `image_analysis.vision_status` rather than a fabricated `neutral`.
+`comment_sentiment` scores the embedded comment thread (the upstream ships none)
+— since the caps were lifted this means **every non-emoji comment**, batched at
+25 per LLM call with bounded concurrency. `want_summary`/`want_insight` opt into
+the LLM tasks. Otherwise the router keeps work on the cheap path unless
+confidence is low.
 
 ---
 
@@ -326,10 +330,24 @@ Poll job/analysis status and fetch results. `{id}` is a `job_id` or `analysis_id
       "comment_analysis": {
         "analyzed": 607,
         "coverage": "607/6567 stored",
+        "coverage_anomaly": null,
         "sentiment_breakdown": {
           "positive": 41,
           "negative": 466,
           "neutral": 100
+        },
+        "sentiment_breakdown_substantive": {
+          "positive": 36,
+          "negative": 452,
+          "neutral": 91
+        },
+        "reaction_only": 28,
+        "provenance": {
+          "total": 607,
+          "inferred": 579,
+          "heuristic": 28,
+          "inferred_share": 0.9539,
+          "by_method": { "llm": 579, "emoji": 28 }
         },
         "themes": [
           "anger at India's treatment of Muslims",

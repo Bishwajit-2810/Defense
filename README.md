@@ -5,10 +5,23 @@ A production-grade, multilingual (Bangla + English + **Banglish**) AI
 platform**: it pulls a **post-with-details** payload (post **with its comments
 embedded**, plus `engagement`, `reactionBreakdown`, and `sampleShares`) from that
 platform's REST API, analyzes it in its **own separate database**, and returns
-structured JSON — a post summary in the original language, **multimodal sentiment
-(text + image)**, **per-comment sentiment** over the thread, topics, intents,
-entities, brand mentions — for downstream projects to consume. It scales from
-1k → 10k → 100k threads per batch.
+structured JSON — a post summary in the original language, **post sentiment**,
+**per-comment sentiment** over the thread, topics, intents, entities, brand
+mentions — for downstream projects to consume. It scales from 1k → 10k → 100k
+threads per batch.
+
+> **Modality scope (current).** Post sentiment is a **text** measurement today.
+> The image path (SigLIP zero-shot + OCR) is implemented but unexercised: the
+> dataset's 69 `photoUrls` are relative object-storage keys and the objects are
+> not in MinIO, so no image bytes are reachable in any runnable configuration.
+> Fusion weights renormalise over the terms that actually carry a model verdict,
+> so the absent image term no longer silently shrinks the text signal, and a
+> failed image fetch now reports as a failure instead of as a neutral verdict.
+> The working corpus is [posts_text_only.json](posts_text_only.json) (43
+> captioned posts, 8,965 comments; `python -m eval.make_text_corpus`) — the 7
+> `null`-caption `PHOTO` posts are excluded because without image or OCR there
+> is nothing to analyse. See [data_contract.md](data_contract.md) §4 and
+> [PROJECT_ASSESSMENT.md](PROJECT_ASSESSMENT.md) §5.2.
 
 > **Input contract:** the real upstream **post-with-details** schema (embedded
 > comments + engagement + reactions + shares), the integration model (pull + our
@@ -22,25 +35,52 @@ kept as a **baseline** while the smart layer **recomputes** richer sentiment;
 **comment sentiment is empty upstream and OCR is no longer shipped — both are our
 job** (see [data_contract.md](data_contract.md) §4).
 
-**First target (multimodal, in order):** post **text sentiment** → **image
-sentiment** (a visual model on the photo; we also OCR it) → fuse (cross-check the
-crowd `reactionBreakdown`) → a **post summary grounded on caption + image/OCR** →
-**per-comment sentiment** over the **embedded** comment thread (reported with
-coverage, since only a stored sample of comments ships). Most posts carry an image
-and some have no caption, so the image is not optional — see
+**First target (in order):** post **text sentiment** → _(image sentiment — a
+visual model on the photo, plus OCR — implemented but unexercised, see above)_ →
+fuse (cross-check the crowd `reactionBreakdown`) → a **post summary grounded on
+caption** → **per-comment sentiment** over the **embedded** comment thread
+(reported with coverage, since only a stored sample of comments ships). See
 [data_contract.md](data_contract.md) §4.
 
-It is built around a **smart routing layer** ("thinking layer") that decides, per
-thread, how much intelligence each one needs: cheap NLP models carry the bulk of
-the work, and a selective LLM handles the summarization/insight work and the cases
-Stage 1 is not confident about. The share of posts that reach the LLM is a
-**measured** quantity, not an assumption — the router exports it as
-`stats:llm_routed / stats:total_processed` (see
-[PROJECT_ASSESSMENT.md](PROJECT_ASSESSMENT.md) §4 for the rate on the 50-post
-sample, and §7 for the accuracy-vs-cost sweep over the confidence threshold). That LLM
-runs behind a **pluggable, runtime-switchable backend — `local` (self-hosted
-vLLM) or `groq` (Groq Cloud API)** — so the operator can choose no-egress/no-bill
-local serving or fastest/zero-GPU Groq, and switch anytime. The hard goals:
+It is built around a **smart routing layer** ("thinking layer") that decides how
+much intelligence each unit of work needs. The claim is deliberately narrow and
+measured: **cheap NLP filters which _comments_ and which _posts_ deserve an
+LLM.** Both halves matter, and the second is no longer the bigger one —
+
+Measured on the 43-post working corpus, cold cache, 25 comments per batch:
+
+| | Keyword stub | Stage-1 LLM (shipped) |
+| --- | --- | --- |
+| Posts routed to Stage 2 | 32 / 43 (**74%**) | 7 / 43 (**16%**) |
+| Post-level LLM calls | 124 (15%) | 22 (4%) |
+| Comment-level LLM calls | 689 (85%) | 507 (96%) |
+| Total calls per run | 813 | 529 |
+| Share the router gate governs | 55% | **30%** |
+
+Reproduce with `python -m eval.measure_routing_rate`, which prints the routing
+rate, the comment volume and the post-vs-comment split. Emoji-only comments
+(2.8%) never enter a batch — there is no text in them to read.
+
+Two things follow, and both are worth stating plainly:
+
+- **The routing rate measures Stage-1 quality, not cost efficiency.** A Stage 1
+  that types a post confidently bypasses Stage 2, so the rate *falls as Stage 1
+  improves* — same code, two engines, two rates.
+- **The better Stage 1 gets, the less the gate governs.** Comment labelling runs
+  for every post, routed or not, so improving Stage 1 shrinks the gate's share of
+  spend (55% → 30%) without shrinking the bill. What sets the bill is how many
+  comments exist.
+
+See [PROJECT_ASSESSMENT.md](PROJECT_ASSESSMENT.md) §4.6 and §6.8.
+
+That LLM runs behind a **pluggable, runtime-switchable backend — `local`
+(self-hosted vLLM/Ollama) or `groq` (Groq Cloud API)** — so the operator can
+choose no-egress/no-bill local serving or fastest/zero-GPU Groq, and switch
+anytime. Summarization and classification run on **separate roles**, so the
+fluent (expensive) model is spent only on the task that needs prose, once per
+post. `GET /v1/usage` reports tokens and cost **per backend and model**, with
+local priced at zero — its marginal token cost genuinely is zero, and a single
+blended rate was wrong for both backends in opposite directions. The hard goals:
 **fast, cost-effective, efficient, and accurate on Bangla/Banglish** (with
 fine-tuning hooks the owner can drive).
 
@@ -82,10 +122,19 @@ concrete input→output, see [examples.md](examples.md).
 | [evaluation.md](evaluation.md)                       | **Evaluation plan** — how we score each task, the summary, the agents, and system properties; gold sets, gates, drift                                                             |
 | [plan.md](plan.md)                                   | Phased implementation roadmap and milestones                                                                                                                                      |
 | [HOWTO.md](HOWTO.md)                                 | **Build guide for coding agents** — golden rules, ordered tasks with definition-of-done, repo layout; how to actually implement this design                                       |
+| [stance_targets.md](stance_targets.md)               | **Watchlist-driven target stance** — the project's novelty item: per-entity stance over a configurable, alias-aware watchlist for code-mixed Bangla/Banglish. **Specified, not built.**            |
 
-Background: [social_media_llm_architecture_prompt.md](social_media_llm_architecture_prompt.md)
-is the original system-design request. It has been reconciled with
+Background: the original system-design request has been reconciled with
 [what.txt](what.txt), which is now the authoritative source and supersedes it.
+(`social_media_llm_architecture_prompt.md` was removed in commit `e9fba98`; the
+link is dropped rather than left dangling.)
+
+**Current implementation status** is in
+[PROJECT_ASSESSMENT.md](PROJECT_ASSESSMENT.md) — read its status header first.
+The design documents in the table above describe the *intended* system; where
+the two disagree, the assessment is what actually runs. Claims that are
+implemented-but-unexercised (the image modality) or measured-and-different-from-
+target (the routing rate) are flagged inline in each document.
 
 ## TL;DR of the recommendation
 

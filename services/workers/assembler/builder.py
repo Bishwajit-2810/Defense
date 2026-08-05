@@ -113,12 +113,17 @@ def build_canonical_result(
     post_summary_lang: str | None = None
     post_summary_source: str | None = None
     post_summary_grounding: str | None = None
+    # True when the summary still ended at the model's token ceiling after
+    # LLMClient exhausted its continuation budget (§6.1). A short summary is
+    # fine; a half one that claims to be whole is not.
+    post_summary_truncated: bool = False
 
     if stage2_result is not None:
         post_summary = stage2_result.get("post_summary")
         post_summary_lang = stage2_result.get("post_summary_lang")
         post_summary_source = stage2_result.get("post_summary_source")
         post_summary_grounding = stage2_result.get("post_summary_grounding")
+        post_summary_truncated = bool(stage2_result.get("post_summary_truncated"))
 
     # ------------------------------------------------------------------
     # Sentiment fields — Stage 1
@@ -215,6 +220,9 @@ def build_canonical_result(
         "llm_used": stage2_result is not None,
         "llm_backend": s2_proc.get("llm_backend") if stage2_result is not None else None,
         "llm_model": s2_proc.get("llm_model") if stage2_result is not None else None,
+        # {role: resolved model id} — summarization and classification no longer
+        # share a model, so a single `llm_model` can't attribute the summary.
+        "role_models": s2_proc.get("role_models") if stage2_result is not None else None,
         "schema_version": SCHEMA_VERSION,
     }
 
@@ -240,6 +248,7 @@ def build_canonical_result(
         "post_summary_lang": post_summary_lang,
         "post_summary_source": post_summary_source,
         "post_summary_grounding": post_summary_grounding,
+        "post_summary_truncated": post_summary_truncated,
         "overall_sentiment": overall_sentiment,
         "sentiment_score": sentiment_score,
         "text_sentiment": text_sentiment,

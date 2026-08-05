@@ -136,9 +136,29 @@ services:
 
 ### Autoscaling
 
-- **KEDA** `ScaledObject` per worker pool with a Kafka-lag trigger
-  (e.g. scale 0→N when topic lag > threshold) → workers track backlog, scale to
-  zero between batches, surge for 10k/100k bursts.
+- **KEDA** `ScaledObject` per worker pool with a **lag** trigger
+  (scale 0→N when the consumer group's lag > threshold) → workers track backlog,
+  scale to zero between batches, surge for 10k/100k bursts.
+
+> **Two things here failed silently until 4 August 2026** — worth knowing
+> because both are easy to reintroduce ([PROJECT_ASSESSMENT.md](PROJECT_ASSESSMENT.md) §5.5):
+>
+> 1. **The trigger must name the consumer group the worker actually creates.**
+>    Three of five scalers named groups (`ingestion-group`, `router-group`,
+>    `stage2-llm-group`) that no worker ever created, and two named streams
+>    (`stage1_nlp:queue`, `stage2_llm:queue`) that do not exist. A
+>    `redis-streams` trigger pointed at a nonexistent group reports **no
+>    backlog** — so ingestion, the router and **Stage 2, the only stage where
+>    scaling changes cost or latency**, never scaled, while the manifests read as
+>    correct. Names now come from `libs/streams.py` and `tests/test_streams.py`
+>    asserts the manifests agree with the workers.
+> 2. **`pendingEntriesCount` cannot scale from zero.** Pending entries are
+>    messages *delivered to a consumer and not yet ACKed*; with
+>    `minReplicaCount: 0` there is no consumer, so nothing is delivered, the
+>    count stays 0, and KEDA never wakes the deployment. Every trigger now uses
+>    **`lagCount`** (stream length vs the group's last-delivered id), which is
+>    the only Redis-Streams metric that works from zero.
+
 - **HPA** for the API tier (CPU / requests-per-second).
 - **Cluster Autoscaler / Karpenter** to add GPU nodes (incl. **spot**) for batch
   surges; batch tolerates preemption thanks to Kafka replay.

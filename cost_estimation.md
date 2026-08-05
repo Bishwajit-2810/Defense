@@ -21,9 +21,55 @@ GPU**. Both are priced below.
 Assumptions used below: a "batch" is the per-run size; we assume **continuous
 operation** processing many batches/day. A unit is a **post + its comment thread**
 (so one unit may be tens–hundreds of short texts). The headline number that
-matters is **cost per 1,000 threads analyzed**, which the hybrid pipeline drives
-down by keeping the LLM to one cluster-level summary per thread, not one call per
-comment.
+matters is **cost per 1,000 threads analyzed**.
+
+> ## ⚠ The cost shape changed — measured 4 August 2026
+>
+> This document was written assuming **the LLM slice is a small, post-level
+> fraction**, and that the router gate is the dominant lever. Both assumptions
+> are now out of date, and the numbers below are stale accordingly.
+>
+> **What actually happens** on the 43-post working corpus, cold cache
+> (`python -m eval.measure_routing_rate`, PROJECT_ASSESSMENT §6.8):
+>
+> | | Keyword-stub Stage 1 | Stage-1 LLM (shipped) |
+> | --- | --- | --- |
+> | Posts routed to Stage 2 | 74% | **16%** |
+> | Post-level LLM calls | 124 (15%) | 22 (4%) |
+> | **Comment-level LLM calls** | **689 (85%)** | **507 (96%)** |
+> | Total calls per corpus run | 813 | 529 |
+> | Share the router gate governs | 55% | **30%** |
+>
+> Three corrections follow, and they invert the framing of §1 below:
+>
+> 1. **The LLM bill is comment-dominated, not post-dominated.** Since every
+>    non-emoji comment is labelled by an LLM (PROJECT_ASSESSMENT §6.3 — the
+>    previous 60/40 caps meant only ~29% of comments were ever labelled while the
+>    output described itself as full coverage), the per-thread cost scales with
+>    **comments per thread**, not with posts. A 2,857-comment thread costs ~115
+>    LLM calls on its own.
+> 2. **The routing gate is no longer the "biggest lever."** It governs 30–55% of
+>    calls, and *the better Stage 1 gets the less it governs* — Stage-1 comment
+>    labelling runs for every post, routed or not. The biggest lever is now
+>    **comments per thread** and the batch size (`STAGE1_LLM_BATCH`), not the
+>    confidence threshold.
+> 3. **"Single digits %" was never measured and is not achievable as stated.**
+>    See §5 below.
+>
+> **Sizing rule of thumb that replaces the old one:** per thread, budget
+> `ceil(non_emoji_comments / 25)` Stage-1 calls, plus `ceil(.../25)` more if the
+> post routes to Stage 2, plus ~3 post-level calls if it routes. Set
+> `STAGE1_LLM_COMMENT_MAX` / `COMMENT_STANCE_MAX_PER_POST` above 0 to cap this
+> deliberately — full comment coverage is a *chosen* trade, and the caps are how
+> you un-choose it.
+>
+> **Per-backend pricing is now real.** `GET /v1/usage` reports
+> `tokens_by_backend_model` and `cost_by_backend_model`, with **local priced at
+> 0.0** (its marginal token cost genuinely is zero) and Groq priced per model.
+> One blended `$0.002/1k` rate used to be applied to every token, which was wrong
+> for both backends in opposite directions. The dollar figures below still use
+> the old blended assumption and should be re-derived from a real run
+> (PROJECT_ASSESSMENT §9.8).
 
 ---
 
@@ -129,13 +175,43 @@ caching, and capping the per-call token budget are. A common enterprise pattern 
 
 ## 5. Levers ranked by impact
 
-1. **Hybrid routing** — keep the LLM slice in the single digits %. Biggest lever.
-2. **Caching + dedup** — social feeds are repetitive; cache hits are free results.
-3. **Cluster-level LLM** — summarize clusters, not individual posts.
-4. **Quantization + batching** — maximize GPU utilization (vLLM/Triton).
-5. **Spot/reserved GPUs** — batch tolerates preemption (Kafka replay); reserve
+**Re-ranked 4 August 2026 against the measured split.** The old ranking put
+"hybrid routing, keep the LLM slice in the single digits %" first. That was
+wrong in two ways: single digits was never measured (the shipped rate is **16%**,
+and the gate spent a period routing **100%** — PROJECT_ASSESSMENT §4), and the
+gate governs only 30–55% of calls because comment labelling runs for every post.
+
+1. **Comment volume per thread.** The dominant driver: 85–96% of LLM calls are
+   comment-level, and a thread's cost is `ceil(non_emoji_comments / batch)`.
+   Levers, in order of bluntness:
+   - `STAGE1_LLM_COMMENT_MAX` / `COMMENT_STANCE_MAX_PER_POST` (default **0** =
+     every comment). Setting these caps the bill directly — but it also caps
+     coverage, so the caps and the coverage claim must be quoted together.
+   - `STAGE1_LLM_BATCH` (default 25): more comments per call is fewer calls, at
+     the cost of a longer prompt and a coarser retry granularity.
+   - Emoji filtering — real but small: **2.8%** of comments, not the ~17% an
+     earlier estimate implied.
+2. **Caching + dedup** — social feeds are repetitive; cache hits are free
+   results. The Stage-2 response cache now keys on the **resolved model id**, so
+   changing a model correctly misses instead of silently serving the old model's
+   answers (PROJECT_ASSESSMENT §5.10). `LLM_CACHE_DISABLED=1` bypasses it for
+   evaluation runs.
+3. **Hybrid routing (the confidence gate)** — still a real lever, governing
+   30–55% of calls, and still the one with an accuracy trade-off worth plotting
+   (§9 P1.5's threshold sweep). But note the counter-intuitive part: *the better
+   Stage 1 gets, the smaller this lever becomes*, because fewer posts route while
+   comment labelling is unchanged.
+4. **Model choice per role.** Summarization and classification now resolve to
+   separate roles (`summary` vs `stage2`), so the fluent, expensive model is
+   spent once per post instead of on every classification call. Compare
+   candidates with `python -m eval.bakeoff_summary`.
+5. **Cluster-level LLM** — summarize clusters, not individual posts. Note that
+   the clustering currently runs on **stub embeddings** by default
+   (PROJECT_ASSESSMENT §5.9), so this lever is not yet real.
+6. **Quantization + batching** — maximize GPU utilization (vLLM/Triton).
+7. **Spot/reserved GPUs** — batch tolerates preemption (Kafka replay); reserve
    the steady base.
-6. **Right-size the backend.** `local` (vLLM) — zero per-token pricing, no data
+8. **Right-size the backend.** `local` (vLLM) — zero per-token pricing, no data
    egress, scale by adding GPUs; best for steady volume. `groq` — no LLM GPUs to
    own or reserve, pay only for the selective slice; best for bursty/low volume or
    no-GPU MVPs. Either way, right-size the roles: cheap LLM-A for per-post, larger

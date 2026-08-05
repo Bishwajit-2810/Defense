@@ -93,10 +93,21 @@ object per thread, reporting comment **coverage** since only a sample is shipped
 - **Unit of analysis = post + its comment thread.** The service analyzes the whole
   thread and emits one JSON object per thread (see §8).
 - **Hybrid analysis pipeline.** Cheap, fast NLP models (fastText, transformer
-  classifiers, spaCy/GLiNER) run over the post and every comment and handle
-  ~90–95% of the work. An LLM is invoked **selectively** only for the
-  original-language summary, insight, and low-confidence/ambiguous cases. This is
-  the central cost-control idea.
+  classifiers, spaCy/GLiNER) run over the post and every comment; an LLM is
+  invoked **selectively** for the original-language summary, insight, and
+  low-confidence/ambiguous cases. This is the central cost-control idea.
+
+  > **As measured (4 Aug 2026):** **16%** of posts reach Stage 2 on the shipped
+  > configuration (74% under the keyword stub). The "~90–95% handled by cheap
+  > NLP" figure was a design target, never a measurement — and for a period the
+  > gate routed **100%** of posts because of two field-name bugs
+  > ([PROJECT_ASSESSMENT.md](PROJECT_ASSESSMENT.md) §4).
+  >
+  > The framing has also moved: since every non-emoji comment is LLM-labelled,
+  > **85–96% of LLM calls are comment-level**, and the routing gate governs only
+  > 30–55% of spend. The defensible claim is *"cheap NLP filters which comments
+  > and which posts deserve an LLM"* — not *"only N% of posts reach the LLM"*.
+  > See §6.8 of the assessment.
 - **Two LLM roles, a pluggable backend (local ⇄ Groq), switchable at runtime.**
   The selective stage uses **LLM-A** (fast 7B/8B) for per-post refinement and
   **LLM-B** (larger 14B/32B) for cluster summarization, insight, and grounded
@@ -310,8 +321,12 @@ runtime per the routing rules in §7.
         │ confident, no LLM task        │ ambiguous mixed-lang          │ requested
         ▼                               ▼                               ▼
    COMPLETE (no LLM)            LLM verify/refine               LLM generate
-   ~90–95% of posts            small slice                     (summary/insight/report)
+   84% of posts (measured)     16% (measured)                  (summary/insight/report)
 ```
+
+_Measured on the 43-post working corpus with the shipped Stage-1 LLM; 26%/74%
+under the keyword stub. The rate tracks Stage-1 quality — it falls as Stage 1
+improves._
 
 Levers that keep token usage and cost low:
 
@@ -333,9 +348,14 @@ Levers that keep token usage and cost low:
   local LLM-A + Groq for LLM-B reports).
 - **LLM response cache** keyed by `(backend, model, task, content_hash)`.
 
-Expected outcome: LLM touches a single-digit-to-low-double-digit percentage of
-posts, and the per-batch LLM bill is dominated by _cluster-level_ generation, not
-per-post calls.
+Expected outcome, **revised against measurement**: the LLM touches ~16% of posts
+on the shipped configuration, but the per-batch bill is dominated by neither
+post-level nor cluster-level generation — it is dominated by **per-comment
+labelling** (85–96% of calls), because full per-comment coverage is a deliberate
+choice ([PROJECT_ASSESSMENT.md](PROJECT_ASSESSMENT.md) §6.3). The cost lever that
+matters most is therefore comments-per-thread and the batch size, not the
+confidence threshold. Cluster-level summarization remains a good idea but is not
+yet real: it currently clusters **stub embeddings** by default (§5.9).
 
 ---
 
@@ -952,7 +972,7 @@ hundreds of short texts — Stage-1 throughput is better measured in **texts
   50 comments = ~51 texts.
 - **Stage-2 LLMs** (two roles — **LLM-A** 7B/8B for per-post refinement, **LLM-B**
   14B/32B for cluster/report generation): order of **thousands of output tokens/sec**
-  aggregate; but they only see the **selective slice** (single-digit % of posts) and
+  aggregate; but they only see the **selective slice** (16% of posts, measured) and
   mostly **cluster-level** calls. This throughput is delivered by the configured
   backend: `local` (vLLM continuous batching on our GPUs — sized below) or `groq`
   (Groq LPU — throughput is Groq's to scale, bounded by your rate-limit/quota rather
@@ -1164,7 +1184,7 @@ over-provisioning GPUs.
 
 ### 16.5 Levers ranked by impact
 
-1. **Hybrid routing** — keep the LLM slice in the single digits %. Biggest lever.
+1. **Hybrid routing** — the LLM slice is **16% measured** (not single digits). A real lever, but no longer the biggest: comment labelling is 85–96% of calls.
 2. **Caching + dedup** — social feeds are repetitive; cache hits are free results.
 3. **Cluster-level LLM** — summarize clusters, not individual posts.
 4. **Quantization + batching** — maximize GPU utilization (vLLM/Triton).
@@ -1955,7 +1975,7 @@ Goal: scale, reliability, and the move to Kubernetes.
   beats baseline on the eval set (§14.4).
 
 **Exit criteria:** 10,000-post batches within target latency; autoscaling proven
-under burst; DLQ < threshold; LLM slice held in single digits %; per-language
+under burst; DLQ < threshold; LLM slice **measured and reported with its Stage-1 engine named** (16% shipped) rather than held to a target; per-language
 accuracy improved over MVP baseline.
 
 ### Phase 3 — Enterprise scale (week 10+) — 100,000 posts/batch

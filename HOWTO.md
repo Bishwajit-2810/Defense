@@ -22,9 +22,15 @@ The other docs say _what/why_; this says _what to do next_.
 
 ## 0. Golden rules (invariants — never break these)
 
-1. **Don't send every post to an LLM.** Cheap NLP/vision handles ~all posts; the
-   LLM/VLM runs **selectively** (target: single-digit % of posts). The Router gates
-   it on confidence + task flags. ([architecture.md](architecture.md) §1, §5)
+1. **Don't send every post to an LLM.** Cheap NLP handles every post; the LLM runs
+   **selectively** on the ones Stage 1 is not confident about. The Router gates it
+   on confidence + task flags. ([architecture.md](architecture.md) §1, §5)
+   **Measured: 16% of posts reach Stage 2** on the shipped configuration, 74%
+   under the keyword stub. ~~Target: single-digit %.~~ That target is retired —
+   the rate measures *Stage-1 quality*, not cost efficiency, and it falls as
+   Stage 1 improves. Since every non-emoji comment is LLM-labelled, **85–96% of
+   LLM calls are comment-level**, so the gate is not the dominant cost lever
+   either. See [PROJECT_ASSESSMENT.md](PROJECT_ASSESSMENT.md) §6.8.
 2. **Input is one `post-with-details` payload** — post **with `comments[]`
    embedded**, plus `engagement`, `reactionBreakdown`, `sampleShares`. There is **no
    separate Comment API**. ([data_contract.md](data_contract.md))
@@ -116,7 +122,10 @@ brings everything healthy; `GET /v1/health` returns 200.
 **Task 0.2 — Lock the two contracts (`/libs/schemas`).**
 
 - **Input schema** = the post-with-details object ([data_contract.md](data_contract.md)
-  §1/§1.1/§1.2/§2). Validate against `posts_with_details.json` (all 50 must pass).
+  §1/§1.1/§1.2/§2). Validate against `posts_with_details.json` (all 50 must pass). The **working**
+  corpus for analysis runs is `posts_text_only.json` (43 captioned posts) — the
+  7 null-caption `PHOTO` posts are excluded because no image bytes are reachable
+  (PROJECT_ASSESSMENT §5.2); regenerate it with `python -m eval.make_text_corpus`.
 - **Output schema** = [architecture.md](architecture.md) §6 (post_id, campaign_id,
   platform, platform_post_id, media_type, language, post_type, post_summary,
   post_summary_lang, post_summary_grounding, overall_sentiment, sentiment_score,
@@ -175,8 +184,13 @@ present for image posts.
   `reaction_breakdown` sums to `totalReactions`; baseline preserved.
 
 **Task 1.3 — Router/Triage.** Confidence gates + task flags decide complete-vs-LLM.
-**DoD:** measured LLM-routing rate is single-digit % on a sample batch; low-confidence
-items route to Stage 2.
+**DoD:** the routing rate is **measured and reported with its Stage-1 engine
+named** (`python -m eval.measure_routing_rate`); the bypass leg is exercised by a
+test that validates a bypassed post against the output schema; every rule reads
+through a named reader so a field rename breaks a test instead of silently
+disabling a gate. Do **not** gate on a target rate — a rate that is "too high"
+means Stage 1 is weak, and a rate that is "too low" may mean the gate is inert
+(it once routed 100% of posts while looking correct).
 
 **Task 1.4 — Stage-2 LLM/VLM worker.** Backend-agnostic (Task 0.3). Produce
 `post_summary` **grounded on caption+OCR+image** — **VLM** for image posts
@@ -207,9 +221,11 @@ rate + cache hits. Stand up the eval harness + gold sets per
 [evaluation.md](evaluation.md). **DoD:** per-task scorecard runs; ship-gate check
 exists.
 
-**Phase 1 exit:** 1,000-post batches reliably; LLM slice single-digit %; per-task
+**Phase 1 exit:** 1,000-post batches reliably; routing rate **measured** with its
+engine named and the post-vs-comment call split reported alongside it; per-task
 metrics baselined on the gold set ([evaluation.md](evaluation.md)); cost-per-1k
-recorded.
+recorded **per backend and model** (local is 0.0/token by definition — a single
+blended rate is wrong for both backends).
 
 ---
 
@@ -239,13 +255,19 @@ pools, data-layer scale-out, hybrid local+groq burst, continuous fine-tuning).
 
 ## 5. Definition of done (whole system)
 
-- [ ] All 50 sample posts ingest, analyze, and emit **JSON-Schema-valid** output.
+- [ ] All 50 sample posts ingest, analyze, and emit **JSON-Schema-valid** output
+      (43 of them carry a caption and form the working analysis corpus).
 - [ ] Sentiment is **recomputed**; `baseline_*` preserved; **comment sentiment + OCR
       are ours**; `coverage` reported.
-- [ ] Multimodal fields correct (image vs text-only null rules; fusion;
-      `reaction_breakdown` cross-check; summary grounding + language).
-- [ ] LLM-routing rate single-digit %; backend switch `local⇄groq` works; tenant
-      policy enforced.
+- [ ] Fusion weights **renormalise over present terms** — an absent image term
+      must not consume its 0.4 and shrink a real text signal; `vision_status`
+      distinguishes a real neutral from a failed fetch; `reaction_breakdown`
+      cross-check; summary grounding + language.
+- [ ] Routing rate **measured** (not targeted) with its engine named, reported
+      beside the post-vs-comment call split; backend switch `local⇄groq` works;
+      tenant policy enforced (**still open** — see PROJECT_ASSESSMENT §5.6).
+- [ ] Comment labels carry honest provenance (`method`, `provenance`); coverage
+      clamped to 1.0 with `coverage_anomaly` for upstream mismatches.
 - [ ] Dashboard is plain HTML/CSS/JS; backend is FastAPI.
 - [ ] Eval gates green on the per-language gold set ([evaluation.md](evaluation.md)).
 - [ ] (Phase 2) Agents corpus-tier only; MCP servers internal + read-mostly;

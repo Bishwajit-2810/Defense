@@ -155,11 +155,35 @@ def reaction_breakdown_to_dict(rb: dict) -> dict:
 
 
 def compute_coverage(analyzed: int, total_comment_count: int) -> float:
-    """Return the fraction of comments that have been analyzed.
+    """Return the fraction of comments that have been analyzed, clamped to 1.0.
 
     If total_comment_count is 0, returns 1.0 (full coverage by convention).
-    Coverage can exceed 1.0 when storedCommentRows >= commentCount.
+
+    **Clamped.** Five posts in the corpus store more comments than the platform
+    reports having — up to 112 stored against a reported `commentCount` of 42,
+    which used to render as "266.7% coverage". It is not replies inflating the
+    numerator (0 of 10,272 comments carry a `parentId`); it is an upstream
+    inconsistency. Absorbing it silently produced a number that cannot be true;
+    use :func:`coverage_anomaly` to surface it as a data-quality event instead.
     """
     if total_comment_count == 0:
         return 1.0
-    return analyzed / total_comment_count
+    return min(1.0, analyzed / total_comment_count)
+
+
+def coverage_anomaly(analyzed: int, total_comment_count: int) -> dict | None:
+    """Describe an impossible coverage ratio, or None when there is nothing wrong.
+
+    ``analyzed > total_comment_count`` means the upstream `commentCount` and the
+    stored comment rows disagree. That is worth reporting — it bounds how much
+    the coverage figure can be trusted — but it must not be reported as coverage
+    above 100%.
+    """
+    if total_comment_count <= 0 or analyzed <= total_comment_count:
+        return None
+    return {
+        "kind": "stored_exceeds_reported",
+        "analyzed": analyzed,
+        "reported_comment_count": total_comment_count,
+        "raw_ratio": round(analyzed / total_comment_count, 4),
+    }
