@@ -305,6 +305,7 @@ Poll job/analysis status and fetch results. `{id}` is a `job_id` or `analysis_id
       "emotion": "anger",
       "intents": ["express_grievance", "inform"],
       "topics": ["india", "muslims", "politics"],
+      "insight": "The grievance is framed as a national-identity issue rather than a policy one.",
       "entities": [
         { "type": "location", "value": "India", "confidence": 0.93 }
       ],

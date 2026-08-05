@@ -182,6 +182,34 @@ def _stub_reaction_mix(campaign_id: str) -> dict:
 
 
 # ---------------------------------------------------------------------------
+# Latest-row-per-post deduplication
+# ---------------------------------------------------------------------------
+# `analysis_events` is an append-only MergeTree, and re-analysis is a
+# first-class operation (`POST /v1/analysis/run` re-normalizes from
+# `posts.raw_payload` and replays the pipeline). So a post analysed twice has
+# TWO rows, and every aggregate below used to count it twice, weight it twice
+# in every average, and let it appear twice in a top-N list. The skew is not
+# random — it pulls toward whichever posts happened to be re-run, which is
+# exactly what a live "flip the backend and re-run" demo does.
+#
+# Postgres (`ON CONFLICT (post_id) DO UPDATE`) and object storage (deterministic
+# key) are idempotent, and the sibling `comment_sentiments` table is a
+# ReplacingMergeTree — so ClickHouse's post-level table was the one store where
+# FEATURES.md §1's "re-analysis is a first-class operation" did not hold.
+#
+# Fixed on the READ side rather than by migrating the table. The table is named
+# `analysis_events` and being append-only is defensible — the per-run history is
+# real information. What was wrong is aggregating over it without collapsing to
+# one row per post. `LIMIT 1 BY post_id` after `ORDER BY inserted_at DESC` keeps
+# the newest row per post, which is the same "latest wins" rule the Postgres
+# upsert applies. No schema change, so no migration on existing deployments.
+#
+# `run_all.py::reset_data` still truncates on reset; that is now a convenience
+# rather than the thing correctness depends on.
+_LATEST_PER_POST = "ORDER BY inserted_at DESC\n            LIMIT 1 BY post_id"
+
+
+# ---------------------------------------------------------------------------
 # Tool handlers (real ClickHouse path)
 # ---------------------------------------------------------------------------
 
@@ -196,16 +224,21 @@ def _handle_trend_query(
         return _stub_trend_query(campaign_id, from_date, to_date, granularity)
 
     interval = _interval(granularity)
+    # Aggregates run over ONE row per post — see _LATEST_PER_POST.
     sql = f"""
         SELECT
             toStartOfInterval(created_at, INTERVAL {interval}) AS period,
             count()                                              AS count,
             avg(sentiment_score)                                 AS avg_sentiment,
             avg(toxicity_score)                                  AS avg_toxicity
-        FROM analysis_events
-        WHERE
-            campaign_id = %(campaign_id)s
-            AND created_at BETWEEN %(from_date)s AND %(to_date)s
+        FROM (
+            SELECT post_id, created_at, sentiment_score, toxicity_score
+            FROM analysis_events
+            WHERE
+                campaign_id = %(campaign_id)s
+                AND created_at BETWEEN %(from_date)s AND %(to_date)s
+            {_LATEST_PER_POST}
+        )
         GROUP BY period
         ORDER BY period
     """
@@ -237,11 +270,13 @@ def _handle_sentiment_over_time(
         FROM (
             SELECT
                 toStartOfInterval(created_at, INTERVAL {interval}) AS period,
+                post_id,
                 overall_sentiment
             FROM analysis_events
             WHERE
                 campaign_id = %(campaign_id)s
                 AND created_at BETWEEN %(from_date)s AND %(to_date)s
+            {_LATEST_PER_POST}
         )
         GROUP BY period
         ORDER BY period
@@ -283,6 +318,8 @@ def _handle_top_posts(
         date_filter = "AND created_at <= %(to_date)s"
         params["to_date"] = to_date
 
+    # Rank over ONE row per post, or a re-analysed post occupies several slots
+    # in its own top-N list — see _LATEST_PER_POST.
     sql = f"""
         SELECT
             post_id,
@@ -291,9 +328,15 @@ def _handle_top_posts(
             toxicity_score,
             hate_speech_score,
             overall_sentiment
-        FROM analysis_events
-        WHERE campaign_id = %(campaign_id)s
-        {date_filter}
+        FROM (
+            SELECT
+                post_id, total_reactions, comment_count,
+                toxicity_score, hate_speech_score, overall_sentiment
+            FROM analysis_events
+            WHERE campaign_id = %(campaign_id)s
+            {date_filter}
+            {_LATEST_PER_POST}
+        )
         ORDER BY {metric} DESC
         LIMIT %(limit)s
     """
@@ -321,6 +364,12 @@ def _handle_reaction_mix(
         date_filter = "AND created_at <= %(to_date)s"
         params["to_date"] = to_date
 
+    # This used to read `FROM reaction_events` — a table no migration ever
+    # created and no writer ever populated, so the tool raised in any non-stub
+    # deployment while the stub path kept returning plausible synthetic numbers.
+    # The counts now live on the post-level row (assembler/persistence.py
+    # `_reaction_columns`), which also puts the mix on the same one-row-per-post
+    # dedup as every other aggregate here.
     sql = f"""
         SELECT
             sum(like_count)    AS LIKE,
@@ -330,9 +379,15 @@ def _handle_reaction_mix(
             sum(sad_count)     AS SAD,
             sum(angry_count)   AS ANGRY,
             sum(care_count)    AS CARE
-        FROM reaction_events
-        WHERE campaign_id = %(campaign_id)s
-        {date_filter}
+        FROM (
+            SELECT
+                post_id, like_count, love_count, haha_count,
+                wow_count, sad_count, angry_count, care_count
+            FROM analysis_events
+            WHERE campaign_id = %(campaign_id)s
+            {date_filter}
+            {_LATEST_PER_POST}
+        )
     """
     rows = _ch_query(sql, params)
     if not rows:

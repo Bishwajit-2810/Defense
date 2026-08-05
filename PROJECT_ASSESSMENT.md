@@ -86,6 +86,24 @@ Bangla / English / Banglish)
 > | §9.9 — hand-label ~300 comments | **Human task.** Nothing to automate. Still the single decisive gap (§7.2). |
 > | P1.6 — ablate fusion weights | **Moot.** The image term was scoped out (§9.3), so there is nothing to ablate until the objects exist. |
 > | §5.6's remaining hardening | Provisioning, not code: `api_keys`/`users` rows have to be seeded, and `APP_ENV` set to something other than `dev`, for the fail-closed paths to engage. |
+>
+> ### Fourth pass — fresh-eyes audit, 5 August 2026
+>
+> A full read by a reviewer with no prior context, covering every service,
+> `libs/`, the MCP servers, the dashboard JS, the schemas and the manifests.
+> **It found a seventh instance of §5.1 — and the most expensive one yet,
+> because this time what was lost was not a provenance field but an entire
+> LLM task's output.** Stage 2's `insight` task ran, was billed, and was then
+> discarded by the assembler; `insight` was not even in the output schema.
+>
+> A second theme emerged alongside it: **three queries whose source could not
+> deliver.** ClickHouse's post-level table double-counted every re-analysed post
+> across all its aggregates; `/v1/usage` summed tokens out of a Postgres table
+> nothing has ever written; and `get_reaction_mix` read a table **no migration
+> ever created**, so it raised in every non-stub deployment while the stub path
+> returned plausible synthetic numbers. All three are fixed — the ClickHouse one
+> on the read side, with no schema migration. **Everything in §11 is now closed.
+> Test count 565 → 588.**
 
 - **Pass 1** found and fixed the routing defect and measured the routing rate (§4).
 - **Pass 2** was a full second review of everything §4 did _not_ touch — vision, comments,
@@ -94,6 +112,8 @@ Bangla / English / Banglish)
 - **Pass 3** specifies six requirements reported by the owner — truncated summaries, emoji
   filtering, full-coverage comment batching, a stance watchlist, a second LLM for summarization,
   and a broken JWT auth path. **§6. Specified, not implemented.**
+- **Pass 4** is a fresh-eyes audit of the whole repository after all of the above landed.
+  **§11.** Ten findings, all fixed and regression-tested.
 
 **Scope:** design documents, all 99 Python modules (19,557 LOC), routing rules, evaluation
 harness, dataset, 16 test files (323 tests, all passing), Docker Compose + Kubernetes
@@ -1483,11 +1503,12 @@ worked. Reverting them one at a time did.
 
 ### Reproducibility
 
-The test suite runs: `uv sync --extra dev`, then **565 tests across 31 files pass** (up from 323 —
+The test suite runs: `uv sync --extra dev`, then **588 tests across 33 files pass** (up from 323 —
 the new files pin every fix in the 4 August implementation pass: summary truncation, JWT
 transport, vision status + fusion renormalisation, comment provenance, coverage clamping,
 KEDA/stream identifiers, DLQ job accounting, comment kinds, the batch queue, and the LLM cache
-key), and `compileall` is clean. Two notes for a clean checkout: the `dev` extra was missing
+key; plus §11's `test_stage2_insight_survives.py` and
+`test_analytics_storage_contract.py`), and `compileall` is clean. Two notes for a clean checkout: the `dev` extra was missing
 `pytest-asyncio` (fixed here), and the working venv has no `pip` or `ruff`, so `uv` is the install
 path. Document that step — a demo that cannot be reproduced from `README` instructions is a live
 risk.
@@ -1591,3 +1612,218 @@ annotated at scale (§8 Step 1).**
    §7) is what makes the novelty claim measurable rather than asserted.
 
 Everything else in this document is implemented.
+
+---
+
+## 11. Pass 4 — fresh-eyes audit, 5 August 2026
+
+A full read of the codebase by a reviewer with no prior context: every service,
+`libs/`, the MCP servers, the dashboard JS, the schemas and the deploy manifests.
+**All ten findings below are fixed and regression-tested.** Baseline before the
+pass: 565 tests passing, no `ruff` correctness findings
+(`F`/`E4`/`E7`/`E9`/`B` is clean — the 641 total hits are style: `BLE001`,
+`UP045`, `B008` from FastAPI `Depends()` defaults, and so on).
+
+**The headline finding is another instance of §5.1's pattern** — one component
+writes a field, the next reads a different set, and the mismatch degrades to a
+silent omission rather than an error. That makes it the *sixth* occurrence, and
+the first one found in the direction the assessment had not looked: not a field
+lost between Stage 1 and the router, but a whole **LLM task's output** lost
+between Stage 2 and the assembler.
+
+### 11.1 Stage-2's insight task was computed, paid for, and discarded — FIXED
+
+`stage2_llm/worker._run_insight` issues a real LLM call (up to
+`INSIGHT_MAX_TOKENS`, default 768) for every routed post whose `want_insight`
+flag fires — and it fires whenever Stage 1 produced fewer than two topics, which
+is common. It returns `refined_topics`, `intents` and a one-line `insight`.
+
+`assembler/builder.build_canonical_result` read `topics` and `intents` from
+`stage1_result` **only**, and never read `insight` at all; `insight` was also
+absent from `libs/schemas/output_schema.json` and from
+`AnalysisResultResponse`. So the task's entire output was thrown away before it
+reached the API, Postgres, ClickHouse, MinIO or the dashboard. Reproduction, on
+the pre-fix builder:
+
+```
+stage2_result = {"topics": ["REFINED_A"], "intents": ["REFINED_I"], "insight": "..."}
+build_canonical_result(...)["topics"]   -> ["stage1topic"]     # Stage 2 ignored
+build_canonical_result(...)["intents"]  -> ["stage1intent"]    # Stage 2 ignored
+build_canonical_result(...)["insight"]  -> KeyError            # never emitted
+```
+
+This is worse than a dropped provenance key, because it is **spend**. It is also
+the failure mode FEATURES.md's own legend warns about: the feature was listed
+🟡 *Works, unmeasured*, when from any consumer's position it did not work at all.
+
+**Fixed.** `builder._merge_stage2_labels` merges all three with the same
+precedence `post_type` already used — Stage 2 wins when it produced something,
+Stage 1's labels stand when it did not, and an *empty* refinement never erases
+Stage 1. `insight` is declared in the output schema, carried through
+`AnalysisResultResponse` and `_row_to_result`, and `SCHEMA_VERSION` is now
+`1.3`. Pinned by `tests/test_stage2_insight_survives.py` (6 tests).
+
+### 11.2 ClickHouse `analysis_events` double-counted on re-analysis — FIXED
+
+Re-analysis is a first-class operation (`POST /v1/analysis/run` re-normalizes
+from `posts.raw_payload` and replays the pipeline), and FEATURES.md §1 lists
+**Idempotent upsert** as ✅ Measured. Two of the three persistence targets are in
+fact idempotent — Postgres uses `ON CONFLICT (post_id) DO UPDATE`, MinIO uses a
+deterministic key — and `comment_sentiments` is a `ReplacingMergeTree`, so it
+dedups on merge.
+
+`analysis_events` is a plain `MergeTree` (`ORDER BY (campaign_id, created_at,
+post_id)`). Re-analysing a post **appends a second row**. Every analytics
+aggregate in `mcp_servers/analytics_mcp/server.py` reads that table:
+`count()`, `avg(sentiment_score)`, `avg(toxicity_score)`,
+`countIf(overall_sentiment = …)`, and `_handle_top_posts`. So a post analysed
+twice is counted twice, weighted twice in every average, and can appear twice in
+the top-posts list.
+
+`run_all.py::reset_data` already works around this by truncating both ClickHouse
+tables on reset, and its comment says so explicitly — so the behaviour is known
+at the operational layer but not at the storage layer.
+
+**Fixed on the READ side, not by migrating the table.** The first draft of this
+section recommended `ReplacingMergeTree(inserted_at) ORDER BY (campaign_id,
+post_id)`; scoping the change afterwards showed that only **three** queries read
+the table, which makes the cheaper fix the better one:
+
+* the table is named `analysis_events`, and being append-only is defensible —
+  the per-run history is real information. What was wrong was aggregating over
+  it without collapsing to one row per post;
+* `ORDER BY inserted_at DESC` + `LIMIT 1 BY post_id` in a subquery applies the
+  same "latest wins" rule the Postgres `ON CONFLICT` upsert already applies;
+* `ReplacingMergeTree` could not have been an `ALTER` (ClickHouse changes
+  neither engine nor `ORDER BY` in place), so it meant drop + recreate +
+  backfill on every existing deployment; its dedup is also only *eventual*, so
+  the queries would have needed `FINAL` to be exact anyway — and dropping
+  `created_at` from the sort key would have penalised the time-range filters
+  that are most of this table's traffic.
+
+Zero schema change, so no migration. `run_all.py::reset_data` still truncates on
+reset; that is now a convenience rather than the thing correctness depends on.
+Pinned by `tests/test_analytics_storage_contract.py`, which captures the SQL the
+handlers actually emit rather than grepping the source.
+
+### 11.3 `/v1/usage` read a table nothing writes — FIXED
+
+`deploy/init-db.sql` creates a Postgres `llm_cache` table, and `usage.py`'s
+Query 2 sums `response->>'total_tokens'` out of it. **Nothing ever writes that
+table** — `stage2_llm/cache.py` is Redis-only (`llm_cache:{backend}:{model}:…`
+keys with a 7-day TTL). The consequences:
+
+* `cache_rows` and the `total_tokens` fallback are permanently `0`;
+* the `cache_hit_rate` fallback branch (`cache_rows / max(llm_calls, cache_rows)`)
+  is dead code that can only ever return `0.0`;
+* the `UsageResponse.total_tokens` docstring and the endpoint's source table both
+  name `llm_cache` as a source it is not;
+* unlike the Redis block, the query is **not** wrapped in `try/except`, so a
+  deployment whose `init-db.sql` has not been applied gets a 500 from
+  `/v1/usage` rather than a degraded number.
+
+The endpoint was still correct in practice, because the Redis counters take
+precedence whenever they exist. But it was a documented source that cannot
+deliver, in the one subsystem the cost-efficiency argument (§5.8 / §6.7) rests
+on — the same species of claim this document exists to catch.
+
+**Fixed by removal, which is behaviour-preserving.** Query 2, the dead fallback
+branch, the table in `deploy/init-db.sql` and the docstrings naming it are all
+gone; `cache_hit_rate` now says in `scope_note` when it is 0.0 because nothing
+has run, rather than presenting that as a measurement. Nothing observable
+changed, because an always-empty table contributed zero either way — and the
+unguarded query that 500'd `/v1/usage` on a partially-initialised database is
+gone with it. `DROP TABLE IF EXISTS llm_cache;` cleans up existing deployments.
+
+`tests/test_analytics_storage_contract.py` asserts via the AST (not a grep, so a
+comment cannot satisfy it) that no SQL literal in `usage.py` reads the table,
+that `cache_rows`/`token_row` are not dangling names, and that nothing under
+`services/` has since added a writer — the last one so that if someone *does*
+decide to populate it, the removal gets reconsidered rather than silently
+half-restored.
+
+### 11.3b `get_reaction_mix` queried a table that never existed — FIXED
+
+Found while scoping §11.2. `analytics_mcp._handle_reaction_mix` read
+`FROM reaction_events` — a table **no migration creates and no writer
+populates**. `clickhouse_init.sql` defines exactly three tables
+(`analysis_events`, `comment_sentiments`, `llm_usage`); `reaction_events`
+appears nowhere else in the repository. So the tool raised in every non-stub
+deployment, while `ANALYTICS_MCP_STUB=true` kept returning plausible synthetic
+reaction mixes — the §5.2 pattern again (a stub masking a path that cannot run).
+
+The data was never missing: `reaction_breakdown` is on the canonical result and
+in the input payload. It simply had nowhere to land in ClickHouse. The seven
+per-type counts (`like_count` … `care_count`) are now columns on
+`analysis_events`, written by `persistence._reaction_columns` (case-insensitive,
+because the normalizer lower-cases the keys and Stage 1 re-emits them
+upper-cased) and read by the reaction-mix query on the same dedup path as every
+other aggregate. Additive `ALTER TABLE … ADD COLUMN IF NOT EXISTS` statements
+follow the file's existing idiom, so no rebuild is needed.
+
+A test now asserts the general rule rather than this one instance: **every table
+named in a `FROM` clause the analytics handlers emit must be one
+`clickhouse_init.sql` creates.**
+
+### 11.4 Smaller findings — all FIXED
+
+| # | Finding | Fix |
+| - | ------- | --- |
+| a | `LLMClient.chat` accumulated usage **after** the degenerate-JSON retry rebound `completion`, so the degenerate call's tokens never reached any counter — an undercount in exactly the path §5.8 added counters to measure. | `totals`/`_accumulate` seeded before the retry; both calls counted. |
+| b | `LLMClient.chat_stream`'s Groq→local fallback could raise **out of the async generator** when the local open also failed, instead of yielding the `error` frame every other failure path yields. The SSE bridge saw an unhandled exception mid-response. | Wrapped; yields `{"type":"error"}` and records the local breaker failure. |
+| c | `platform_from_url` stripped only `www.`, so `m.facebook.com` — the form most shared links take on phones — classified as `"other"`. Latent, not observed: the corpus is 100% `www.facebook.com` (43/43 and 50/50). Contradicted FEATURES.md's "not Facebook-specific" claim in the one case that matters. | Strips `m.`/`mobile.`/`web.`/`business.`/`l.` too; `fb.watch` added. |
+| d | `compute_coverage` divided straight through for a **negative** `total_comment_count` and returned a negative ratio, which its own docstring's clamp promised could not happen. | Clamped to `[0.0, 1.0]`; `<= 0` returns `1.0`. |
+| e | `/v1/search` keyword mode interpolated the raw query into a `LIKE` pattern without escaping, so `q=%` matched every row and `a_c` matched `abc`. Parameterised, so never injection — but a wildcard leak. | Metacharacters escaped, explicit `ESCAPE '\'` on every predicate. |
+| f | The same search never looked at `post_text`, so a post the router sent straight to the assembler (no `post_summary`) was findable only by its topics/keywords — the majority of the corpus, given the gate routes 16%. | `result->>'post_text'` added to the predicate list. |
+
+### 11.5 Noted, not changed
+
+* **`libs/dlq.record_failure` retries `max_retries - 1` times.** `attempts <
+  max_retries` means `max_retries=3` yields 3 total attempts / 2 retries. The
+  behaviour is bounded and correct; only the parameter name overstates it.
+* **`POST /v1/chat` accepts an arbitrary `model` id** and forwards it to the
+  backend. `check_llm_backend_policy` guards the *backend*, which is the privacy
+  boundary that matters, so this is a cost surface rather than a data-egress one.
+* **`analysis_run` enqueues to Redis before its `jobs` INSERT commits** (the
+  commit happens in `get_db` after the handler returns). A fast pipeline could
+  therefore `UPDATE jobs` against a row that does not exist yet, silently
+  matching zero rows. Self-healing: `GET /v1/analysis/{id}` reconciles a stale
+  row from the Redis counters (§9.7's mechanism), so it resolves on the first
+  poll.
+* **The auth layer held up.** JWT claim allowlisting, server-set `auth_method`,
+  hash-based API-key lookup with the tenant from the row, single-use SSE tickets
+  that delete-before-return, fail-closed tenant-policy lookup, constant-time
+  password verify. No finding.
+* **The dashboard escapes consistently.** 86 `innerHTML` assignments were
+  reviewed; every user-derived value (comment text, author, sentiment label,
+  comment id) goes through `escHtml`/`escAttr`. No XSS finding.
+
+### 11.6 The theme of this pass
+
+Pass 2 named the recurring defect as *cross-component identifier mismatch* —
+one component writes a name, the next reads a different one. Pass 4's findings
+sharpen that into a more general rule, because §11.2/§11.3/§11.3b are not
+mismatches at all:
+
+> **A read whose source cannot deliver fails silently, and a stub makes it
+> invisible.**
+
+`insight` was computed and never read. `llm_cache` was read and never written.
+`reaction_events` was read and never created. In each case the failure surfaced
+as a plausible number — a Stage-1 topic list, a `0`, a synthetic reaction mix —
+rather than as an error. The mitigation is the same one §5.1 arrived at, one
+level up: assert the *contract between components* in a test, not just the
+behaviour of each side. `tests/test_analytics_storage_contract.py` asserts the
+general rule ("every table the handlers query must be one the migration
+creates"), so the next table added without a migration fails a test instead of
+raising in production.
+
+Worth noting for the defense: the stub modes are what let all three survive.
+`ANALYTICS_MCP_STUB` returned synthetic reaction mixes for a query that could
+not run; `MODEL_STUB_MODE` did the same for embeddings in §5.9. Stubs that
+return *plausible* data rather than an obvious sentinel are load-bearing in
+every one of these findings.
+
+**Test suite after this pass: 588 passing, 33 files** (571 after §11.1/§11.4,
+then 588 with §11.2/§11.3/§11.3b's contract tests). Each fix was mutation-tested
+by reverting it against a copy of the tree and confirming the new tests fail.

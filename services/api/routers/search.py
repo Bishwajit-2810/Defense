@@ -147,19 +147,33 @@ async def _keyword_search(
 
     Searches the following JSONB fields (case-insensitive):
       - result->>'post_summary'
+      - result->>'post_text'   (the post's own caption)
       - result->'keywords' (array contains)
       - result->'topics'   (array contains)
       - result->'comment_analysis'->'themes' (array contains)
+
+    LIKE metacharacters in ``q`` are escaped, so a query of ``%`` searches for a
+    literal percent sign rather than matching every row.
     """
-    pattern = f"%{q.lower()}%"
+    # Escape the LIKE metacharacters in the user's query before wrapping it in
+    # wildcards. The query is parameterised (so this was never SQL injection),
+    # but an unescaped `%` or `_` is still a wildcard *inside* the pattern: a
+    # search for "%" matched every row, and "a_c" matched "abc". The ESCAPE
+    # clause in each predicate below makes the backslash the escape character.
+    escaped = q.lower().replace("\\", "\\\\").replace("%", "\\%").replace("_", "\\_")
+    pattern = f"%{escaped}%"
     params: dict[str, Any] = {"pattern": pattern, "limit": limit}
 
     # Base WHERE clause — text fields
     where_clauses = [
-        "LOWER(ar.result->>'post_summary') LIKE :pattern",
-        "EXISTS (SELECT 1 FROM jsonb_array_elements_text(ar.result->'keywords') kw WHERE LOWER(kw) LIKE :pattern)",
-        "EXISTS (SELECT 1 FROM jsonb_array_elements_text(ar.result->'topics') t WHERE LOWER(t) LIKE :pattern)",
-        "EXISTS (SELECT 1 FROM jsonb_array_elements_text(ar.result->'comment_analysis'->'themes') th WHERE LOWER(th) LIKE :pattern)",
+        r"LOWER(ar.result->>'post_summary') LIKE :pattern ESCAPE '\'",
+        # `post_text` is the post's own caption. Without it, a post the router
+        # sent straight to the assembler has no `post_summary`, so its actual
+        # words were unsearchable — only its topics/keywords were.
+        r"LOWER(ar.result->>'post_text') LIKE :pattern ESCAPE '\'",
+        r"EXISTS (SELECT 1 FROM jsonb_array_elements_text(ar.result->'keywords') kw WHERE LOWER(kw) LIKE :pattern ESCAPE '\')",
+        r"EXISTS (SELECT 1 FROM jsonb_array_elements_text(ar.result->'topics') t WHERE LOWER(t) LIKE :pattern ESCAPE '\')",
+        r"EXISTS (SELECT 1 FROM jsonb_array_elements_text(ar.result->'comment_analysis'->'themes') th WHERE LOWER(th) LIKE :pattern ESCAPE '\')",
     ]
 
     if campaign_id:

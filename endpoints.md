@@ -55,6 +55,7 @@ This is the JSON the whole system exists to produce:
   "emotion":   { "anger": 0.55, "sadness": 0.2, "joy": 0.05 },
   "intents":   ["criticism", "mobilization"],
   "topics":    ["fuel prices", "government policy"],
+  "insight":   "Anger is aimed at the pricing decision, not at the fuel shortage itself.",  // Stage-2 only; null when Stage 2 was skipped
   "entities":  [ { "type": "ORG", "value": "BPC" } ],
   "brand_mentions": [],
   "keywords":  ["তেল", "দাম", "সরকার"],

@@ -18,12 +18,19 @@ def platform_from_url(url: str) -> str:
     except Exception:
         return "other"
 
-    # Normalise: strip www. prefix for cleaner matching
+    # Normalise: strip the common host prefixes so a mobile or regional link
+    # resolves to the same platform as the canonical one. Matching only "www."
+    # meant `m.facebook.com` — the form most shared links take on phones —
+    # classified as "other", which would silently reclassify a whole segment of
+    # a real corpus. The current sample is entirely `www.facebook.com`, so this
+    # is a latent gap rather than an observed one.
     hostname = hostname.lower()
-    if hostname.startswith("www."):
-        hostname = hostname[4:]
+    for prefix in ("www.", "m.", "mobile.", "web.", "business.", "l."):
+        if hostname.startswith(prefix):
+            hostname = hostname[len(prefix):]
+            break
 
-    if hostname in ("facebook.com", "fb.com"):
+    if hostname in ("facebook.com", "fb.com", "fb.watch"):
         return "facebook"
     if hostname == "instagram.com":
         return "instagram"
@@ -166,9 +173,13 @@ def compute_coverage(analyzed: int, total_comment_count: int) -> float:
     inconsistency. Absorbing it silently produced a number that cannot be true;
     use :func:`coverage_anomaly` to surface it as a data-quality event instead.
     """
-    if total_comment_count == 0:
+    if total_comment_count <= 0:
+        # A zero count means "no comments to cover" — full coverage by
+        # convention. A NEGATIVE count is nonsense upstream data; it used to
+        # divide straight through and return a negative "coverage", which the
+        # docstring's clamp promised could not happen.
         return 1.0
-    return min(1.0, analyzed / total_comment_count)
+    return min(1.0, max(0.0, analyzed / total_comment_count))
 
 
 def coverage_anomaly(analyzed: int, total_comment_count: int) -> dict | None:

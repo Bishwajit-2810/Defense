@@ -17,9 +17,9 @@ and what the image modality was before §9.3.
 | ⚠️ **Unexercised** | Implemented, but cannot currently produce a signal |
 | 📋 **Planned** | Designed, not built |
 
-**Scale (measured 5 Aug 2026):** **26,731 lines of Python across 121 files** —
-`services/` 14,379, `tests/` 6,021, `libs/` 3,446, `eval/` 1,109,
-`mcp_servers/` 1,105, `run_all.py` 671. **565 tests** across 31 files. Working
+**Scale (measured 5 Aug 2026):** **27,243 lines of Python across 123 files** —
+`services/` 14,477, `tests/` 6,351, `libs/` 3,475, `eval/` 1,109,
+`mcp_servers/` 1,160, `run_all.py` 671. **588 tests** across 33 files. Working
 corpus: 43 posts, 8,965 comments.
 
 Test code is now 23% of the Python in the repository, up from 14%. That ratio is
@@ -36,7 +36,7 @@ reverted.
 | ------- | ------------ | ----- |
 | **Post-with-details pull** | Pulls one payload per post — the post *with its comments embedded*, plus `engagement`, `reactionBreakdown`, `sampleShares` — into our own database. Read-only consumer; never writes back upstream. | ✅ Measured |
 | **Platform detection** | Derives the platform from each post's URL host, so the service is not Facebook-specific. | ✅ Measured |
-| **Idempotent upsert** | Every post has a stable content hash; re-ingesting is safe and re-analysis is a first-class operation. | ✅ Measured |
+| **Idempotent upsert** | Every post has a stable content hash; re-ingesting is safe and re-analysis is a first-class operation. Postgres upserts on `post_id`, object storage writes a deterministic key, and the two ClickHouse tables collapse to the newest row per post — `comment_sentiments` in the engine, `analysis_events` in the queries. **Until 5 Aug 2026 the last of those was missing**, so a re-analysed post was counted twice in every analytics aggregate; see PROJECT_ASSESSMENT §11.2. | ✅ Measured |
 | **Baseline preservation** | The upstream's coarse `sentiment`/`viralPotential` are kept as `baseline_*` and never overwritten, so our recomputation can be compared against theirs. | ✅ Measured |
 | **Near-duplicate reuse** | A post within cosine 0.97 of an already-analysed one reuses that result and skips both stages. | 🟡 Works, unmeasured — and see the stub-embedding caveat in §4 |
 | **Working-corpus filter** | `eval/make_text_corpus.py` writes `posts_text_only.json` (43 captioned posts) and prints exactly what it dropped and why. The source corpus is never modified. | ✅ Measured |
@@ -91,7 +91,7 @@ reverted.
 | **Separate `summary` role** | Summarization and classification resolve to **different models**: classification picks from a fixed vocabulary and wants a cheap constrained model; summarization writes prose and wants a fluent one. The expensive model is spent once per post, not on every classification call. | ✅ Measured |
 | **Truncation recovery** | `finish_reason` is inspected; a reply that hit the token ceiling is auto-continued (up to `LLM_MAX_CONTINUATIONS`), trimmed to its last complete sentence, flagged `post_summary_truncated`, and **never cached**. Truncation is language-correlated — Bangla costs far more tokens per character — so this was silently biased against Bangla. | ✅ Measured |
 | **Post-type classification** | Nine-label taxonomy shared from `libs/labels.py` so Stage 1, the Stage-2 prompt and the router cannot drift apart. | ✅ Measured |
-| **Insight / topic refinement** | Refines topics and intents, and writes a short insight. | 🟡 Works, unmeasured |
+| **Insight / topic refinement** | Refines topics and intents, and writes a short one-line `insight`. **This row was wrong until 5 Aug 2026:** the LLM call ran and was paid for, but the assembler read `topics`/`intents` from Stage 1 only and never read `insight` at all, which was also absent from `output_schema.json` — so the entire task's output was discarded before it reached the API, the stores or the dashboard. Merged now (`builder._merge_stage2_labels`, schema `1.3`), pinned by `tests/test_stage2_insight_survives.py`. | 🟡 Works, unmeasured |
 | **Context-aware comment stance** | Re-labels comments by stance *toward the post*, with the post as context — a different and better signal than standalone comment sentiment. | ✅ Measured |
 | **Comment-thread summary** | A short natural-language account of how commenters reacted, grounded on the recomputed breakdowns. | 🟡 Works, unmeasured |
 | **Bounded-concurrency batch queue** | Comments batch at 25 and run 3 batches in flight with per-batch retry and index-alignment assertions. Replaced a strictly sequential loop — which is why the old caps existed at all. | ✅ Measured |
@@ -139,7 +139,7 @@ Full design: **[stance_targets.md](stance_targets.md)**.
 | **Coverage honesty** | `coverage = analyzed / commentCount`, **clamped to 1.0**. Five posts store more comments than the platform reports (up to 112 against 42) — that surfaces as `coverage_anomaly`, never as "267% coverage". Corpus-level coverage is reported alongside the per-post figure. | ✅ Measured |
 | **Three-store fan-out** | Postgres + pgvector (canonical + vectors), ClickHouse (analytics), object storage (raw results) — written in parallel. | ✅ Measured |
 | **Semantic search** | kNN over pgvector. Every result carries `embedding_is_stub`, because a hash-seeded stub vector returns *arbitrary* neighbours with scores that look exactly as plausible as real ones. `EMBEDDING_ALLOW_STUB=false` refuses the write outright. | ✅ Measured (as stub-backed by default) |
-| **Keyword search** | JSONB search over summaries, keywords, topics and themes. | ✅ Measured |
+| **Keyword search** | JSONB search over the post's own text, summaries, keywords, topics and themes. `post_text` was added 5 Aug 2026 — without it, a post the router sent straight to the assembler has no `post_summary`, so its actual words were unsearchable. LIKE metacharacters in the query are escaped, so `q=%` no longer matches every row. | ✅ Measured |
 | **Cost telemetry** | `GET /v1/usage` reports tokens and cost **per backend and model** — local priced at 0.0 (its marginal token cost genuinely is zero) — plus the post-vs-comment `lane_split`. One blended `$0.002/1k` rate was wrong for both backends in opposite directions. | ✅ Measured |
 | **Dead-letter queue** | Bounded retry-by-re-enqueue, then dead-letter with error context; the original is always ACKed. A dead-lettered post is **counted against its job**, so one LLM timeout no longer leaves the progress bar at 49/50 forever. | ✅ Measured |
 | **Per-identity rate limiting** | A per-minute budget on expensive endpoints, with `X-RateLimit-*` headers and `Retry-After`. | ✅ Measured |
@@ -181,7 +181,7 @@ Full design: **[stance_targets.md](stance_targets.md)**.
 | Feature | What it does | State |
 | ------- | ------------ | ----- |
 | **Three agents** | `analyst` (Q&A over the corpus), `coverage` (comment-coverage analysis), `alerting` (monitoring). Corpus-tier only, never per post. | 🟡 Works, unmeasured |
-| **MCP tool servers** | `analytics` / `retrieval` / `ingest` — internal, read-mostly; `ingest-mcp` never writes upstream. | 🟡 Works, unmeasured |
+| **MCP tool servers** | `analytics` / `retrieval` / `ingest` — internal, read-mostly; `ingest-mcp` never writes upstream. **Caveat worth knowing:** `analytics-mcp`'s tools had only ever been exercised through `ANALYTICS_MCP_STUB=true`, which is how `get_reaction_mix` came to query a `reaction_events` table no migration creates — it raised on every real deployment while the stub returned plausible numbers (PROJECT_ASSESSMENT §11.3b). Fixed, and a test now asserts every table the handlers name is one the migration creates. | 🟡 Works, unmeasured |
 | **Budget cap** | `max_tool_calls` with a synthetic "budget cap reached" tool reply, so an agent loop cannot run away. | ✅ Measured |
 | **Citations** | Post IDs are extracted from tool results so an answer can be traced to its evidence. | 🟡 Works, unmeasured |
 | **Prompt-injection hardening** | Tool results carry Facebook comment text verbatim, on a corpus of political content with adversarial participants. Results are wrapped in `<tool_data trust="untrusted">` with forged-delimiter neutralisation, and the system prompt states that content inside is data. **Risk reduction, not a fix** — no prompt-level defence can promise resistance. | 🟡 Built + probed |

@@ -41,6 +41,7 @@
     },
     "intents": {"type":"array","items":{"type":"string"}},
     "topics": {"type":"array","items":{"type":"string"}},
+    "insight": {"type":["string","null"]},
     "entities": {
       "type":"array",
       "items": {

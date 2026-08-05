@@ -62,16 +62,16 @@ CREATE TABLE IF NOT EXISTS jobs (
     error       TEXT
 );
 
-CREATE TABLE IF NOT EXISTS llm_cache (
-    id           SERIAL PRIMARY KEY,
-    cache_key    VARCHAR UNIQUE,
-    backend      VARCHAR,
-    model        VARCHAR,
-    task         VARCHAR,
-    content_hash VARCHAR,
-    response     JSONB,
-    created_at   TIMESTAMPTZ DEFAULT NOW()
-);
+-- There is deliberately no `llm_cache` table here.
+--
+-- The Stage-2 LLM response cache is Redis-only: keys of the form
+-- `llm_cache:{backend}:{model}:{task}:{content_hash}` with a 7-day TTL, written
+-- by services/workers/stage2_llm/cache.py. A Postgres table of the same name
+-- used to be created here and read by GET /v1/usage, but nothing ever wrote it,
+-- so it reported 0 tokens and 0 cache rows forever while the endpoint's docs
+-- named it as a source. Dropped rather than left as a shape nothing fills.
+--
+-- Existing deployments can clean it up with:  DROP TABLE IF EXISTS llm_cache;
 
 CREATE TABLE IF NOT EXISTS tenant_policies (
     tenant_id      VARCHAR PRIMARY KEY,

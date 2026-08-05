@@ -18,12 +18,35 @@ CREATE TABLE IF NOT EXISTS analysis_events (
   llm_backend Nullable(String),
   topics Array(String),
   keywords Array(String),
+  -- Per-type reaction counts, for the reaction-mix aggregate. These used to
+  -- live on a `reaction_events` table that analytics_mcp queried but that no
+  -- migration ever created and no writer ever populated, so `get_reaction_mix`
+  -- raised in any non-stub deployment. Folding them onto the post-level row
+  -- keeps the mix on the same dedup path as every other aggregate.
+  like_count Int64 DEFAULT 0,
+  love_count Int64 DEFAULT 0,
+  haha_count Int64 DEFAULT 0,
+  wow_count Int64 DEFAULT 0,
+  sad_count Int64 DEFAULT 0,
+  angry_count Int64 DEFAULT 0,
+  care_count Int64 DEFAULT 0,
   created_at DateTime,
   scraped_at DateTime,
   inserted_at DateTime DEFAULT now()
 ) ENGINE = MergeTree()
 PARTITION BY toYYYYMM(created_at)
 ORDER BY (campaign_id, created_at, post_id);
+
+-- Backfill the reaction columns on tables created before they existed
+-- (idempotent — no-ops once present). Additive only: no engine or ORDER BY
+-- change, so this needs no table rebuild on an existing deployment.
+ALTER TABLE analysis_events ADD COLUMN IF NOT EXISTS like_count  Int64 DEFAULT 0 AFTER keywords;
+ALTER TABLE analysis_events ADD COLUMN IF NOT EXISTS love_count  Int64 DEFAULT 0 AFTER like_count;
+ALTER TABLE analysis_events ADD COLUMN IF NOT EXISTS haha_count  Int64 DEFAULT 0 AFTER love_count;
+ALTER TABLE analysis_events ADD COLUMN IF NOT EXISTS wow_count   Int64 DEFAULT 0 AFTER haha_count;
+ALTER TABLE analysis_events ADD COLUMN IF NOT EXISTS sad_count   Int64 DEFAULT 0 AFTER wow_count;
+ALTER TABLE analysis_events ADD COLUMN IF NOT EXISTS angry_count Int64 DEFAULT 0 AFTER sad_count;
+ALTER TABLE analysis_events ADD COLUMN IF NOT EXISTS care_count  Int64 DEFAULT 0 AFTER angry_count;
 
 CREATE TABLE IF NOT EXISTS comment_sentiments (
   comment_id String,

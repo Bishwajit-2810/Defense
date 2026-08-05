@@ -25,7 +25,9 @@ from schemas.validator import assert_valid_output
 # ---------------------------------------------------------------------------
 # 1.1: per-comment emotion label + comment_analysis.emotion_breakdown
 # 1.2: text_sentiment / image_sentiment carry their own {label, score} object
-SCHEMA_VERSION = "1.2"
+# 1.3: Stage-2's insight-task output (refined topics/intents + `insight`) is
+#      merged instead of dropped — see _merge_stage2_labels below
+SCHEMA_VERSION = "1.3"
 
 #: Stage-1 provenance forwarded verbatim into `processing`. These answer "what
 #: actually produced this result?", which is the question every §5 finding in
@@ -43,6 +45,46 @@ _STAGE1_PROVENANCE_KEYS: tuple[str, ...] = (
     "vision_status",
     "model_versions",
 )
+
+
+def _merge_stage2_labels(
+    stage1_result: dict,
+    stage2_result: dict | None,
+) -> tuple[list, list, str | None]:
+    """Return ``(topics, intents, insight)`` with Stage-2's refinements applied.
+
+    Stage-2's *insight* task (``stage2_llm/worker._run_insight``) spends a real
+    LLM call — up to ``INSIGHT_MAX_TOKENS`` per routed post — producing
+    ``refined_topics``, ``intents`` and a one-line ``insight``. This function
+    used not to exist: ``topics`` and ``intents`` were read from
+    ``stage1_result`` only, and ``insight`` was read nowhere and was absent from
+    the output schema, so the entire task's output was paid for and then
+    discarded before it reached the API, Postgres, ClickHouse or the dashboard.
+
+    That is the same defect as the ``processing`` whitelist documented below,
+    one field-group over: one component writes, the next reads a different set,
+    and the mismatch degrades to a silent omission rather than an error.
+
+    Precedence mirrors ``post_type``: Stage 2 wins when it actually produced
+    something, otherwise Stage 1's value stands. An empty Stage-2 list means the
+    LLM declined to refine, not that Stage 1's labels should be erased.
+    """
+    topics: list = stage1_result.get("topics", [])
+    intents: list = stage1_result.get("intents", [])
+    insight: str | None = None
+
+    if stage2_result is not None:
+        s2_topics = stage2_result.get("topics")
+        if s2_topics:
+            topics = s2_topics
+        s2_intents = stage2_result.get("intents")
+        if s2_intents:
+            intents = s2_intents
+        s2_insight = stage2_result.get("insight")
+        if isinstance(s2_insight, str) and s2_insight.strip():
+            insight = s2_insight.strip()
+
+    return topics, intents, insight
 
 
 def _norm_component_sentiment(value: object) -> dict | None:
@@ -166,8 +208,10 @@ def build_canonical_result(
     emotion: dict = stage1_result.get("emotion") or {"primary": "neutral", "scores": {}}
     if emotion.get("primary") is None:
         emotion = {**emotion, "primary": "neutral"}
-    intents: list = stage1_result.get("intents", [])
-    topics: list = stage1_result.get("topics", [])
+    # topics / intents / insight: Stage-2's insight task refines the first two
+    # and produces the third. All three used to be dropped here — see
+    # _merge_stage2_labels.
+    topics, intents, insight = _merge_stage2_labels(stage1_result, stage2_result)
     entities: list = stage1_result.get("entities", [])
     brand_mentions: list = stage1_result.get("brand_mentions", [])
     keywords: list = stage1_result.get("keywords", [])
@@ -300,6 +344,9 @@ def build_canonical_result(
         "emotion": emotion,
         "intents": intents,
         "topics": topics,
+        # One-line Stage-2 insight; null when Stage 2 was skipped or the insight
+        # task did not run / returned nothing.
+        "insight": insight,
         "entities": entities,
         "brand_mentions": brand_mentions,
         "keywords": keywords,

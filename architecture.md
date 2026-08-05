@@ -406,6 +406,7 @@ since only a stored sample of comments is shipped.
   },
   "intents": ["commemorate", "express_grievance"],
   "topics": ["shapla chattar", "2013", "politics", "grief"],
+  "insight": "Commenters treat the anniversary as unfinished business, not history.",
   "entities": [
     { "text": "Shapla Chattar", "label": "EVENT", "confidence": 0.9 },
     { "text": "Awami League", "label": "ORG", "confidence": 0.86 }
@@ -470,7 +471,7 @@ since only a stored sample of comments is shipped.
     "llm_used": true,
     "llm_backend": "local",
     "llm_model": "qwen2.5:7b",
-    "schema_version": "1.2"
+    "schema_version": "1.3"
   },
   "created_at": "2026-05-04T18:19:14",
   "scraped_at": "2026-05-05T17:39:44.464"

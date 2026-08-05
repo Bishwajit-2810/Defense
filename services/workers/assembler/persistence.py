@@ -190,6 +190,33 @@ async def persist_postgres(result: dict, engine, embedding: list | None = None) 
 # ClickHouse
 # ---------------------------------------------------------------------------
 
+#: Reaction types the analytics reaction-mix aggregate reports on, in the order
+#: the ClickHouse columns are declared. The canonical result's
+#: `reaction_breakdown` is lower-cased by the normalizer, but Stage 1 re-emits it
+#: upper-cased, so the lookup below is case-insensitive rather than trusting
+#: either.
+_REACTION_TYPES: tuple[str, ...] = ("like", "love", "haha", "wow", "sad", "angry", "care")
+
+
+def _reaction_columns(result: dict) -> dict[str, int]:
+    """Map `reaction_breakdown` onto the per-type ClickHouse columns.
+
+    These columns exist because `analytics_mcp.get_reaction_mix` queried a
+    `reaction_events` table that no migration created and no writer populated —
+    the tool raised in any non-stub deployment. The data was always available on
+    the canonical result; it simply had nowhere to land.
+    """
+    raw = result.get("reaction_breakdown") or {}
+    lowered = {str(k).lower(): v for k, v in raw.items()} if isinstance(raw, dict) else {}
+    out: dict[str, int] = {}
+    for kind in _REACTION_TYPES:
+        try:
+            out[f"{kind}_count"] = int(lowered.get(kind) or 0)
+        except (TypeError, ValueError):
+            out[f"{kind}_count"] = 0
+    return out
+
+
 def _clickhouse_insert_sync(result: dict, ch_client) -> None:
     """Synchronous ClickHouse insert (called via executor)."""
     eng = result.get("engagement", {})
@@ -210,7 +237,11 @@ def _clickhouse_insert_sync(result: dict, ch_client) -> None:
     stored_comments: int = int(eng.get("stored_comments", 0))
     coverage: float = float(comment_analysis.get("coverage", 0.0))
     llm_used: bool = bool(proc.get("llm_used", False))
-    llm_model: str = proc.get("llm_model") or ""
+    # No `llm_model` here: `analysis_events` has `llm_backend` but no model
+    # column. This used to read `proc["llm_model"]` into a local that was never
+    # put in the row — dead since the column list was written. Per-model token
+    # spend is dimensioned in Redis instead (`usage:tokens:{backend}:{model}`,
+    # §5.8), which is where the cost breakdown is actually answered.
 
     # Parse timestamps; fall back to epoch if unparseable
     created_at_dt = _iso_to_dt(result.get("created_at")) or datetime(1970, 1, 1, tzinfo=timezone.utc)
@@ -238,6 +269,8 @@ def _clickhouse_insert_sync(result: dict, ch_client) -> None:
         "llm_backend": proc.get("llm_backend"),
         "topics": result.get("topics") or [],
         "keywords": result.get("keywords") or [],
+        # Per-type reaction counts — the reaction-mix aggregate's only source.
+        **_reaction_columns(result),
         "created_at": created_at_dt.replace(tzinfo=None),   # CH expects naive UTC datetimes
         "scraped_at": scraped_at_dt.replace(tzinfo=None),
     }
@@ -249,7 +282,9 @@ def _clickhouse_insert_sync(result: dict, ch_client) -> None:
         "(post_id, campaign_id, platform, media_type, language, overall_sentiment, "
         "sentiment_score, text_sentiment, image_sentiment, toxicity_score, "
         "hate_speech_score, comment_count, stored_comments, total_reactions, coverage, "
-        "llm_used, llm_backend, topics, keywords, created_at, scraped_at) VALUES",
+        "llm_used, llm_backend, topics, keywords, "
+        "like_count, love_count, haha_count, wow_count, sad_count, angry_count, care_count, "
+        "created_at, scraped_at) VALUES",
         [row],
     )
 
@@ -308,9 +343,14 @@ async def persist_clickhouse(result: dict, ch_client) -> None:
     Table ``analysis_events`` columns
     -----------------------------------
     post_id, campaign_id, platform, media_type, language,
-    overall_sentiment, sentiment_score, toxicity_score, hate_speech_score,
-    comment_count, total_reactions, stored_comments, coverage,
-    llm_used, llm_used_model, created_at, scraped_at
+    overall_sentiment, sentiment_score, text_sentiment, image_sentiment,
+    toxicity_score, hate_speech_score, comment_count, stored_comments,
+    total_reactions, coverage, llm_used, llm_backend, topics, keywords,
+    like_count, love_count, haha_count, wow_count, sad_count, angry_count,
+    care_count, created_at, scraped_at
+
+    (There is no ``llm_used_model`` column — this list named one for a while,
+    which is the kind of drift §11.3b's test now catches for table names.)
 
     Parameters
     ----------

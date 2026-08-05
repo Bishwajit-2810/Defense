@@ -350,6 +350,22 @@ class LLMClient:
 
         choice = completion.choices[0]
 
+        # Usage accumulates across the degeneracy retry and every continuation,
+        # so the cost counters see the true token spend of the recovered answer
+        # rather than only its last part. Seeded here, BEFORE the retry below can
+        # rebind `completion` — accumulating afterwards silently dropped the
+        # degenerate call's tokens from every usage counter.
+        totals = {"prompt_tokens": 0, "completion_tokens": 0, "total_tokens": 0}
+
+        def _accumulate(usage_obj) -> None:
+            if not usage_obj:
+                return
+            totals["prompt_tokens"] += usage_obj.prompt_tokens or 0
+            totals["completion_tokens"] += usage_obj.completion_tokens or 0
+            totals["total_tokens"] += usage_obj.total_tokens or 0
+
+        _accumulate(completion.usage)
+
         # JSON-mode degeneracy retry: Ollama turns `response_format=json_object`
         # into grammar-constrained decoding, and small models (gemma3:4b) satisfy
         # that grammar with the *empty* object `{}` — 2 completion tokens, a
@@ -372,19 +388,7 @@ class LLMClient:
                 temperature=temperature,
             )
             choice = completion.choices[0]
-
-        # Usage accumulates across continuations, so the cost counters see the
-        # true token spend of the recovered answer rather than only its first part.
-        totals = {"prompt_tokens": 0, "completion_tokens": 0, "total_tokens": 0}
-
-        def _accumulate(usage_obj) -> None:
-            if not usage_obj:
-                return
-            totals["prompt_tokens"] += usage_obj.prompt_tokens or 0
-            totals["completion_tokens"] += usage_obj.completion_tokens or 0
-            totals["total_tokens"] += usage_obj.total_tokens or 0
-
-        _accumulate(completion.usage)
+            _accumulate(completion.usage)
 
         content = choice.message.content or ""
         finish_reason = getattr(choice, "finish_reason", None) or "stop"
@@ -513,7 +517,21 @@ class LLMClient:
                 )
                 effective_backend = "local"
                 model_id = self._resolve_model(role, "local")
-                stream = await _open(effective_backend, model_id)
+                # A failing fallback must end the stream with an `error` event
+                # like every other failure path. Letting it propagate raises out
+                # of the async generator instead, which reaches the SSE bridge as
+                # an unhandled exception mid-response rather than as a frame the
+                # client can render.
+                try:
+                    stream = await _open(effective_backend, model_id)
+                except Exception as local_exc:
+                    self._breakers["local"].record_failure()
+                    log.error(
+                        "llm_stream_local_fallback_failed model={} error={}",
+                        model_id, local_exc,
+                    )
+                    yield {"type": "error", "error": str(local_exc)}
+                    return
             else:
                 log.error("llm_stream_open_failed backend={} error={}", effective_backend, exc)
                 yield {"type": "error", "error": str(exc)}

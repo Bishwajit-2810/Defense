@@ -792,6 +792,7 @@ def _row_to_result(row: Any) -> AnalysisResultResponse:
         emotion=r.get("emotion"),
         intents=r.get("intents", []),
         topics=r.get("topics", []),
+        insight=r.get("insight"),
         entities=r.get("entities", []),
         brand_mentions=r.get("brand_mentions", []),
         keywords=r.get("keywords", []),

@@ -259,6 +259,10 @@ class AnalysisResultResponse(BaseModel):
     emotion: Optional[Dict[str, Any]] = None
     intents: List[str] = []
     topics: List[str] = []
+    # One-line Stage-2 insight (null when Stage 2 was skipped). `intents` and
+    # `topics` above also carry Stage-2's refinements; all three used to be
+    # dropped by the assembler before reaching this response.
+    insight: Optional[str] = None
     entities: List[Dict[str, Any]] = []
     brand_mentions: List[str] = []
     keywords: List[str] = []

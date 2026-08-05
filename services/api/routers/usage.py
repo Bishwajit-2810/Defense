@@ -72,14 +72,17 @@ class UsageResponse(BaseModel):
     """Fraction of analyses that used an LLM (0.0 – 1.0)."""
 
     total_tokens: int
-    """Sum of token counts recorded in the llm_cache response JSONB.
+    """Total tokens spent, from the Redis counter ``usage:tokens:total``.
 
-    Reads ``response->>'total_tokens'`` when present; falls back to
-    ``(response->'usage'->>'total_tokens')``.
+    0 when no Stage-2 LLM call has been made in this deployment. This used to
+    claim a Postgres ``llm_cache`` table as a second source; nothing has ever
+    written that table, so the claim could not be honoured.
     """
 
     estimated_cost_usd: float
-    """Rough cost estimate: ``total_tokens / 1 000 * 0.002``."""
+    """Σ over ``tokens_by_backend_model`` of that model's price — local is 0.0
+    by definition. 0.0 (not a blended guess) when no dimensioned counters exist
+    yet; ``scope_note`` says which case applies."""
 
     llm_api_calls: int = 0
     """Fresh (non-cached) LLM API calls made by Stage-2 (Redis counter)."""
@@ -88,12 +91,11 @@ class UsageResponse(BaseModel):
     """LLM tasks served from the response cache (Redis counter)."""
 
     cache_hit_rate: float
-    """Fraction of LLM calls served from the cache vs issued fresh.
+    """Fraction of Stage-2 LLM tasks served from the response cache.
 
-    Computed as ``cached_rows / (cached_rows + fresh_calls)`` where
-    ``cached_rows`` is the size of ``llm_cache`` and ``fresh_calls`` is
-    the LLM call count that could not have been cached (approximated as
-    ``llm_calls - cached_rows`` when positive, else 0).
+    ``usage:cache_hits / (usage:llm_calls + usage:cache_hits)`` — both Redis
+    counters written by the Stage-2 worker, which is the only place that knows
+    whether a task hit the cache. 0.0 when neither counter exists yet.
     """
 
     tokens_by_backend_model: Dict[str, int] = {}
@@ -138,8 +140,8 @@ async def get_usage(
     redis: aioredis.Redis = Depends(get_redis),
     user: dict = Depends(get_current_user),
 ) -> UsageResponse:
-    """Return usage statistics drawn from the ``analysis_results`` and
-    ``llm_cache`` Postgres tables.
+    """Return usage statistics drawn from the ``analysis_results`` Postgres
+    table and the Stage-2 worker's Redis counters.
 
     **Fields returned**
 
@@ -148,11 +150,15 @@ async def get_usage(
     | ``posts_analyzed`` | ``COUNT(*)`` from ``analysis_results`` |
     | ``llm_calls`` | rows where ``result->>'llm_used' = 'true'`` or ``result->'processing'->>'llm_used' = 'true'`` |
     | ``llm_routing_rate`` | ``llm_calls / posts_analyzed`` |
-    | ``total_tokens`` | Redis ``usage:tokens:total``, else ``llm_cache.response`` JSONB |
+    | ``total_tokens`` | Redis ``usage:tokens:total`` |
     | ``tokens_by_backend_model`` | Redis ``usage:tokens:{backend}:{model}`` |
     | ``estimated_cost_usd`` | Σ per-model tokens × that model's price (local = 0) |
     | ``lane_split`` | Redis ``usage:{tokens,calls}:lane:{post,comment}`` |
-    | ``cache_hit_rate`` | Redis counters, else ``llm_cache`` row count |
+    | ``cache_hit_rate`` | Redis ``usage:cache_hits`` / (``usage:llm_calls`` + ``usage:cache_hits``) |
+
+    Every token/cost/cache figure therefore comes from Redis. There is no
+    Postgres fallback, because the ``llm_cache`` table this endpoint used to
+    read has never had a writer — see the note in the body.
 
     **Scope caveat:** ``?campaign_id=`` filters the post counts only. Token,
     cost, cache and lane figures come from process-wide Redis counters. The
@@ -208,42 +214,31 @@ async def get_usage(
     llm_calls: int = int(analysis_row["llm_calls"] or 0)
 
     # ------------------------------------------------------------------
-    # Query 2: llm_cache — total token counts and cache row count
+    # There is no Query 2 any more.
     #
-    # The response JSONB may store tokens under different keys depending
-    # on which LLM backend wrote the cache entry:
-    #   • response->>'total_tokens'                  (flat)
-    #   • response->'usage'->>'total_tokens'         (OpenAI-style usage object)
-    #   • response->'usage'->>'input_tokens' +
-    #     response->'usage'->>'output_tokens'        (Anthropic-style)
+    # This endpoint used to sum `response->>'total_tokens'` out of a Postgres
+    # `llm_cache` table, and fall back to its row count for `cache_hit_rate`.
+    # **Nothing has ever written that table** — the Stage-2 response cache is
+    # Redis-only (`llm_cache:{backend}:{model}:{task}:{hash}` keys with a 7-day
+    # TTL, see stage2_llm/cache.py). So:
+    #
+    #   * `cache_rows` and that token sum were permanently 0;
+    #   * the `cache_hit_rate` fallback branch could only ever return 0.0;
+    #   * the field docstrings and this endpoint's own source table named
+    #     `llm_cache` as a source it could not deliver — in the one subsystem
+    #     the cost-efficiency argument (§5.8 / §6.7) rests on;
+    #   * and unlike the Redis block below, the query was NOT wrapped, so a
+    #     deployment whose init-db.sql had not been applied got a 500 from
+    #     /v1/usage rather than a degraded number.
+    #
+    # Removing it is behaviour-preserving: the Redis counters already took
+    # precedence whenever they existed, and when they do not, an always-empty
+    # table contributed nothing either way.
     # ------------------------------------------------------------------
-    token_row: Any = (
-        await db.execute(
-            text(
-                """
-                SELECT
-                    COUNT(*)                                                 AS cache_rows,
-                    COALESCE(SUM(
-                        COALESCE(
-                            (response->>'total_tokens')::bigint,
-                            (response->'usage'->>'total_tokens')::bigint,
-                            (
-                                COALESCE((response->'usage'->>'input_tokens')::bigint, 0)
-                                + COALESCE((response->'usage'->>'output_tokens')::bigint, 0)
-                            )
-                        )
-                    ), 0)                                                    AS total_tokens
-                FROM llm_cache
-                """
-            )
-        )
-    ).mappings().first()
-
-    cache_rows: int = int(token_row["cache_rows"] or 0)
-    total_tokens: int = int(token_row["total_tokens"] or 0)
+    total_tokens: int = 0
 
     # ------------------------------------------------------------------
-    # Query 3: Redis usage counters maintained by the Stage-2 worker
+    # Redis usage counters maintained by the Stage-2 worker
     # (usage:llm_calls, usage:cache_hits, usage:tokens:total). These are
     # authoritative when present; the llm_cache table read above is the
     # fallback for deployments without the counters.
@@ -306,11 +301,10 @@ async def get_usage(
         for lane in ("post", "comment")
     }
 
-    # §5.8 defect 3: ?campaign_id= is honoured by ONE query out of three. The
-    # post counts below are campaign-scoped; the Redis counters and the
-    # llm_cache token/row query are process-global. Rather than return
-    # campaign-scoped posts beside system-wide tokens under a docstring that
-    # says "per-tenant", say which is which.
+    # §5.8 defect 3: ?campaign_id= is honoured by the post-count query only.
+    # The Redis counters are process-global. Rather than return campaign-scoped
+    # posts beside system-wide tokens under a docstring that says "per-tenant",
+    # say which is which.
     if campaign_id:
         scope_note = (
             f"posts_analyzed/llm_calls/llm_routing_rate are scoped to campaign "
@@ -325,13 +319,21 @@ async def get_usage(
             "estimated_cost_usd is 0.0 rather than a blended guess."
         )
 
-    # cache_hit_rate: prefer the live Redis counters; fall back to the cache
-    # row count as a proxy when no counters exist yet.
+    # cache_hit_rate comes from the Redis counters, which are the only thing
+    # that records it. The former fallback ("proxy it from the llm_cache row
+    # count") could only ever produce 0.0, since nothing writes that table — a
+    # dead branch that read as a working degradation path. Nothing has run yet
+    # is now reported as 0.0 and said so in scope_note, rather than dressed up
+    # as a measurement.
     if r_calls or r_hits:
         cache_hit_rate: float = r_hits / (r_calls + r_hits)
     else:
-        total_llm_demand: int = max(llm_calls, cache_rows)
-        cache_hit_rate = (cache_rows / total_llm_demand) if total_llm_demand > 0 else 0.0
+        cache_hit_rate = 0.0
+        scope_note += (
+            " No Stage-2 LLM calls recorded yet, so cache_hit_rate is 0.0 "
+            "because nothing has been cached or missed — not because the cache "
+            "is ineffective."
+        )
 
     log.info(
         "usage_queried",
@@ -339,7 +341,6 @@ async def get_usage(
         posts_analyzed=posts_analyzed,
         llm_calls=llm_calls,
         total_tokens=total_tokens,
-        cache_rows=cache_rows,
     )
 
     return UsageResponse(
