@@ -1746,9 +1746,9 @@ half-restored.
 
 Found while scoping §11.2. `analytics_mcp._handle_reaction_mix` read
 `FROM reaction_events` — a table **no migration creates and no writer
-populates**. `clickhouse_init.sql` defines exactly three tables
-(`analysis_events`, `comment_sentiments`, `llm_usage`); `reaction_events`
-appears nowhere else in the repository. So the tool raised in every non-stub
+populates**. `clickhouse_init.sql` defined exactly three tables at the time
+(`analysis_events`, `comment_sentiments`, `llm_usage` — the third has since been
+dropped, see §12.2); `reaction_events` appears nowhere else in the repository. So the tool raised in every non-stub
 deployment, while `ANALYTICS_MCP_STUB=true` kept returning plausible synthetic
 reaction mixes — the §5.2 pattern again (a stub masking a path that cannot run).
 
@@ -1827,3 +1827,212 @@ every one of these findings.
 **Test suite after this pass: 588 passing, 33 files** (571 after §11.1/§11.4,
 then 588 with §11.2/§11.3/§11.3b's contract tests). Each fix was mutation-tested
 by reverting it against a copy of the tree and confirming the new tests fail.
+
+---
+
+## 12. Pass 5 — fresh-eyes audit, 5 August 2026 (after Pass 4's fixes landed)
+
+A second independent read of the whole tree, starting from the assumption that
+Pass 4's fixes were correct and looking for what they *left*. Two things came out
+of it that Pass 4 could not have found, because both are consequences of Pass 4's
+own reasoning taken one step further, and one that Pass 4 verified only on paper.
+
+Method note: unlike every earlier pass, the ClickHouse and Postgres findings here
+were **executed**, not read. A throwaway `clickhouse/clickhouse-server` and
+`pgvector/pgvector:pg16` container were brought up, `clickhouse_init.sql` and
+`init-db.sql` applied, and the real `persistence.persist_clickhouse` /
+`persist_postgres` / `analytics_mcp._handle_*` / `search._keyword_search`
+functions run against them. That is what turned §12.1 from a suspicion into a
+reproduction, and it is what confirmed §11.2/§11.3b actually work.
+
+### 12.1 A degraded `api_keys` lookup returned a 500 — the thing it exists to prevent — FIXED
+
+`deps._principal_from_api_key` deliberately swallows a database error so that a
+missing `api_keys` table costs one log line rather than a failure per request.
+Its comment says so: *"Log ONCE and let the caller apply its own policy rather
+than 500-ing every request."*
+
+It did not do that. `db` is the **request's** session, and on Postgres a failed
+statement aborts the whole transaction. So the endpoint handler — which runs
+moments later on that same session — died with:
+
+```
+asyncpg.exceptions.InFailedSQLTransactionError:
+current transaction is aborted, commands ignored until end of transaction block
+```
+
+i.e. a 500 from whatever endpoint the caller was hitting, in exactly the failure
+mode the branch exists to avoid. Reproduced against Postgres 16 by renaming
+`api_keys` away and calling the real function:
+
+```
+principal: None | lookup disabled: True
+endpoint query after degraded auth -> FAILED: DBAPIError ... current transaction is aborted
+```
+
+Two things hid this. First, `_API_KEY_TABLE_USABLE` latches false after the first
+failure, so **only one request per process** shows it — the rest skip the lookup
+and behave exactly as intended. Second, the `except` block *looks* complete: it
+logs, sets the latch, and returns the documented value. Nothing about it says
+"and the caller's transaction is now unusable".
+
+Fixed with `await db.rollback()` before returning, in both handlers here (the
+lookup and the cosmetic `last_used` UPDATE — a telemetry write must not 500 a
+request either). The same shape was fixed in two sibling sites found by grepping
+for *"swallowed `db.execute` failure on a session the caller keeps using"*:
+
+| Site | What would have 500'd |
+| ---- | --------------------- |
+| `deps._principal_from_api_key` (×2) | every endpoint, on the first API-key request after the table became unreadable |
+| `analysis.get_analysis` progress block | `?include=results` — the job's actual results, after a failed status-reconciliation UPDATE |
+| `auth._lookup_user` | nothing today (login issues no further query), fixed defensively |
+
+`tests/test_auth_hardening.py` gained two tests whose stub `_Db` models the one
+behaviour that matters: **once a statement has failed, the next one fails too
+until a rollback.** Both fail when the fix is reverted.
+
+### 12.2 `llm_usage` was the mirror image of the `llm_cache` defect — FIXED
+
+§11.3 removed the Postgres `llm_cache` table on the grounds that nothing wrote
+it, and pinned the rule with a test: *no query may read a ClickHouse table the
+migration does not create.*
+
+The inverse went unpinned, and `clickhouse_init.sql` was still creating an
+`llm_usage` table (post_id, campaign_id, backend, model, task,
+prompt/completion/total_tokens, latency_ms, cache_hit) with **no writer and no
+reader anywhere in the tree** — its only other mention in the whole repository
+was a prose line in §11.3b of this document. That is the same "shape nothing
+fills" §11.3 argued against, in the other store, and it is how `llm_cache`
+started: a plausible schema sitting there until someone points a reader at it and
+gets a permanent zero.
+
+Dropped, with the same in-file note `init-db.sql` carries for `llm_cache`,
+including the `DROP TABLE IF EXISTS llm_usage;` line for existing deployments.
+Per-(backend, model, task) spend is already dimensioned in Redis
+(`usage:tokens:{backend}:{model}`, `usage:calls:task:{task}`), which is where
+§5.8's cost question is actually answered — and unlike the table, those have a
+writer.
+
+`test_every_clickhouse_table_created_has_a_writer` now asserts the other
+direction, so the pair is complete: nothing reads what isn't created, nothing is
+created that isn't written.
+
+### 12.3 `endpoints.md`'s canonical result did not validate against the output schema — FIXED
+
+`endpoints.md` §1 introduces its example as *"the JSON the whole system exists to
+produce"*. It is the document an integrator codes against. Fed to the project's
+own `assert_valid_output`:
+
+```
+Output payload failed schema validation:
+  - [text_sentiment] 'negative' is not of type 'object', 'null'
+```
+
+Four drifts, each one a field an earlier pass had deliberately changed:
+
+| Documented | Actually emitted | Introduced by |
+| ---------- | ---------------- | ------------- |
+| `"text_sentiment": "negative"` | `{label, score}` — the caption's score is not the fused overall one | schema 1.2 |
+| `"emotion": {"anger": 0.55, …}` | `{primary, scores}`; `primary` is the label consumers read | schema 1.1 |
+| `"entities": [{"type", "value"}]` | `[{text, label, confidence}]` | Stage-1 NER |
+| `"schema_version": "1.0"` | `"1.3"` | §11.1 |
+
+Plus `post_text`, `language_method`, `role_models`, `nlp_engine` and `stub_mode`
+were absent — every one of them a field added *because* something computed it and
+nothing read it (§9.11, §11.1, §11.4f). A contract document that omits them
+recreates the conditions those fixes addressed.
+
+This is §11.6's rule at one more remove. There, a component read a source that
+could not deliver. Here, the *document defining the contract* describes a shape
+the producer does not emit — and it degrades the same way: silently, into a
+consumer written against the wrong type.
+
+Fixed in `endpoints.md`, and `tests/test_documented_result_matches_schema.py`
+validates both documented examples (`endpoints.md`, `architecture.md`) against
+`output_schema.json` and against the builder's live `SCHEMA_VERSION`. Writing it
+immediately caught a second instance: `architecture.md`'s example — the one that
+was otherwise current — omitted `language_method` and the whole `processing`
+provenance block. Fixed too.
+
+### 12.4 Smaller findings — all FIXED
+
+| # | Finding | Fix |
+| - | ------- | --- |
+| a | `LLMClient.chat`'s Groq→local fallback recorded only the local **success** on the local breaker, never the failure. So a local backend failing *as the Groq fallback* never counted toward its own threshold — the local circuit could not open along the path that hits it hardest, since every Groq failure re-fires there. §11.4b fixed precisely this in `chat_stream` and left `chat`. | Wrapped; `record_failure()` on the local breaker before re-raising. |
+| b | `_track_usage` incremented `usage:calls:task:{task}` on the fresh-call path only, so a counter documented as the per-task call count measured per-task cache **misses** — and understated more the better the cache worked. `usage:llm_calls` is correctly fresh-only (it is `cache_hit_rate`'s denominator); the per-task one is not. | Incremented on the cache-hit path too; docstring says which is which. |
+| c | `persistence._clickhouse_insert_comments_sync` wrote `comment_id = str(c.get("id") or "")`. `comment_sentiments` is a `ReplacingMergeTree` keyed `(post_id, comment_id)`, so an empty id is not a harmless blank — **every id-less comment on a post collapses into one surviving row on merge.** Latent exactly as §11.4c was: all 10,272 corpus comments carry an `id`. | Falls back to `{post_id}#idx{n}`, stable per result document and unique within the post. |
+| d | Stage 2's `insight` reached the API after §11.1, but the dashboard rendered it only as an untitled row in the bottom "All Fields" dump — beside `post_id` and `created_at`, which is not where a reader looks for the analytical finding the call was paid for. The §11.1 fix stopped one hop short of the surface it was justified by. | Own section next to the summary in the detail modal, plus an `insight` row in the Trace tab. |
+| e | `usage.py` still carried a comment describing "the llm_cache table read above" as the Redis counters' fallback, and seeded `total_tokens = 0` for it to overwrite — vestiges of the removed query, i.e. the same misleading-source problem §11.3 removed the query for. | Comment rewritten to state there is no second source; `total_tokens` read straight from the counter. |
+
+### 12.5 Verified working, not changed
+
+Pass 4's ClickHouse fixes were reasoned about but never executed. Both now have
+been, against a real server:
+
+* **§11.2's dedup is correct.** Two `analysis_events` rows for one post, differing
+  `inserted_at`: `count()` returns 1 not 2, `avg(sentiment_score)` weights the
+  newest row only, and `top_posts` lists the post once. `ORDER BY inserted_at
+  DESC` inside the subquery works even though `inserted_at` is not in its SELECT
+  list, and `AS LIKE` parses despite `LIKE` being a keyword (ClickHouse skips the
+  restricted-keyword check when `AS` is explicit — worth stating, because it
+  looks like a bug and is not).
+* **§11.3b's reaction mix is correct.** The real `persist_clickhouse` wrote all
+  seven counts from a `reaction_breakdown` with upper-cased keys, and the real
+  `_handle_reaction_mix` read them back: `{'LIKE': 300, 'LOVE': 50, 'HAHA': 20,
+  'WOW': 10, 'SAD': 5, 'ANGRY': 115, 'CARE': 0}`, percentages summing to 100.
+* **§11.4e/f's search fixes are correct.** Against real Postgres: `q=%` matched
+  only the row literally containing `%`, `q=a_c` matched `a_c` and not `abc`, and
+  a post with no `post_summary` was found by its `post_text`.
+* **The router gate reads Stage 1's real shape.** Re-checked §4's fix: every rule
+  reads through a named reader accepting all three shapes the pipeline emits.
+* **`_merge_stage2_labels` precedence is right.** An empty Stage-2 list falls back
+  to Stage 1's labels rather than erasing them, and `insight: ""` becomes `null`
+  rather than an empty string — both verified against the Stage-2 worker's actual
+  `out` dict, which sets `intents`/`insight` unconditionally.
+
+Also noted, not changed:
+
+* **`assembler._process_message` flips the whole job to `failed` on one post's
+  persist failure**, before the bounded retry has been exhausted. Self-healing —
+  the next post's `_track_job_progress` writes `running` again and §9.7's counter
+  reconciliation settles it — but it does briefly contradict the counter-based
+  status §5.7 introduced, and it clears `jobs.error` on the way through.
+* **`analysis_run` applies no tenant scoping.** Any authenticated caller can
+  re-analyse any `post_id`. The privacy boundary the design defends is *which
+  backend sees the data*, not row-level isolation, so this is consistent with the
+  rest of the API — but it is a single-tenant assumption, not an oversight, and
+  should be said out loud rather than discovered.
+* **`get_task_flags` defaults `want_summary=True` while the gate routes ~16%.**
+  The comment says *"the product requirement is a summary + sentiment for every
+  post"*, and the majority of posts never reach Stage 2 to get one. Both
+  statements are true and they are in tension; §6.7's lane-split argument is the
+  resolution, but the comment reads as a promise the gate does not keep.
+
+### 12.6 The theme of this pass
+
+§11.6's rule was *a read whose source cannot deliver fails silently*. Pass 5's
+three findings sharpen it once more, in a direction worth stating for the
+defense:
+
+> **A degradation path is a code path. If it has never been executed, it is not a
+> fallback — it is an untested branch that runs only when things are already
+> going wrong.**
+
+§12.1 is the clearest case: a hand-written `except` block whose stated purpose was
+*avoid a 500*, which produced a 500, on the one request per process where it
+mattered. §12.2 and §12.3 are the same species as Pass 4's, found by asking what
+the *inverse* of each Pass 4 assertion would be — the test said "nothing reads
+what isn't created" and the gap was "something is created that isn't written";
+the schema was enforced on the producer and not on the document describing it.
+
+The practical lesson, and the one that generalises past this codebase: Pass 4
+reasoned about the ClickHouse fixes and got them right, but *reasoning was the
+only evidence*. Bringing up a throwaway container took under a minute and
+converted three "should work" claims into three demonstrated ones — plus one
+reproduction (§12.1) that reading had only suggested. Every remaining unexecuted
+path in this system is a §12.1 waiting to be found.
+
+**Test suite after this pass: 597 passing, 34 files** (588 → 591 with §12.1's
+rollback tests, → 592 with §12.2's writer-contract test, → 597 with §12.3's
+documented-schema tests). Each fix was mutation-tested by reverting it and
+confirming the new tests fail.

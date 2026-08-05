@@ -50,16 +50,32 @@ def _reset_api_key_lookup():
     deps._API_KEY_TABLE_USABLE = True
 
 class _Db:
-    """Returns a preset row for the first query, then None."""
+    """Returns a preset row for the first query, then None.
 
-    def __init__(self, row=None, raises=False):
+    Models the one behaviour that matters for the rollback tests below: once a
+    statement has failed, Postgres refuses every later statement on the same
+    transaction until it is rolled back ("current transaction is aborted").
+    """
+
+    def __init__(self, row=None, raises=False, fail_after=None):
         self._row = row
         self._raises = raises
+        # Queries 1..n succeed, then the next ONE fails (and aborts the
+        # transaction). A later query succeeds again only after a rollback.
+        self._fail_after = fail_after
         self.queries: list[str] = []
+        self.rollbacks = 0
+        self._aborted = False
 
     async def execute(self, stmt, params=None):
         self.queries.append(str(stmt))
-        if self._raises:
+        if self._aborted:
+            raise RuntimeError("current transaction is aborted, commands ignored")
+        if self._raises or (
+            self._fail_after is not None and len(self.queries) > self._fail_after
+        ):
+            self._aborted = True
+            self._fail_after = None       # one failure, then honest again
             raise RuntimeError("database is down")
         row, self._row = self._row, None
 
@@ -68,6 +84,10 @@ class _Db:
                 return row
 
         return _R()
+
+    async def rollback(self):
+        self.rollbacks += 1
+        self._aborted = False
 
 
 class _Redis:
@@ -179,6 +199,43 @@ async def test_registered_key_authenticates_with_its_tenant(monkeypatch):
         sse_ticket=None, db=_Db(row=("acme", "user", "dash")), redis=_Redis(),
     )
     assert principal["tenant_id"] == "acme"
+
+
+# ---------------------------------------------------------------------------
+# A degraded api_keys lookup must not poison the request's transaction
+# ---------------------------------------------------------------------------
+# The lookup deliberately swallows a DB error so a missing `api_keys` table costs
+# one log line rather than a 500 per request. But `db` is the REQUEST's session:
+# on Postgres the failed SELECT aborts its transaction, so the endpoint handler's
+# own queries then died with `InFailedSQLTransactionError` and the caller got the
+# 500 anyway — only on the first request per process, because the latch below
+# skips the lookup afterwards. Verified against a real Postgres 16 before the fix.
+
+
+@pytest.mark.asyncio
+async def test_failed_api_key_lookup_rolls_back_so_the_request_can_continue():
+    db = _Db(fail_after=0)   # the api_keys SELECT itself fails
+
+    assert await _principal_from_api_key(db, "any-key") is None
+    assert db.rollbacks == 1, "the aborted transaction was left aborted"
+
+    # What the endpoint handler does next, on the same session.
+    result = await db.execute("SELECT count(*) FROM analysis_results")
+    assert result is not None
+
+
+@pytest.mark.asyncio
+async def test_failed_last_used_update_rolls_back_but_still_authenticates():
+    """`last_used` is telemetry; a cosmetic write must not 500 the request."""
+    # Query 1 (the SELECT) succeeds; query 2 (the last_used UPDATE) fails.
+    db = _Db(row=("acme", "user", "dash"), fail_after=1)
+
+    principal = await _principal_from_api_key(db, "some-raw-key")
+    assert principal is not None and principal["tenant_id"] == "acme"
+    assert db.rollbacks == 1
+
+    result = await db.execute("SELECT count(*) FROM analysis_results")
+    assert result is not None
 
 
 # ---------------------------------------------------------------------------

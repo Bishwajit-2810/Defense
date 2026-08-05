@@ -332,14 +332,28 @@ class LLMClient:
                 )
                 effective_backend = "local"
                 model_id = self._resolve_model(role, "local")
-                completion = await self._call_api(
-                    client=self._get_client("local"),
-                    model=model_id,
-                    messages=messages,
-                    response_format=response_format,
-                    max_tokens=max_tokens,
-                    temperature=temperature,
-                )
+                # Record the local outcome on the local breaker either way. Only
+                # the success used to be recorded, so a local backend that failed
+                # *as the Groq fallback* never counted toward its own failure
+                # threshold — the local circuit could not open along the one path
+                # that hits it hardest (every Groq failure re-fires at local), and
+                # `chat_stream` had the same gap until it was fixed there.
+                try:
+                    completion = await self._call_api(
+                        client=self._get_client("local"),
+                        model=model_id,
+                        messages=messages,
+                        response_format=response_format,
+                        max_tokens=max_tokens,
+                        temperature=temperature,
+                    )
+                except Exception as local_exc:
+                    self._breakers["local"].record_failure()
+                    log.error(
+                        "llm_local_fallback_failed role={} model={} error={}",
+                        role, model_id, local_exc,
+                    )
+                    raise
                 self._breakers["local"].record_success()
             else:
                 log.error(

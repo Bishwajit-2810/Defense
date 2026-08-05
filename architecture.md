@@ -388,6 +388,7 @@ since only a stored sample of comments is shipped.
   "platform_post_id": "4460219584209360",
   "media_type": "PHOTO_TEXT",
   "language": "bn",
+  "language_method": "fasttext",
   "post_text": "শাপলা চত্বরের সেই রক্তাক্ত রাতের কথা আজও ভুলিনি।",
   "post_type": "commemoration",
   "post_summary": "শাপলা চত্বরের ঘটনার স্মরণে একটি আবেগঘন বাংলা পোস্ট; ছবিতে সেই রাতের দৃশ্য। পোস্ট ও মন্তব্যে শোক ও আওয়ামী লীগের প্রতি ক্ষোভ প্রবল।",
@@ -471,6 +472,10 @@ since only a stored sample of comments is shipped.
     "llm_used": true,
     "llm_backend": "local",
     "llm_model": "qwen2.5:7b",
+    "role_models": { "summary": "qwen2.5:7b", "stage2": "qwen2.5:7b", "vlm": "qwen3-vl:4b" },
+    "nlp_engine": "llm",
+    "stub_mode": false,
+    "degraded_components": [],
     "schema_version": "1.3"
   },
   "created_at": "2026-05-04T18:19:14",

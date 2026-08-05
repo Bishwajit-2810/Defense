@@ -311,7 +311,14 @@ def _clickhouse_insert_comments_sync(result: dict, ch_client) -> int:
 
     rows = [
         {
-            "comment_id": str(c.get("id") or ""),
+            # `comment_sentiments` is a ReplacingMergeTree keyed
+            # (post_id, comment_id), so an EMPTY comment_id is not a harmless
+            # blank — every id-less comment on a post collapses into one
+            # surviving row on merge, silently. Fall back to the row's position,
+            # which is stable for a given result document and unique within the
+            # post. Latent today (all 10,272 corpus comments carry an `id`), the
+            # same way `m.facebook.com` was latent in platform_from_url.
+            "comment_id": str(c.get("id") or "") or f"{post_id}#idx{i}",
             "post_id": post_id,
             "campaign_id": campaign_id,
             "platform": platform,
@@ -322,7 +329,7 @@ def _clickhouse_insert_comments_sync(result: dict, ch_client) -> int:
             "likes": int(c.get("likes") or 0),
             "author": c.get("author"),
         }
-        for c in comments
+        for i, c in enumerate(comments)
     ]
 
     ch_client.execute(

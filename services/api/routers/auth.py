@@ -90,6 +90,14 @@ async def _lookup_user(db: AsyncSession, username: str) -> dict | None:
         ).first()
     except Exception as exc:
         log.warning("user_lookup_failed", error=str(exc))
+        # Roll back before returning: a failed statement aborts the request's
+        # Postgres transaction, so anything else this request runs on the same
+        # session would fail with "current transaction is aborted" rather than
+        # taking the degraded path this `return None` is here to enable.
+        try:
+            await db.rollback()
+        except Exception:
+            pass
         return None
     if row is None:
         return None

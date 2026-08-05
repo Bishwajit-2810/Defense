@@ -235,13 +235,13 @@ async def get_usage(
     # precedence whenever they existed, and when they do not, an always-empty
     # table contributed nothing either way.
     # ------------------------------------------------------------------
-    total_tokens: int = 0
 
     # ------------------------------------------------------------------
     # Redis usage counters maintained by the Stage-2 worker
-    # (usage:llm_calls, usage:cache_hits, usage:tokens:total). These are
-    # authoritative when present; the llm_cache table read above is the
-    # fallback for deployments without the counters.
+    # (usage:llm_calls, usage:cache_hits, usage:tokens:total). These are now the
+    # ONLY source for every token/cost/cache figure — there is no second source
+    # to fall back to, so a Redis failure below reports 0 and says so in
+    # `scope_note` rather than silently substituting another number.
     # ------------------------------------------------------------------
     r_calls = r_hits = r_tokens = 0
     tokens_by_backend_model: dict[str, int] = {}
@@ -266,8 +266,9 @@ async def get_usage(
     except Exception as exc:
         log.warning("usage_redis_counters_failed", error=str(exc))
 
-    if r_tokens:
-        total_tokens = r_tokens
+    # `usage:tokens:total` is the whole story now, so read it straight rather
+    # than conditionally overwriting a zero seeded from the removed table.
+    total_tokens: int = r_tokens
 
     # ------------------------------------------------------------------
     # Derived metrics

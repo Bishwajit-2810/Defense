@@ -575,6 +575,14 @@ async def get_analysis(
                 )
     except Exception as exc:
         log.warning("job_progress_read_failed", analysis_id=analysis_id, error=str(exc))
+        # The reconciliation UPDATE above runs on the request's session, so if it
+        # is the thing that failed, the transaction is aborted and every query
+        # below (`include=results`) would raise "current transaction is aborted".
+        # Progress is best-effort; the results are not.
+        try:
+            await db.rollback()
+        except Exception:
+            pass
 
     results: list[AnalysisResultResponse] | None = None
     wants_results = include and "results" in include.split(",")

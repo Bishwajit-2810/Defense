@@ -846,6 +846,20 @@ function renderPostModal(r) {
     + '</div>';
   }
 
+  // ---- Insight ----
+  // Stage 2's one-line analytical takeaway (null when Stage 2 was skipped).
+  // §11.1 restored this to the canonical result and the API, but it arrived here
+  // only as an untitled row in the "All Fields" dump at the bottom — next to
+  // post_id and created_at, which is not where a reader looks for the finding.
+  if (r.insight) {
+    html += '<div class="modal-section">'
+      + '<div class="modal-section-title">Insight'
+      + ' <span class="tag tag-sm" title="produced by the Stage-2 LLM insight task">stage 2</span>'
+      + '</div>'
+      + '<div class="summary-box">' + escHtml(r.insight) + '</div>'
+    + '</div>';
+  }
+
   // ---- Sentiment breakdown ----
   var textSent  = r.text_sentiment  || {};
   var imageSent = r.image_sentiment || null;
@@ -947,7 +961,9 @@ function renderPostModal(r) {
   var skip = new Set(['post_summary','text_sentiment','image_sentiment','overall_sentiment',
     'reaction_breakdown','comment_analysis','engagement','processing','entities','keywords',
     'topics','intents','brand_mentions','language_mix','post_summary_grounding','post_summary_source',
-    'post_summary_truncated','image_analysis','emotion','confidence']);
+    'post_summary_truncated','image_analysis','emotion','confidence',
+    // Rendered in its own section above, not as a raw metadata row.
+    'insight']);
 
   var metaFields = [];
   Object.keys(r).forEach(function(k) {
@@ -4228,6 +4244,7 @@ async function loadTraceResult() {
       + '<dt>post_type</dt><dd>' + traceValue('s', r.post_type) + '</dd>'
       + '<dt>post_summary</dt><dd>' + traceValue('long', r.post_summary || null) + '</dd>'
       + '<dt>summary_lang</dt><dd>' + traceValue('s', r.post_summary_lang) + '</dd>'
+      + '<dt>insight</dt><dd>' + traceValue('long', r.insight || null) + '</dd>'
       + '<dt>grounding</dt><dd>' + traceValue('a', r.post_summary_grounding) + '</dd>'
       + '<dt>confidence</dt><dd>' + traceValue('o', (conf && typeof conf === 'object') ? conf : { overall: conf }) + '</dd>'
       + '<dt>comments</dt><dd>' + traceValue('n', ca.analyzed) + ' analyzed, coverage ' + traceValue('n', ca.coverage) + '</dd>'

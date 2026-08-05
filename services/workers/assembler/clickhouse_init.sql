@@ -67,17 +67,19 @@ ORDER BY (post_id, comment_id);
 -- labels existed (idempotent — no-op once the column is present).
 ALTER TABLE comment_sentiments ADD COLUMN IF NOT EXISTS emotion LowCardinality(String) DEFAULT 'neutral' AFTER sentiment_score;
 
-CREATE TABLE IF NOT EXISTS llm_usage (
-  post_id String,
-  campaign_id String,
-  backend LowCardinality(String),
-  model String,
-  task String,
-  prompt_tokens Int32,
-  completion_tokens Int32,
-  total_tokens Int32,
-  latency_ms Int32,
-  cache_hit UInt8,
-  created_at DateTime DEFAULT now()
-) ENGINE = MergeTree()
-ORDER BY (created_at, backend, task);
+-- There is deliberately no `llm_usage` table here.
+--
+-- One used to be created (post_id, campaign_id, backend, model, task,
+-- prompt/completion/total_tokens, latency_ms, cache_hit) and **nothing ever
+-- wrote or read it** — grep the tree: the only other mention was a prose line in
+-- PROJECT_ASSESSMENT.md. That is the exact defect §11.3 removed the Postgres
+-- `llm_cache` table for, one store over, and leaving it standing would have kept
+-- a plausible-looking schema around for a reader to be pointed at later.
+--
+-- Per-(backend, model, task) LLM spend is dimensioned in Redis instead —
+-- `usage:tokens:{backend}:{model}`, `usage:tokens:lane:{lane}`,
+-- `usage:calls:task:{task}`, written by stage2_llm/worker._track_usage and read
+-- by GET /v1/usage (§5.8). That is where the cost breakdown is actually
+-- answered, and unlike this table it has a writer.
+--
+-- Existing deployments can clean it up with:  DROP TABLE IF EXISTS llm_usage;

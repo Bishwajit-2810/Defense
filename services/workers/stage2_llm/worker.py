@@ -230,7 +230,9 @@ async def _track_usage(
             it with.
         usage:tokens:lane:{lane}         — post-level vs comment-level split.
         usage:calls:lane:{lane}
-        usage:calls:task:{task}
+        usage:calls:task:{task}       — per-task task count, cached and fresh
+            alike (a cached task still ran; only `usage:llm_calls` is
+            fresh-calls-only, because that is what cache_hit_rate divides by).
 
     Add the dimension BEFORE a measurement run, or the run has to be repeated.
     """
@@ -238,6 +240,13 @@ async def _track_usage(
         if cache_hit:
             await redis.incr("usage:cache_hits")
             await redis.incr(f"usage:cache_hits:lane:{lane}")
+            # A cached task is still a task. This counter used to be incremented
+            # on the fresh-call path only, so `usage:calls:task:{task}` measured
+            # cache MISSES per task while reading as "how often each task runs" —
+            # and the better the cache works, the more it understated. The global
+            # `usage:llm_calls` is deliberately left alone: it means "fresh API
+            # calls", which is what /v1/usage's cache_hit_rate denominator needs.
+            await redis.incr(f"usage:calls:task:{task}")
             return
         await redis.incr("usage:llm_calls")
         await redis.incr(f"usage:calls:lane:{lane}")

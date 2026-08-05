@@ -35,6 +35,8 @@ This is the JSON the whole system exists to produce:
 
   // ---- language & summary (Stage-2 LLM/VLM) ---------------------------
   "language":               "bn",                   // bn | en | banglish | mixed | und
+  "language_method":        "fasttext",             // which detector produced `language` (fasttext | script_heuristic)
+  "post_text":              "তেলের দাম আবার বাড়ল…",   // the post's own caption, as ingested; null for image-only posts
   "post_type":              "political",            // complaint|news|opinion|promotion|humor|personal|political|religious|other
   "post_summary":           "পোস্টটি জ্বালানি তেলের মূল্যবৃদ্ধি নিয়ে সরকারের সমালোচনা করছে…",
   "post_summary_lang":      "bn",                   // language the summary was written in
@@ -47,16 +49,22 @@ This is the JSON the whole system exists to produce:
   // so an absent image term does NOT shrink the text signal toward neutral.
   "overall_sentiment":  "negative",                 // positive | negative | neutral | mixed
   "sentiment_score":    -0.62,                      // -1.0 … 1.0
-  "text_sentiment":     "negative",
-  "image_sentiment":    null,                       // null for text-only posts AND whenever no vision model produced a verdict
+  // Since schema 1.2 each component carries its OWN {label, score} — the
+  // caption's score is not the fused overall one. null, not a bare label:
+  // text_sentiment is null for a null-caption post, image_sentiment for a
+  // text-only one or whenever no vision model produced a verdict.
+  "text_sentiment":     { "label": "negative", "score": -0.71 },
+  "image_sentiment":    null,
   "baseline_sentiment": -0.5,                       // upstream platform's own score (for comparison)
 
   // ---- classification ---------------------------------------------------
-  "emotion":   { "anger": 0.55, "sadness": 0.2, "joy": 0.05 },
+  // `emotion` is {primary, scores}, not a bare score map: `primary` is the
+  // label consumers read, and it is never null (defaults to "neutral").
+  "emotion":   { "primary": "anger", "scores": { "anger": 0.55, "sadness": 0.2, "joy": 0.05 } },
   "intents":   ["criticism", "mobilization"],
   "topics":    ["fuel prices", "government policy"],
   "insight":   "Anger is aimed at the pricing decision, not at the fuel shortage itself.",  // Stage-2 only; null when Stage 2 was skipped
-  "entities":  [ { "type": "ORG", "value": "BPC" } ],
+  "entities":  [ { "text": "BPC", "label": "ORG", "confidence": 0.88 } ],
   "brand_mentions": [],
   "keywords":  ["তেল", "দাম", "সরকার"],
   "toxicity_score":    0.12,                        // 0.0 … 1.0
@@ -114,7 +122,14 @@ This is the JSON the whole system exists to produce:
     "llm_used":    true,                            // false = Stage-1-only (cheap path)
     "llm_backend": "local",                         // local | groq
     "llm_model":   "qwen3-vl:4b",
-    "schema_version": "1.0"
+    // {role: resolved model id} — summarization and classification no longer
+    // share a model, so one `llm_model` cannot attribute the summary (§6.5).
+    "role_models": { "summary": "qwen2.5:7b", "stage2": "qwen2.5:7b" },
+    // Stage-1 provenance, forwarded verbatim: what actually produced this row.
+    "nlp_engine":  "llm",                           // stub | models | llm
+    "stub_mode":   false,                           // MODEL_STUB_MODE — true means the embedding is a hash, not a vector
+    "degraded_components": [],                      // real-mode components that fell back (§9.10)
+    "schema_version": "1.3"
   },
   "created_at": "2026-06-12T10:00:00Z",
   "scraped_at": "2026-06-10T08:00:00Z"

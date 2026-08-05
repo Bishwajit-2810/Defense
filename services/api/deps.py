@@ -230,7 +230,22 @@ async def _principal_from_api_key(db: AsyncSession, raw_key: str) -> dict | None
     except Exception as exc:
         # No table yet, or the DB is down. Log ONCE and let the caller apply its
         # own policy rather than 500-ing every request.
+        #
+        # The ROLLBACK is not optional. On Postgres a failed statement aborts the
+        # whole transaction, and this session is the request's session — the
+        # endpoint handler runs its own queries on it moments later. Without the
+        # rollback, swallowing this error only *looked* like graceful
+        # degradation: the request went on to die with
+        # `InFailedSQLTransactionError: current transaction is aborted`, i.e. a
+        # 500 from whatever endpoint the caller was hitting, in the exact failure
+        # mode this branch exists to avoid. Only the first request per process
+        # showed it (the flag below skips the lookup afterwards), which is what
+        # made it easy to miss.
         _API_KEY_TABLE_USABLE = False
+        try:
+            await db.rollback()
+        except Exception:
+            pass
         log.warning(
             "api_key_lookup_failed_disabling_lookup",
             error=str(exc),
@@ -249,7 +264,13 @@ async def _principal_from_api_key(db: AsyncSession, raw_key: str) -> dict | None
             {"h": key_hash},
         )
     except Exception:
-        pass  # last_used is telemetry, not authorization
+        # last_used is telemetry, not authorization — but a failed UPDATE still
+        # aborts the request's transaction, so the endpoint's own queries would
+        # 500 on a purely cosmetic write. Roll back and carry on authenticated.
+        try:
+            await db.rollback()
+        except Exception:
+            pass
     return {
         "sub": f"api_key:{row[2] or 'unnamed'}",
         "auth_method": "api_key",

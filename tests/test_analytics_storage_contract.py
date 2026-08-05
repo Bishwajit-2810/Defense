@@ -218,3 +218,39 @@ def test_nothing_writes_a_postgres_llm_cache_table():
         if re.search(r'INSERT\s+INTO\s+llm_cache', p.read_text(encoding='utf-8'), re.IGNORECASE)
     ]
     assert not hits, f"a writer for the Postgres llm_cache table appeared in {hits}"
+
+
+# ---------------------------------------------------------------------------
+# 4. The inverse: no migration may create a ClickHouse table nothing writes
+# ---------------------------------------------------------------------------
+# §11.3/§11.3b pinned "no query reads a table nothing creates". The mirror image
+# went unpinned, and `llm_usage` was sitting in clickhouse_init.sql the whole
+# time with no writer and no reader anywhere in the tree — a schema whose only
+# other mention was a prose line in the assessment. An unfilled shape is how the
+# `llm_cache` defect started: it looks like a source until someone points a
+# reader at it. Both directions are asserted now.
+
+
+def _python_sources() -> list[Path]:
+    return [
+        p
+        for d in ('services', 'mcp_servers', 'libs', 'eval')
+        for p in (_REPO / d).rglob('*.py')
+    ]
+
+
+def test_every_clickhouse_table_created_has_a_writer():
+    created = set(re.findall(r'CREATE TABLE IF NOT EXISTS\s+(\w+)', _CH_INIT, re.IGNORECASE))
+    assert created, 'no CREATE TABLE found — the parser is wrong, not the schema'
+
+    written: set[str] = set()
+    for path in _python_sources():
+        src = path.read_text(encoding='utf-8')
+        written |= {t.lower() for t in re.findall(r'INSERT\s+INTO\s+([a-z_][a-z0-9_]*)', src, re.IGNORECASE)}
+
+    unwritten = {t for t in created if t.lower() not in written}
+    assert not unwritten, (
+        f"clickhouse_init.sql creates table(s) nothing writes: {sorted(unwritten)}. "
+        f"`llm_usage` was one of these — created, never written, never read. "
+        f"Either add the writer or drop the table; do not leave a shape nothing fills."
+    )
