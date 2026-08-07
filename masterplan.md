@@ -18,6 +18,22 @@
 > image bytes are reachable, so post sentiment is a text measurement); and cost is
 > **comment-dominated** (85–96% of LLM calls), so the routing gate is no longer
 > the dominant lever.
+>
+> Four more, from the sixth audit pass (§13) — each one a place where this
+> document describes a mechanism that exists but did not reach its consumer:
+>
+> - **Cost telemetry covers every caller, and the per-post figure is
+>   `pipeline_tokens`.** `lane_split` has five lanes; `total_tokens` now includes
+>   chat and agent spend, which scales with questions asked, not corpus size.
+> - **The privacy lock is enforced at the enqueue boundary**, not by the workers —
+>   they have no database and no tenant. The API resolves each job's backend,
+>   applies the lock, and stamps the decision into the envelope.
+> - **Near-duplicate reuse composes rather than copies**, and reuses post-level
+>   analysis only: the comment thread of a caption-matched post is its own and is
+>   reported unanalysed.
+> - **Cluster summarization delivers output.** The per-cluster LLM calls this
+>   document describes as the cost lever were, until §13.1, computed and then
+>   stripped by the API's response model.
 
 A single, self-contained master document for the social-media analysis smart
 layer. It consolidates the whole design — overview, architecture, alternatives,

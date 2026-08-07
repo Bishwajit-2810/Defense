@@ -254,6 +254,11 @@ def _build_result(
         "entities": text_result.get("entities", []),
         "keywords": text_result.get("keywords", []),
         "embedding": text_result.get("embedding"),
+        # Travels WITH the vector. The stub is the same 768 dims as a real
+        # embedding, so persistence's dimension check classified every stub in
+        # the default configuration as real — the inverse of what the
+        # `embedding_is_stub` column exists to disclose (§13.2).
+        "embedding_is_stub": text_result.get("embedding_is_stub"),
 
         # --- Vision ---
         "image_analysis": image_analysis,
@@ -559,14 +564,20 @@ async def run_worker() -> None:
             # Follow the dashboard LLM backend toggle (PUT /v1/config/llm) so the
             # stage1 LLM uses the same backend as Stage 2. Blank/invalid => None
             # => LLM_BACKEND default. Only read when llm_mode is on.
-            backend_override = None
+            #
+            # This is the FALLBACK. Each envelope may carry a backend the API
+            # already resolved and policy-checked for its tenant, and that wins
+            # per message below — the toggle is global, so a privacy-locked
+            # tenant following it was exactly how the pipeline escaped the lock
+            # (PROJECT_ASSESSMENT §13.5).
+            toggle_backend = None
             if registry.llm_mode:
                 try:
                     raw_backend = await redis.get(LLM_BACKEND_CONFIG_KEY)
                     if raw_backend in ("local", "groq"):
-                        backend_override = raw_backend
+                        toggle_backend = raw_backend
                 except Exception:
-                    backend_override = None
+                    toggle_backend = None
 
             # messages: [(stream_name, [(msg_id, {field: value, ...}), ...])]
             for _stream, entries in messages:
@@ -577,6 +588,15 @@ async def run_worker() -> None:
                     try:
                         envelope: dict[str, Any] = json.loads(fields.get("data", "{}"))
                         post: dict[str, Any] = envelope.get("raw_post", {})
+
+                        # Per-message backend: the API stamped the tenant's
+                        # policy-checked decision into `options` at enqueue time.
+                        stamped_backend = (envelope.get("options") or {}).get("llm_backend")
+                        backend_override = (
+                            stamped_backend
+                            if stamped_backend in ("local", "groq")
+                            else toggle_backend
+                        )
                         post_id = envelope.get("post_id", "unknown")
                     except json.JSONDecodeError as exc:
                         log.error(

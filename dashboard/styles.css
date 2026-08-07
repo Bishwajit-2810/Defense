@@ -1487,7 +1487,83 @@ canvas {
 .login-subtitle {
   font-size: 0.875rem;
   color: var(--text-secondary);
-  margin-bottom: 24px;
+  margin-bottom: 20px;
+}
+
+/* Sign in / Create account switch. A segmented control rather than two links:
+   the two modes are peers, and which one is active has to be unmistakable on a
+   card that is otherwise all inputs. */
+.auth-mode-tabs {
+  display: flex;
+  gap: 4px;
+  padding: 4px;
+  margin-bottom: 20px;
+  background: var(--bg-subtle);
+  border: 1px solid var(--border-color);
+  border-radius: var(--border-radius);
+}
+
+.auth-mode-tab {
+  flex: 1;
+  padding: 8px 10px;
+  font-family: inherit;
+  font-size: 0.8125rem;
+  font-weight: 600;
+  color: var(--text-secondary);
+  background: none;
+  border: none;
+  border-radius: calc(var(--border-radius) - 3px);
+  cursor: pointer;
+  transition: background var(--transition), color var(--transition);
+}
+
+.auth-mode-tab:hover:not(:disabled):not(.active) { color: var(--text-primary); }
+
+.auth-mode-tab.active {
+  color: var(--text-on-accent);
+  background: var(--accent);
+  box-shadow: var(--shadow-sm);
+}
+
+/* Signup disabled server-side (ALLOW_SIGNUP=false and accounts already exist).
+   Shown-but-unavailable rather than hidden, so the reason can live in the
+   tooltip instead of leaving the user wondering where registration went. */
+.auth-mode-tab:disabled {
+  opacity: 0.45;
+  cursor: not-allowed;
+}
+
+.auth-mode-tab:focus-visible {
+  outline: none;
+  box-shadow: var(--focus-ring);
+}
+
+/* Field-level rules (username charset, password length). Sourced from
+   GET /v1/auth/config where the server has an opinion, so the hint cannot drift
+   from what actually validates. */
+.form-hint {
+  font-size: 0.75rem;
+  color: var(--text-muted);
+  margin-top: 4px;
+}
+
+.form-hint code {
+  font-family: var(--font-mono);
+  font-size: 0.7rem;
+  padding: 0 2px;
+}
+
+/* "You are about to create the admin account" — a state worth flagging, since
+   it happens exactly once per deployment. */
+.auth-note {
+  font-size: 0.75rem;
+  line-height: 1.5;
+  color: var(--text-primary);
+  background: var(--accent-light);
+  border: 1px solid var(--accent-border);
+  border-radius: var(--border-radius);
+  padding: 8px 10px;
+  margin-bottom: 16px;
 }
 
 .login-footer {

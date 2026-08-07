@@ -101,6 +101,101 @@ def _norm_component_sentiment(value: object) -> dict | None:
     return None
 
 
+#: Fields of a canonical result that describe THE POST, not its analysis. On the
+#: near-duplicate reuse path these must all come from the new post — they are
+#: facts about a specific upload, and two posts that share a caption share none
+#: of them (PROJECT_ASSESSMENT §13.3).
+_POST_IDENTITY_FIELDS: tuple[str, ...] = (
+    "post_id", "campaign_id", "platform", "platform_post_id", "media_type",
+    "post_text", "created_at", "scraped_at", "engagement", "reaction_breakdown",
+    "baseline_sentiment", "baseline_viral_potential",
+)
+
+
+def build_reused_result(
+    normalized_post: dict,
+    source_result: dict,
+    source_post_id: str,
+    score: float,
+) -> dict:
+    """Compose a canonical result for a near-duplicate from a prior analysis.
+
+    Near-duplicate reuse skips Stage 1 and Stage 2 for a post whose caption is
+    within cosine threshold of one already analysed. Ingestion used to implement
+    that as a **verbatim SQL row copy**, which carried three defects (§13.3):
+
+    * the copied document kept the SOURCE's ``post_id``, ``engagement`` and
+      ``reaction_breakdown`` — facts about a different upload. ``/v1/search``
+      returns that document, so a hit on the new post described the old one;
+    * ``embedding_is_stub`` was left out of the INSERT column list, so an
+      honestly-flagged stub row produced a copy claiming to be a real vector;
+    * only Postgres was written, so reused posts were missing from every
+      ClickHouse analytics aggregate while still counting in Postgres-backed
+      reports.
+
+    Composing here instead means the reused post takes the same validation and
+    the same three-store fan-out as any other, with the post's own facts intact.
+
+    **The comment analysis is NOT reused.** A near-duplicate is a caption match;
+    the two threads are different people saying different things, and carrying
+    the source's per-comment labels over would be the §13.3 defect in its worst
+    form — fabricated data about comments that were never read. The new post's
+    thread is reported as unanalysed, which is true, and ``processing.reused_from``
+    says why.
+    """
+    # The canonical result's field names are a superset of the ones
+    # `build_canonical_result` reads out of a stage-1 and a stage-2 result
+    # (`overall_sentiment`, `topics`, `post_summary`, `post_type`, …), so the
+    # prior analysis can simply be fed back in as those inputs. That means the
+    # identity, engagement and reaction fields are taken from `normalized_post`
+    # by the same code that handles every other post — the reuse path does not
+    # get its own, subtly different, notion of which fields belong to the post.
+    analysis = dict(source_result)
+
+    # The comment thread was never analysed: a near-duplicate is a CAPTION
+    # match, and these are different people saying different things. Inheriting
+    # the source's per-comment labels would be fabricated data about comments
+    # nobody read.
+    n_comments = len(normalized_post.get("comments") or [])
+    analysis["comment_analysis"] = {
+        "analyzed": 0,
+        "coverage": 0.0,
+        "sentiment_breakdown": {"positive": 0, "negative": 0, "neutral": 0},
+        "provenance": {
+            "note": (
+                "not analysed — this post's analysis was reused from a "
+                "near-duplicate caption; its comment thread is its own"
+            ),
+            "stored_comments": n_comments,
+        },
+    }
+
+    # Only claim Stage 2 ran if it ran for the SOURCE. `llm_used` is derived from
+    # whether a stage-2 result was supplied, so handing one over unconditionally
+    # would report an LLM call that never happened — on a corpus where §5.8
+    # counts exactly that.
+    source_proc = source_result.get("processing") or {}
+    stage2_input = analysis if source_proc.get("llm_used") else None
+
+    result = build_canonical_result(normalized_post, analysis, stage2_input)
+
+    # Provenance, so a reused result is never mistaken for a fresh one.
+    processing = dict(result.get("processing") or {})
+    processing["reused_from"] = {
+        "source_post_id": source_post_id,
+        "similarity": round(float(score), 4),
+        "reused": "post_level_analysis_only",
+    }
+    # No stage ran for THIS post. Carrying the source's timings would corrupt any
+    # latency figure taken over the corpus.
+    processing["stage1_ms"] = 0
+    processing["stage2_ms"] = 0
+    result["processing"] = processing
+
+    assert_valid_output(result)
+    return result
+
+
 def build_canonical_result(
     normalized_post: dict,
     stage1_result: dict,

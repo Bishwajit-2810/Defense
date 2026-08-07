@@ -1,4 +1,11 @@
-"""Authentication endpoints — token issuance, refresh, identity, SSE tickets.
+"""Authentication endpoints — signup, token issuance, refresh, identity, SSE tickets.
+
+Registration (`POST /v1/auth/signup`) is what makes the rest of this module
+reachable without a psql session: the dashboard could verify a password but
+nothing could *create* one, so every deployment either seeded `users` by hand or
+lived on the `ALLOW_ANY_LOGIN` dev path. `GET /v1/auth/config` tells the login
+screen which of those it is looking at.
+
 
 Closes the remainder of PROJECT_ASSESSMENT §6.6. The JWT *core* was always
 sound — HS256, correct `datetime` claims, expiry enforced by `python-jose`. What
@@ -25,7 +32,7 @@ from sqlalchemy import text
 from sqlalchemy.ext.asyncio import AsyncSession
 
 from deps import get_current_user, get_db, get_redis, verify_token
-from libs.auth import mint_sse_ticket, verify_password
+from libs.auth import hash_password, mint_sse_ticket, verify_password
 from libs.common.config import (
     JWT_ALGORITHM,
     app_env,
@@ -33,7 +40,13 @@ from libs.common.config import (
     jwt_secret_fingerprint,
     require_jwt_secret,
 )
-from models import TokenRequest, TokenResponse
+from models import (
+    MIN_PASSWORD_LENGTH,
+    SignupRequest,
+    SignupResponse,
+    TokenRequest,
+    TokenResponse,
+)
 
 log = structlog.get_logger(__name__)
 
@@ -61,6 +74,25 @@ _ALLOW_ANY_LOGIN = (
     == "true"
 )
 
+# Self-service signup. Open in dev so a fresh checkout can create an account from
+# the dashboard; closed elsewhere, because "anyone on the internet can mint a
+# tenant-scoped account" is not a default anybody should inherit by accident.
+#
+# The bootstrap exception below is what keeps that closed default usable: a
+# deployment with an EMPTY users table always accepts one signup, so production
+# gets its first admin from the login screen instead of from a psql session.
+_ALLOW_SIGNUP = (
+    os.environ.get(
+        "ALLOW_SIGNUP",
+        "true" if app_env() in ("dev", "development", "local", "test", "ci") else "false",
+    ).lower()
+    == "true"
+)
+
+# Signups land here. Never taken from the request body — see SignupRequest: a
+# client that picks its own tenant picks whose data it can read.
+_SIGNUP_TENANT_ID = os.environ.get("SIGNUP_TENANT_ID", "default")
+
 
 def _create_access_token(
     subject: str, tenant_id: str = "default", role: str = "user"
@@ -77,15 +109,23 @@ def _create_access_token(
 
 
 async def _lookup_user(db: AsyncSession, username: str) -> dict | None:
-    """Fetch an active user row, or None. A missing table reads as 'no users'."""
+    """Fetch an active user row, or None. A missing table reads as 'no users'.
+
+    The match is case-insensitive because signup stores usernames case-folded. A
+    literal ``username = :u`` would mean someone who registered as "Alice" — and
+    was stored as "alice" — fails this lookup on login, then falls through to
+    either the ``ALLOW_ANY_LOGIN`` dev path (a token with no real password check)
+    or a 401 on their own correct password. Comparing on ``lower()`` also still
+    matches any mixed-case row seeded before signup existed.
+    """
     try:
         row = (
             await db.execute(
                 text(
                     "SELECT username, password_hash, tenant_id, role FROM users "
-                    "WHERE username = :u AND active = TRUE"
+                    "WHERE lower(username) = :u AND active = TRUE"
                 ),
-                {"u": username},
+                {"u": (username or "").strip().lower()},
             )
         ).first()
     except Exception as exc:
@@ -102,6 +142,166 @@ async def _lookup_user(db: AsyncSession, username: str) -> dict | None:
     if row is None:
         return None
     return {"username": row[0], "password_hash": row[1], "tenant_id": row[2], "role": row[3]}
+
+
+async def _count_users(db: AsyncSession) -> int | None:
+    """How many users exist, or None when ``users`` is unreadable.
+
+    The None case is a real state, not a paranoia branch: on a checkout where
+    ``deploy/init-db.sql`` has not been run there is no table, and signup must say
+    so plainly (503 with the fix) rather than 500 on a raw asyncpg error.
+    """
+    try:
+        row = (await db.execute(text("SELECT COUNT(*) FROM users"))).first()
+    except Exception as exc:
+        log.warning("user_count_failed", error=str(exc))
+        # Same reason as _lookup_user: a failed statement aborts this request's
+        # transaction, so anything the handler runs next on this session fails
+        # with "current transaction is aborted" instead of taking this path.
+        try:
+            await db.rollback()
+        except Exception:
+            pass
+        return None
+    return int(row[0]) if row else 0
+
+
+@router.get(
+    "/config",
+    summary="What the login screen is allowed to offer (unauthenticated)",
+)
+async def auth_config(db: AsyncSession = Depends(get_db)) -> dict:
+    """Advertise the auth policy so the UI can render honestly.
+
+    Without this the dashboard has to *guess* whether to show a signup form, and
+    a guess is wrong in both directions: offering registration on a deployment
+    that refuses it, or hiding it on one that needs a first admin. The password
+    rule comes from the same constant the request model enforces, so the hint the
+    user reads cannot drift from the rule the server applies.
+
+    Deliberately unauthenticated — a login screen has no credential yet — and
+    deliberately thin: booleans and a length, no user list, no user count.
+    """
+    count = await _count_users(db)
+    return {
+        # `count is not None` is load-bearing: with no users table every signup
+        # can only 503, so advertising it as available would put a form on screen
+        # whose sole outcome is an error. `bootstrap` stays false for the same
+        # reason — an unknown user count is not a promise of admin rights.
+        "signup_enabled": count is not None and (_ALLOW_SIGNUP or count == 0),
+        "bootstrap": count == 0,  # first account becomes admin
+        "min_password_length": MIN_PASSWORD_LENGTH,
+        "allow_any_login": _ALLOW_ANY_LOGIN,
+        "users_table_ready": count is not None,
+    }
+
+
+@router.post(
+    "/signup",
+    response_model=SignupResponse,
+    status_code=status.HTTP_201_CREATED,
+    summary="Register a user and return a Bearer JWT",
+)
+async def signup(
+    body: SignupRequest,
+    db: AsyncSession = Depends(get_db),
+) -> SignupResponse:
+    """Create an account, then log it straight in.
+
+    Three properties worth stating, because each is a way this endpoint could
+    have quietly undermined the auth work it sits next to:
+
+    * **The password is never stored.** Only ``pbkdf2_sha256$…`` from
+      ``libs.auth.hash_password``, which is the same format ``/v1/auth/token``
+      verifies against — so a signed-up user's login is a *real* password check,
+      not the ``ALLOW_ANY_LOGIN`` dev path.
+    * **Tenant and role are assigned here**, from server config, never from the
+      body. The privacy-locked-tenant guarantee is keyed on ``tenant_id``; a
+      self-chosen one would hand a caller any tenant it named.
+    * **Duplicates lose the race, not the row.** ``ON CONFLICT DO NOTHING``
+      means two concurrent signups for one username cannot overwrite an existing
+      password hash — the second gets a 409, and the first account is untouched.
+    """
+    count = await _count_users(db)
+    if count is None:
+        raise HTTPException(
+            status_code=status.HTTP_503_SERVICE_UNAVAILABLE,
+            detail=(
+                "The users table is unavailable, so accounts cannot be created. "
+                "Run deploy/init-db.sql against the API's database."
+            ),
+        )
+
+    is_bootstrap = count == 0
+    if not _ALLOW_SIGNUP and not is_bootstrap:
+        log.warning("signup_rejected_disabled", username=body.username)
+        raise HTTPException(
+            status_code=status.HTTP_403_FORBIDDEN,
+            detail=(
+                "Self-service signup is disabled on this deployment. Ask an "
+                "administrator for an account or an API key."
+            ),
+        )
+
+    # The first account administers the deployment; everyone after is a plain
+    # user. Two simultaneous first signups could both read count == 0 and both
+    # land as admin — a one-request window on an empty database, which is a
+    # better trade than making the bootstrap path require a pre-seeded row.
+    role = "admin" if is_bootstrap else "user"
+
+    try:
+        result = await db.execute(
+            text(
+                "INSERT INTO users (username, password_hash, tenant_id, role, active) "
+                "VALUES (:u, :h, :t, :r, TRUE) "
+                "ON CONFLICT (username) DO NOTHING"
+            ),
+            {
+                "u": body.username,
+                "h": hash_password(body.password),
+                "t": _SIGNUP_TENANT_ID,
+                "r": role,
+            },
+        )
+    except Exception as exc:
+        log.error("signup_insert_failed", username=body.username, error=str(exc))
+        try:
+            await db.rollback()
+        except Exception:
+            pass
+        raise HTTPException(
+            status_code=status.HTTP_503_SERVICE_UNAVAILABLE,
+            detail="Could not create the account right now. Try again.",
+        ) from exc
+
+    if result.rowcount == 0:
+        # Taken. This is one of the few places where confirming a username exists
+        # is unavoidable — a registration form cannot function otherwise — so it
+        # is stated once here and nowhere in the login path, which stays silent.
+        log.info("signup_rejected_duplicate", username=body.username)
+        raise HTTPException(
+            status_code=status.HTTP_409_CONFLICT,
+            detail=f"Username '{body.username}' is already taken",
+        )
+
+    # Commit before handing back a token: the token asserts an account exists, so
+    # the row must be durable first, not merely pending on this session.
+    await db.commit()
+
+    log.info(
+        "signup_succeeded",
+        username=body.username,
+        tenant_id=_SIGNUP_TENANT_ID,
+        role=role,
+        bootstrap=is_bootstrap,
+    )
+    return SignupResponse(
+        access_token=_create_access_token(body.username, _SIGNUP_TENANT_ID, role),
+        token_type="bearer",
+        username=body.username,
+        tenant_id=_SIGNUP_TENANT_ID,
+        role=role,
+    )
 
 
 @router.post(
@@ -134,12 +334,18 @@ async def login(
         log.info("auth_token_issued", username=user["username"], tenant_id=user["tenant_id"])
         return TokenResponse(access_token=token, token_type="bearer")
 
-    if _ALLOW_ANY_LOGIN:
-        # Dev only. Loud, because it is exactly the behaviour §6.6 flagged.
+    if _ALLOW_ANY_LOGIN and await _count_users(db) == 0:
+        # Dev only, and only while the deployment has NO accounts at all.
+        #
+        # That second condition is new, and it is what makes signup mean anything
+        # in dev. The flag exists for "no users provisioned yet"; the check was
+        # "no row for *this* username", so once one account existed, anybody could
+        # still log in as any other name and receive a signed token. Now the
+        # escape hatch closes the moment a real account exists.
         log.warning(
             "auth_login_unverified_dev_mode",
             username=body.username,
-            detail="no users row; ALLOW_ANY_LOGIN is on — never enable outside dev",
+            detail="empty users table; ALLOW_ANY_LOGIN is on — never enable outside dev",
         )
         token = _create_access_token(body.username)
         return TokenResponse(access_token=token, token_type="bearer")

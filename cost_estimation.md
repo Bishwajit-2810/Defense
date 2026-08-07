@@ -70,6 +70,26 @@ matters is **cost per 1,000 threads analyzed**.
 > for both backends in opposite directions. The dollar figures below still use
 > the old blended assumption and should be re-derived from a real run
 > (PROJECT_ASSESSMENT §9.8).
+>
+> **Quote `pipeline_tokens`, not `total_tokens`, for a per-post figure.** The
+> counters are written by `LLMClient` itself, so they now cover **every** LLM
+> caller, and `lane_split` reports five lanes:
+>
+> | Lane | What it is | Scales with |
+> | ---- | ---------- | ----------- |
+> | `post` | summary / post_type / insight | posts routed to Stage 2 |
+> | `comment` | comment stance, thread summary | comments per post |
+> | `stage1` | Stage-1's own LLM path (`STAGE1_LLM=true`) | posts **and** comments |
+> | `interactive` | `/v1/chat`, report narratives, cluster summaries | *questions asked*, not corpus size |
+> | `agent` | agent tool-calling turns | *questions asked* |
+>
+> `pipeline_tokens` sums the first three. The last two are per-question costs with
+> no relation to how many posts you analysed, so folding them into a per-post
+> figure inflates it by however much anyone used the chatbot. Until
+> PROJECT_ASSESSMENT §13.4 only the Stage-2 worker incremented anything, so the
+> `stage1`, `interactive` and `agent` lanes spent tokens nothing counted at all —
+> and in the shipped `STAGE1_LLM=true` configuration that is the majority of
+> calls (§6.8 measured comment-level work at 96% of the total there).
 
 ---
 

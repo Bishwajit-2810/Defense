@@ -61,6 +61,9 @@ log = structlog.get_logger(__name__)
 INGESTION_STREAM = streams.INGESTION.name
 NLP_STREAM = streams.STAGE1_NLP.name
 CONSUMER_GROUP = streams.INGESTION.group
+# Near-duplicate reuse hands the post straight to the assembler, skipping
+# Stage 1 and Stage 2 — see _enqueue_reuse (§13.3).
+ASSEMBLER_STREAM = streams.ASSEMBLER.name
 CONSUMER_NAME = "ingestion-service-1"
 
 # XREAD block timeout in milliseconds (1 second).  This lets the loop wake up
@@ -260,30 +263,80 @@ async def _find_near_duplicate(
     return None
 
 
-async def _reuse_analysis(session: AsyncSession, src_post_id: str, new_post_id: str) -> bool:
-    """Copy a prior analysis_results row onto a new post_id (near-dup reuse).
+async def _fetch_source_analysis(session: AsyncSession, src_post_id: str) -> dict | None:
+    """The prior analysis to reuse, plus the provenance of its vector.
 
-    The new post gets a full result without ever touching Stage-1/2. Returns
-    True when a row was written.
+    Returns ``{"result": <canonical>, "embedding": [...], "embedding_is_stub": bool}``
+    or None. ``embedding_is_stub`` is read explicitly because dropping it is
+    exactly what the old row-copy did — the copy inherited the column DEFAULT
+    ``FALSE`` and so claimed a hash stub was a real semantic vector (§13.3).
     """
-    sql = text(
-        """
-        INSERT INTO analysis_results
-            (post_id, campaign_id, result, embedding, schema_version, created_at, updated_at)
-        SELECT :new_id, ar.campaign_id, ar.result, ar.embedding, ar.schema_version, NOW(), NOW()
-        FROM analysis_results ar
-        WHERE ar.post_id = :src
-        ORDER BY ar.created_at DESC
-        LIMIT 1
-        ON CONFLICT (post_id) DO UPDATE SET
-            result         = EXCLUDED.result,
-            embedding      = EXCLUDED.embedding,
-            schema_version = EXCLUDED.schema_version,
-            updated_at     = NOW()
-        """
+    row = (
+        await session.execute(
+            text(
+                """
+                SELECT ar.result                              AS result,
+                       ar.embedding::text                     AS emb,
+                       COALESCE(ar.embedding_is_stub, FALSE)  AS is_stub
+                FROM analysis_results ar
+                WHERE ar.post_id = :src
+                ORDER BY ar.created_at DESC
+                LIMIT 1
+                """
+            ),
+            {"src": src_post_id},
+        )
+    ).mappings().first()
+    if not row or not row["result"]:
+        return None
+
+    from libs.clustering import parse_pgvector  # noqa: PLC0415
+
+    return {
+        "result": row["result"],
+        "embedding": parse_pgvector(row["emb"]),
+        "embedding_is_stub": bool(row["is_stub"]),
+    }
+
+
+async def _enqueue_reuse(
+    redis: Redis,
+    normalized: dict,
+    source: dict,
+    src_post_id: str,
+    score: float,
+    job_id: str | None,
+) -> None:
+    """Hand a near-duplicate to the ASSEMBLER rather than copying its DB row.
+
+    Reuse used to be an ``INSERT … SELECT`` straight into ``analysis_results``,
+    which wrote **Postgres only**: no ClickHouse row and no object-storage blob.
+    Reused posts were therefore absent from every analytics aggregate (trend,
+    top posts, reaction mix, sentiment-over-time) while still counting in the
+    Postgres-backed reports — the two stores disagreed by construction (§13.3).
+
+    The assembler already owns the three-store fan-out, schema validation and
+    job accounting, so routing through it fixes the store gap and the identity
+    rewrite in one move, without duplicating any of that here. Stage 1 and
+    Stage 2 are still skipped, which is the whole point of the feature.
+    """
+    envelope = {
+        "post_id": normalized["post_id"],
+        "normalized_post": normalized,
+        # No stage1_result: the assembler composes the document from the source
+        # analysis plus THIS post's facts (builder.build_reused_result).
+        "stage1_result": {},
+        "stage2_result": None,
+        "reused_result": source["result"],
+        "reused_from": {"source_post_id": src_post_id, "score": round(float(score), 4)},
+        "embedding": source.get("embedding"),
+        "embedding_is_stub": source.get("embedding_is_stub", True),
+        "job_id": job_id,
+    }
+    await redis.xadd(
+        ASSEMBLER_STREAM,
+        {"data": json.dumps(envelope, ensure_ascii=False, default=str)},
     )
-    res = await session.execute(sql, {"new_id": new_post_id, "src": src_post_id})
-    return (res.rowcount or 0) > 0
 
 
 # ---------------------------------------------------------------------------
@@ -616,19 +669,25 @@ async def _process_message(
         try:
             async with session_factory() as session:
                 dup = await _find_near_duplicate(session, caption, raw.get("campaignId"))
-                if dup and await _reuse_analysis(session, dup[0], post_id):
-                    await session.commit()
+                source = await _fetch_source_analysis(session, dup[0]) if dup else None
+                if source:
+                    # Hand it to the assembler rather than copying the row here.
+                    # The assembler owns schema validation and the three-store
+                    # fan-out; the old row-copy wrote Postgres only, so reused
+                    # posts were missing from every ClickHouse aggregate (§13.3).
+                    await _enqueue_reuse(redis, normalized, source, dup[0], dup[1], job_id)
                     log.info(
                         "ingestion.near_duplicate_reused",
                         post_id=post_id,
                         source_post_id=dup[0],
                         score=round(dup[1], 4),
                         message_id=msg_id_str,
+                        note="post-level analysis only; comment thread not reused",
                     )
-                    if job_id:
-                        await _count_skipped_for_job(
-                            redis, session_factory, job_id, post_id, "near_duplicate_reused"
-                        )
+                    # NOT counted as skipped: unlike the dedup path, this post
+                    # DOES reach the assembler, which does its own job
+                    # accounting. Counting it here as well would complete the
+                    # job one post early.
                     await redis.xack(stream_name, CONSUMER_GROUP, message_id)
                     return
         except Exception as exc:
@@ -658,9 +717,13 @@ async def _ensure_consumer_group(redis: Redis) -> None:
     """
     Create the consumer group if it does not already exist.
 
-    Uses "$" as the start ID so we only process messages that arrive after the
-    service starts.  Set start to "0" to reprocess all existing messages on
-    a fresh deployment.
+    Uses **"0"** as the start ID, so a group created on a stream that already has
+    entries picks up that backlog rather than skipping it — which is what a
+    restart after a queued upload needs.
+
+    (This docstring used to claim ``"$"``, i.e. the opposite behaviour, and
+    offered ``"0"`` as the change to make for reprocessing — advice describing
+    the state the code was already in. PROJECT_ASSESSMENT §13.7c.)
     """
     try:
         await redis.xgroup_create(

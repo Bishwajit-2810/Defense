@@ -58,6 +58,53 @@ services:
 
 ---
 
+## 2b. What actually ships in this repo — and where each piece runs
+
+§2 above is the target shape. What is checked in today differs in two ways worth
+knowing before you run anything: there is **no `gateway`/NGINX service and no
+`vllm` service**, and **Ollama is not containerised at all**. There are two run
+modes, and the documented one is a hybrid.
+
+### Mode A — `uv run run_all.py` (the local dev path, and the one everything is tested against)
+
+| In Docker (4 containers) | On your host |
+| --- | --- |
+| `postgres` (pgvector), `redis`, `clickhouse`, `minio` | the 5 workers + the API (uvicorn, `127.0.0.1:8001`) |
+| | the dashboard static server (`:8080`) |
+| | with `--with-agents`: analytics-mcp `:8110`, retrieval `:8101`, ingest `:8102`, agents `:8010` |
+| | **Ollama (`:11434`)** — you install it and pull the models yourself |
+
+`run_all.py` starts exactly `["postgres", "redis", "clickhouse", "minio"]` in
+Docker; everything else is a host subprocess run with `.venv/bin/python`. So
+Docker alone is **not** enough — you also need `uv`, Ollama, and the three pulled
+models (`gemma3:4b`, `qwen2.5:7b`, `qwen3-vl:4b`).
+
+### Mode B — `cd deploy && docker compose up` (everything containerised)
+
+The compose file does define all ten app services — api, ingestion, the four
+workers, the three MCP servers and agents — each with a real Dockerfile, plus
+observability (`prometheus`, `grafana`, `jaeger`, `loki`, `promtail`) that Mode A
+never starts. `deploy/.env` is present, so `env_file` resolves.
+
+Two things still reach outside the compose network:
+
+* **Ollama.** Containers reach the *host's* Ollama via
+  `host.docker.internal:host-gateway` (`LOCAL_LLM_BASE_URL` in `deploy/.env`), so
+  even full-Docker needs it running on the host — or `LLM_BACKEND=groq` with a
+  real key, since `.env` ships the `your_groq_api_key_here` placeholder.
+* **The API port differs**: `:8000` in compose, `:8001` under `run_all.py`. The
+  dashboard targets the dev API on `:8001`.
+
+> **Status honestly stated:** Mode B's app-service images are **not** what any of
+> this project's verification runs used — every measurement, probe and test in
+> [PROJECT_ASSESSMENT.md](PROJECT_ASSESSMENT.md) was taken under Mode A or against
+> throwaway containers. The compose config is complete and the Dockerfiles exist,
+> but `docker compose build` has not been exercised as part of the assessment, and
+> the Kubernetes manifests have never run in a cluster (§5.5). Treat Mode B as
+> configured-but-unexercised until someone builds it.
+
+---
+
 ## 3. Production architecture (Kubernetes)
 
 ```text

@@ -14,6 +14,8 @@ from sqlalchemy.ext.asyncio import AsyncSession
 
 from deps import get_current_user, get_db, get_redis
 
+from libs.llm.usage import ALL_LANES, PIPELINE_LANES
+
 log = structlog.get_logger(__name__)
 
 router = APIRouter(prefix="/v1/usage", tags=["usage"])
@@ -61,6 +63,19 @@ def _price_per_1k(backend: str, model: str) -> float:
 # ---------------------------------------------------------------------------
 
 
+class LaneUsage(BaseModel):
+    """One lane's spend. `calls` and `tokens` are COUNTS, so they are ints.
+
+    This was a bare ``Dict[str, float]``, which coerced both to floats and
+    rendered a token count as ``45678.0`` (§13.7d).
+    """
+
+    calls: int = 0
+    tokens: int = 0
+    token_share: float = 0.0
+    call_share: float = 0.0
+
+
 class UsageResponse(BaseModel):
     posts_analyzed: int
     """Total number of posts that have an analysis result row."""
@@ -72,11 +87,12 @@ class UsageResponse(BaseModel):
     """Fraction of analyses that used an LLM (0.0 – 1.0)."""
 
     total_tokens: int
-    """Total tokens spent, from the Redis counter ``usage:tokens:total``.
+    """Total tokens spent across every LLM caller, from ``usage:tokens:total``.
 
-    0 when no Stage-2 LLM call has been made in this deployment. This used to
-    claim a Postgres ``llm_cache`` table as a second source; nothing has ever
-    written that table, so the claim could not be honoured.
+    0 when no LLM call has been made in this deployment. This used to claim a
+    Postgres ``llm_cache`` table as a second source; nothing has ever written
+    that table, so the claim could not be honoured. It was also Stage-2-only
+    while describing itself as a total — see ``pipeline_tokens`` and §13.4.
     """
 
     estimated_cost_usd: float
@@ -106,8 +122,8 @@ class UsageResponse(BaseModel):
     cost_by_backend_model: Dict[str, float] = {}
     """Per-model cost in USD, priced by backend. Local is 0.0 by definition."""
 
-    lane_split: Dict[str, Dict[str, float]] = {}
-    """Post-level vs comment-level cost split (§6.7).
+    lane_split: Dict[str, LaneUsage] = {}
+    """Per-lane cost split (§6.7).
 
     Before §6.3, Stage 2 was a handful of per-post calls, so post-level routing
     was the dominant cost lever and the 28% routing figure roughly *was* the
@@ -117,6 +133,14 @@ class UsageResponse(BaseModel):
     than an assertion — the thesis lever becomes *"cheap NLP filters which
     comments and which posts deserve an LLM"*, not *"only N% of posts reach the
     LLM"*.
+    """
+
+    pipeline_tokens: int = 0
+    """Tokens spent by the ANALYSIS PIPELINE only (post + comment + stage1 lanes).
+
+    Separated from the total because §6.8's per-post cost model must not be
+    inflated by a chatbot session or an agent run, which are per-question costs
+    with no relation to corpus size. ``total_tokens`` is everything.
     """
 
     scope_note: str = ""
@@ -153,12 +177,22 @@ async def get_usage(
     | ``total_tokens`` | Redis ``usage:tokens:total`` |
     | ``tokens_by_backend_model`` | Redis ``usage:tokens:{backend}:{model}`` |
     | ``estimated_cost_usd`` | Σ per-model tokens × that model's price (local = 0) |
-    | ``lane_split`` | Redis ``usage:{tokens,calls}:lane:{post,comment}`` |
+    | ``lane_split`` | Redis ``usage:{tokens,calls}:lane:{post,comment,stage1,interactive,agent}`` |
+    | ``pipeline_tokens`` | Σ of the post/comment/stage1 lanes only |
     | ``cache_hit_rate`` | Redis ``usage:cache_hits`` / (``usage:llm_calls`` + ``usage:cache_hits``) |
 
     Every token/cost/cache figure therefore comes from Redis. There is no
     Postgres fallback, because the ``llm_cache`` table this endpoint used to
     read has never had a writer — see the note in the body.
+
+    **Coverage.** Those counters are written by ``LLMClient`` itself, so they
+    cover EVERY LLM caller: the Stage-1 and Stage-2 pipeline, ``/v1/chat``,
+    report narratives and cluster summaries, and agent runs. They used to be
+    incremented only by the Stage-2 worker, which meant five other callers spent
+    tokens nothing counted while this docstring and ``scope_note`` described the
+    figures as system-wide (PROJECT_ASSESSMENT §13.4). ``lane_split`` says which
+    lane spent what, and ``pipeline_tokens`` isolates the per-post pipeline from
+    the per-question interactive lanes.
 
     **Scope caveat:** ``?campaign_id=`` filters the post counts only. Token,
     cost, cache and lane figures come from process-wide Redis counters. The
@@ -259,8 +293,10 @@ async def get_usage(
             if n:
                 tokens_by_backend_model[key] = n
 
-        # Post-level vs comment-level — the §6.7 split.
-        for lane in ("post", "comment"):
+        # Per-lane split (§6.7). Now covers every lane that spends tokens, not
+        # just the two pipeline ones — chat, reports, agents and Stage-1's LLM
+        # path were entirely uncounted before §13.4.
+        for lane in ALL_LANES:
             lane_tokens[lane] = int(await redis.get(f"usage:tokens:lane:{lane}") or 0)
             lane_calls[lane] = int(await redis.get(f"usage:calls:lane:{lane}") or 0)
     except Exception as exc:
@@ -290,17 +326,19 @@ async def get_usage(
 
     lane_total_tokens = sum(lane_tokens.values())
     lane_total_calls = sum(lane_calls.values())
-    lane_split: dict[str, dict[str, float]] = {
-        lane: {
-            "calls": lane_calls.get(lane, 0),
-            "tokens": lane_tokens.get(lane, 0),
-            "token_share": round(lane_tokens.get(lane, 0) / lane_total_tokens, 4)
+    lane_split: dict[str, LaneUsage] = {
+        lane: LaneUsage(
+            calls=lane_calls.get(lane, 0),
+            tokens=lane_tokens.get(lane, 0),
+            token_share=round(lane_tokens.get(lane, 0) / lane_total_tokens, 4)
             if lane_total_tokens else 0.0,
-            "call_share": round(lane_calls.get(lane, 0) / lane_total_calls, 4)
+            call_share=round(lane_calls.get(lane, 0) / lane_total_calls, 4)
             if lane_total_calls else 0.0,
-        }
-        for lane in ("post", "comment")
+        )
+        for lane in ALL_LANES
     }
+    # The pipeline's own spend, for §6.8's per-post model.
+    pipeline_tokens = sum(lane_tokens.get(lane, 0) for lane in PIPELINE_LANES)
 
     # §5.8 defect 3: ?campaign_id= is honoured by the post-count query only.
     # The Redis counters are process-global. Rather than return campaign-scoped
@@ -313,7 +351,10 @@ async def get_usage(
             "process-wide counters and are NOT campaign-scoped."
         )
     else:
-        scope_note = "All figures are system-wide."
+        scope_note = (
+            "All figures are system-wide, across every LLM caller "
+            "(pipeline, chat, reports and agents)."
+        )
     if not cost_by_backend_model:
         scope_note += (
             " No per-(backend, model) token counters recorded yet, so "
@@ -356,5 +397,6 @@ async def get_usage(
         tokens_by_backend_model=tokens_by_backend_model,
         cost_by_backend_model=cost_by_backend_model,
         lane_split=lane_split,
+        pipeline_tokens=pipeline_tokens,
         scope_note=scope_note,
     )

@@ -29,6 +29,7 @@ from tenacity import (
 
 from .circuit import CircuitBreaker
 from .policy import DEFAULT_POLICY, PolicyViolationError, TenantPolicy, enforce_policy
+from .usage import LANE_INTERACTIVE, track_usage
 
 T = TypeVar("T")
 
@@ -232,6 +233,8 @@ class LLMClient:
         response_format: Optional[dict[str, Any]],
         max_tokens: int,
         temperature: float,
+        tools: Optional[list[dict[str, Any]]] = None,
+        tool_choice: Optional[str] = None,
     ) -> Any:
         kwargs: dict[str, Any] = {
             "model": model,
@@ -241,6 +244,13 @@ class LLMClient:
         }
         if response_format is not None:
             kwargs["response_format"] = response_format
+        # Tool definitions. Their absence here is why the agent runner reached
+        # past this class into the raw AsyncOpenAI client — and lost the circuit
+        # breaker, the Groq→local failover, truncation recovery and usage
+        # tracking on the way (PROJECT_ASSESSMENT §13.6).
+        if tools:
+            kwargs["tools"] = tools
+            kwargs["tool_choice"] = tool_choice or "auto"
 
         return await client.chat.completions.create(**kwargs)
 
@@ -258,6 +268,12 @@ class LLMClient:
         max_tokens: int = 2048,
         temperature: float = 0.1,
         model: Optional[str] = None,
+        tools: Optional[list[dict[str, Any]]] = None,
+        tool_choice: Optional[str] = None,
+        usage_redis: Any = None,
+        usage_lane: str = LANE_INTERACTIVE,
+        usage_task: Optional[str] = None,
+        track: bool = True,
     ) -> dict[str, Any]:
         """
         Send a chat request and return a normalised response dict.
@@ -272,7 +288,22 @@ class LLMClient:
             "finish_reason": str,   # "stop" | "length" | ... as reported by the backend
             "truncated": bool,      # True when the reply STILL ends at the token ceiling
             "continuations": int,   # how many follow-up calls were spent recovering it
+            "tool_calls": list,     # OpenAI tool_calls, normalised; [] when none
         }
+
+        Pass ``tools`` (OpenAI function-tool definitions) to enable tool calling.
+        A reply carrying tool calls is returned as-is: continuation and the
+        JSON-degeneracy retry are both skipped for it, because the model stopped
+        to call a tool rather than because it ran out of room.
+
+        **Every successful call is recorded** in the Redis usage counters
+        `GET /v1/usage` reads, dimensioned by ``usage_lane`` and ``usage_task``.
+        Tracking here rather than at each call site is deliberate: it lived in
+        the Stage-2 worker, so the five other callers in the system spent tokens
+        that reached no counter while the endpoint reported its figures as
+        system-wide (PROJECT_ASSESSMENT §13.4). Pass ``track=False`` for calls
+        that must not count (offline evals); pass ``usage_redis`` to reuse a
+        connection you already hold.
 
         A completion that stopped because it hit ``max_tokens`` used to be
         returned exactly like a completed one, so no caller could tell a finished
@@ -318,6 +349,8 @@ class LLMClient:
                 response_format=response_format,
                 max_tokens=max_tokens,
                 temperature=temperature,
+                tools=tools,
+                tool_choice=tool_choice,
             )
             self._breakers[effective_backend].record_success()
         except Exception as exc:
@@ -346,6 +379,8 @@ class LLMClient:
                         response_format=response_format,
                         max_tokens=max_tokens,
                         temperature=temperature,
+                        tools=tools,
+                        tool_choice=tool_choice,
                     )
                 except Exception as local_exc:
                     self._breakers["local"].record_failure()
@@ -407,13 +442,32 @@ class LLMClient:
         content = choice.message.content or ""
         finish_reason = getattr(choice, "finish_reason", None) or "stop"
 
+        # Tool calls, normalised into plain serialisable dicts so callers never
+        # touch the SDK's objects. This normalisation used to live in the agent
+        # runner, which is the only reason that module reached past this class
+        # (§13.6).
+        tool_calls_out: list[dict[str, Any]] = []
+        for tc in (getattr(choice.message, "tool_calls", None) or []):
+            tool_calls_out.append({
+                "id": tc.id,
+                "type": "function",
+                "function": {
+                    "name": tc.function.name,
+                    "arguments": tc.function.arguments,
+                },
+            })
+
         # Auto-continuation: a reply that stopped at the token ceiling is half an
         # answer, and nothing downstream could previously tell. Re-ask with the
         # partial text as context and concatenate. Only for free-text — a
         # JSON-mode reply cannot be continued token-wise into valid JSON, so
         # those are reported as truncated and left to the caller's parser.
+        #
+        # Never continue a reply that carries tool calls: the model stopped to
+        # invoke a tool, and asking it to "continue" would produce prose the
+        # caller's tool loop has no slot for.
         continuations = 0
-        if response_format is None and finish_reason == "length":
+        if response_format is None and finish_reason == "length" and not tool_calls_out:
             budget = _max_continuations()
             while finish_reason == "length" and continuations < budget:
                 continuations += 1
@@ -458,7 +512,7 @@ class LLMClient:
                 effective_backend, role, model_id, max_tokens, len(content),
             )
 
-        return {
+        result = {
             "content": content,
             "usage": totals,
             "model": completion.model,
@@ -466,7 +520,20 @@ class LLMClient:
             "finish_reason": finish_reason,
             "truncated": truncated,
             "continuations": continuations,
+            "tool_calls": tool_calls_out,
         }
+
+        # Count it. `track_usage` swallows its own failures — a cost counter must
+        # never be the reason a call fails — so this is safe on the success path.
+        if track:
+            await track_usage(
+                usage_redis,
+                result,
+                lane=usage_lane,
+                task=usage_task or role,
+            )
+
+        return result
 
     async def chat_stream(
         self,
@@ -477,6 +544,10 @@ class LLMClient:
         max_tokens: int = 1024,
         temperature: float = 0.3,
         model: Optional[str] = None,
+        usage_redis: Any = None,
+        usage_lane: str = LANE_INTERACTIVE,
+        usage_task: Optional[str] = None,
+        track: bool = True,
     ) -> AsyncIterator[dict[str, Any]]:
         """Stream a chat completion token-by-token (for the chatbot endpoint).
 
@@ -579,6 +650,16 @@ class LLMClient:
             "llm_stream backend={} role={} model={} tokens={} latency_ms={}",
             effective_backend, role, model_id, usage["total_tokens"], latency_ms,
         )
+        # Count the stream too. A streamed chatbot turn costs exactly what a
+        # non-streamed one costs, and counting only the latter would rebuild
+        # §13.4's blind spot on the endpoint the dashboard actually uses.
+        if track:
+            await track_usage(
+                usage_redis,
+                {"usage": usage, "backend": effective_backend, "model": model_id},
+                lane=usage_lane,
+                task=usage_task or role,
+            )
         yield {"type": "done", "backend": effective_backend, "model": model_id, "usage": usage}
 
     async def chat_structured(

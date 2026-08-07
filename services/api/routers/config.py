@@ -17,7 +17,9 @@ import redis.asyncio as aioredis
 from fastapi import APIRouter, Depends, HTTPException, status
 from pydantic import BaseModel
 
-from deps import get_current_user, get_redis
+from sqlalchemy.ext.asyncio import AsyncSession
+
+from deps import get_current_user, get_db, get_redis, tenant_is_privacy_locked
 
 from libs import sentiment_models
 
@@ -28,27 +30,22 @@ router = APIRouter(prefix="/v1/config", tags=["config"])
 LLM_BACKEND_KEY = "config:llm_backend"
 _VALID_BACKENDS = ("local", "groq")
 
+#: Roles allowed to flip the GLOBAL backend switch. Selecting `groq` routes
+#: every tenant's analysis off-box, so it is an operator action (§13.5).
+_ADMIN_ROLES = frozenset({"admin", "owner", "operator"})
+
 # Runtime sentiment-model override (mirrors the Stage-1 worker's key). Absent =>
 # auto-route by detected language.
 SENTIMENT_MODEL_KEY = "config:sentiment_model"
 
-# Mirrors libs/llm/client.py role→model defaults.
-_MODEL_ENVS = {
-    "local": {
-        "stage1": ("STAGE1_LOCAL_MODEL", "gemma3:4b"),
-        "stage2": ("STAGE2_LOCAL_MODEL", "qwen2.5:7b"),
-        "llm_a": ("LLM_A_LOCAL_MODEL", "qwen2.5:7b"),
-        "llm_b": ("LLM_B_LOCAL_MODEL", "qwen2.5:7b"),
-        "vlm": ("VLM_LOCAL_MODEL", "qwen3-vl:4b"),
-    },
-    "groq": {
-        "stage1": ("STAGE1_GROQ_MODEL", "llama-3.1-8b-instant"),
-        "stage2": ("STAGE2_GROQ_MODEL", "llama-3.3-70b-versatile"),
-        "llm_a": ("LLM_A_GROQ_MODEL", "llama-3.1-8b-instant"),
-        "llm_b": ("LLM_B_GROQ_MODEL", "llama-3.3-70b-versatile"),
-        "vlm": ("VLM_GROQ_MODEL", "meta-llama/llama-4-scout-17b-16e-instruct"),
-    },
-}
+# Role→model resolution is READ FROM libs/llm/client.py, never mirrored.
+#
+# This was a hand-maintained copy of that module's two tables, and it had already
+# drifted: it listed five roles and omitted `summary` — the role §6.5 added
+# specifically so summarization gets a stronger model than classification. So
+# `GET /v1/config/llm` could not show which model writes the summaries, which is
+# the headline of that requirement (PROJECT_ASSESSMENT §13.7a). A copy of another
+# module's table is §5.1's pattern; the fix is to stop copying.
 
 
 class LLMConfigUpdate(BaseModel):
@@ -56,9 +53,17 @@ class LLMConfigUpdate(BaseModel):
 
 
 def _models() -> dict:
+    """The resolved role→model map per backend, straight from the LLM client.
+
+    `default_model` already applies each role's env override, so this reports
+    exactly what a call would use — and gains any new role automatically.
+    """
+    from libs.llm.client import VALID_ROLES, LLMClient  # noqa: PLC0415
+
+    client = LLMClient()
     return {
-        be: {role: os.environ.get(env, default) for role, (env, default) in roles.items()}
-        for be, roles in _MODEL_ENVS.items()
+        be: {role: client.default_model(role, be) for role in sorted(VALID_ROLES)}
+        for be in _VALID_BACKENDS
     }
 
 
@@ -88,13 +93,48 @@ async def get_llm_config(
 async def put_llm_config(
     body: LLMConfigUpdate,
     redis: aioredis.Redis = Depends(get_redis),
+    db: AsyncSession = Depends(get_db),
     current_user: dict = Depends(get_current_user),
 ) -> dict:
     """Applies to new Stage-2 work only; in-flight messages keep their backend.
 
     ``{"backend": null}`` clears the override (falls back to the env default).
     Groq requires GROQ_API_KEY in the worker's environment.
+
+    **This is a GLOBAL switch**, not a per-request one: it applies to every
+    tenant's pipeline work. It used to be settable by any authenticated caller
+    with no policy check at all, which meant a privacy-locked tenant's post
+    content followed it straight to Groq (PROJECT_ASSESSMENT §13.5). Two guards
+    now apply:
+
+    * switching to ``groq`` requires an **admin** role — a global switch is an
+      operator action, not a tenant-user one;
+    * a caller whose own tenant is privacy-locked cannot select ``groq`` at all,
+      because it would be asking for its own content to be sent off-box.
+
+    Locked tenants are unaffected by whatever the switch ends up saying: the API
+    pins them to ``local`` when it resolves each job's backend.
     """
+    if body.backend == "groq":
+        role = (current_user.get("role") or "user").lower()
+        if role not in _ADMIN_ROLES:
+            raise HTTPException(
+                status_code=status.HTTP_403_FORBIDDEN,
+                detail=(
+                    "Switching the global LLM backend to 'groq' requires an admin "
+                    "role — it routes every tenant's analysis off-box."
+                ),
+            )
+        if await tenant_is_privacy_locked(db, current_user):
+            raise HTTPException(
+                status_code=status.HTTP_403_FORBIDDEN,
+                detail=(
+                    f"Tenant '{current_user.get('tenant_id') or 'default'}' is "
+                    "privacy-locked: 'groq' is not permitted (data must not "
+                    "leave the local backend)"
+                ),
+            )
+
     if body.backend is None:
         await redis.delete(LLM_BACKEND_KEY)
         log.info("llm_backend_override_cleared")

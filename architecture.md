@@ -327,6 +327,10 @@ Levers that keep token usage and cost low:
   task from a labeled validation set.
 - **Exact + near-duplicate caching.** Social feeds are highly repetitive
   (reshares, copypasta, viral captions). Hash + embedding dedup avoids reanalysis.
+  Reuse is **post-level only**: a caption match is not a thread match, so the
+  reused post keeps its own identity, engagement and reactions, and its comment
+  thread is reported unanalysed rather than inheriting the source's per-comment
+  labels (PROJECT_ASSESSMENT §13.3).
 - **Batch & cluster summarization.** Don't summarize 10,000 posts individually.
   Cluster embeddings (pgvector + k-means/HDBSCAN), then have the LLM summarize a
   _cluster_ or representative samples → "cluster summarization" and "insight
@@ -349,8 +353,11 @@ labelling** (85–96% of calls), because full per-comment coverage is a delibera
 choice ([PROJECT_ASSESSMENT.md](PROJECT_ASSESSMENT.md) §6.3, §6.8). The lever
 that matters most is comments-per-thread and the batch size, not the confidence
 threshold. Cluster-level summarization is still a good idea but is not yet real:
-it currently clusters **stub embeddings** by default (§5.9). Quantified in
-[cost_estimation.md](cost_estimation.md).
+it currently clusters **stub embeddings** by default (§5.9). Its output now
+reaches the API and the dashboard as `embedding_clusters`, with
+`embedding_clusters_are_stub` disclosing when the groupings are noise — until
+§13.1 the summaries were computed, paid for, and stripped by the response model.
+Quantified in [cost_estimation.md](cost_estimation.md).
 
 ---
 
@@ -621,6 +628,16 @@ Rationale for each data-layer pick and the alternatives rejected is in
   only where the data classification permits it, and **pin privacy-sensitive
   tenants to `local`** so a runtime switch can never route their PII to Groq.
   Record the backend used on every result (`processing.llm_backend`) for audit.
+  **Enforced at the enqueue boundary.** The workers have no database and no
+  tenant, so they cannot evaluate a policy; the API resolves each job's backend
+  (request > toggle > env), applies the lock where the tenant *is* known, and
+  stamps the decision into the job envelope, which both stages honour. An
+  explicit request for `groq` is refused; the global toggle is downgraded to
+  `local` for a locked tenant rather than erroring, since an operator's switch is
+  not that tenant's choice. `PUT /v1/config/llm` requires an admin role. Until
+  §13.5 the pipeline read the global key directly and the guarded per-request
+  option was read by no worker ([PROJECT_ASSESSMENT.md](PROJECT_ASSESSMENT.md)
+  §13.5).
 - **Secrets:** Kubernetes Secrets / Vault; no secrets in images or env files —
   including the **Groq API key**, which is mounted only into Stage-2 workers.
 - **Network:** private subnets for DBs and model servers; only the gateway is

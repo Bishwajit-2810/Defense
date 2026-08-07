@@ -33,7 +33,7 @@ _LIBS_ROOT = os.path.join(os.path.dirname(__file__), "..", "..", "..", "libs")
 if _LIBS_ROOT not in sys.path:
     sys.path.insert(0, os.path.abspath(_LIBS_ROOT))
 
-from builder import build_canonical_result
+from builder import build_canonical_result, build_reused_result
 from persistence import (
     persist_clickhouse,
     persist_minio,
@@ -88,12 +88,41 @@ def _decode_message(fields: dict[bytes, bytes]) -> dict[str, Any]:
     return decoded
 
 
-def _parse_message(raw: dict[str, Any]) -> tuple[str, dict, dict, dict | None, str | None]:
+def _embedding_is_stub(result: dict, stage1_result: dict) -> bool:
+    """Whether the Stage-1 vector for this post is the deterministic hash stub.
+
+    **Read the producer's answer; do not infer one.** Stage 1 reports
+    ``embedding_is_stub`` beside ``embedding`` (``text_analyzer.
+    _embed_with_provenance``) because it is the only layer that knows — the stub
+    is EMBEDDING_DIM-sized exactly like a real vector, so nothing downstream can
+    tell them apart. Two separate places used to guess, and disagreed:
+    persistence classified by dimension (recording every stub as real), while
+    this module read ``processing.stub_mode``. PROJECT_ASSESSMENT §13.2.
+
+    The two fallbacks below are for messages produced before Stage 1 carried the
+    flag, in the same order of trustworthiness: the run-wide stub_mode marker,
+    then "there is no vector at all", which means persistence will substitute its
+    own post_id-seeded stub.
+    """
+    explicit = stage1_result.get("embedding_is_stub")
+    if explicit is not None:
+        return bool(explicit)
+    return bool(
+        (result.get("processing") or {}).get("stub_mode")
+        or not stage1_result.get("embedding")
+    )
+
+
+def _parse_message(raw: dict[str, Any]) -> tuple[str, dict, dict, dict | None, str | None, dict]:
     """Parse and JSON-decode the fields of a single stream message.
 
     Returns
     -------
-    (post_id, normalized_post, stage1_result, stage2_result, job_id)
+    (post_id, normalized_post, stage1_result, stage2_result, job_id, env)
+
+    The whole envelope comes back as the last element because the
+    near-duplicate reuse path carries extra keys (``reused_result``,
+    ``reused_from``, ``embedding``) that only that path reads.
     """
     # Every inter-stage message is a single ``data`` field holding a JSON
     # envelope: {post_id, normalized_post, stage1_result, stage2_result, ...}.
@@ -101,11 +130,11 @@ def _parse_message(raw: dict[str, Any]) -> tuple[str, dict, dict, dict | None, s
 
     post_id: str = env["post_id"]
     normalized_post: dict = env["normalized_post"]
-    stage1_result: dict = env["stage1_result"]
+    stage1_result: dict = env.get("stage1_result") or {}
     stage2_result: dict | None = env.get("stage2_result")
     job_id: str | None = env.get("job_id") or None
 
-    return post_id, normalized_post, stage1_result, stage2_result, job_id
+    return post_id, normalized_post, stage1_result, stage2_result, job_id, env
 
 
 async def _update_job_status(
@@ -246,13 +275,27 @@ async def _process_message(
     t0 = time.monotonic()
 
     raw = _decode_message(fields)
-    post_id, normalized_post, stage1_result, stage2_result, job_id = _parse_message(raw)
+    post_id, normalized_post, stage1_result, stage2_result, job_id, env = _parse_message(raw)
 
     bound_log = log.bind(post_id=post_id, msg_id=msg_id)
 
     # --- Build & validate ---------------------------------------------------
+    # A near-duplicate carries a prior analysis instead of Stage-1/2 output.
+    # It is composed rather than copied: the post's own identity, engagement and
+    # reactions come from THIS post, and its comment thread is reported
+    # unanalysed rather than inheriting the source's labels (§13.3).
+    reused_result = env.get("reused_result")
     try:
-        result = build_canonical_result(normalized_post, stage1_result, stage2_result)
+        if reused_result:
+            reuse_meta = env.get("reused_from") or {}
+            result = build_reused_result(
+                normalized_post,
+                reused_result,
+                reuse_meta.get("source_post_id", "unknown"),
+                reuse_meta.get("score", 0.0),
+            )
+        else:
+            result = build_canonical_result(normalized_post, stage1_result, stage2_result)
     except (ValueError, KeyError) as exc:
         bound_log.error("build_failed", error=str(exc))
         if job_id:
@@ -267,7 +310,25 @@ async def _process_message(
     # --- Persist (fan-out, parallel) ----------------------------------------
     # The Stage-1 document embedding rides alongside the canonical result (it
     # is not part of the output schema) and lands in the pgvector column.
-    stage1_embedding = stage1_result.get("embedding")
+    # On the reuse path the vector comes from the source row, carried in the
+    # envelope along with its honest stub flag — dropping that flag is what made
+    # a copied stub claim to be a real semantic vector (§13.3).
+    stage1_embedding = (
+        env.get("embedding") if reused_result else stage1_result.get("embedding")
+    )
+
+    # ...and so does its provenance. Stage 1 now reports whether the vector is
+    # the deterministic hash stub, because it is the only layer that knows: the
+    # stub is EMBEDDING_DIM-sized exactly like a real vector, so persistence's
+    # dimension check recorded every stub in the default configuration as real
+    # (§13.2). ONE value is computed here and used for both the trace frame and
+    # the database column, so the two cannot disagree again — which is how the
+    # §9.11 fix left half the defect standing.
+    stage1_embedding_is_stub = (
+        bool(env.get("embedding_is_stub", True))
+        if reused_result
+        else _embedding_is_stub(result, stage1_result)
+    )
 
     # Time each backend separately. The fan-out is a gather, so a single
     # "persist took 4s" line cannot tell you which store was slow — and these
@@ -292,15 +353,17 @@ async def _process_message(
         "persist_fanout_start",
         targets=["postgres", "clickhouse", "object_storage"],
         embedding_dims=len(stage1_embedding or []),
-        embedding_is_stub=bool(
-            (result.get("processing") or {}).get("stub_mode") or not stage1_embedding
-        ),
+        embedding_is_stub=stage1_embedding_is_stub,
         comment_rows=n_comments,
     )
     t_fan = time.monotonic()
     try:
         await asyncio.gather(
-            _timed("postgres", persist_postgres(result, engine, embedding=stage1_embedding)),
+            _timed("postgres", persist_postgres(
+                result, engine,
+                embedding=stage1_embedding,
+                embedding_is_stub=stage1_embedding_is_stub,
+            )),
             # persist_clickhouse writes both the analytics row AND the per-comment
             # rows on its single connection (sequentially) — they must NOT be
             # separate gather tasks or clickhouse-driver rejects the concurrent use.
@@ -358,14 +421,12 @@ async def _process_message(
             # `embedding_stored: true` + `embedding_dims: 768` both read as
             # success even when the vector is the hash stub, which is why §5.9
             # went unnoticed. Say which it is.
-            # Reads `processing.stub_mode`, which the builder used to DROP — so
-            # this fell through to `not stage1_embedding` and reported a stub
-            # vector as non-stub, exactly backwards. The key now survives
-            # (tests/test_provenance_survives.py pins it).
-            "embedding_is_stub": bool(
-                (result.get("processing") or {}).get("stub_mode")
-                or not stage1_embedding
-            ),
+            #
+            # This is the SAME value handed to persist_postgres above, not a
+            # second computation of it. Two independent computations is exactly
+            # what §13.2 was: this frame said `true` while the column it is
+            # supposed to describe said `false`.
+            "embedding_is_stub": stage1_embedding_is_stub,
             "writes": ["postgres+pgvector", "clickhouse", "object storage"],
         },
         log=bound_log,

@@ -52,7 +52,11 @@ class StubEmbeddingRefused(RuntimeError):
     """Raised when a stub vector would be persisted but stubs are disallowed."""
 
 
-def _resolve_embedding(embedding: list | None, post_id: str) -> tuple[list[float], bool]:
+def _resolve_embedding(
+    embedding: list | None,
+    post_id: str,
+    is_stub: bool | None = None,
+) -> tuple[list[float], bool]:
     """Return ``(vector, is_stub)`` for the semantic-search column.
 
     Uses the Stage-1 embedding when present and of the expected dimension;
@@ -64,11 +68,20 @@ def _resolve_embedding(embedding: list | None, post_id: str) -> tuple[list[float
     returns arbitrary neighbours, and nothing downstream could previously tell,
     because the row looked identical to a real one. The flag travels with the
     row so search and report paths can say so.
+
+    ``is_stub`` is the **producer's** answer, and it wins whenever it is given.
+    This function used to derive the flag from the vector's *dimension* alone,
+    reasoning that a correctly-sized vector must be a real one. It is not: the
+    stub is EMBEDDING_DIM-sized by construction, so with ``MODEL_STUB_MODE=true``
+    — the default — every row the pipeline wrote was recorded as
+    ``embedding_is_stub = FALSE``, the inverse of the truth, for the entire
+    corpus (PROJECT_ASSESSMENT §13.2). The dimension heuristic survives only as
+    the fallback for callers that do not pass the flag.
     """
     if embedding and len(embedding) == EMBEDDING_DIM:
-        # A real Stage-1 vector — unless Stage 1 itself was in stub mode, which
-        # the caller reports separately via processing.stub_mode.
-        return [float(v) for v in embedding], False
+        # A usable vector. Whether it is semantic is the producer's to say —
+        # Stage 1 knows, this layer cannot.
+        return [float(v) for v in embedding], bool(is_stub)
     if embedding:
         log.warning(
             "stage1 embedding dim %d != EMBEDDING_DIM %d for post %s — using stub",
@@ -121,7 +134,12 @@ def _sentiment_label(value: object) -> str | None:
 # PostgreSQL
 # ---------------------------------------------------------------------------
 
-async def persist_postgres(result: dict, engine, embedding: list | None = None) -> None:
+async def persist_postgres(
+    result: dict,
+    engine,
+    embedding: list | None = None,
+    embedding_is_stub: bool | None = None,
+) -> None:
     """Upsert the canonical result + semantic-search embedding into analysis_results.
 
     The pgvector ``embedding`` column is written in the same upsert (this is the
@@ -138,6 +156,10 @@ async def persist_postgres(result: dict, engine, embedding: list | None = None) 
         The Stage-1 document embedding (``stage1_result["embedding"]``). The
         canonical result itself stays schema-pure, so the vector is passed
         alongside it rather than embedded in it.
+    embedding_is_stub:
+        Whether that vector is the deterministic hash stub, **as reported by the
+        component that produced it**. Omit it and the dimension heuristic
+        applies, which is wrong for every stub (§13.2).
     """
     from sqlalchemy import text
 
@@ -145,7 +167,9 @@ async def persist_postgres(result: dict, engine, embedding: list | None = None) 
     campaign_id: str = result["campaign_id"]
     schema_version: str = (result.get("processing") or {}).get("schema_version", "")
     result_json: str = json.dumps(result, ensure_ascii=False)
-    embedding_vec, embedding_is_stub = _resolve_embedding(embedding, post_id)
+    embedding_vec, embedding_is_stub = _resolve_embedding(
+        embedding, post_id, embedding_is_stub
+    )
     embedding_lit: str = to_pgvector_literal(embedding_vec)
     if embedding_is_stub:
         # Not a warning per post (that would be every post in stub mode), but the

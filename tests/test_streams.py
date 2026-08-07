@@ -122,6 +122,26 @@ def test_workers_import_their_names_from_libs_streams():
         streams.ASSEMBLER.name, streams.ASSEMBLER.group)
 
 
+def test_the_monitoring_view_reads_the_same_names_the_workers_use():
+    """The dashboard's Pipeline tab was the last un-pinned copy of these names.
+
+    `routers/pipeline.py::_STAGES` hardcoded all five stream AND group names as
+    string literals. They matched the defaults, so nothing was visibly wrong —
+    but every name is env-overridable by design, and `_stage_stats` swallows the
+    `xinfo_groups` error a wrong group produces and returns zeros. Under any
+    override the tab would render an idle, healthy pipeline while work queued:
+    the §5.5 KEDA failure mode, reproduced in the view you would use to notice
+    it (PROJECT_ASSESSMENT §13.7b).
+    """
+    sys.path.insert(0, '/home/bk/code/defense/services/api')
+    sys.path.insert(0, '/home/bk/code/defense/services/api/routers')
+    from routers.pipeline import _STAGES  # noqa: PLC0415
+
+    seen = {stream: group for _key, _label, stream, group in _STAGES}
+    expected = {spec.name: spec.group for spec in streams.ALL.values()}
+    assert seen == expected
+
+
 def test_the_pipeline_hands_off_to_the_next_stages_stream():
     """Each producer must write to the stream the next consumer reads."""
     from services.ingestion import service as ingestion

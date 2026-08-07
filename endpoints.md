@@ -243,10 +243,31 @@ curl -s -H "$KEY" "$API/v1/analysis/latest?limit=200" \
 curl -s $API/v1/health                       # {"status":"ok"} — no auth needed
 curl -s $API/v1/ready                        # checks Postgres + Redis
 
+# What may the login screen offer? Unauthenticated, because a login screen has
+# no credential yet. The dashboard calls this before rendering its Sign in /
+# Create account tabs.
+curl -s $API/v1/auth/config
+# → {"signup_enabled":true,"bootstrap":true,"min_password_length":8,
+#    "allow_any_login":true,"users_table_ready":true}
+
+# Register. Username + password ONLY: tenant_id and role are assigned
+# server-side (SIGNUP_TENANT_ID), because a client that names its own tenant
+# names whose data it can read. Returns a token, so no second round-trip.
+# `bootstrap: true` above means the users table is empty and THIS account
+# becomes the administrator.
+curl -s -X POST $API/v1/auth/signup -H "Content-Type: application/json" \
+  -d '{"username":"analyst","password":"a-good-long-password"}'
+# → 201 {"access_token":"…","token_type":"bearer","username":"analyst",
+#        "tenant_id":"default","role":"admin"}
+# → 409 if the username is taken · 422 if it fails validation
+# → 403 if signup is disabled · 503 if there is no users table
+
 # Log in. Credentials are verified against the `users` table when rows exist;
-# with none, dev accepts anything and logs a loud warning (ALLOW_ANY_LOGIN).
+# while it is EMPTY, dev accepts anything and logs a loud warning
+# (ALLOW_ANY_LOGIN). The first real account closes that hatch.
+# The username match is case-insensitive, because signup stores it case-folded.
 TOKEN=$(curl -s -X POST $API/v1/auth/token -H "Content-Type: application/json" \
-  -d '{"username":"demo","password":"demo"}' | python -c 'import sys,json;print(json.load(sys.stdin)["access_token"])')
+  -d '{"username":"analyst","password":"a-good-long-password"}' | python -c 'import sys,json;print(json.load(sys.stdin)["access_token"])')
 
 # Who am I — lets a client tell "no token" from "expired token".
 curl -s -H "Authorization: Bearer $TOKEN" $API/v1/auth/me | python -m json.tool
@@ -306,6 +327,11 @@ curl -s -H "$KEY" "$API/v1/search?q=fuel%20price%20anger&semantic=true&limit=10"
 # that look exactly as plausible as real ones. Do not render that as a semantic
 # match. Set EMBEDDING_ALLOW_STUB=false to refuse the write outright, or load a
 # real embedding model. (PROJECT_ASSESSMENT §5.9)
+#
+# The flag is REPORTED BY STAGE 1 and carried to the column, not derived
+# downstream — the stub is the same 768 dims as a real vector, and deriving it
+# from the dimension is why every row was recorded as `false` until 5 Aug 2026
+# (PROJECT_ASSESSMENT §13.2).
 # → {"query":"…","semantic":true,"total":N,"results":[{"post_id","score","snippet","result":{<full §1 JSON>}}]}
 ```
 
@@ -322,6 +348,16 @@ curl -s -X POST $API/v1/reports -H "$KEY" -H "Content-Type: application/json" \
 curl -s -H "$KEY" $API/v1/reports                  # list
 curl -s -H "$KEY" $API/v1/reports/<report_id>      # fetch one
 ```
+
+**`clusters` is the SQL topic aggregate; `embedding_clusters` is the LLM one.**
+A grounded report also runs the embedding-cluster path (k-means over the corpus
+vectors, one LLM-B call per cluster — the cost lever architecture.md §5
+describes), returned as `embedding_clusters` alongside
+`embedding_clusters_are_stub`. When that flag is true the vectors were hash
+stubs, so the groupings are arbitrary and the summaries describe nothing —
+render the disclosure, not just the text. Until 5 Aug 2026 these summaries were
+computed, paid for, and stripped by the response model (PROJECT_ASSESSMENT
+§13.1).
 
 ### Usage & cost telemetry
 
@@ -347,6 +383,14 @@ the routing rate alone is not the cost story (PROJECT_ASSESSMENT §6.8).
 `?campaign_id=` filters the **post counts only** — token, cost, cache and lane
 figures come from process-wide counters. `scope_note` says which is which.
 
+**Coverage.** The counters are written by `LLMClient` itself, so every caller is
+counted: both pipeline stages, `POST /v1/chat`, report narratives and cluster
+summaries, and agent runs. `lane_split` has five lanes (`post`, `comment`,
+`stage1`, `interactive`, `agent`) and `pipeline_tokens` sums the first three, so
+the per-post cost model is not inflated by a chatbot session. Until 5 Aug 2026
+only the Stage-2 worker incremented anything, leaving five callers uncounted
+under a `scope_note` claiming system-wide coverage (PROJECT_ASSESSMENT §13.4).
+
 ### LLM backend (runtime switch)
 
 ```bash
@@ -356,6 +400,25 @@ curl -s -X PUT $API/v1/config/llm -H "$KEY" -H "Content-Type: application/json" 
 curl -s -X PUT $API/v1/config/llm -H "$KEY" -H "Content-Type: application/json" \
   -d '{"backend":null}'                                                # back to default (local)
 ```
+
+**This key is global, and selecting `groq` needs an admin role.** It applies to
+every tenant's pipeline work, so it is an operator action. A privacy-locked
+tenant is unaffected by whatever it says: the API resolves each job's backend
+(request > toggle > env), applies the lock where the tenant is known, and stamps
+the decision into the job envelope, which both workers honour. An explicit
+`llm_backend:"groq"` on a request is refused with 403; the global toggle is
+silently downgraded to `local` for a locked tenant, because an operator's switch
+is not their choice.
+
+Until 5 Aug 2026 this endpoint had no policy check and no role check, and the
+pipeline read the key directly — so a locked tenant's content followed the toggle
+to Groq while `POST /v1/analysis` still returned a 403 that read as the lock
+holding (PROJECT_ASSESSMENT §13.5).
+
+`GET /v1/config/llm` reports every role in `VALID_ROLES` — including `summary`,
+the role §6.5 added so summaries get a stronger model. It is derived from
+`LLMClient.default_model` rather than mirrored, so a new role appears
+automatically (§13.7a).
 
 ### Chatbot (ask it anything — honours the LLM toggle above)
 

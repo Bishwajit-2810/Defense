@@ -30,6 +30,7 @@ sys.path.insert(
 )
 
 from libs.labels import POST_TYPES, POST_TYPE_SET  # noqa: E402
+from libs.llm.usage import LANE_STAGE1
 
 # Label vocabularies — kept in lock-step with the stub/real paths in
 # text_analyzer.py and comment_analyzer.py and with libs/schemas/output_schema.json.
@@ -229,6 +230,8 @@ async def analyze_text_llm(
         response_format={"type": "json_object"},
         max_tokens=512,
         temperature=0.0,
+        usage_lane=LANE_STAGE1,
+        usage_task="stage1_post",
     )
     data = _parse_json(response.get("content", ""))
     if not isinstance(data, dict):
@@ -297,6 +300,8 @@ async def classify_comments_llm(
         # ~40 tokens/comment covers {"i":N,"s":"...","e":"...","k":[...]}.
         max_tokens=min(4096, 40 * len(texts) + 64),
         temperature=0.0,
+        usage_lane=LANE_STAGE1,
+        usage_task="stage1_comments",
     )
     data = _parse_json(response.get("content", ""))
     labels = data.get("labels") if isinstance(data, dict) else data

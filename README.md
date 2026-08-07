@@ -1,5 +1,17 @@
 # Social Media "Smart Layer" — Design Documentation
 
+**Run the whole thing with one command:**
+
+```bash
+uv run run_all.py --with-agents --reset
+```
+
+Datastores in Docker, everything else on your host; dashboard on
+**<http://127.0.0.1:8080>**, API on :8001. Needs Docker, [uv](https://docs.astral.sh/uv/)
+and Ollama with three models pulled — see [easy_run.md](easy_run.md) §1.
+
+---
+
 A production-grade, multilingual (Bangla + English + **Banglish**) AI
 **microservice** that sits on top of an **existing social-media monitoring
 platform**: it pulls a **post-with-details** payload (post **with its comments
@@ -124,6 +136,9 @@ concrete input→output, see [examples.md](examples.md).
 | [plan.md](plan.md)                                   | Phased implementation roadmap and milestones                                                                                                                                      |
 | [HOWTO.md](HOWTO.md)                                 | **Build guide for coding agents** — golden rules, ordered tasks with definition-of-done, repo layout; how to actually implement this design                                       |
 | [stance_targets.md](stance_targets.md)               | **Watchlist-driven target stance** — the project's novelty item: per-entity stance over a configurable, alias-aware watchlist for code-mixed Bangla/Banglish. **Built**; watchlist contents and validation outstanding.  |
+| [PROJECT_ASSESSMENT.md](PROJECT_ASSESSMENT.md)       | **Capstone / paper readiness review** — six independent audit passes, every finding with its evidence class (measured / probed / read), what was fixed, and what is still open       |
+| [OPEN_ISSUES.md](OPEN_ISSUES.md)                     | The actionable form of the latest audit pass: per-issue what-to-change, how-to-prove-it, and the regression test each one left behind. **All currently closed**                      |
+| [run.md](run.md) · [easy_run.md](easy_run.md)        | Running it: the one-command quickstart, then the deep reference (every env var, scaling, troubleshooting)                                                                            |
 
 Background: the original system-design request has been reconciled with
 [what.txt](what.txt), which is now the authoritative source and supersedes it.
@@ -164,8 +179,11 @@ target (the routing rate) are flagged inline in each document.
   the default) or **`groq`** (Groq Cloud API — fastest inference, zero GPU ops,
   per-token cost). Both speak an OpenAI-compatible API, so switching is a
   config/flag change (`run_all.py --groq` / `--ollama`, the dashboard **LLM**
-  chip, or a per-request `backend`), and you can run hybrid/failover. Pin
-  privacy-sensitive tenants to `local`.
+  chip, or a per-request `backend`), and you can run hybrid/failover.
+  Privacy-sensitive tenants are pinned to `local` **on every path**: the API
+  resolves each job's backend, applies the lock where the tenant is known, and
+  stamps the decision into the job envelope, so a global toggle cannot route a
+  locked tenant's content off-box (PROJECT_ASSESSMENT §13.5).
 - **Queue-based, horizontally scalable.** API → ingestion → message bus →
   stateless GPU/CPU workers → result store. Workers scale independently per
   stage.
@@ -183,6 +201,11 @@ target (the routing rate) are flagged inline in each document.
   LLM anything from the API or the dashboard **Chat** tab; replies stream token
   by token (SSE) and use whichever backend the toggle points at (local ⇄ Groq),
   overridable per request and subject to the same tenant privacy policy.
+- **Cost telemetry that covers every caller.** `GET /v1/usage` counts tokens per
+  backend and model, and splits spend across five lanes (`post`, `comment`,
+  `stage1`, `interactive`, `agent`). `pipeline_tokens` isolates the per-post
+  figure from per-question chat and agent spend, so the cost claim cannot be
+  inflated by however much anyone used the chatbot.
 - **Backend FastAPI; dashboard plain HTML/CSS/JS.**
 - **Deployment:** Docker Compose for MVP, Kubernetes (with KEDA autoscaling on
   queue depth) for Production and beyond.

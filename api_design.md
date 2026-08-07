@@ -151,13 +151,28 @@ comment `sentiment` arrives `null` and is **computed by us**. Banglish comments
 (romanized Bangla) are handled natively. `platform`, OCR, and `baseline_*` are
 derived on ingest exactly as in the pull path.
 
-`llm_backend` selects the Stage-2 LLM provider for this request: `"local"`
-(self-hosted vLLM), `"groq"` (Groq Cloud API), or `"auto"` (default — use the
-server's configured backend and failover policy). A per-request override lets
+`llm_backend` selects the LLM provider for this request: `"local"`
+(self-hosted vLLM/Ollama), `"groq"` (Groq Cloud API), or `"auto"` (default — use
+the server's configured backend and failover policy). A per-request override lets
 callers pin sensitive data to `"local"` or send burst traffic to `"groq"` without
-changing server config. **Tenant policy wins:** a tenant pinned to `local` for
-data-residency cannot be overridden to `groq` by a request (the override is
-rejected with `forbidden`). See [models.md](models.md) §2.
+changing server config.
+
+**How it is resolved and enforced.** The API resolves the backend at enqueue time
+— `request option > runtime toggle (config:llm_backend) > LLM_BACKEND env` — and
+applies the tenant policy to the **result**, then stamps that resolved value into
+the job envelope. The pipeline workers have no database and no tenant, so this is
+the only layer that can decide it. Two outcomes for a privacy-locked tenant, and
+the asymmetry is deliberate:
+
+* they **asked** for `groq` → `403 forbidden`; it is their own request, and it is
+  refusable;
+* the **toggle or the env default** says `groq` → silently pinned to `local`. An
+  operator's global switch is not that tenant's choice, and the guarantee is
+  "their content never leaves the local backend", not "they get an error".
+
+Until PROJECT_ASSESSMENT §13.5 this option was policy-checked and then **read by
+no worker** — the pipeline took its backend from the global Redis toggle — so the
+403 was the override's only observable effect. See [models.md](models.md) §2.
 
 ### Request (large file)
 
@@ -230,9 +245,11 @@ batch with specific options — useful for reprocessing after a model upgrade.
 `{ "filter": { "platform": "telegram", "from": "...", "to": "..." } }`
 (`platform` is the derived host value: `facebook` | `telegram` | `x` |
 `instagram` | …).
-`llm_backend` (`auto` | `local` | `groq`) overrides the Stage-2 provider for this
-run — handy to reprocess a batch on a different backend (e.g. compare local vs
-Groq output, or rerun on `groq` while LLM GPUs are down), subject to tenant policy.
+`llm_backend` (`auto` | `local` | `groq`) overrides the provider for this run —
+handy to reprocess a batch on a different backend (e.g. compare local vs Groq
+output, or rerun on `groq` while LLM GPUs are down). Resolved and policy-checked
+at enqueue time, then carried in the job envelope so the workers honour it; see
+the note under `POST /v1/posts/upload` above.
 
 ### Response — `202 Accepted`
 
@@ -554,8 +571,9 @@ because the payload used to be spread last and any claim in the token won.
 }
 ```
 
-Standard codes: `unauthorized`, `forbidden` (incl. an `llm_backend` override that
-violates tenant data-residency policy), `validation_error`, `rate_limited` (with
+Standard codes: `unauthorized`, `forbidden` (an `llm_backend` override that
+violates tenant data-residency policy, or a non-admin selecting `groq` on the
+global `PUT /v1/config/llm` toggle), `validation_error`, `rate_limited` (with
 `Retry-After` — also surfaced when the `groq` backend returns HTTP 429),
 `not_found`, `conflict` (idempotency), `internal`. The service handles a saturated
 or failed backend internally (failover/degrade per

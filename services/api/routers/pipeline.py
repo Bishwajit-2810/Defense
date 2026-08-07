@@ -17,6 +17,9 @@ import asyncio
 import json
 from typing import AsyncGenerator
 
+import os
+import sys
+
 import redis.asyncio as aioredis
 import structlog
 from fastapi import APIRouter, Depends
@@ -24,19 +27,39 @@ from fastapi.responses import StreamingResponse
 from sqlalchemy import text
 from sqlalchemy.ext.asyncio import AsyncSession
 
-from deps import get_current_user, get_db, get_redis
+# Repo root on path for `libs.*` (no-op when PYTHONPATH already provides it).
+_REPO_ROOT = os.path.abspath(os.path.join(os.path.dirname(__file__), "..", "..", ".."))
+if _REPO_ROOT not in sys.path:
+    sys.path.insert(0, _REPO_ROOT)
+
+from libs import streams  # noqa: E402
+
+from deps import get_current_user, get_db, get_redis  # noqa: E402
 
 log = structlog.get_logger(__name__)
 
 router = APIRouter(prefix="/v1/pipeline", tags=["pipeline"])
 
 # (key, label, stream, consumer-group) in pipeline order.
+#
+# Names come from libs/streams.py — the single source of truth (§5.1 / §5.5).
+# They were hardcoded string literals here, matching the defaults by luck. Every
+# name is env-overridable *by design* ("deployments legitimately shard streams"),
+# and under any override `_stage_stats` swallows the resulting `xinfo_groups`
+# error and returns zeros — so this tab would have rendered an **idle, healthy**
+# pipeline while work piled up. That is the §5.5 KEDA failure mode reproduced in
+# the monitoring view (PROJECT_ASSESSMENT §13.7b).
+_STAGE_LABELS: list[tuple[str, str, str]] = [
+    ("ingestion", "Ingestion", "ingestion"),
+    ("stage1", "Stage-1 NLP", "stage1-nlp"),
+    ("router", "Router", "router"),
+    ("stage2", "Stage-2 LLM", "stage2-llm"),
+    ("assembler", "Assembler", "assembler"),
+]
+
 _STAGES: list[tuple[str, str, str, str]] = [
-    ("ingestion", "Ingestion", "ingestion:queue", "ingestion-workers"),
-    ("stage1", "Stage-1 NLP", "nlp:stage1:queue", "stage1-nlp-group"),
-    ("router", "Router", "router:queue", "router-workers"),
-    ("stage2", "Stage-2 LLM", "llm:stage2:queue", "stage2-llm-workers"),
-    ("assembler", "Assembler", "assembler:queue", "assembler-group"),
+    (key, label, streams.ALL[spec_key].name, streams.ALL[spec_key].group)
+    for key, label, spec_key in _STAGE_LABELS
 ]
 
 _POLL_SECONDS = 1.5

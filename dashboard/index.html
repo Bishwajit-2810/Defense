@@ -34,7 +34,8 @@
       <button id="llm-chip" class="llm-chip hidden" type="button" title="LLM backend — click to open settings">LLM: ...</button>
       <button id="nlp-chip" class="llm-chip hidden" type="button" title="Stage-1 sentiment model — click to open settings">NLP: ...</button>
       <span id="header-auth-status" class="auth-status disconnected">Not authenticated</span>
-      <button id="header-login-btn" class="btn btn-secondary btn-sm">Login / API Key</button>
+      <button id="header-login-btn" class="btn btn-secondary btn-sm">Sign in / Sign up</button>
+      <button id="header-logout-btn" class="btn btn-secondary btn-sm hidden" title="Clear the stored token and API key">Sign out</button>
     </div>
   </header>
 
@@ -808,7 +809,17 @@
   <div id="login-overlay" class="login-overlay hidden" role="dialog" aria-modal="true" aria-labelledby="login-title">
     <div class="login-card">
       <div class="login-title" id="login-title">Sign In</div>
-      <div class="login-subtitle">Enter your credentials or API key to connect to the API.</div>
+      <div class="login-subtitle" id="login-subtitle">Enter your credentials or API key to connect to the API.</div>
+
+      <!-- Mode switch. The "Create account" tab is disabled when
+           GET /v1/auth/config reports signup_enabled: false, so the form is
+           never offered on a deployment that would refuse it. -->
+      <div class="auth-mode-tabs" role="tablist" aria-label="Authentication mode">
+        <button type="button" id="auth-mode-signin" class="auth-mode-tab active"
+                data-mode="signin" role="tab" aria-selected="true">Sign in</button>
+        <button type="button" id="auth-mode-signup" class="auth-mode-tab"
+                data-mode="signup" role="tab" aria-selected="false">Create account</button>
+      </div>
 
       <form id="login-form" autocomplete="off">
         <div class="form-group">
@@ -859,6 +870,64 @@
           <br />
           <button type="button" class="btn btn-sm" style="background:none;border:none;color:var(--accent);cursor:pointer;padding:4px 0;text-decoration:underline;font-size:0.75rem" onclick="hideLoginModal()">
             Skip (try without auth)
+          </button>
+        </div>
+      </form>
+
+      <!-- Signup — POST /v1/auth/signup. Username and password only: the server
+           assigns tenant and role, so there is nothing else to ask for. -->
+      <form id="signup-form" class="hidden" autocomplete="off">
+        <div id="signup-bootstrap-note" class="auth-note hidden">
+          No accounts exist yet — this first account becomes the administrator.
+        </div>
+
+        <div class="form-group">
+          <label class="form-label" for="signup-username">Username</label>
+          <input
+            type="text"
+            id="signup-username"
+            class="form-input"
+            placeholder="analyst"
+            autocomplete="username"
+          />
+          <div class="form-hint">3–64 characters: lowercase letters, digits, <code>.</code> <code>_</code> <code>-</code></div>
+        </div>
+
+        <div class="form-group">
+          <label class="form-label" for="signup-password">Password</label>
+          <input
+            type="password"
+            id="signup-password"
+            class="form-input"
+            placeholder="••••••••"
+            autocomplete="new-password"
+          />
+          <div class="form-hint" id="signup-password-hint">At least 8 characters</div>
+        </div>
+
+        <div class="form-group">
+          <label class="form-label" for="signup-password2">Confirm password</label>
+          <input
+            type="password"
+            id="signup-password2"
+            class="form-input"
+            placeholder="••••••••"
+            autocomplete="new-password"
+          />
+        </div>
+
+        <div id="signup-error" style="color:var(--danger);font-size:0.8125rem;margin-bottom:10px;min-height:18px"></div>
+
+        <button type="submit" id="signup-submit-btn" class="btn btn-primary" style="width:100%;justify-content:center">
+          Create account &amp; sign in
+        </button>
+
+        <div class="login-footer">
+          Your password is hashed server-side (pbkdf2_sha256) and never stored in
+          plain text.
+          <br />
+          <button type="button" class="btn btn-sm" style="background:none;border:none;color:var(--accent);cursor:pointer;padding:4px 0;text-decoration:underline;font-size:0.75rem" onclick="setAuthMode('signin')">
+            Already have an account? Sign in
           </button>
         </div>
       </form>

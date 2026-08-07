@@ -274,7 +274,17 @@ pools, data-layer scale-out, hybrid local+groq burst, continuous fine-tuning).
 - [ ] Real-mode runs report `processing.degraded_components`, and it is **empty**
       before any latency or accuracy number is recorded.
 - [ ] Semantic-search results carry `embedding_is_stub`, and no demo of semantic
-      search runs on stub vectors without saying so.
+      search runs on stub vectors without saying so. The flag is reported by
+      Stage 1 and carried to the column — it was derived from the vector's
+      *dimension* until §13.2, which recorded every stub as real.
+- [ ] The LLM-backend privacy lock covers the analysis pipeline, not just
+      `/v1/chat` and agents: the API resolves each job's backend, applies the
+      lock, and stamps the decision into the envelope (§13.5). Be ready to say
+      *how* it is enforced — "the workers have no database, so the decision is
+      made where the tenant is known" is the answer.
+- [ ] `GET /v1/usage` counts every LLM caller, and `pipeline_tokens` is the
+      figure to quote for per-post cost — `total_tokens` includes chat and agent
+      spend (§13.4).
 - [ ] If the watchlist is configured: `target_stances` is a **separate field**
       from `sentiment`, and the file is described as a stated bias model.
 - [ ] Dashboard is plain HTML/CSS/JS; backend is FastAPI.

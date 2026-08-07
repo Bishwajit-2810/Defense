@@ -1,10 +1,17 @@
 # easy_run.md — one-command quickstart (with the dashboard UI)
 
 Run the whole pipeline, load the 50 sample posts, and open the **dashboard in
-your browser** — with a single command. Local dev, no GPU: Stage-1 NLP runs on the
-**gemma3:4b** LLM and Stage-2 on **qwen2.5:7b** (both via Ollama); embeddings and
-vision stay stubbed. For the deep reference (every env var, scaling, full
-troubleshooting) see [run.md](run.md).
+your browser** — with a single command:
+
+```bash
+uv run run_all.py --with-agents --reset
+```
+
+Local dev, no GPU: Stage-1 NLP runs on the **gemma3:4b** LLM and Stage-2 on
+**qwen2.5:7b** (both via Ollama); embeddings and vision stay stubbed. One-time
+prerequisites are in [§1](#1-prerequisites-one-time); the command itself is
+[§2](#2-run-it--one-command). For the deep reference (every env var, scaling,
+full troubleshooting) see [run.md](run.md).
 
 Pipeline: `API → ingestion → stage1 NLP → router → stage2 LLM → assembler`
 → Postgres (+pgvector) + ClickHouse + MinIO. The **dashboard** is a static web UI
@@ -18,7 +25,7 @@ What ends up running:
 | 5 workers + API                              | host, API on **:8001**            | ✅ yes                                          |
 | Ollama (Stage-1 + Stage-2 LLMs + VLM)        | host, **:11434**                  | ✅ yes                                          |
 | **Dashboard**                                | host, **:8080** → open in browser | ✅ this is the UI                               |
-| Agents + 3 MCP servers                       | host, :8010 / :8110, :8101–8102   | ⛔ optional ([§4](#4-optional-the-agent-layer)) |
+| Agents + 3 MCP servers                       | host, :8010 / :8110, :8101–8102   | ⛔ optional — included by `--with-agents` ([§4](#4-optional-the-agent-layer)) |
 
 ---
 
@@ -30,10 +37,15 @@ What ends up running:
   Stage 2 run on **different** models:
 
   ```bash
-  ollama pull gemma3:4b      # Stage-1 Fast NLP (sentiment/emotion/topics/… + comments)
-  ollama pull qwen2.5:7b     # Stage-2 summary / insight / comment stance
-  ollama pull qwen3-vl:4b    # VLM — image-grounded summaries
+  # one line, ~7 GB total — Stage-1 NLP, Stage-2 text, and the VLM
+  ollama pull gemma3:4b && ollama pull qwen2.5:7b && ollama pull qwen3-vl:4b
   ```
+
+  | Model | Used for |
+  | ----- | -------- |
+  | `gemma3:4b` | Stage-1 Fast NLP — sentiment / emotion / topics + every comment |
+  | `qwen2.5:7b` | Stage-2 — summary, insight, comment stance; also the Chat tab |
+  | `qwen3-vl:4b` | VLM — image-grounded summaries (unexercised: no image bytes are reachable) |
 
 Repo assumed at `/home/bk/code/defense`.
 
@@ -41,14 +53,43 @@ Repo assumed at `/home/bk/code/defense`.
 
 ## 2. Run it — one command 🚀
 
+### The whole thing, from a clean slate
+
+```bash
+cd /home/bk/code/defense && uv run run_all.py --with-agents --reset
+```
+
+That one line is the **full run**, in this order: install deps → start the four
+datastore containers and wait for health → create the ClickHouse tables → **wipe
+any previous data** → start the five workers and the API → start the agent layer
+and its three MCP servers → serve the dashboard → upload and analyse the 50 sample
+posts. Then it prints every URL and stays in the foreground.
+
+| Up after that command | Where |
+| --------------------- | ----- |
+| **Dashboard** (this is the UI) | **<http://127.0.0.1:8080>** |
+| API | <http://127.0.0.1:8001> · docs at `/docs` |
+| Agents · analytics-mcp · retrieval-mcp · ingest-mcp | :8010 · :8110 · :8101 · :8102 |
+| Postgres · Redis · ClickHouse · MinIO | Docker (MinIO console :9001) |
+| Ollama | :11434 — on your host, **not** in Docker (§1) |
+
+**Leave it running.** Press **Ctrl-C** when you're done and it stops everything it
+started. Drop `--reset` to keep data from previous runs; drop `--with-agents` if
+you don't need the Agents tab.
+
+> Nothing is containerised except the four datastores — the workers, API,
+> dashboard, agents and Ollama all run on your host. See
+> [deployment.md](deployment.md) §2b if you want the everything-in-Docker mode
+> instead (it exists, but nothing here is verified against it).
+
+### Just the core (no agent layer)
+
 ```bash
 cd /home/bk/code/defense
 uv run run_all.py
 ```
 
-That's it. The script brings everything up, waits for it to be healthy, loads the
-50 posts, serves the UI, and prints the URLs. **Leave it running** — press
-**Ctrl-C** when you're done and it stops everything it started.
+Same thing minus the agents + MCP servers, and without wiping prior data.
 
 > First run is slower than you might expect: Stage-1 NLP (`gemma3:4b`) and Stage-2
 > (`qwen2.5:7b`) make real Ollama calls per post **on CPU**, so analysing the 50
@@ -62,10 +103,13 @@ That's it. The script brings everything up, waits for it to be healthy, loads th
 
 1. `uv sync` — installs deps into `.venv`
 2. `docker compose up` the datastores → waits until healthy → creates the ClickHouse tables
-3. checks **Ollama** (starts it if installed but not running)
-4. launches the **5 workers + API** (on :8001), waits for `/v1/health`
-5. **serves the dashboard on :8080** (it already targets the dev API on :8001) — **the UI is up now**
-6. uploads the **50 sample posts** and waits for all 50 to be analysed — the dashboard is
+3. with `--reset`: wipes Redis + Postgres + ClickHouse **before anything starts**, so no
+   worker ever sees the old data
+4. checks **Ollama** (starts it if installed but not running)
+5. launches the **5 workers + API** (on :8001), waits for `/v1/health`
+6. with `--with-agents`: starts the 3 MCP servers (:8110, :8101, :8102) and the agents service (:8010)
+7. **serves the dashboard on :8080** (it already targets the dev API on :8001) — **the UI is up now**
+8. uploads the **50 sample posts** and waits for all 50 to be analysed — the dashboard is
    already open, so you watch them populate live (skip this with `--manual-load` and push them yourself)
 
 </details>
@@ -153,8 +197,10 @@ submit. (Dev mode accepts any key.) The tabs:
 
 ## 4. (Optional) The agent layer
 
-The dashboard doesn't need this — it powers the `/v1/agents/query` API
-(natural-language Q&A over the corpus). Start it together with everything else:
+The dashboard doesn't need this — it powers the `/v1/agents/query` API and the
+**Agents** tab (natural-language Q&A over the corpus). **The full-run command in
+[§2](#2-run-it--one-command) already includes it**; this section is what you
+need if you started without it, or want to know what it adds.
 
 ```bash
 uv run run_all.py --with-agents
@@ -210,9 +256,20 @@ block). Full reference in [run.md](run.md).
 - **Semantic search is stub-backed in stub mode.** Every result carries
   `embedding_is_stub`; a stub vector is a hash, so kNN returns arbitrary
   neighbours. `EMBEDDING_ALLOW_STUB=false` refuses the write instead.
+  The flag is reported by Stage 1 and carried to the column, so it stays correct
+  when you flip `MODEL_STUB_MODE=false` to demo against a corpus analysed in stub
+  mode. It was derived from the vector's *dimension* until §13.2 — and the stub
+  is the same 768 dims as a real vector, so every row read as real.
 - **Near-duplicate reuse** (on by default): a post within cosine `NEAR_DUP_THRESHOLD`
   (0.97) of an already-analyzed one reuses that result and skips Stage-1/2.
-  `NEAR_DUP_DEDUP=false` to disable. (In stub mode only *identical* captions match.)
+  `NEAR_DUP_DEDUP=false` to disable. (In stub mode only *identical* captions match —
+  which, since identical text hashes to an identical vector, means cosine 1.0 and a
+  guaranteed hit.) The result is **composed, not copied** (§13.3): identity,
+  engagement and reactions come from the new post, only the post-level analysis is
+  reused, the comment thread is reported unanalysed, and `processing.reused_from`
+  records the source. It goes through the assembler, so all three stores are
+  written. Still set `NEAR_DUP_DEDUP=false` for a run whose per-post *latency*
+  numbers you intend to quote — a reused post does no stage work.
 - **Dead-letter queues**: failed messages retry then land on `<stream>:dlq`
   (`STAGE1_MAX_RETRIES`, `ASSEMBLER_MAX_RETRIES`).
 - **Tracing (OpenTelemetry → Jaeger/Loki)**: `uv sync --extra obs`, then

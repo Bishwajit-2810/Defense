@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import re
 from datetime import datetime
 from typing import Any, Dict, List, Optional
 
@@ -21,6 +22,65 @@ class TokenRequest(BaseModel):
 class TokenResponse(BaseModel):
     access_token: str
     token_type: str = "bearer"
+
+
+#: Usernames are an identity other tenants' operators read in audit logs, so keep
+#: them boring: no whitespace, no unicode look-alikes, no empty string.
+_USERNAME_PATTERN = re.compile(r"^[a-z0-9][a-z0-9._-]{2,63}$")
+
+#: Deliberately low, and enforced in one place shared by the model and the
+#: ``/v1/auth/config`` advertisement the dashboard renders — a rule the UI states
+#: but the server does not apply is worse than no rule.
+MIN_PASSWORD_LENGTH = 8
+
+
+class SignupRequest(BaseModel):
+    """Self-service registration.
+
+    Note what is *absent*: ``tenant_id`` and ``role``. A client that could name
+    its own tenant could read another tenant's corpus, and one that could name
+    its own role would grant itself admin — so both are assigned server-side.
+    """
+
+    username: str = Field(
+        ...,
+        description="3-64 chars, lowercase letters/digits/._- , starting alphanumeric",
+    )
+    password: str = Field(..., description=f"At least {MIN_PASSWORD_LENGTH} characters")
+
+    @field_validator("username")
+    @classmethod
+    def _valid_username(cls, v: str) -> str:
+        # Case-fold before validating AND before storing: `users.username` is the
+        # primary key, so without this "Alice" and "alice" are two accounts and
+        # whoever registers second silently gets the other's login prompt.
+        v = (v or "").strip().lower()
+        if not _USERNAME_PATTERN.match(v):
+            raise ValueError(
+                "username must be 3-64 characters of lowercase letters, digits, "
+                "'.', '_' or '-', and start with a letter or digit"
+            )
+        return v
+
+    @field_validator("password")
+    @classmethod
+    def _valid_password(cls, v: str) -> str:
+        if len(v or "") < MIN_PASSWORD_LENGTH:
+            raise ValueError(f"password must be at least {MIN_PASSWORD_LENGTH} characters")
+        return v
+
+
+class SignupResponse(TokenResponse):
+    """A token, plus the identity the server actually assigned.
+
+    The token is returned so the dashboard does not have to immediately re-post
+    the password to ``/v1/auth/token``; the echoed fields exist so the UI shows
+    the tenant and role it *was given* rather than the ones it asked for.
+    """
+
+    username: str
+    tenant_id: str
+    role: str
 
 
 # ---------------------------------------------------------------------------
@@ -379,6 +439,19 @@ class ReportResponse(BaseModel):
     summary: Optional[str] = None
     summary_source: Optional[str] = None  # "llm" (grounded narrative) | "aggregate"
     clusters: Optional[List[Dict[str, Any]]] = None
+    # Embedding clusters — the LLM cost lever (architecture.md §5): one LLM-B
+    # call per cluster instead of one per post. Distinct from `clusters` above,
+    # which is the zero-LLM SQL topic aggregate.
+    #
+    # This field's absence WAS the bug: `_embedding_clusters` ran, paid for up to
+    # MAX_CLUSTERS summaries, wrote them into the job row — and FastAPI's
+    # response_model stripped them, because nothing declared them here. The same
+    # shape as §11.1's discarded Stage-2 `insight`, in the feature the cost
+    # argument is named after (PROJECT_ASSESSMENT §13.1).
+    embedding_clusters: Optional[List[Dict[str, Any]]] = None
+    # True when the vectors those clusters were computed from are hash stubs, so
+    # a reader is never invited to treat a summary of noise as a finding (§13.2).
+    embedding_clusters_are_stub: bool = False
     metrics: Optional[Dict[str, Any]] = None
 
 

@@ -191,6 +191,7 @@ def _empty_result() -> dict:
         "entities": [],
         "keywords": [],
         "embedding": None,
+        "embedding_is_stub": None,
         "sentiment_route": None,
         "sentiment_model": None,
         "engine": None,
@@ -533,6 +534,29 @@ def _real_embedding(text: str, embed_model: object) -> list[float]:
         return []
 
 
+def _embed_with_provenance(text: str, embed_model: object) -> tuple[list[float], bool]:
+    """``(vector, is_stub)`` — the honest pair, produced where the truth is known.
+
+    The stub is "a deterministic unit vector seeded from the text hash (not
+    semantic)", and it is **EMBEDDING_DIM-sized**, exactly like a real one. So no
+    downstream consumer can recover this distinction from the vector itself.
+    `persistence._resolve_embedding` tried, using the dimension, and therefore
+    recorded every stub written in the default configuration as a real vector —
+    the inverse of what the `embedding_is_stub` column exists to say
+    (PROJECT_ASSESSMENT §13.2). This returns the flag from the one place that
+    knows, so nothing has to guess.
+
+    A real model that raises falls back to the stub **and says so**, rather than
+    returning the empty vector it used to — which read downstream as "no
+    embedding" and silently became a *different* stub, seeded from the post_id.
+    """
+    if embed_model is not None:
+        vec = _real_embedding(text, embed_model)
+        if vec:
+            return vec, False
+    return _stub_embedding(text), True
+
+
 # ---------------------------------------------------------------------------
 # Embedding-prototype topic / intent classification (real mode)
 #
@@ -843,7 +867,7 @@ async def _analyze_text_llm_path(
 
     # Embedding: real model when available (non-stub), else the shared stub.
     embed_model = registry.get_embedding_model()
-    embedding = _real_embedding(text, embed_model) if embed_model is not None else _stub_embedding(text)
+    embedding, embedding_is_stub = _embed_with_provenance(text, embed_model)
 
     return {
         "language": language,
@@ -863,6 +887,9 @@ async def _analyze_text_llm_path(
         "entities": nlp["entities"],
         "keywords": nlp["keywords"],
         "embedding": embedding,
+        # Whether that vector is the deterministic hash stub. Carried, never
+        # inferred from its shape — see _embed_with_provenance (§13.2).
+        "embedding_is_stub": embedding_is_stub,
         # The "model" is the stage1 LLM itself; route records that the LLM produced it.
         "sentiment_route": "llm:stage1",
         "sentiment_model": nlp.get("_llm_model"),
@@ -911,6 +938,7 @@ async def analyze_text(
         entities = _stub_ner(text)
         keywords = _stub_keywords(text)
         embedding = _stub_embedding(text)
+        embedding_is_stub = True
         engine = "stub"
         lang_method = "stub"
     else:
@@ -962,17 +990,20 @@ async def analyze_text(
 
         # --- Embedding ---
         embed_model = registry.get_embedding_model()
-        if embed_model is not None:
-            embedding = _real_embedding(text, embed_model)
-        else:
-            embedding = _stub_embedding(text)
+        embedding, embedding_is_stub = _embed_with_provenance(text, embed_model)
 
         # --- Topics / intents ---
         # Union the keyword seeds (high precision) with embedding-prototype
         # classification (recall for paraphrases / Banglish), reusing the post
         # embedding. Prototypes need a real embedding model + real (non-stub)
         # vectors; otherwise fall back to the heuristic alone.
-        if embed_model is not None:
+        #
+        # `not embedding_is_stub` is the second half of that sentence, and it used
+        # to be missing: a real model that *failed* left an empty vector, which
+        # `_classify_by_prototype` read as "no embedding" and skipped. Now the
+        # fallback returns a usable stub, so the flag — not the vector's
+        # emptiness — is what keeps prototypes off hash noise.
+        if embed_model is not None and not embedding_is_stub:
             proto_topics = _classify_by_prototype(
                 embedding, "topics", _TOPIC_LABELS, embed_model, _TOPIC_PROTO_FLOOR, top_k=3
             )
@@ -1013,6 +1044,9 @@ async def analyze_text(
         "entities": entities,
         "keywords": keywords,
         "embedding": embedding,
+        # Whether that vector is the deterministic hash stub. Carried, never
+        # inferred from its shape — see _embed_with_provenance (§13.2).
+        "embedding_is_stub": embedding_is_stub,
         # Which sentiment model the language router selected for this post.
         "sentiment_route": sent_route,
         "sentiment_model": sent_model_name,

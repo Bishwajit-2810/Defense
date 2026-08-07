@@ -11,7 +11,7 @@ from __future__ import annotations
 
 import os
 import sys
-from typing import AsyncGenerator
+from typing import Any, AsyncGenerator
 
 import redis.asyncio as aioredis
 import structlog
@@ -49,6 +49,13 @@ _ALLOW_UNKNOWN_API_KEYS = (
 )
 
 log = structlog.get_logger(__name__)
+
+#: The runtime LLM-backend override the dashboard sets and the pipeline workers
+#: read. Mirrors `routers/config.py::LLM_BACKEND_KEY` and
+#: `stage2_llm/worker.py` — this is the key that actually decides which backend
+#: a post is analysed on, which is why the tenant policy has to be applied
+#: against it and not only against the per-request option (§13.5).
+LLM_BACKEND_CONFIG_KEY = "config:llm_backend"
 
 # Per-identity request rate limit (architecture §9).
 RATE_LIMIT_ENABLED = os.getenv("RATE_LIMIT_ENABLED", "true").lower() == "true"
@@ -410,6 +417,104 @@ async def rate_limit(
 # ---------------------------------------------------------------------------
 
 
+async def tenant_is_privacy_locked(db: AsyncSession, current_user: dict) -> bool:
+    """Whether this principal's tenant is pinned to the local backend.
+
+    **Fails closed**, by raising 503 rather than returning False: a privacy
+    guarantee that evaporates when the database hiccups is not a guarantee (the
+    reasoning §5.6 arrived at, preserved here now that two callers share it).
+    """
+    # `tenant_id` now originates from the api_keys row or from verified,
+    # allowlisted JWT claims — never merged wholesale from a token body, which
+    # used to let a self-signed token name any tenant it liked.
+    tenant_id = current_user.get("tenant_id") or "default"
+    try:
+        row = (
+            await db.execute(
+                text(
+                    "SELECT privacy_locked FROM tenant_policies WHERE tenant_id = :tid"
+                ),
+                {"tid": tenant_id},
+            )
+        ).first()
+    except Exception as exc:
+        log.error("tenant_policy_lookup_failed_denying", tenant_id=tenant_id, error=str(exc))
+        raise HTTPException(
+            status_code=status.HTTP_503_SERVICE_UNAVAILABLE,
+            detail=(
+                "Cannot verify the tenant's LLM-backend policy right now, so the "
+                "requested 'groq' backend is refused. Retry, or omit llm_backend "
+                "to use the default local backend."
+            ),
+        ) from exc
+    return bool(row and row[0])
+
+
+async def resolve_llm_backend(
+    db: AsyncSession,
+    redis: Any,
+    current_user: dict,
+    options: dict | None,
+) -> str:
+    """Resolve the backend this job will actually run on, and enforce the lock.
+
+    **This exists because the guarded knob was not the deciding knob**
+    (PROJECT_ASSESSMENT §13.5). `check_llm_backend_policy` inspected
+    ``options["llm_backend"]``, which no worker ever read: Stage 1 and Stage 2
+    both resolve their backend from the global Redis key ``config:llm_backend``.
+    So a privacy-locked tenant's posts went to Groq whenever that global toggle
+    pointed there, while an explicit ``llm_backend: "groq"`` on the request still
+    returned a 403 that read as the guarantee holding.
+
+    The resolution order matches what the workers do — request > toggle > env —
+    and the **resolved** value is what the caller stamps into the job envelope,
+    so the decision is made once, here, where the tenant is known. The workers
+    have no database and so cannot make it themselves.
+
+    Two different outcomes for a locked tenant, deliberately:
+
+    * they **asked** for groq → 403. It is their request and it is refusable.
+    * the **toggle or the env default** says groq → silently pinned to local.
+      The operator's global switch is not their choice, and the guarantee is
+      "their content never leaves the local backend", not "they get an error".
+      Raising here would take a locked tenant offline whenever anyone flipped
+      the switch.
+    """
+    explicit = (options or {}).get("llm_backend")
+    toggle = None
+    try:
+        raw = await redis.get(LLM_BACKEND_CONFIG_KEY)
+        decoded = raw.decode() if isinstance(raw, (bytes, bytearray)) else raw
+        if decoded in ("local", "groq"):
+            toggle = decoded
+    except Exception as exc:  # Redis down → fall through to the env default
+        log.warning("llm_backend_toggle_read_failed", error=str(exc))
+
+    resolved = explicit or toggle or os.environ.get("LLM_BACKEND", "local")
+    if resolved != "groq":
+        return resolved
+
+    if not await tenant_is_privacy_locked(db, current_user):
+        return resolved
+
+    tenant_id = current_user.get("tenant_id") or "default"
+    if explicit == "groq":
+        raise HTTPException(
+            status_code=status.HTTP_403_FORBIDDEN,
+            detail=(
+                f"Tenant '{tenant_id}' is privacy-locked: llm_backend='groq' "
+                "is not permitted (data must not leave the local backend)"
+            ),
+        )
+    log.info(
+        "privacy_locked_tenant_pinned_to_local",
+        tenant_id=tenant_id,
+        would_have_been=resolved,
+        source="toggle" if toggle == "groq" else "env_default",
+    )
+    return "local"
+
+
 async def check_llm_backend_policy(
     db: AsyncSession,
     current_user: dict,
@@ -417,6 +522,10 @@ async def check_llm_backend_policy(
 ) -> None:
     """Reject a per-request ``llm_backend: "groq"`` override when the tenant
     is privacy-locked (tenant_policies.privacy_locked).
+
+    **Scope:** this guards a backend the CALLER named. For work handed to the
+    pipeline, use :func:`resolve_llm_backend` instead — the pipeline's backend
+    comes from the global toggle, which this function never sees (§13.5).
 
     Raises:
         HTTPException 403 when the override violates the tenant policy.

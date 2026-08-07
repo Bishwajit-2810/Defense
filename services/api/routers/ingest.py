@@ -13,7 +13,7 @@ from sqlalchemy import text
 from sqlalchemy.ext.asyncio import AsyncSession
 
 import redis.asyncio as aioredis
-from deps import check_llm_backend_policy, get_current_user, get_db, get_redis
+from deps import get_current_user, get_db, get_redis, resolve_llm_backend
 from models import IngestSyncRequest, JobResponse, UploadJobResponse, UploadRequest
 
 log = structlog.get_logger(__name__)
@@ -148,9 +148,12 @@ async def posts_upload(
     """
     job_id = str(uuid.uuid4())
 
-    options: dict[str, Any] = body.options or {}
-    # Privacy-locked tenants may not override the backend to groq (403).
-    await check_llm_backend_policy(db, current_user, options)
+    options: dict[str, Any] = dict(body.options or {})
+    # Resolve the backend this job will ACTUALLY run on and enforce the tenant's
+    # privacy lock against it, then stamp the decision into `options` so it
+    # travels with the envelope. The workers have no database, so this is the
+    # only layer that can make it (PROJECT_ASSESSMENT §13.5).
+    options["llm_backend"] = await resolve_llm_backend(db, redis, current_user, options)
 
     # Count inline posts if provided
     post_count: int | None = len(body.posts) if body.posts is not None else None

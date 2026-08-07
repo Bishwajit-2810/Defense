@@ -25,7 +25,7 @@ from sqlalchemy.ext.asyncio import AsyncSession
 import redis.asyncio as aioredis
 from libs.labels import label_provenance
 from libs.progress import publish_stage, replay_events
-from deps import check_llm_backend_policy, get_current_user, get_db, get_redis, rate_limit
+from deps import get_current_user, get_db, get_redis, rate_limit, resolve_llm_backend
 from models import (
     AnalysisDetailResponse,
     AnalysisResultResponse,
@@ -108,9 +108,16 @@ async def analysis_run(
             detail="Provide at least one of 'post_ids' or 'campaign_id'",
         )
 
-    options: dict[str, Any] = body.options or {}
-    # Privacy-locked tenants may not override the backend to groq (403).
-    await check_llm_backend_policy(db, current_user, options)
+    options: dict[str, Any] = dict(body.options or {})
+    # Resolve the backend this job will ACTUALLY run on (request > toggle > env)
+    # and enforce the tenant's privacy lock against it, here where the tenant is
+    # known — the workers have no database and cannot do it themselves.
+    #
+    # The resolved value is then stamped into `options`, which travels in the job
+    # envelope. Without that stamp the check was theatre: it inspected an option
+    # no worker read, while Stage 1 and Stage 2 took their backend from the
+    # global `config:llm_backend` key (PROJECT_ASSESSMENT §13.5).
+    options["llm_backend"] = await resolve_llm_backend(db, redis, current_user, options)
 
     analysis_id = str(uuid.uuid4())
 

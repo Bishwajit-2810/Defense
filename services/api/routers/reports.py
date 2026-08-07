@@ -68,6 +68,11 @@ def _row_to_report(row: dict) -> ReportResponse:
         summary=content.get("summary"),
         summary_source=content.get("summary_source"),
         clusters=content.get("clusters"),
+        # Read back what `create_report` paid for. Omitting these two was §13.1:
+        # the summaries were generated, stored in `options.result`, and then
+        # never read by any of the three report endpoints.
+        embedding_clusters=content.get("embedding_clusters"),
+        embedding_clusters_are_stub=bool(content.get("embedding_clusters_are_stub")),
         metrics=content.get("metrics"),
     )
 
@@ -219,6 +224,7 @@ async def _llm_narrative(
                 backend_override=backend_override,
                 max_tokens=400,
                 temperature=0.2,
+                usage_task="report_narrative",
             ),
             timeout=30.0,
         )
@@ -241,18 +247,25 @@ async def _embedding_clusters(
     db: AsyncSession,
     campaign_id: str,
     backend_override: str | None,
-) -> list[dict]:
+) -> tuple[list[dict], bool]:
     """Cluster post embeddings (pgvector → k-means) and summarize one slice per
     cluster with a single LLM-B call each — N posts, ~k LLM calls (§5).
 
-    Returns [] when there are too few embeddings or clustering is unavailable;
-    cluster summaries degrade to None (not an error) if the LLM is unreachable.
+    Returns ``(clusters, any_vector_was_a_stub)``. The second element exists
+    because these summaries cost real LLM calls and a stub vector is not
+    semantic: clustering hash vectors groups posts arbitrarily, so the summaries
+    describe nothing. That has to travel to the reader rather than being
+    inferable only from a log line (§13.1 / §13.2).
+
+    Clusters are [] when there are too few embeddings or clustering is
+    unavailable; individual summaries degrade to None (not an error) if the LLM
+    is unreachable.
     """
     try:
         from libs.clustering import cluster_embeddings, parse_pgvector  # noqa: PLC0415
     except Exception as exc:  # numpy missing, etc.
         log.warning("clustering_unavailable", error=str(exc))
-        return []
+        return [], False
 
     scoped = campaign_id not in ("", "all")
     where = "WHERE ar.embedding IS NOT NULL"
@@ -268,7 +281,8 @@ async def _embedding_clusters(
                 SELECT ar.post_id                          AS post_id,
                        ar.embedding::text                  AS emb,
                        ar.result->>'post_summary'          AS summary,
-                       ar.result->>'overall_sentiment'     AS sentiment
+                       ar.result->>'overall_sentiment'     AS sentiment,
+                       COALESCE(ar.embedding_is_stub, FALSE) AS is_stub
                 FROM analysis_results ar
                 {where}
                 ORDER BY ar.created_at DESC
@@ -281,10 +295,13 @@ async def _embedding_clusters(
 
     vectors: list[list[float]] = []
     meta: list[dict] = []
+    stub_vectors = 0
     for r in rows:
         vec = parse_pgvector(r["emb"])
         if vec:
             vectors.append(vec)
+            if r["is_stub"]:
+                stub_vectors += 1
             meta.append({
                 "post_id": r["post_id"],
                 "summary": r["summary"],
@@ -292,7 +309,19 @@ async def _embedding_clusters(
             })
 
     if len(vectors) < 2:
-        return []
+        return [], bool(stub_vectors)
+
+    # A hash stub is "not semantic", so clustering a table of them groups noise
+    # and every per-cluster LLM call summarises an arbitrary set of posts. That
+    # has to reach the reader, not just this log line — the caller puts it on the
+    # response as `embedding_clusters_are_stub` (§13.2 / §5.9).
+    if stub_vectors:
+        log.warning(
+            "embedding_clusters_over_stub_vectors",
+            stub_vectors=stub_vectors,
+            total_vectors=len(vectors),
+            detail="clusters group hash noise; summaries are not meaningful",
+        )
 
     cr = cluster_embeddings(vectors)
 
@@ -331,7 +360,7 @@ async def _embedding_clusters(
         })
 
     clusters.sort(key=lambda c: c["size"], reverse=True)
-    return clusters
+    return clusters, bool(stub_vectors)
 
 
 async def _summarize_cluster(
@@ -357,6 +386,7 @@ async def _summarize_cluster(
                 backend_override=backend_override,
                 max_tokens=120,
                 temperature=0.2,
+                usage_task="report_cluster_summary",
             ),
             timeout=30.0,
         )
@@ -469,12 +499,15 @@ async def create_report(
             # ~k LLM calls for the whole corpus, not one per post. Best-effort —
             # never fail report creation if clustering/LLM is unavailable.
             try:
-                content["embedding_clusters"] = await _embedding_clusters(
+                emb_clusters, emb_are_stub = await _embedding_clusters(
                     db, campaign_id, backend_override
                 )
+                content["embedding_clusters"] = emb_clusters
+                content["embedding_clusters_are_stub"] = emb_are_stub
             except Exception as exc:
                 log.warning("embedding_clusters_failed", error=str(exc))
                 content["embedding_clusters"] = []
+                content["embedding_clusters_are_stub"] = False
 
         options["result"] = content
         await db.execute(
@@ -515,6 +548,8 @@ async def create_report(
         summary=content.get("summary"),
         summary_source=content.get("summary_source"),
         clusters=content.get("clusters"),
+        embedding_clusters=content.get("embedding_clusters"),
+        embedding_clusters_are_stub=bool(content.get("embedding_clusters_are_stub")),
         metrics=content.get("metrics"),
     )
 

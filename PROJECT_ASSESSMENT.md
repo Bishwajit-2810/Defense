@@ -114,6 +114,14 @@ Bangla / English / Banglish)
   and a broken JWT auth path. **§6. Specified, not implemented.**
 - **Pass 4** is a fresh-eyes audit of the whole repository after all of the above landed.
   **§11.** Ten findings, all fixed and regression-tested.
+- **Pass 5** re-audits the tree Pass 4 left, executing the storage paths against real
+  containers rather than reasoning about them. **§12.** Seven findings, all fixed.
+- **Pass 6** is a third fresh-eyes audit, weighted toward the files the earlier passes
+  touched least (ingestion, the report/search/config/pipeline routers, the agent runner).
+  **§13. Six findings plus four smaller ones — all OPEN.** This pass deliberately changed
+  no code, so nothing in it is regression-tested. Read **§13.5** (the privacy lock does not
+  cover the analysis pipeline) and **§13.4** (`/v1/usage` counts Stage 2 only) before making
+  either claim out loud; §13.8 ranks the rest.
 
 **Scope:** design documents, all 99 Python modules (19,557 LOC), routing rules, evaluation
 harness, dataset, 16 test files (323 tests, all passing), Docker Compose + Kubernetes
@@ -2036,3 +2044,359 @@ path in this system is a §12.1 waiting to be found.
 rollback tests, → 592 with §12.2's writer-contract test, → 597 with §12.3's
 documented-schema tests). Each fix was mutation-tested by reverting it and
 confirming the new tests fail.
+
+---
+
+## 13. Pass 6 — fresh-eyes audit, 5 August 2026 (after Pass 5's fixes landed)
+
+A third independent read of the whole tree, deliberately weighted toward the
+files the previous passes touched least: `services/ingestion/service.py`, the
+report/search/config/pipeline routers, `services/agents/runner.py` and
+`libs/clustering.py`. Baseline: **597 tests passing, 34 files.**
+
+**All ten findings below are now FIXED and regression-tested** (5 August 2026),
+plus the dashboard gaps the fixes themselves opened (§13.9).
+The audit and the remediation were separate passes: the findings were written up
+first, with no code changed, and [OPEN_ISSUES.md](OPEN_ISSUES.md) carries the
+per-issue landing notes. Test suite **597 → 662 passing, 34 → 39 files**.
+
+Two of them were decisions rather than defects, and were resolved deliberately:
+§13.5 was **enforced** rather than merely restated, and §13.3's store gap was
+closed by routing reuse **through the assembler** rather than by adding storage
+clients to the ingestion service.
+
+Method note: the ClickHouse/Postgres findings follow §12.6's lesson and were
+**executed**, not read. A throwaway `pgvector/pgvector:pg16` container was
+brought up, `deploy/init-db.sql` applied, and the real `persist_postgres`,
+`_reuse_analysis` SQL and Stage-1 `analyze_text` run against it. Two of the five
+main findings only became certain that way, and one hypothesis died there — see
+§13.7.
+
+### 13.1 The report layer's cluster summaries are computed, paid for, and discarded — **[measured]** — FIXED
+
+`reports._embedding_clusters` is the code architecture.md §5 calls **the LLM cost
+lever**: rather than summarize N posts with N calls, it pulls up to
+`REPORT_CLUSTER_SAMPLE_CAP` (1500) embeddings, k-means them
+(`MAX_CLUSTERS = 8`), and spends **one LLM-B call per cluster** summarizing a
+representative slice. It writes the result to `content["embedding_clusters"]`.
+
+Nothing ever reads it back:
+
+* `ReportResponse` declares no `embedding_clusters` field, and FastAPI's
+  `response_model` strips undeclared keys — so `POST /v1/reports` does not
+  return it. Verified directly:
+
+  ```
+  declared fields: campaign_id, clusters, created_at, download_url, id, metrics,
+                   period, report_id, status, summary, summary_source, title,
+                   type, updated_at
+  has embedding_clusters: False
+  ```
+
+* `_row_to_report` never reads the key either, so `GET /v1/reports` and
+  `GET /v1/reports/{id}` do not return it;
+* `embedding_clusters` appears **nowhere** in `dashboard/app.js`, and nowhere in
+  any `.md` file.
+
+Its only existence is the raw `jobs.options` JSONB column. Meanwhile the
+`clusters` field the API *does* return is `_generate_report_content`'s
+topic-count aggregate — pure SQL, zero LLM calls. **The report renders the cheap
+artefact and discards the expensive one.**
+
+This is §11.1 exactly — a whole LLM task's output lost between producer and
+consumer — one layer up, and now in the feature the cost argument is named after.
+§11.1's own write-up says *"this is worse than a dropped provenance key, because
+it is spend"*; the same sentence applies here without modification.
+
+### 13.2 `embedding_is_stub` is `FALSE` on every row the pipeline writes by default — **[probed]** — FIXED
+
+§9.11 consequence 1 recorded that `assembler.py` computed `embedding_is_stub`
+from a `processing.stub_mode` key the builder had dropped, *"therefore reported
+stub vectors as **not** stubs, exactly inverting the §5.9 fix"*. That was fixed —
+for the assembler's **trace frame**. The **database column**, which is what
+`/v1/search` actually returns, is computed somewhere else entirely and still
+inverts.
+
+There are two independent computations of one flag, and they disagree:
+
+| Site | Rule | Value in stub mode |
+| ---- | ---- | ------------------ |
+| `assembler.py:295` (trace frame / log) | `processing.stub_mode or not stage1_embedding` | **True** ✓ |
+| `persistence._resolve_embedding` (the DB column) | dimension check: `len(embedding) == EMBEDDING_DIM → not a stub` | **False** ✗ |
+
+With `MODEL_STUB_MODE=true` — the default — Stage 1 emits `stub_embedding(text)`,
+a 768-dim hash vector. Its dimension is correct, so persistence classifies it as
+a real Stage-1 vector. Run against a real Postgres 16 + pgvector:
+
+```
+stage1 embedding dims: 768
+stage1 vector IS the hash stub? True
+assembler trace frame says embedding_is_stub = True
+DB column (what /v1/search returns) says      = False
+```
+
+The `is_stub=True` branch fires only when Stage 1 supplied **no** embedding or a
+wrong-dimension one — i.e. the one case where the vector is persistence's own
+`post_id`-seeded fallback rather than a Stage-1 stub. The column is therefore
+close to the inverse of its documented meaning.
+
+**Why it has stayed invisible.** `_semantic_search` ORs the row flag with
+`query_is_stub`, and in a fully-stubbed deployment the query embedding is a stub
+too, so the response-level disclosure is right for the wrong reason. It breaks in
+the exact sequence a demo follows: analyse the corpus in stub mode (fast), then
+install the `ml` extra and set `MODEL_STUB_MODE=false` to show semantic search.
+The query is then real, `stub_rows` counts 0, the
+`semantic_search_over_stub_vectors` warning never fires, and every hit reports
+`embedding_is_stub: false` over a corpus of hash noise. FEATURES.md §7 rates this
+row ✅ *Measured*.
+
+It also silently governs §13.1: `_embedding_clusters` clusters those same
+vectors, and nothing in the report says the clusters are noise.
+
+### 13.3 Near-duplicate reuse copies the analysis but not its provenance — **[probed]** — FIXED
+
+`ingestion._reuse_analysis` copies a prior `analysis_results` row onto a new
+`post_id`, skipping Stage 1 and Stage 2 entirely. Three problems, all executed
+against a real database rather than reasoned about:
+
+1. **The stub flag is dropped.** The INSERT column list is
+   `(post_id, campaign_id, result, embedding, schema_version, created_at, updated_at)`
+   — `embedding_is_stub` is **not** in it, so the copy takes the column
+   `DEFAULT FALSE`, and the `ON CONFLICT DO UPDATE` branch does not set it
+   either. A source row honestly flagged `TRUE` produces a copy claiming `FALSE`:
+
+   ```
+    post_id | embedding_is_stub | result_post_id
+   ---------+-------------------+----------------
+    new     | f                 | src
+    src     | t                 | src
+   ```
+
+2. **The copied document names the wrong post.** `result` is copied verbatim, so
+   the new row's canonical JSON keeps the **source's** `post_id`, and with it the
+   source's `post_text`, `engagement` and `reaction_breakdown`. `/v1/search`
+   returns that raw `result` dict, so a hit on the new post carries a document
+   describing a different one. Reactions and comment counts are per-post *facts*,
+   not analysis — two posts can share a caption and have nothing else in common,
+   which is the normal case for a repost.
+
+3. **Only Postgres is written.** No ClickHouse row, no object-storage blob. So a
+   reused post is invisible to every analytics aggregate (trend, top posts,
+   reaction mix, sentiment-over-time) while still counting in the
+   Postgres-backed `/v1/reports` and `/v1/usage` numbers. The two stores
+   disagree by construction, and §11.2's dedup work does not help — the row was
+   never inserted.
+
+**This is not a rare path.** `NEAR_DUP_DEDUP` defaults to `true`, and identical
+text yields an identical stub vector, so cosine is exactly 1.0 ≥ the 0.97
+threshold. Any repost with the same caption takes it. `tests/test_near_dup.py`
+exercises the functions against a `FakeSession` that returns canned rows, so the
+SQL in this function has never once been executed by the suite — §12.6's rule,
+third instance.
+
+### 13.4 `/v1/usage` counts Stage 2 only, and `scope_note` says the opposite — **[measured]** — FIXED
+
+`_track_usage` — the writer for `usage:tokens:total`, `usage:llm_calls`,
+`usage:cache_hits`, `usage:tokens:{backend}:{model}` and the lane counters —
+exists in exactly one file, `services/workers/stage2_llm/worker.py`. Grepping
+every `LLMClient` call site in the tree shows five others, none of which touch a
+counter:
+
+| Call site | When it runs | Rough volume |
+| --------- | ------------ | ------------ |
+| `chat.py` — `POST /v1/chat`, `POST /v1/chat/stream` | every chatbot turn | unbounded, user-driven |
+| `reports.py` — `_llm_narrative` | every grounded report (the default) | 1 per report |
+| `reports.py` — `_summarize_cluster` | every grounded report | up to 8 per report (§13.1) |
+| `stage1_nlp/llm_analyzer.py` (2 sites) | when `STAGE1_LLM=true` — **the shipped configuration** | per post |
+| `agents/runner.py` — `_llm_chat_with_tools` | every agent turn | per tool-calling turn |
+
+§11.3 removed the `llm_cache` query on the grounds that a documented source which
+cannot deliver is worse than no source, and §12.4e went back for the vestigial
+comment. This is the same defect from the other end: the counters are real and
+correct, and the **scope** claimed for them is not. `UsageResponse.total_tokens`
+says *"Total tokens spent"*; the endpoint docstring says *"Every token/cost/cache
+figure therefore comes from Redis"* without saying which callers write it; and
+`scope_note` — the field §5.8 added specifically to state what the numbers cover
+— returns the flat string `"All figures are system-wide."`
+
+It matters most in the configuration the project ships: with `STAGE1_LLM=true`,
+Stage-1 comment labelling is uncounted, and §6.8 measured comment-level calls at
+**96%** of the total there. `estimated_cost_usd` is the number the cost-efficiency
+thesis rests on.
+
+### 13.5 The privacy lock does not cover the analysis pipeline, and the knob it guards is dead — **[read]** — FIXED
+
+§3.3 calls the local⇄Groq policy *"the best design decision in the project"*, and
+§5.6 fixed the authentication half of enforcing it (tenant from the `api_keys`
+row, allowlisted JWT claims, fail-closed policy lookup). §11.5 concluded *"the
+auth layer held up"*. It did. The leak is not in the auth layer.
+
+**`check_llm_backend_policy` guards an option no worker reads.** Its first
+statement is:
+
+```python
+requested = (options or {}).get("llm_backend")
+if requested != "groq":
+    return
+```
+
+`POST /v1/analysis` and `POST /v1/ingest` both call it with the request's
+`options`. But grepping `services/workers/` for `llm_backend` shows no consumer:
+Stage 1 (`LLM_BACKEND_CONFIG_KEY`) and Stage 2 (`worker.py:991`) both resolve
+their backend from the **global Redis key `config:llm_backend`**, falling back to
+the `LLM_BACKEND` env var. The per-request `llm_backend` option is accepted,
+policy-checked, persisted into the job envelope — and never consumed. Its only
+observable effect is the 403.
+
+**The key that does decide is unguarded.** `PUT /v1/config/llm` sets
+`config:llm_backend` with no `check_llm_backend_policy` call and no role check —
+any authenticated principal can flip it, and it applies **process-wide, to every
+tenant's posts**. Nothing in the pipeline carries a tenant id, so there is no
+point at which a privacy-locked tenant's post could be excluded even in
+principle.
+
+Net effect: a privacy-locked tenant's post content goes to Groq whenever the
+global toggle points there, while `POST /v1/analysis` with `llm_backend: "groq"`
+still returns a 403 that reads as the guarantee working. FEATURES.md §6 rates
+"Tenant backend pinning" ✅ *Measured*, and run.md documents flipping the toggle
+with the demo key as a normal operation.
+
+The honest framing available today is the one §12.5 already reached for
+`analysis_run`'s missing tenant scoping: **the pipeline is single-tenant, and the
+backend policy is enforced on the interactive surfaces (`/v1/chat`, agents) but
+not on batch analysis.** That is defensible if said out loud. It is not what the
+docs currently say.
+
+### 13.6 The agent runner bypasses every LLMClient resilience path — **[read]** — FIXED
+
+`runner._llm_chat_with_tools` reaches past `LLMClient.chat` into
+`self.llm._get_client(...)` and calls `oai_client.chat.completions.create`
+directly, because `chat()` does not forward tool definitions. Its docstring is
+accurate about what that preserves — *"policy enforcement and model
+resolution"* — and silent about what it drops:
+
+* **the circuit breaker** — no `record_success` / `record_failure`, so agent
+  traffic can neither open Groq's breaker nor contribute to it. §11.4b and
+  §12.4a were both fixes for exactly this class of gap in `chat`/`chat_stream`;
+* **the Groq→local failover** — every other caller degrades; agents hard-fail;
+* **truncation continuation** (§6.1) and the **JSON-mode degeneracy retry**
+  (§11.4/§5) — an agent turn that hits the token ceiling is silently cut;
+* **usage tracking** — §13.4's fifth row.
+
+### 13.7 Smaller findings
+
+| # | Finding | Evidence |
+| - | ------- | -------- |
+| a | `config.py::_MODEL_ENVS` is a hand-maintained mirror of `client.py`'s role→model tables, and is **missing the `summary` role** — the one §6.5 added so summaries get a stronger model. `GET /v1/config/llm` reports five roles; the model that writes summaries is not among them, so the dashboard's model panel cannot show it. The ten values it does carry all agree with `client.py` today. | diffed programmatically |
+| b | `pipeline.py::_STAGES` hardcodes all five stream **and** consumer-group names as string literals instead of importing `libs/streams.py`. They match the defaults today, but every name is env-overridable *by design* ("deployments legitimately shard streams"), and under any override `_stage_stats` swallows the `xinfo_groups` error and returns zeros — so the dashboard's Pipeline tab renders an **idle, healthy** pipeline while work is queued. That is the §5.5 KEDA failure mode reproduced in the monitoring view. `tests/test_streams.py::test_workers_import_their_names_from_libs_streams` covers the five workers and not this file; it is the last un-pinned copy of those identifiers. | read + test scope checked |
+| c | `ingestion._ensure_consumer_group`'s docstring says it uses `"$"` *"so we only process messages that arrive after the service starts"*, and offers `"0"` as the change to make for reprocessing. The code passes `id="0"`. The comment describes the opposite of the behaviour, and its remediation advice describes the state it is already in. | read |
+| d | `UsageResponse.lane_split` is typed `Dict[str, Dict[str, float]]`, so the integer call and token counts inside it serialize as floats — `{"calls": 123.0, "tokens": 45678.0}`. Cosmetic, but it is a token *count*. | verified |
+
+**One hypothesis died in the probe, recorded so it is not re-raised.**
+`_reuse_analysis` issues `INSERT … SELECT … ORDER BY … LIMIT 1 ON CONFLICT …`,
+which looks like it should need a CTE or subquery wrapper. It does not —
+PostgreSQL 16 parses and executes it correctly (`INSERT 0 1`). Ten seconds
+against a container settled what would otherwise have been an argument, which is
+§12.6's point restated.
+
+### 13.8 The theme of this pass
+
+Pass 4's rule was *a read whose source cannot deliver fails silently*. Pass 5
+sharpened it to *a degradation path that has never executed is not a fallback*.
+Pass 6's findings are neither. Four of the six are instances of one thing:
+
+> **A fix applied at the layer where the defect was noticed, and not at the layer
+> where the value is consumed.**
+
+§9.11 fixed `embedding_is_stub` in the assembler's log frame and left the
+database column that users actually read (§13.2). §5.9 marked the row and left
+the reuse path that copies rows (§13.3). §11.1 carried Stage 2's `insight` to the
+API, and §12.4d had to carry it the last hop to the dashboard — the report
+layer's cluster summaries never got that second pass at all (§13.1). §5.6
+hardened how a tenant is *identified* and never checked whether anything
+downstream *uses* the identity (§13.5).
+
+The mitigation generalises past this codebase, and it is a sharper version of
+§11.6's: when a fix adds a signal, **follow the signal to the surface a human
+reads and assert it there**. §12.3 already did this once for a document
+(`endpoints.md` validated against the schema). Every regression test written for
+this pass takes that shape — they start at the consumer and walk back:
+
+* `test_embedding_provenance` asserts the **bound SQL parameter**, not Stage 1's
+  return value;
+* `test_report_clusters_survive` asserts the **response model and the dashboard
+  source**, not `_embedding_clusters`;
+* `test_usage_covers_every_caller` asserts **no module bypasses the client**,
+  rather than checking each call site;
+* `test_near_dup_reuse_identity` asserts the **composed document**, which is what
+  `/v1/search` hands back.
+
+### 13.9 The dashboard was out of sync with the fixes — FIXED
+
+Fixing §13.1–§13.7 changed the API surface, and the dashboard was checked against
+it afterwards rather than assumed correct. **Three gaps, all instances of §13.8's
+rule** — a signal added and not carried to the surface a human reads:
+
+| Gap | Consequence |
+| --- | ----------- |
+| The Overview "Cost split" card read `lane_split.post` and `.comment` only | `stage1`, `interactive` and `agent` were invisible — the three lanes §13.4 had just *started counting*. Worse, the card's "% of calls are comment-level" used `comment.call_share`, whose denominator now spans every lane, so a per-post figure was silently diluted by chat and agent traffic while still labelled post-vs-comment. |
+| `pipeline_tokens` was not rendered | The token card showed `total_tokens`, which now includes per-question chat/agent spend, so a chatbot session inflated the per-post cost figure with no way to see the corpus-only number. |
+| `processing.reused_from` was rendered nowhere | A near-duplicate showed `Stage1 0 ms · Stage2 0 ms · LLM Used false` — indistinguishable from a genuinely cheap analysis. Its comment section showed `0 analyzed` with no explanation, because `provenanceSummary` needs `prov.total` and returns "—" without it. |
+
+The third is the sharpest: **§13.3's own fix reintroduced §13.8's pattern.** The
+reuse provenance was added to the canonical result and stopped at the API — the
+same hop §11.1 stopped at with `insight`, which §12.4d then had to finish.
+
+Fixed: the cost split computes its share over the pipeline lanes only and names
+every lane in a "Spend by lane" breakdown; `pipeline_tokens` is its own stat with
+a subtitle saying what the total covers that it does not; reused posts carry a
+`near-dup` tag in the post list, a "Reused Analysis" block naming the source post
+and similarity in the detail modal, a `reused` row in the Trace tab (whose rail
+is otherwise empty, since no stage ran), and an explicit "this thread was not
+analysed" note driven by `comment_analysis.provenance.note`.
+
+`tests/test_dashboard_renders_api_fields.py` pins the contract: every lane in
+`ALL_LANES` must be named in the UI, the hint table must not drift from
+`libs/llm/usage.py`, and the fields earlier passes had to chase to this surface
+(`insight`, `embedding_clusters`, `embedding_is_stub`, `degraded_components`)
+must still be read.
+
+**Mutation-testing the test caught a flaw in the test itself.** It scanned the
+raw source, and this codebase comments heavily — citing the very field names
+under test. Removing every real read of `reused_from` left the assertion passing,
+because the explanatory comments still mentioned it. The scan now strips comment
+lines first, and asserts *property reads* (`x.reused_from`) rather than string
+presence. Two assertions were tightened the same way: `pipeline_tokens` must
+appear as its own `makeStatCard`, not merely be referenced somewhere.
+
+### 13.10 Mutation testing the fixes
+
+Each fix was reverted against the tree to confirm the new tests notice. **One of
+the first four did not**, and it is the instructive one: reverting
+`LLMClient.chat`'s tracking call (`if track:` → `if False:`) left all 659 tests
+green, because every test for §13.4 was *structural* — an AST check that nothing
+bypasses the client, and unit tests of `track_usage` in isolation. Both pass
+perfectly well against a `chat()` that imports the counter and never calls it.
+
+That is the same species of gap as the findings themselves: the tests asserted
+the *shape* of the fix rather than its *effect*. Three behavioural tests were
+added that drive the real `chat()` with a stubbed backend and watch the counters
+fire; the mutation now fails two of them. Final results:
+
+| Reverted fix | Outcome |
+| ------------ | ------- |
+| §13.1 — drop `embedding_clusters` from `ReportResponse` | 5 tests fail |
+| §13.2 — report a stub vector as real | 2 tests fail |
+| §13.3 — keep the source's stage timings | 1 test fails |
+| §13.4 — stop recording usage in `chat()` | 2 tests fail *(after the behavioural tests were added; 0 before)* |
+| §13.5 — stop pinning a locked tenant to local | 2 tests fail |
+| §13.9 — stop reading `reused_from` in the UI | 1 test fails *(after the comment-stripping fix; 0 before)* |
+| §13.9 — revert the lane-share denominator | 1 test fails |
+| §13.9 — drop a lane from the UI hint table | 2 tests fail |
+| §13.9 — remove the pipeline-tokens stat card | 1 test fails *(after asserting the card, not the field)* |
+
+**Test suite after this pass: 673 passing, 40 files** (597 → 608 with §13.2's
+provenance chain, → 615 with §13.1's consumer tests, → 632 with §13.4/§13.6's
+client tests, → 646 with §13.5's policy tests, → 659 with §13.3's identity tests,
+→ 662 with the behavioural usage tests §13.10 forced, → 673 with §13.9's
+dashboard-contract tests.)

@@ -17,6 +17,9 @@ var API_BASE = window.API_BASE || 'http://127.0.0.1:8001';  // dev API (run.md /
 var AUTO_REFRESH_MS = 15000;
 var authToken = localStorage.getItem('auth_token');
 var apiKey    = localStorage.getItem('api_key') || '';
+var authUser  = localStorage.getItem('auth_user') || '';   // display name for the header chip
+var authMode  = 'signin';       // 'signin' | 'signup' — which login-card form is showing
+var authConfig = null;          // last GET /v1/auth/config (null = not asked / unavailable)
 var currentTab = 'overview';
 var llmConfig = null;           // last loaded /v1/config/llm payload (null = unavailable)
 var nlpConfig = null;           // last loaded /v1/config/nlp payload (null = unavailable)
@@ -74,7 +77,9 @@ async function apiCall(path, options) {
       // PROJECT_ASSESSMENT §6.6 defect 4 describes, and very likely what
       // "JWT auth is not working properly" looked like from the outside.
       authToken = null;
+      authUser = '';
       localStorage.removeItem('auth_token');
+      localStorage.removeItem('auth_user');
       updateAuthStatus(false);
       disconnectAllStreams();
       throw new Error('Unauthorized — please log in again.');
@@ -93,7 +98,18 @@ async function apiCall(path, options) {
       if (data && data.error) {
         msg = data.error.message || JSON.stringify(data.error);
       } else if (data && data.detail) {
-        msg = typeof data.detail === 'string' ? data.detail : JSON.stringify(data.detail);
+        // FastAPI validation errors arrive as [{loc, msg, ...}]. Stringifying the
+        // array put raw JSON in front of the user — on the signup form, where a
+        // 422 is the most likely error, that is the whole message they get. Pull
+        // the human sentences out and leave every other shape as it was.
+        if (Object.prototype.toString.call(data.detail) === '[object Array]') {
+          var parts = data.detail.map(function(d) {
+            return d && d.msg ? String(d.msg).replace(/^Value error,\s*/, '') : null;
+          }).filter(Boolean);
+          msg = parts.length ? parts.join('; ') : JSON.stringify(data.detail);
+        } else {
+          msg = typeof data.detail === 'string' ? data.detail : JSON.stringify(data.detail);
+        }
       } else if (typeof data === 'string' && data) {
         msg = data;
       }
@@ -163,6 +179,7 @@ async function login(username, password, apiKeyInput) {
   if (apiKeyInput) {
     apiKey = apiKeyInput.trim();
     localStorage.setItem('api_key', apiKey);
+    setAuthUser('');                 // an API key is a service identity, not a person
     updateAuthStatus(true);
     updateApiStatus('ok');
     return;
@@ -175,8 +192,119 @@ async function login(username, password, apiKeyInput) {
   });
   authToken = data.access_token || data.token;
   localStorage.setItem('auth_token', authToken);
+  setAuthUser((username || '').trim().toLowerCase());
   updateAuthStatus(true);
   updateApiStatus('ok');
+}
+
+/** Register an account, then use the token the server hands back.
+ *
+ * No second round-trip to /v1/auth/token: signup returns a token precisely so
+ * the password does not have to cross the wire twice to get a session.
+ *
+ * Note what is NOT sent — tenant or role. The server assigns both, so a form
+ * field for either would be a lie about who decides.
+ */
+async function signup(username, password) {
+  var data = await apiCall('/v1/auth/signup', {
+    method: 'POST',
+    body: JSON.stringify({ username: username, password: password })
+  });
+  authToken = data.access_token || data.token;
+  localStorage.setItem('auth_token', authToken);
+  // A stale API key would otherwise keep winning in apiCall()'s header order on
+  // some paths — clear it so the new session is the one credential in play.
+  apiKey = '';
+  localStorage.removeItem('api_key');
+  setAuthUser(data.username || username);
+  updateAuthStatus(true);
+  updateApiStatus('ok');
+  return data;
+}
+
+/** Drop every stored credential and tear down the streams running on them.
+ *
+ * The teardown is the part that matters: without it the header reads "Not
+ * authenticated" while the Trace, Logs and Pipeline EventSources keep delivering
+ * data on the credential the user just revoked — the same split state §6.6
+ * defect 4 describes, arrived at from the other direction.
+ */
+function logout() {
+  authToken = null;
+  apiKey = '';
+  localStorage.removeItem('auth_token');
+  localStorage.removeItem('api_key');
+  setAuthUser('');
+  disconnectAllStreams();
+  updateAuthStatus(false);
+  showToast('Signed out', 'info');
+  showLoginModal();
+}
+
+function setAuthUser(name) {
+  authUser = name || '';
+  if (authUser) localStorage.setItem('auth_user', authUser);
+  else localStorage.removeItem('auth_user');
+}
+
+/** Ask the server what the login screen may offer, before rendering it.
+ *
+ * Without this the signup tab is a guess: shown on a deployment that returns 403
+ * for every registration, or hidden on one whose users table is empty and needs
+ * a first admin. Tolerates an older server (or an unreachable one) by leaving
+ * signup enabled — a 403 from the form is a clearer failure than a tab that
+ * silently vanished.
+ */
+async function loadAuthConfig() {
+  try {
+    authConfig = await apiCall('/v1/auth/config');
+  } catch (err) {
+    console.warn('auth config unavailable:', err.message);
+    authConfig = null;
+  }
+  applyAuthConfig();
+  return authConfig;
+}
+
+function applyAuthConfig() {
+  var signupTab = document.getElementById('auth-mode-signup');
+  var note = document.getElementById('signup-bootstrap-note');
+  var hint = document.getElementById('signup-password-hint');
+  var cfg = authConfig;
+
+  if (signupTab) {
+    var enabled = !cfg || cfg.signup_enabled !== false;
+    signupTab.disabled = !enabled;
+    if (enabled) {
+      signupTab.title = 'Register a new account';
+    } else if (cfg && cfg.users_table_ready === false) {
+      // Different cause, different fix — "ask an administrator" is useless advice
+      // when the real problem is an unmigrated database.
+      signupTab.title = 'The API has no users table — run deploy/init-db.sql to enable accounts';
+    } else {
+      signupTab.title = 'Signup is disabled on this deployment — ask an administrator '
+                      + 'for an account or an API key';
+    }
+    // If signup just became unavailable while its form was open, fall back
+    // rather than leaving a form up that cannot succeed.
+    if (!enabled && authMode === 'signup') setAuthMode('signin');
+  }
+  if (note) {
+    if (cfg && cfg.bootstrap) note.classList.remove('hidden');
+    else note.classList.add('hidden');
+  }
+  if (hint && cfg && cfg.min_password_length) {
+    hint.textContent = 'At least ' + cfg.min_password_length + ' characters';
+  }
+  // A missing users table means signup will 503 with the fix in the message;
+  // say so up front instead of after a failed submit.
+  if (cfg && cfg.users_table_ready === false) {
+    var sub = document.getElementById('login-subtitle');
+    if (sub) {
+      sub.textContent = 'The API has no users table yet — run deploy/init-db.sql to '
+                      + 'enable accounts. An API key still works.';
+    }
+  }
 }
 
 async function checkHealth() {
@@ -293,14 +421,26 @@ async function loadOverview() {
   }
 
   if (usage) {
-    // Post-vs-comment split: the number that actually bounds cost. The routing
-    // rate alone is not the cost story once every comment reaches an LLM.
+    // Pipeline lane split: the number that actually bounds per-post cost. The
+    // routing rate alone is not the cost story once every comment reaches an LLM.
+    //
+    // The share is computed over the PIPELINE lanes only. `lane_split` gained
+    // `interactive` and `agent` when usage tracking moved into LLMClient, and
+    // reading `comment.call_share` straight off the response would silently
+    // divide by chat and agent traffic too — a per-post figure diluted by
+    // per-question spend, still labelled post-vs-comment (§13.4).
     var lanes = usage.lane_split || {};
     var postLane = lanes.post || {};
     var commentLane = lanes.comment || {};
-    var laneNote = (commentLane.calls || postLane.calls)
-      ? pct(commentLane.call_share) + ' of calls are comment-level'
-      : 'no LLM calls recorded yet';
+    var stage1Lane = lanes.stage1 || {};
+    var pipelineCalls = (postLane.calls || 0) + (commentLane.calls || 0) + (stage1Lane.calls || 0);
+    var commentShare = pipelineCalls ? (commentLane.calls || 0) / pipelineCalls : 0;
+    var laneNote = pipelineCalls
+      ? pct(commentShare) + ' of pipeline calls are comment-level'
+      : 'no pipeline LLM calls recorded yet';
+    var laneHint = formatNumber(postLane.calls || 0) + ' post · '
+      + formatNumber(commentLane.calls || 0) + ' comment'
+      + (stage1Lane.calls ? ' · ' + formatNumber(stage1Lane.calls) + ' stage-1' : '');
 
     statsEl.innerHTML =
         makeStatCard('Posts analyzed', formatNumber(usage.posts_analyzed), null)
@@ -308,10 +448,13 @@ async function loadOverview() {
                      pct(usage.llm_routing_rate) + ' routing rate — a measure of Stage-1 quality')
       + makeStatCard('LLM API calls', formatNumber(usage.llm_api_calls || 0),
                      (usage.cache_hits || 0) + ' cache hits (' + pct(usage.cache_hit_rate) + ')')
-      + makeStatCard('Cost split', laneNote,
-                     formatNumber(postLane.calls || 0) + ' post-level · '
-                     + formatNumber(commentLane.calls || 0) + ' comment-level')
-      + makeStatCard('Tokens used', formatNumber(usage.total_tokens),
+      + makeStatCard('Cost split', laneNote, laneHint)
+      // `pipeline_tokens` is the per-post figure; `total_tokens` includes chat
+      // and agent spend, which is per-question and unrelated to corpus size.
+      // Showing only the total would attribute a chatbot session to the posts.
+      + makeStatCard('Pipeline tokens', formatNumber(usage.pipeline_tokens || 0),
+                     tokenScopeSubtitle(usage))
+      + makeStatCard('Tokens used (all)', formatNumber(usage.total_tokens),
                      costSubtitle(usage));
     statsEl.innerHTML += usageProvenanceHtml(usage);
     updateStatusText('overview-updated', 'Live counters — refreshed ' + new Date().toLocaleTimeString());
@@ -348,6 +491,22 @@ function costSubtitle(usage) {
        + (models.length === 1 ? '' : 's');
 }
 
+/** Subtitle for the pipeline-token card: what the total covers that this doesn't.
+ *
+ * The counters used to be Stage-2 only while `scope_note` called them
+ * system-wide (§13.4). They now cover every caller, which makes the opposite
+ * distinction the one worth drawing: `total_tokens` includes chat, report and
+ * agent spend, and only the pipeline lanes belong in a per-post cost model.
+ */
+function tokenScopeSubtitle(usage) {
+  var total = Number(usage.total_tokens || 0);
+  var pipeline = Number(usage.pipeline_tokens || 0);
+  if (!total) return 'post + comment + stage-1 lanes';
+  var other = total - pipeline;
+  if (other <= 0) return 'all spend so far is pipeline work';
+  return formatNumber(other) + ' more spent on chat / reports / agents';
+}
+
 /** Per-model token/cost table + the campaign-scope caveat.
  *
  * One blended rate used to be applied to every token, which was wrong for both
@@ -371,12 +530,45 @@ function usageProvenanceHtml(usage) {
             }).join('')
           + '</div>';
   }
+  // Every lane, not just the two on the card. `interactive` and `agent` exist
+  // because usage tracking moved into LLMClient and started counting chat,
+  // report and agent calls that previously reached no counter at all (§13.4) —
+  // leaving them off this panel would put them straight back out of sight.
+  var lanes = usage.lane_split || {};
+  var laneKeys = Object.keys(lanes).filter(function(k) {
+    return (lanes[k] && (lanes[k].calls || lanes[k].tokens));
+  });
+  if (laneKeys.length) {
+    html += '<div class="stat-note-title" style="margin-top:10px">Spend by lane</div>'
+          + '<div class="mini-list">'
+          + laneKeys.sort(function(a, b) {
+              return (lanes[b].tokens || 0) - (lanes[a].tokens || 0);
+            }).map(function(k) {
+              var l = lanes[k];
+              return '<div class="mini-row"><span class="mini-name">' + escHtml(k)
+                   + (LANE_HINTS[k] ? ' <span class="text-muted">' + escHtml(LANE_HINTS[k]) + '</span>' : '')
+                   + '</span><span class="text-muted">' + formatNumber(l.calls || 0)
+                   + ' calls · ' + formatNumber(l.tokens || 0) + ' tok</span></div>';
+            }).join('')
+          + '</div>';
+  }
+
   if (usage.scope_note) {
     html += '<div class="text-muted" style="font-size:.72rem;margin-top:6px">'
           + escHtml(usage.scope_note) + '</div>';
   }
   return html + '</div>';
 }
+
+/** What each usage lane means — mirrors libs/llm/usage.py. Per-post cost is the
+ *  first three; the last two are per-question and scale with usage, not corpus. */
+var LANE_HINTS = {
+  post:        '(per post)',
+  comment:     '(per comment)',
+  stage1:      '(per post, STAGE1_LLM)',
+  interactive: '(chat + reports)',
+  agent:       '(per agent turn)'
+};
 
 function makeStatCard(label, value, hint) {
   return '<div class="stat-card">'
@@ -624,10 +816,18 @@ function renderResultsTable(results) {
     if (r.language_mix && r.language_mix.length > 1) {
       langStr += ' <span class="text-muted">+' + (r.language_mix.length - 1) + '</span>';
     }
+    // A reused post inherited its analysis from a near-duplicate caption — the
+    // summary below was written for a DIFFERENT post. Flag it in the list, not
+    // only in the detail modal, or the row reads as this post's own finding.
+    var reusedTag = (r.processing && r.processing.reused_from)
+      ? ' <span class="tag tag-sm" title="reused from near-duplicate post '
+        + escAttr(String(r.processing.reused_from.source_post_id || '')) + '">near-dup</span>'
+      : '';
     var summaryCell = r.post_summary
       ? '<span class="summary-snippet" title="' + escAttr(r.post_summary) + '">' + escHtml(truncate(r.post_summary, 70)) + '</span>'
         + (r.post_summary_source === 'vlm' ? ' <span class="tag tag-sm" title="image-grounded by the VLM">vlm</span>' : '')
-      : '<span class="text-muted">—</span>';
+        + reusedTag
+      : '<span class="text-muted">—</span>' + reusedTag;
 
     html += '<tr data-post-id="' + escAttr(r.post_id) + '" data-idx="' + i + '" onclick="toggleRowDetail(this)">'
       + '<td class="post-number">' + (i + 1) + '</td>'
@@ -1010,6 +1210,28 @@ function renderPostModal(r) {
   // ---- Processing info ----
   if (r.processing) {
     var p = r.processing;
+    // Near-duplicate reuse: this post skipped Stage 1 and Stage 2 entirely and
+    // inherited another post's analysis. Without saying so, the block below
+    // reads as a genuine 0 ms analysis that simply never used an LLM — which is
+    // how a reused row would pass for a fresh one.
+    var reuse = p.reused_from;
+    if (reuse) {
+      html += '<div class="modal-section">'
+        + '<div class="modal-section-title">Reused Analysis'
+        + ' <span class="tag tag-sm" title="near-duplicate caption; Stage 1 and Stage 2 were skipped">near-dup</span>'
+        + '</div>'
+        + '<div class="alert alert-warning" style="margin-bottom:8px">'
+        + 'The post-level analysis below was <strong>copied from another post</strong> whose '
+        + 'caption is a near-duplicate of this one — no model ran for this post. '
+        + 'Its comment thread is its own and was <strong>not</strong> analysed.'
+        + '</div>'
+        + '<div class="meta-grid">'
+        + makeMetaField('Source post', reuse.source_post_id)
+        + makeMetaField('Similarity', reuse.similarity != null ? reuse.similarity : null)
+        + makeMetaField('Reused', reuse.reused)
+        + '</div>'
+      + '</div>';
+    }
     html += '<div class="modal-section">'
       + '<div class="modal-section-title">Processing Info</div>'
       + '<div class="meta-grid">'
@@ -1339,8 +1561,23 @@ function commentInsightsHtml(prefix, r) {
   var reactionOnly = ca.reaction_only || 0;
   var hasSplit = reactionOnly > 0 && (sub.positive || sub.negative || sub.neutral);
 
+  // A thread that was never analysed must say WHY. Absent and zero are different
+  // findings and must not look the same — the rule §13.3 applied to reused
+  // posts, whose analysis was inherited from a near-duplicate caption while
+  // their own comment thread was deliberately left unread.
+  var caProv = ca.provenance || {};
+  var notAnalysedNote = (!(ca.analyzed || 0) && caProv.note)
+    ? '<div class="alert alert-warning" style="margin-top:6px">'
+      + '<strong>This thread was not analysed.</strong> ' + escHtml(caProv.note)
+      + (caProv.stored_comments
+          ? ' (' + escHtml(String(caProv.stored_comments)) + ' comment(s) stored, none labelled.)'
+          : '')
+      + '</div>'
+    : '';
+
   var html = '<div class="comment-insights">'
     + '<div class="modal-section-title">Comment Sentiment <span class="text-muted">(' + escHtml(coverage) + ')</span></div>'
+    + notAnalysedNote
     + '<div id="cs-summary-' + prefix + '">' + commentSummaryBox(ca.summary) + '</div>'
     + (ca.coverage_anomaly
         ? '<div class="text-muted" style="font-size:.75rem;margin-top:4px">⚠ '
@@ -2309,6 +2546,41 @@ async function viewReport(reportId) {
       });
     }
 
+    // ---- Embedding clusters ----
+    // The LLM cost lever (architecture.md §5): one LLM-B call per cluster rather
+    // than one per post. These were computed and paid for on every grounded
+    // report but never reached any response — ReportResponse did not declare the
+    // field, so the response model stripped it (§13.1). The "Topic Clusters"
+    // block above is the SQL aggregate and costs nothing; this one is the spend.
+    if (rep.embedding_clusters && rep.embedding_clusters.length > 0) {
+      html += '<div class="modal-section-title" style="margin-top:16px">Embedding Clusters'
+        + ' <span class="tag tag-sm" title="one LLM-B call per cluster, not per post">llm</span>'
+        + '</div>';
+      // A stub vector is a hash, so the clusters group posts arbitrarily and each
+      // summary describes an arbitrary set. Say so above the summaries rather
+      // than letting them read as findings (§13.2).
+      if (rep.embedding_clusters_are_stub) {
+        html += '<p class="warn-note" style="font-size:0.8125rem;color:var(--warn,#b45309);margin-bottom:8px">'
+          + 'Clustered over stub (hash) embeddings — these groupings are arbitrary and the '
+          + 'summaries are not meaningful. Load a real embedding model to make this a finding.'
+        + '</p>';
+      }
+      rep.embedding_clusters.forEach(function(c) {
+        var sent = c.top_sentiment || 'neutral';
+        html += '<div class="cluster-item">'
+          + '<div class="cluster-header">'
+          + '<span class="cluster-label">' + escHtml(c.cluster_id || 'cluster') + '</span>'
+          + '<span class="badge badge-' + escAttr(sent) + '">' + escHtml(sent) + '</span>'
+          + '</div>'
+          + '<span class="cluster-count">' + (c.size || 0) + ' posts</span>'
+          + (c.representative_post_id
+              ? '<span class="cluster-count" style="margin-left:8px">rep: ' + escHtml(c.representative_post_id) + '</span>'
+              : '')
+          + (c.summary ? '<p class="cluster-summary" style="margin-top:6px">' + escHtml(c.summary) + '</p>' : '')
+        + '</div>';
+      });
+    }
+
     if (rep.metrics) {
       html += '<div class="modal-section-title" style="margin-top:16px">Metrics</div>'
         + '<div class="meta-grid">'
@@ -2843,11 +3115,37 @@ function updateApiStatus(state) {
   }
 }
 
-function updateAuthStatus(connected) {
+/** Reflect the session in the header.
+ *
+ * `label` overrides the derived text (verifySession passes the server's own
+ * `sub`, which is the authoritative answer to "who am I"). Omit it and the
+ * caller's existing boolean-only calls keep working.
+ */
+function updateAuthStatus(connected, label) {
   var el = document.getElementById('header-auth-status');
-  if (!el) return;
-  el.textContent = connected ? 'Authenticated' : 'Not authenticated';
-  el.className = 'auth-status ' + (connected ? 'connected' : 'disconnected');
+  if (el) {
+    var text;
+    if (!connected) {
+      text = 'Not authenticated';
+    } else if (label) {
+      text = label;
+    } else if (authUser) {
+      text = authUser;
+    } else if (apiKey && !authToken) {
+      text = 'API key';
+    } else {
+      text = 'Authenticated';
+    }
+    el.textContent = text;
+    el.className = 'auth-status ' + (connected ? 'connected' : 'disconnected');
+    el.title = connected ? 'Signed in — click Sign out to clear credentials' : 'No credential stored';
+  }
+
+  // Sign out is only meaningful when there is something to clear.
+  var logoutBtn = document.getElementById('header-logout-btn');
+  if (logoutBtn) logoutBtn.classList.toggle('hidden', !connected);
+  var loginBtn = document.getElementById('header-login-btn');
+  if (loginBtn) loginBtn.textContent = connected ? 'Switch account' : 'Sign in / Sign up';
 }
 
 function updateStatusText(id, text) {
@@ -2858,19 +3156,63 @@ function updateStatusText(id, text) {
 /* ============================================================
    Login modal
    ============================================================ */
-function showLoginModal() {
+function showLoginModal(mode) {
   var overlay = document.getElementById('login-overlay');
   if (overlay) overlay.classList.remove('hidden');
-  // Autofocus the API-key field (autofocus attr only fires on page load)
-  var apiKeyEl = document.getElementById('login-apikey');
-  if (apiKeyEl) {
-    setTimeout(function() { apiKeyEl.focus(); }, 50);
-  }
+  setAuthMode(mode || 'signin');
+  // Asked every time the modal opens, not once at boot: signup availability
+  // flips the moment the first account is created, and a cached "bootstrap: true"
+  // would keep promising admin rights that the next signup will not get.
+  loadAuthConfig();
 }
 
 function hideLoginModal() {
   var overlay = document.getElementById('login-overlay');
   if (overlay) overlay.classList.add('hidden');
+}
+
+/** Switch the login card between signing in and registering.
+ *
+ * One card with two forms rather than two modals: the user who lands on the
+ * wrong one is one click from the other, and both share the card's framing.
+ */
+function setAuthMode(mode) {
+  if (mode === 'signup') {
+    var tab = document.getElementById('auth-mode-signup');
+    if (tab && tab.disabled) mode = 'signin';   // server says no; do not offer it
+  }
+  authMode = mode === 'signup' ? 'signup' : 'signin';
+  var isSignup = authMode === 'signup';
+
+  var loginForm  = document.getElementById('login-form');
+  var signupForm = document.getElementById('signup-form');
+  if (loginForm)  loginForm.classList.toggle('hidden', isSignup);
+  if (signupForm) signupForm.classList.toggle('hidden', !isSignup);
+
+  ['signin', 'signup'].forEach(function(m) {
+    var t = document.getElementById('auth-mode-' + m);
+    if (!t) return;
+    var active = (m === authMode);
+    t.classList.toggle('active', active);
+    t.setAttribute('aria-selected', active ? 'true' : 'false');
+  });
+
+  var title = document.getElementById('login-title');
+  if (title) title.textContent = isSignup ? 'Create Account' : 'Sign In';
+  var sub = document.getElementById('login-subtitle');
+  if (sub) {
+    sub.textContent = isSignup
+      ? 'Pick a username and password. The server assigns your tenant and role.'
+      : 'Enter your credentials or API key to connect to the API.';
+  }
+
+  // Clear the other form's error so a stale message cannot appear to belong to
+  // the form now on screen.
+  var stale = document.getElementById(isSignup ? 'login-error' : 'signup-error');
+  if (stale) stale.textContent = '';
+
+  var focusEl = document.getElementById(isSignup ? 'signup-username' : 'login-apikey');
+  if (focusEl) setTimeout(function() { focusEl.focus(); }, 50);
 }
 
 async function handleLoginSubmit(evt) {
@@ -2899,6 +3241,50 @@ async function handleLoginSubmit(evt) {
     loadNlpConfig();
   } catch (err) {
     if (errEl) errEl.textContent = err.message;
+  } finally {
+    setLoading(btn, false);
+  }
+}
+
+async function handleSignupSubmit(evt) {
+  evt.preventDefault();
+  var username  = (document.getElementById('signup-username').value || '').trim().toLowerCase();
+  var password  = document.getElementById('signup-password').value || '';
+  var password2 = document.getElementById('signup-password2').value || '';
+  var errEl = document.getElementById('signup-error');
+  var btn   = document.getElementById('signup-submit-btn');
+  var minLen = (authConfig && authConfig.min_password_length) || 8;
+
+  function fail(msg) {
+    if (errEl) errEl.textContent = msg;
+  }
+  if (errEl) errEl.textContent = '';
+
+  // Client-side checks mirror the server's rules — they do not replace them.
+  // Confirm-password is the one check that is client-only by nature: the server
+  // never sees the second field, so a typo caught here is a locked-out account
+  // avoided.
+  if (!username) return fail('Choose a username.');
+  if (!/^[a-z0-9][a-z0-9._-]{2,63}$/.test(username)) {
+    return fail('Username must be 3–64 characters: lowercase letters, digits, . _ or -, starting with a letter or digit.');
+  }
+  if (password.length < minLen) return fail('Password must be at least ' + minLen + ' characters.');
+  if (password !== password2) return fail('The two passwords do not match.');
+
+  setLoading(btn, true);
+  try {
+    var data = await signup(username, password);
+    hideLoginModal();
+    showToast(
+      'Account created — signed in as ' + (data.username || username)
+        + (data.role === 'admin' ? ' (administrator)' : ''),
+      'success'
+    );
+    refreshTab(currentTab);
+    loadLlmConfig();
+    loadNlpConfig();
+  } catch (err) {
+    fail(err.message);
   } finally {
     setLoading(btn, false);
   }
@@ -4089,6 +4475,22 @@ function provenanceSummary(ca) {
        + prov.total + '; ' + prov.heuristic + ' heuristic)</span>';
 }
 
+/** Near-duplicate reuse — "no model ran for this post" in one line.
+ *
+ * A reused post's stage timings are 0 and `llm_used` is false, which reads as a
+ * cheap successful analysis rather than as an inherited one. Only
+ * `processing.reused_from` distinguishes them (§13.3).
+ */
+function reuseSummary(proc) {
+  var reuse = (proc || {}).reused_from;
+  if (!reuse) return '<span class="trace-null">no — analysed directly</span>';
+  return '<span class="trace-warn">reused from ' + escHtml(String(reuse.source_post_id || '?'))
+       + '</span> <span class="text-muted">(similarity '
+       + escHtml(String(reuse.similarity != null ? reuse.similarity : '?'))
+       + '; ' + escHtml(String(reuse.reused || 'post-level analysis'))
+       + '; comment thread not analysed)</span>';
+}
+
 /** Vision status — only `ok` licenses a claim about image sentiment.
  *
  * A failed fetch used to be indistinguishable from a genuine neutral verdict.
@@ -4249,6 +4651,9 @@ async function loadTraceResult() {
       + '<dt>confidence</dt><dd>' + traceValue('o', (conf && typeof conf === 'object') ? conf : { overall: conf }) + '</dd>'
       + '<dt>comments</dt><dd>' + traceValue('n', ca.analyzed) + ' analyzed, coverage ' + traceValue('n', ca.coverage) + '</dd>'
       + '<dt>label mix</dt><dd>' + provenanceSummary(ca) + '</dd>'
+      // A reused post has an empty trace rail — no stage ever ran for it — so
+      // this row is the only place the Trace tab can explain why.
+      + '<dt>reused</dt><dd>' + reuseSummary(proc) + '</dd>'
       + '<dt>vision</dt><dd>' + visionSummary(r.image_analysis) + '</dd>'
       + '<dt>degraded</dt><dd>' + degradedSummary(proc) + '</dd>'
       + '<dt>processing</dt><dd>' + traceValue('o', proc) + '</dd>'
@@ -4626,7 +5031,11 @@ async function verifySession() {
   }
   try {
     var me = await apiCall('/v1/auth/me');
-    updateAuthStatus(true);
+    // The server's `sub` is the authoritative identity — prefer it over whatever
+    // the login form happened to type, and remember it so a reload shows the
+    // same name without another round-trip.
+    if (me && me.sub && me.auth_method === 'jwt') setAuthUser(me.sub);
+    updateAuthStatus(true, me && me.sub ? me.sub : null);
     if (me && me.sub) console.info('session:', me.sub, '· tenant:', me.tenant_id || 'default');
   } catch (err) {
     // apiCall already cleared the token and tore down streams on a 401.
@@ -4884,15 +5293,33 @@ function init() {
     nlpCloseBtn.addEventListener('click', closeNlpSettings);
   }
 
-  // Login form
+  // Login / signup forms
   var loginForm = document.getElementById('login-form');
   if (loginForm) {
     loginForm.addEventListener('submit', handleLoginSubmit);
   }
 
+  var signupForm = document.getElementById('signup-form');
+  if (signupForm) {
+    signupForm.addEventListener('submit', handleSignupSubmit);
+  }
+
+  // Mode switch (Sign in / Create account)
+  ['signin', 'signup'].forEach(function(mode) {
+    var tab = document.getElementById('auth-mode-' + mode);
+    if (tab) tab.addEventListener('click', function() { setAuthMode(mode); });
+  });
+
   var loginBtn = document.getElementById('header-login-btn');
   if (loginBtn) {
-    loginBtn.addEventListener('click', showLoginModal);
+    // Wrapped, not passed directly: showLoginModal takes a mode, and handing it
+    // the click Event would make that argument meaningless.
+    loginBtn.addEventListener('click', function() { showLoginModal('signin'); });
+  }
+
+  var logoutBtn = document.getElementById('header-logout-btn');
+  if (logoutBtn) {
+    logoutBtn.addEventListener('click', logout);
   }
 
   // Health check and initial load (auto-loads the overview)

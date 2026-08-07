@@ -206,6 +206,8 @@ async def chat(
             max_tokens=body.max_tokens,
             temperature=body.temperature,
             model=(body.model or "").strip() or None,
+            usage_redis=redis,
+            usage_task="chat",
         )
     except Exception as exc:
         log.error("chat_failed", error=str(exc))
@@ -264,6 +266,7 @@ async def _sse(
             max_tokens=body.max_tokens,
             temperature=body.temperature,
             model=(body.model or "").strip() or None,
+            usage_task="chat_stream",
         ):
             etype = evt.pop("type", "delta")
             yield f"event: {etype}\ndata: {json.dumps(evt, ensure_ascii=False)}\n\n"

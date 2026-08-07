@@ -24,6 +24,8 @@ from typing import Any, Optional
 
 import structlog
 
+from libs.llm.usage import LANE_AGENT
+
 from .mcp_client import MCPClient
 from .registry import AgentDefinition
 
@@ -414,65 +416,43 @@ class AgentRunner:
         tenant_policy: Any,
         backend_override: str | None,
     ) -> dict[str, Any]:
-        """Call the LLM and return a normalised response dict.
+        """Call the LLM with tool definitions and return a normalised response.
 
-        The existing LLMClient.chat() does not forward tool definitions, so we
-        call the underlying AsyncOpenAI client directly through the LLMClient's
-        private helpers.  This preserves policy enforcement and model resolution
-        while adding tool_calls support.
+        A thin adapter over ``LLMClient.chat`` — which now forwards ``tools`` and
+        returns normalised ``tool_calls``, so this no longer has to reach past it.
+
+        It used to. `chat()` had no tool passthrough, so this method resolved the
+        backend itself and called ``AsyncOpenAI.chat.completions.create``
+        directly through the client's private helpers. Its docstring named what
+        that preserved — policy enforcement and model resolution — and was silent
+        about everything it dropped (PROJECT_ASSESSMENT §13.6):
+
+        * the **circuit breaker**: no success/failure was ever recorded, so agent
+          traffic could neither open Groq's breaker nor be spared by it — the two
+          bugs §11.4b and §12.4a fixed for `chat`/`chat_stream`, still standing
+          here;
+        * the **Groq→local failover**: every other caller degrades, agents
+          hard-failed;
+        * **truncation continuation** and the **JSON-degeneracy retry**;
+        * **usage tracking**, so agent spend reached no cost counter.
 
         Returns a dict with keys: content, tool_calls, usage, model, backend.
         """
-        # Resolve backend and model via the existing LLMClient machinery
-        from libs.llm.policy import enforce_policy
-
-        effective_backend = enforce_policy(
+        response = await self.llm.chat(
+            role=agent_def.llm_role,
+            messages=messages,
+            backend_override=backend_override,
             tenant_policy=tenant_policy,
-            requested_backend=backend_override,
-            default_backend=self.llm._default_backend,
+            max_tokens=_MAX_TOKENS_PER_TURN,
+            temperature=_TEMPERATURE,
+            tools=tools or None,
+            usage_lane=LANE_AGENT,
+            usage_task="agent",
         )
-        model_id = self.llm._resolve_model(agent_def.llm_role, effective_backend)
-        oai_client = self.llm._get_client(effective_backend)
-
-        kwargs: dict[str, Any] = {
-            "model": model_id,
-            "messages": messages,
-            "max_tokens": _MAX_TOKENS_PER_TURN,
-            "temperature": _TEMPERATURE,
-        }
-        if tools:
-            kwargs["tools"] = tools
-            kwargs["tool_choice"] = "auto"
-
-        completion = await oai_client.chat.completions.create(**kwargs)
-
-        choice = completion.choices[0]
-        usage = completion.usage
-        message = choice.message
-
-        # Normalise tool_calls into a serialisable list
-        tool_calls_out: list[dict] = []
-        if message.tool_calls:
-            for tc in message.tool_calls:
-                tool_calls_out.append(
-                    {
-                        "id": tc.id,
-                        "type": "function",
-                        "function": {
-                            "name": tc.function.name,
-                            "arguments": tc.function.arguments,
-                        },
-                    }
-                )
-
         return {
-            "content": message.content or "",
-            "tool_calls": tool_calls_out,
-            "usage": {
-                "prompt_tokens": usage.prompt_tokens if usage else 0,
-                "completion_tokens": usage.completion_tokens if usage else 0,
-                "total_tokens": usage.total_tokens if usage else 0,
-            },
-            "model": completion.model,
-            "backend": effective_backend,
+            "content": response.get("content", ""),
+            "tool_calls": response.get("tool_calls", []),
+            "usage": response.get("usage", {}),
+            "model": response.get("model"),
+            "backend": response.get("backend"),
         }

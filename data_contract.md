@@ -291,3 +291,39 @@ How §1/§2 inputs land in the canonical output ([architecture.md](architecture.
 
 Fields with **no upstream source** (post author) are derived where possible; data
 the upstream no longer ships (**OCR text, embeddings**) is **computed by us**.
+
+### 5.1 Provenance fields the output carries about itself
+
+Three fields describe *how the row was produced* rather than what it says. Each
+exists because its absence made a wrong answer indistinguishable from a right one
+(PROJECT_ASSESSMENT §9.11, §13.2, §13.3):
+
+| Field | Meaning | Why it is not inferable |
+| ----- | ------- | ----------------------- |
+| `processing.stub_mode` / `nlp_engine` / `degraded_components` | which engine actually ran, and what fell back | `engine: "models"` says what was *intended*; only these say what **ran** |
+| `analysis_results.embedding_is_stub` (column, not in the JSON) | the stored vector is a deterministic hash of the text, not a semantic embedding | the stub is the same `EMBEDDING_DIM` size as a real vector, so nothing downstream can tell from the vector itself — deriving it from the dimension recorded every stub as real |
+| `processing.reused_from` | this post's analysis was **copied from a near-duplicate caption**; no model ran for it | a reused row otherwise looks like a genuinely cheap analysis: `stage1_ms: 0`, `stage2_ms: 0`, `llm_used: false` |
+
+`reused_from` is `{source_post_id, similarity, reused}`. Only **post-level**
+analysis is reused — `reused: "post_level_analysis_only"`. The new post's
+identity, `engagement`, `reaction_breakdown` and timestamps are its own, and its
+**comment thread is reported unanalysed**:
+
+```jsonc
+"comment_analysis": {
+  "analyzed": 0,
+  "coverage": 0.0,
+  "sentiment_breakdown": { "positive": 0, "negative": 0, "neutral": 0 },
+  "provenance": {
+    "note": "not analysed — this post's analysis was reused from a near-duplicate caption; its comment thread is its own",
+    "stored_comments": 2
+  }
+}
+```
+
+A caption match is not a thread match: the two posts' commenters are different
+people saying different things, so inheriting the source's per-comment labels
+would be fabricated data about comments nobody read. **Absent and zero are
+different findings** — the `provenance.note` is what keeps them from looking the
+same, the same rule `target_stances` follows by omitting unmentioned entities
+rather than reporting them as all-neutral.

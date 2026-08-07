@@ -174,6 +174,7 @@ Detailed rationale in [possible_architecture.md](possible_architecture.md) §6.
 | **Embedding cache** (Redis)    | `content_hash`                         | Avoid recomputing vectors                                      | long                 |
 | **LLM response cache** (Redis) | `(backend, model, task, content_hash)` | Free repeats of LLM calls                                      | medium–long          |
 | **Query cache** (Redis)        | normalized query                       | Fast dashboard aggregations                                    | short (secs–mins)    |
+| **Usage counters** (Redis)     | `usage:{tokens,calls}:…`               | The only source `GET /v1/usage` reads — tokens/calls per backend+model, per lane, per task | no TTL (reset on wipe) |
 | **CDN**                        | URL                                    | Static **HTML/CSS/JS** dashboard assets, static report exports | long, versioned      |
 
 On real social feeds these caches remove a large fraction of total work — they

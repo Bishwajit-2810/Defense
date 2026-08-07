@@ -35,6 +35,7 @@ from libs.stance_scoring import (  # noqa: E402
 )
 from libs.stance_targets import load_targets  # noqa: E402
 from libs.llm import LLMClient  # noqa: E402
+from libs.llm.usage import LANE_COMMENT, LANE_POST, track_usage  # noqa: E402
 from libs.progress import publish_stage  # noqa: E402
 
 from .cache import get_cached, set_cached  # noqa: E402
@@ -203,67 +204,14 @@ async def _fetch_images_as_data_urls(urls: list[str]) -> list[str]:
 #: comment reaches the LLM the cost becomes comment-dominated and the routing
 #: gate stops being the main lever — but that can only be *shown* if the
 #: counters record which lane spent the tokens.
-LANE_POST = "post"
-LANE_COMMENT = "comment"
-
-
-async def _track_usage(
-    redis,
-    response: dict | None = None,
-    cache_hit: bool = False,
-    *,
-    lane: str = LANE_POST,
-    task: str = "unknown",
-) -> None:
-    """Increment the Redis usage counters GET /v1/usage reads.
-
-    Global counters (unchanged): usage:llm_calls, usage:cache_hits,
-    usage:tokens:total.
-
-    Dimensioned counters (§5.8), because the global ones cannot answer the
-    question a cost-efficiency thesis asks:
-
-        usage:tokens:{backend}:{model}   — the local backend's marginal token
-            cost is ZERO and Groq's per-model prices differ by more than an
-            order of magnitude, so one blended price is wrong for both, in
-            opposite directions. Without this dimension there is nothing to fix
-            it with.
-        usage:tokens:lane:{lane}         — post-level vs comment-level split.
-        usage:calls:lane:{lane}
-        usage:calls:task:{task}       — per-task task count, cached and fresh
-            alike (a cached task still ran; only `usage:llm_calls` is
-            fresh-calls-only, because that is what cache_hit_rate divides by).
-
-    Add the dimension BEFORE a measurement run, or the run has to be repeated.
-    """
-    try:
-        if cache_hit:
-            await redis.incr("usage:cache_hits")
-            await redis.incr(f"usage:cache_hits:lane:{lane}")
-            # A cached task is still a task. This counter used to be incremented
-            # on the fresh-call path only, so `usage:calls:task:{task}` measured
-            # cache MISSES per task while reading as "how often each task runs" —
-            # and the better the cache works, the more it understated. The global
-            # `usage:llm_calls` is deliberately left alone: it means "fresh API
-            # calls", which is what /v1/usage's cache_hit_rate denominator needs.
-            await redis.incr(f"usage:calls:task:{task}")
-            return
-        await redis.incr("usage:llm_calls")
-        await redis.incr(f"usage:calls:lane:{lane}")
-        await redis.incr(f"usage:calls:task:{task}")
-
-        usage = (response or {}).get("usage") or {}
-        total = int(usage.get("total_tokens") or 0)
-        if not total:
-            return
-        await redis.incrby("usage:tokens:total", total)
-        await redis.incrby(f"usage:tokens:lane:{lane}", total)
-        backend = (response or {}).get("backend") or "unknown"
-        model = (response or {}).get("model") or "unknown"
-        await redis.incrby(f"usage:tokens:{backend}:{model}", total)
-        await redis.sadd("usage:models", f"{backend}:{model}")
-    except Exception as exc:
-        logger.warning("usage_tracking_failed", error=str(exc))
+#
+# Both now come from libs/llm/usage.py. They were defined here, and so was the
+# only code that incremented the counters — which is why the five LLM callers
+# outside this worker spent tokens nothing counted (§13.4). Fresh calls are
+# recorded by `LLMClient.chat` itself now (see the `usage_lane` / `usage_task`
+# arguments on the calls below); this module only still reports CACHE HITS,
+# because a cache hit never reaches the client.
+_track_usage = track_usage
 
 
 # Sentence terminators across the three scripts this corpus writes in: the
@@ -374,6 +322,10 @@ async def _run_summary(
             backend_override=backend_override,
             max_tokens=_SUMMARY_MAX_TOKENS,
             temperature=0.2,
+        
+            usage_redis=redis,
+            usage_lane=LANE_POST,
+            usage_task="summary",
         )
 
     # Only actually drive the VLM when an image was genuinely fetched. A "vlm"
@@ -405,7 +357,6 @@ async def _run_summary(
         grounded_on_image = False
         response = await _chat(_SUMMARY_ROLE, text_only_messages)
 
-    await _track_usage(redis, response, lane=LANE_POST, task="summary")
 
     summary_text = (response.get("content") or "").strip()
     # `truncated` means the reply STILL ended at the token ceiling after
@@ -504,9 +455,12 @@ async def _run_post_type(
         response_format={"type": "json_object"},
         max_tokens=_POST_TYPE_MAX_TOKENS,
         temperature=0.0,
+    
+        usage_redis=redis,
+        usage_lane=LANE_POST,
+        usage_task="post_type",
     )
 
-    await _track_usage(redis, response, lane=LANE_POST, task="post_type")
 
     # JSON replies can't be continued token-wise into valid JSON, so a truncated
     # one falls through to the caller's fallback — but it must say so rather than
@@ -570,9 +524,12 @@ async def _run_insight(
         response_format={"type": "json_object"},
         max_tokens=_INSIGHT_MAX_TOKENS,
         temperature=0.1,
+    
+        usage_redis=redis,
+        usage_lane=LANE_POST,
+        usage_task="insight",
     )
 
-    await _track_usage(redis, response, lane=LANE_POST, task="insight")
 
     if response.get("truncated"):
         logger.warning(
@@ -763,8 +720,11 @@ async def _run_comment_stance(
                         (56 + 40 * len(batch_targets)) * len(batch) + 64,
                     ),
                     temperature=0.0,
+                
+                    usage_redis=redis,
+                    usage_lane=LANE_COMMENT,
+                    usage_task="comment_stance",
                 )
-                await _track_usage(redis, resp, lane=LANE_COMMENT, task="comment_stance")
                 results = _normalize_stance(
                     _safe_json_parse(resp["content"], {}), len(batch), watchlist_ids
                 )
@@ -934,8 +894,11 @@ async def _run_comment_summary(
         backend_override=backend_override,
         max_tokens=_COMMENT_SUMMARY_MAX_TOKENS,
         temperature=0.3,
+    
+        usage_redis=redis,
+        usage_lane=LANE_COMMENT,
+        usage_task="comment_summary",
     )
-    await _track_usage(redis, resp, lane=LANE_COMMENT, task="comment_summary")
 
     summary = (resp.get("content") or "").strip()
     truncated = bool(resp.get("truncated"))
@@ -985,16 +948,33 @@ async def _process_message(
 
     log = logger.bind(post_id=post_id)
 
-    # Runtime backend override set via PUT /v1/config/llm (dashboard LLM toggle).
+    # Which backend this post is analysed on.
+    #
+    # The job envelope wins. The API resolves the backend when it enqueues —
+    # request option > global toggle > env — and applies the tenant's privacy
+    # lock to the RESULT, which is the only place that can be done: this worker
+    # has no database and no tenant, so it cannot evaluate a policy itself.
+    #
+    # Reading the global toggle first, as this used to, is what made the lock
+    # unenforceable for the pipeline: a privacy-locked tenant's posts followed
+    # whatever the dashboard switch said, and the per-request `llm_backend`
+    # option the policy check guarded was read by nobody (§13.5).
+    options: dict = payload.get("options") or {}
     backend_override: str | None = None
-    try:
-        raw_override = await redis.get("config:llm_backend")
-        if raw_override:
-            decoded = raw_override.decode() if isinstance(raw_override, bytes) else raw_override
-            if decoded in ("local", "groq"):
-                backend_override = decoded
-    except Exception as exc:
-        log.warning("llm_backend_override_read_failed", error=str(exc))
+    stamped = options.get("llm_backend")
+    if stamped in ("local", "groq"):
+        backend_override = stamped
+    else:
+        # No stamp: an envelope from before this landed, or one XADDed by hand.
+        # Fall back to the toggle, which is the old behaviour.
+        try:
+            raw_override = await redis.get("config:llm_backend")
+            if raw_override:
+                decoded = raw_override.decode() if isinstance(raw_override, bytes) else raw_override
+                if decoded in ("local", "groq"):
+                    backend_override = decoded
+        except Exception as exc:
+            log.warning("llm_backend_override_read_failed", error=str(exc))
 
     log.info("stage2_processing", task_flags=task_flags, backend_override=backend_override)
 

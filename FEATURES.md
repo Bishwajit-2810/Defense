@@ -17,9 +17,9 @@ and what the image modality was before §9.3.
 | ⚠️ **Unexercised** | Implemented, but cannot currently produce a signal |
 | 📋 **Planned** | Designed, not built |
 
-**Scale (measured 5 Aug 2026):** **27,243 lines of Python across 123 files** —
+**Scale (measured 5 Aug 2026):** **27,537 lines of Python across 124 files** —
 `services/` 14,477, `tests/` 6,351, `libs/` 3,475, `eval/` 1,109,
-`mcp_servers/` 1,160, `run_all.py` 671. **588 tests** across 33 files. Working
+`mcp_servers/` 1,160, `run_all.py` 671. **673 tests** across 40 files. Working
 corpus: 43 posts, 8,965 comments.
 
 Test code is now 23% of the Python in the repository, up from 14%. That ratio is
@@ -38,7 +38,7 @@ reverted.
 | **Platform detection** | Derives the platform from each post's URL host, so the service is not Facebook-specific. | ✅ Measured |
 | **Idempotent upsert** | Every post has a stable content hash; re-ingesting is safe and re-analysis is a first-class operation. Postgres upserts on `post_id`, object storage writes a deterministic key, and the two ClickHouse tables collapse to the newest row per post — `comment_sentiments` in the engine, `analysis_events` in the queries. **Until 5 Aug 2026 the last of those was missing**, so a re-analysed post was counted twice in every analytics aggregate; see PROJECT_ASSESSMENT §11.2. | ✅ Measured |
 | **Baseline preservation** | The upstream's coarse `sentiment`/`viralPotential` are kept as `baseline_*` and never overwritten, so our recomputation can be compared against theirs. | ✅ Measured |
-| **Near-duplicate reuse** | A post within cosine 0.97 of an already-analysed one reuses that result and skips both stages. | 🟡 Works, unmeasured — and see the stub-embedding caveat in §4 |
+| **Near-duplicate reuse** | A post within cosine 0.97 of an already-analysed one reuses that result and skips both stages. The result is **composed, not copied**: identity, engagement, reactions and timestamps come from the new post, only the post-level analysis is reused, and `processing.reused_from` records the source. The **comment thread is never reused** — a caption match is not a thread match, so the new post's thread is reported unanalysed rather than inheriting labels for comments nobody read. Reuse goes through the assembler, so all three stores are written. | 🟡 Works, unmeasured — was a verbatim row copy until 5 Aug 2026 (§13.3) |
 | **Working-corpus filter** | `eval/make_text_corpus.py` writes `posts_text_only.json` (43 captioned posts) and prints exactly what it dropped and why. The source corpus is never modified. | ✅ Measured |
 
 ---
@@ -127,7 +127,7 @@ Full design: **[stance_targets.md](stance_targets.md)**.
 | **Circuit breaker** | A flapping backend is taken out of rotation for a cooldown instead of being hammered every request. Groq's open circuit pre-empts straight to local. | ✅ Measured |
 | **JSON-mode degeneracy retry** | Ollama turns `response_format=json_object` into grammar-constrained decoding, and small models satisfy it with `{}` — a syntactically valid answer carrying no analysis. Retried unconstrained. | ✅ Measured |
 | **Model bake-off harness** | `eval/bakeoff_summary.py` scores candidates on real Bangla posts: latency p50/p95, truncation rate, whether the summary stayed in the post's script, and a grounding proxy. | ✅ Measured (one run recorded) |
-| **Tenant backend pinning** | A privacy-locked tenant cannot be overridden to `groq`. **Fails closed** — an unreadable policy table now denies rather than permits, which is the one failure mode where you most want the guarantee to hold. | ✅ Measured |
+| **Tenant backend pinning** | A privacy-locked tenant cannot be routed to `groq` **by any path**: the API resolves each job's backend (request > toggle > env), applies the lock where the tenant is known, and stamps the decision into the job envelope, which Stage 1 and Stage 2 honour. An explicit request for `groq` is refused; the *global* toggle is silently downgraded to `local` for a locked tenant, because an operator's switch is not their choice. `PUT /v1/config/llm` needs an admin role. Fails closed — an unreadable policy table denies rather than permits. **Until 5 Aug 2026 this covered `/v1/chat` and agents only**: the pipeline read the global key and the guarded option was read by nobody (§13.5). | ✅ Measured |
 
 ---
 
@@ -138,9 +138,10 @@ Full design: **[stance_targets.md](stance_targets.md)**.
 | **Canonical JSON schema** | One validated object per post+thread. Every result is schema-checked before persistence. | ✅ Measured |
 | **Coverage honesty** | `coverage = analyzed / commentCount`, **clamped to 1.0**. Five posts store more comments than the platform reports (up to 112 against 42) — that surfaces as `coverage_anomaly`, never as "267% coverage". Corpus-level coverage is reported alongside the per-post figure. | ✅ Measured |
 | **Three-store fan-out** | Postgres + pgvector (canonical + vectors), ClickHouse (analytics), object storage (raw results) — written in parallel. Every table either store creates now has a writer: the Postgres `llm_cache` (§11.3) and the ClickHouse `llm_usage` (§12.2) were both dropped for having none, and a test asserts the rule in both directions. | ✅ Measured |
-| **Semantic search** | kNN over pgvector. Every result carries `embedding_is_stub`, because a hash-seeded stub vector returns *arbitrary* neighbours with scores that look exactly as plausible as real ones. `EMBEDDING_ALLOW_STUB=false` refuses the write outright. | ✅ Measured (as stub-backed by default) |
+| **Semantic search** | kNN over pgvector. Every result carries `embedding_is_stub`, because a hash-seeded stub vector returns *arbitrary* neighbours with scores that look exactly as plausible as real ones. The flag is **reported by Stage 1 and carried** to the column — it cannot be derived downstream, because the stub is the same 768 dims as a real vector, and deriving it from the dimension is why **every row was recorded as real** until 5 Aug 2026 (§13.2). `EMBEDDING_ALLOW_STUB=false` refuses the write outright. | ✅ Measured (as stub-backed by default) |
 | **Keyword search** | JSONB search over the post's own text, summaries, keywords, topics and themes. `post_text` was added 5 Aug 2026 — without it, a post the router sent straight to the assembler has no `post_summary`, so its actual words were unsearchable. LIKE metacharacters in the query are escaped, so `q=%` no longer matches every row. | ✅ Measured |
-| **Cost telemetry** | `GET /v1/usage` reports tokens and cost **per backend and model** — local priced at 0.0 (its marginal token cost genuinely is zero) — plus the post-vs-comment `lane_split`. One blended `$0.002/1k` rate was wrong for both backends in opposite directions. | ✅ Measured |
+| **Cluster-summarized reports** | The LLM cost lever architecture.md §5 names: cluster the corpus's embeddings (pure-numpy k-means, ≤8 clusters) and spend **one LLM-B call per cluster** rather than one per post. Returned as `embedding_clusters`, distinct from the zero-LLM SQL topic aggregate in `clusters`, and rendered in its own dashboard section. Clustering over stub vectors is disclosed (`embedding_clusters_are_stub`) so a summary of noise is never shown as a finding. **Until 5 Aug 2026 the summaries were computed, paid for and stripped by the response model** (§13.1). | 🟡 Works, unmeasured |
+| **Cost telemetry** | `GET /v1/usage` reports tokens and cost **per backend and model** — local priced at 0.0 (its marginal token cost genuinely is zero) — plus a five-lane split (`post`, `comment`, `stage1`, `interactive`, `agent`) and `pipeline_tokens`, which isolates the per-post model from per-question chat/agent spend. Counters are written by `LLMClient` itself, so **every** caller is counted; they were written by the Stage-2 worker alone until 5 Aug 2026, leaving five callers uncounted under a `scope_note` claiming system-wide coverage (§13.4). | ✅ Measured |
 | **Dead-letter queue** | Bounded retry-by-re-enqueue, then dead-letter with error context; the original is always ACKed. A dead-lettered post is **counted against its job**, so one LLM timeout no longer leaves the progress bar at 49/50 forever. | ✅ Measured |
 | **Per-identity rate limiting** | A per-minute budget on expensive endpoints, with `X-RateLimit-*` headers and `Retry-After`. | ✅ Measured |
 | **Distributed tracing** | OpenTelemetry → Jaeger/Loki, opt-in. | 🟡 Works, unmeasured |

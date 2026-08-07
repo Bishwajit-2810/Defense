@@ -290,8 +290,18 @@ change it:
   in Redis by a prior run. Omit both for the local default.
 - **Runtime toggle (no restart):** the dashboard's **LLM chip** (header) — or
   `curl -X PUT :8001/v1/config/llm -H 'X-API-Key: demo' -d '{"backend":"groq"}'` —
-  sets a Redis override that Stage-2 picks up per message. `{"backend": null}`
-  clears it. Groq still needs `GROQ_API_KEY` in the worker env.
+  sets a Redis override. `{"backend": null}` clears it. Groq still needs
+  `GROQ_API_KEY` in the worker env.
+
+  **Selecting `groq` requires an admin role** (`admin`/`owner`/`operator`), because
+  this switch is global — it routes *every* tenant's analysis off-box. A caller
+  whose own tenant is `privacy_locked` is refused outright. Locked tenants are
+  unaffected by whatever the switch says: the API resolves each job's backend
+  (request > toggle > env), applies the lock where the tenant is known, and stamps
+  the decision into the job envelope, which both stages honour. Before
+  PROJECT_ASSESSMENT §13.5 this endpoint had no policy or role check and the
+  workers read the global key directly, so a locked tenant's content followed the
+  toggle to Groq.
 
 - **Different Ollama model:** `export LLM_A_LOCAL_MODEL=gemma4:e4b` (or any tag from
   `ollama list`); `ollama pull <model>` first if it isn't listed.
@@ -599,6 +609,41 @@ the watchlist is a **stated bias model**, not a measurement.
 | Variable | Purpose | Required? | Example / default |
 | --- | --- | --- | --- |
 | `EMBEDDING_ALLOW_STUB` | Permit persisting the deterministic hash-seeded stub vector. **Set `false` before demoing semantic search or cluster reports** — kNN over stub rows returns arbitrary neighbours with scores that look exactly as plausible as real ones. Rows are marked `embedding_is_stub` either way. | default `true` | `false` |
+
+`embedding_is_stub` is **reported by Stage 1 and carried** to the column, not
+inferred downstream: the stub is the same `EMBEDDING_DIM` size as a real vector,
+so a dimension check cannot tell them apart — and that is exactly what the
+persistence layer used to do, recording every stub in the default configuration
+as a real semantic vector (PROJECT_ASSESSMENT §13.2).
+
+### Near-duplicate reuse
+
+| Variable | Purpose | Required? | Example / default |
+| --- | --- | --- | --- |
+| `NEAR_DUP_DEDUP` | Reuse a prior analysis for a post whose caption is within `NEAR_DUP_THRESHOLD` cosine of one already analysed, skipping Stage 1 and Stage 2. | default `true` | `false` |
+| `NEAR_DUP_THRESHOLD` | Cosine similarity required to count as a near-duplicate. | default `0.97` | `0.99` |
+
+In stub mode only *identical* captions match — identical text hashes to an
+identical vector, so cosine is exactly 1.0 and any repost takes this path. The
+result is **composed, not copied**: identity, engagement, reactions and
+timestamps come from the new post, only the post-level analysis is reused,
+`processing.reused_from` records the source, and the new post's **comment thread
+is reported unanalysed** rather than inheriting labels for comments nobody read.
+Set `NEAR_DUP_DEDUP=false` for any run whose per-post *latency* numbers you intend
+to quote — a reused post does no stage work.
+
+### Usage & cost counters
+
+| Variable | Purpose | Required? | Example / default |
+| --- | --- | --- | --- |
+| `LLM_USAGE_TRACKING_DISABLED` | Stop writing the Redis usage counters `GET /v1/usage` reads. For offline evals and benchmarks that must not pollute the cost figures. | default off | `1` |
+
+The counters are written by `LLMClient` itself, so **every** caller is counted —
+both pipeline stages, `/v1/chat`, report narratives and cluster summaries, and
+agent runs. They were written by the Stage-2 worker alone until §13.4, which left
+five callers spending tokens nothing counted. `lane_split` reports five lanes
+(`post`, `comment`, `stage1`, `interactive`, `agent`) and `pipeline_tokens` sums
+the first three, so a chatbot session cannot inflate the per-post cost figure.
 
 ### Token budgets & truncation
 
