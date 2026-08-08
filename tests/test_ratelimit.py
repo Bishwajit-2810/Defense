@@ -3,7 +3,7 @@
 import asyncio
 import sys
 
-sys.path.insert(0, '/home/bk/code/defense')
+sys.path.insert(0, '/home/bk/code/defense/src/defense')
 
 from libs.ratelimit import check_rate_limit
 

@@ -657,7 +657,7 @@ An optional layer that answers a question document-level sentiment cannot:
 config/stance_targets.yml                (operator-supplied, versioned)
         │
         ▼
-libs/stance_targets.py    alias matcher — Bangla script · romanized Banglish · English
+src/defense/libs/stance_targets.py    alias matcher — Bangla script · romanized Banglish · English
         │
         ├──▶ STAGE 1: match every comment of EVERY post (pure string work, free)
         │            + deterministic clause-based scorer  → target_stances

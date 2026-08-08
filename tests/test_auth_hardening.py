@@ -17,8 +17,8 @@ database hiccups is not a guarantee. These tests pin the closed behaviour.
 
 import sys
 
-sys.path.insert(0, "/home/bk/code/defense")
-sys.path.insert(0, "/home/bk/code/defense/services/api")
+sys.path.insert(0, '/home/bk/code/defense/src/defense')
+sys.path.insert(0, '/home/bk/code/defense/src/defense/services/api')
 
 import pytest
 from fastapi import HTTPException
@@ -31,7 +31,7 @@ from libs.auth import (
     redeem_sse_ticket,
     verify_password,
 )
-from deps import _principal_from_api_key, check_llm_backend_policy, get_current_user
+from defense.services.api.deps import _principal_from_api_key, check_llm_backend_policy, get_current_user
 
 
 # ---------------------------------------------------------------------------
@@ -103,6 +103,9 @@ class _Redis:
 
     async def delete(self, key):
         return 1 if self.store.pop(key, None) is not None else 0
+
+    async def getdel(self, key):
+        return self.store.pop(key, None)
 
 
 # ---------------------------------------------------------------------------
@@ -227,6 +230,8 @@ async def test_failed_api_key_lookup_rolls_back_so_the_request_can_continue():
 @pytest.mark.asyncio
 async def test_failed_last_used_update_rolls_back_but_still_authenticates():
     """`last_used` is telemetry; a cosmetic write must not 500 the request."""
+    from defense.services.api import deps
+    deps._API_KEY_TABLE_RETRY_AFTER = 0
     # Query 1 (the SELECT) succeeds; query 2 (the last_used UPDATE) fails.
     db = _Db(row=("acme", "user", "dash"), fail_after=1)
 

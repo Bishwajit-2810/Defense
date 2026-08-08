@@ -25,8 +25,8 @@ client sent. An unknown key still falls through to the permissive MVP behaviour
 import sys
 from datetime import datetime, timedelta, timezone
 
-sys.path.insert(0, "/home/bk/code/defense")
-sys.path.insert(0, "/home/bk/code/defense/services/api")
+sys.path.insert(0, '/home/bk/code/defense/src/defense')
+sys.path.insert(0, '/home/bk/code/defense/src/defense/services/api')
 
 import pytest
 from fastapi import HTTPException
@@ -39,7 +39,7 @@ from libs.common.config import (  # noqa: E402
     jwt_secret_fingerprint,
     require_jwt_secret,
 )
-from deps import _looks_like_jwt, get_current_user  # noqa: E402
+from defense.services.api.deps import _looks_like_jwt, get_current_user  # noqa: E402
 
 
 class _NoRowsDb:
@@ -175,6 +175,8 @@ async def test_unlisted_claims_are_dropped_from_the_principal():
 def test_issuer_and_verifier_read_the_same_secret(monkeypatch):
     """Both sides read through libs.common.config, per call — so rotation works."""
     monkeypatch.setenv("JWT_SECRET", "rotated-secret")
+    from defense.libs.common.config import get_settings
+    get_settings.cache_clear()
     assert get_jwt_secret() == "rotated-secret"
     before = jwt_secret_fingerprint()
     monkeypatch.setenv("JWT_SECRET", "rotated-again")
@@ -191,6 +193,8 @@ def test_fingerprint_never_leaks_the_secret(monkeypatch):
 def test_placeholder_secret_is_refused_outside_dev(monkeypatch):
     monkeypatch.delenv("JWT_SECRET", raising=False)
     monkeypatch.setenv("APP_ENV", "production")
+    from defense.libs.common.config import get_settings
+    get_settings.cache_clear()
     with pytest.raises(RuntimeError, match="JWT_SECRET"):
         require_jwt_secret()
 
@@ -198,4 +202,6 @@ def test_placeholder_secret_is_refused_outside_dev(monkeypatch):
 def test_placeholder_secret_is_tolerated_in_dev(monkeypatch):
     monkeypatch.delenv("JWT_SECRET", raising=False)
     monkeypatch.setenv("APP_ENV", "dev")
+    from defense.libs.common.config import get_settings
+    get_settings.cache_clear()
     assert require_jwt_secret() == JWT_DEV_DEFAULT_SECRET

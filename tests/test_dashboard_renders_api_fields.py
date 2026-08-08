@@ -21,14 +21,16 @@ import pathlib
 import re
 import sys
 
-sys.path.insert(0, '/home/bk/code/defense')
+sys.path.insert(0, '/home/bk/code/defense/src/defense')
 
 import pytest
 
 from libs.llm.usage import ALL_LANES
 
 _REPO = pathlib.Path('/home/bk/code/defense')
-_APP_JS = (_REPO / 'dashboard/app.js').read_text(encoding='utf-8')
+_APP_JS = (_REPO / 'dashboard_legacy/app.js').read_text(encoding='utf-8')
+_INDEX = (_REPO / 'dashboard_legacy/index.html').read_text(encoding='utf-8')
+_CSS = (_REPO / 'dashboard_legacy/styles.css').read_text(encoding='utf-8')
 
 
 def _code_only(src: str) -> str:

@@ -17,7 +17,7 @@ a model — with a fake tokenizer/model, which is where the bugs would be anyway
 
 import sys
 
-sys.path.insert(0, '/home/bk/code/defense')
+sys.path.insert(0, '/home/bk/code/defense/src/defense')
 
 import pytest
 

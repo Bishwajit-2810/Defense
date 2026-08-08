@@ -20,7 +20,7 @@ real failure — which is the right place to test it.
 
 import sys
 
-sys.path.insert(0, '/home/bk/code/defense')
+sys.path.insert(0, '/home/bk/code/defense/src/defense')
 
 import pytest
 
@@ -32,6 +32,8 @@ from services.workers.stage1_nlp.text_analyzer import _real_language, analyze_te
 def real_mode(monkeypatch):
     monkeypatch.setenv("MODEL_STUB_MODE", "false")
     monkeypatch.setenv("STAGE1_LLM", "false")
+    from defense.libs.common.config import get_settings
+    get_settings.cache_clear()
     return ModelRegistry()
 
 

@@ -41,7 +41,7 @@ source .venv/bin/activate    # so the bare `python`/`uvicorn` commands below use
 > (e.g. `starlette<0.51`, which FastAPI 0.128 needs, and the `<8` pin on
 > `prometheus-fastapi-instrumentator` whose 8.x pulls an incompatible Starlette).
 > If you'd rather not activate the venv, prefix each command below with `uv run`
-> (e.g. `uv run python -m services.workers.stage1_nlp`).
+> (e.g. `uv run python -m defense.services.workers.stage1_nlp`).
 
 ---
 
@@ -74,7 +74,7 @@ vector column that replaced Qdrant). Create the ClickHouse tables (not auto-crea
 ```bash
 docker exec -i deploy-clickhouse-1 clickhouse-client \
   --user defense --password defense --database defense --multiquery \
-  < /home/bk/code/defense/services/workers/assembler/clickhouse_init.sql
+  < /home/bk/code/defense/src/defense/services/workers/assembler/clickhouse_init.sql
 ```
 
 (The MinIO `defense` bucket is created automatically by the assembler on startup.)
@@ -176,13 +176,12 @@ Launch the five workers + the API (each in its own background process). They rea
 config from the env you exported above, so launch them from that shell:
 
 ```bash
-cd $REPO
-python -m services.workers.stage1_nlp        > /tmp/stage1.log    2>&1 &
-python -m services.workers.router            > /tmp/router.log    2>&1 &
-python -m services.workers.stage2_llm        > /tmp/stage2.log    2>&1 &
-( cd $REPO/services/workers/assembler && python __main__.py ) > /tmp/assembler.log 2>&1 &
-python -m services.ingestion                 > /tmp/ingestion.log 2>&1 &
-( cd $REPO/services/api && uvicorn main:app --host 127.0.0.1 --port 8001 --log-level warning ) > /tmp/api.log 2>&1 &
+python -m defense.services.workers.stage1_nlp        > /tmp/stage1.log    2>&1 &
+python -m defense.services.workers.router            > /tmp/router.log    2>&1 &
+python -m defense.services.workers.stage2_llm        > /tmp/stage2.log    2>&1 &
+( cd src/defense/services/workers/assembler && python __main__.py ) > /tmp/assembler.log 2>&1 &
+python -m defense.services.ingestion                 > /tmp/ingestion.log 2>&1 &
+python -m uvicorn defense.services.api.main:app --host 127.0.0.1 --port 8001 --log-level warning > /tmp/api.log 2>&1 &
 ```
 
 > The API runs on **:8001** here (host :8000 is often taken). Health check:
@@ -342,10 +341,10 @@ docker exec deploy-clickhouse-1 clickhouse-client --user defense --password defe
 
 The Mode B images **build now**. Every application service (and the three MCP
 servers) builds with the **repo root as build context**
-(`build: { context: .., dockerfile: services/<path>/Dockerfile }` in
+(`build: { context: .., dockerfile: src/defense/services/<path>/Dockerfile }` in
 `deploy/docker-compose.yml`), so the Dockerfiles can `COPY libs` and the
-`services/`/`mcp/` packages. Each `CMD` matches the code's actual import style:
-module-path entries (`python -m services.workers.router`,
+`src/defense/services/`/`mcp/` packages. Each `CMD` matches the code's actual import style:
+module-path entries (`python -m defense.services.workers.router`,
 `uvicorn services.agents.main:app`) for package-relative imports, and a
 service-dir `WORKDIR` (`api`, `assembler`, `retrieval-mcp`, `ingest-mcp`) for
 cwd-relative imports. The previously missing Dockerfiles (`ingestion`,
@@ -365,7 +364,7 @@ app service loads via `env_file`. The API is published on host **:8000**
 Notes:
 
 - **stage1 is stub-mode-only by default.** Its image installs
-  `services/workers/stage1_nlp/requirements-stub.txt` (no torch/transformers —
+  `src/defense/services/workers/stage1_nlp/requirements-stub.txt` (no torch/transformers —
   multi-GB) and the compose file pins `MODEL_STUB_MODE=true`. For real ML,
   switch the Dockerfile to the full `requirements.txt` (plus
   `libgomp1`/`tesseract-ocr` apt packages — see the comment in that
@@ -454,8 +453,8 @@ export ANALYTICS_MCP_STUB=true RETRIEVAL_MCP_STUB=true
 # Each MCP server is a FastMCP app exposing the streamable-HTTP endpoint at /mcp.
 # analytics_mcp launches by module path from $REPO:
 uvicorn mcp_servers.analytics_mcp.server:app --host 127.0.0.1 --port 8110 --log-level warning > /tmp/analytics_mcp.log 2>&1 &
-( cd $REPO/mcp_servers/retrieval_mcp && uvicorn server:app --host 127.0.0.1 --port 8101 --log-level warning ) > /tmp/retrieval_mcp.log 2>&1 &
-( cd $REPO/mcp_servers/ingest_mcp    && uvicorn server:app --host 127.0.0.1 --port 8102 --log-level warning ) > /tmp/ingest_mcp.log 2>&1 &
+( cd $REPO/src/defense/mcp_servers/retrieval_mcp && uvicorn server:app --host 127.0.0.1 --port 8101 --log-level warning ) > /tmp/retrieval_mcp.log 2>&1 &
+( cd $REPO/src/defense/mcp_servers/ingest_mcp    && uvicorn server:app --host 127.0.0.1 --port 8102 --log-level warning ) > /tmp/ingest_mcp.log 2>&1 &
 # agents uses package-relative imports — module path from $REPO:
 uvicorn services.agents.main:app --host 127.0.0.1 --port 8010 --log-level warning > /tmp/agents.log 2>&1 &
 ```
@@ -485,7 +484,7 @@ The dashboard is static HTML/JS. It already targets the dev API on
 
 ```bash
 cd $REPO/dashboard
-python -m http.server 8080    # open http://127.0.0.1:8080
+npm install && npm run dev -- --port 8080    # open http://127.0.0.1:8080
 ```
 
 To point it at a different API (e.g. Mode B on :8000), set `window.API_BASE` in
@@ -497,7 +496,7 @@ Log in with any non-empty API key (e.g. `demo`) — see the auth note in [§5](#
 To stop the full-stack processes, the [§8](#8-teardown) `pkill` lines already
 match the workers/API; add `pkill -f "[u]vicorn server:app"` and
 `pkill -f "[u]vicorn main:app"` for the MCP/agents processes (and `pkill -f
-"http.server 8080"` for the dashboard).
+"vite"` for the dashboard).
 
 ---
 
@@ -520,7 +519,7 @@ back to if unset.
 | `MINIO_SECRET_KEY` | MinIO secret key.                                           | **required**            | `minioadmin`                                                |
 | `MINIO_BUCKET`     | Object bucket (auto-created).                               | default `defense`       | `defense`                                                   |
 | `PYTHONPATH`       | Must include the repo root so `libs`/`services` import.     | **required (host run)** | `/home/bk/code/defense`                                     |
-| `JWT_SECRET`       | HS256 secret, read per call by **both** the issuer and the verifier via `libs/common/config.py` (so it can be rotated without a restart, and issuer/verifier cannot drift). A fingerprint is logged at boot in each. | default `change-me`     | `demo`                                                      |
+| `JWT_SECRET`       | HS256 secret, read per call by **both** the issuer and the verifier via `src/defense/libs/common/config.py` (so it can be rotated without a restart, and issuer/verifier cannot drift). A fingerprint is logged at boot in each. | default `change-me`     | `demo`                                                      |
 | `APP_ENV`          | Deployment environment. Outside `dev`/`test`/`ci` the API **refuses to start** while `JWT_SECRET` is still a placeholder that ships in this repo. | default `dev`           | `dev`                                                       |
 | `LOG_LEVEL`        | Log verbosity.                                              | default `INFO`          | `INFO`                                                      |
 
@@ -660,7 +659,7 @@ the first three, so a chatbot session cannot inflate the per-post cost figure.
 | Variable          | Purpose                                                                                     | Required?             | Example / default |
 | ----------------- | ------------------------------------------------------------------------------------------- | --------------------- | ----------------- |
 | `MODEL_STUB_MODE` | `true` = deterministic heuristic stubs (no weights, no GPU); `false` = load real ML models. | default `true`        | `true`            |
-| `EMBEDDING_MODEL` | Real sentence-embedding model (only when `MODEL_STUB_MODE=false`); must output `EMBEDDING_DIM` dims. Shared by Stage-1, the API and retrieval-mcp via `libs/embeddings.py`. | default `paraphrase-multilingual-mpnet-base-v2` (768-dim) | — |
+| `EMBEDDING_MODEL` | Real sentence-embedding model (only when `MODEL_STUB_MODE=false`); must output `EMBEDDING_DIM` dims. Shared by Stage-1, the API and retrieval-mcp via `src/defense/libs/embeddings.py`. | default `paraphrase-multilingual-mpnet-base-v2` (768-dim) | — |
 | `SENTIMENT_MODEL` | Default sentiment checkpoint (XLM-R) — the `xlmr` option / fallback for every language. Must have a 3-class sentiment head. | default `cardiffnlp/twitter-xlm-roberta-base-sentiment` | — |
 | `BANGLABERT_SENTIMENT_MODEL` / `BANGLISHBERT_SENTIMENT_MODEL` / `MBERT_SENTIMENT_MODEL` | Sentiment-**fine-tuned** checkpoints that activate the BanglaBERT / BanglishBERT / mBERT options. Unset ⇒ the option stays unavailable and the language router falls back to XLM-R. Auto-route: Bangla-script→BanglaBERT, Banglish/mixed→BanglishBERT, else→XLM-R. Force one at runtime via `PUT /v1/config/nlp` (dashboard "NLP" chip). | unset | — |
 
@@ -676,7 +675,7 @@ the first three, so a chatbot session cannot inflate the per-post cost figure.
 | `PUBLIC_BASE_URL`                                           | Base URL the agents service uses when building links.                            | default empty                              | `http://127.0.0.1:8010`           |
 | `RETRIEVAL_MCP_STUB`                                        | retrieval-mcp: skip vector search, return by recency.                            | default `false`                            | `true`                            |
 | `ANALYTICS_MCP_STUB`                                        | analytics-mcp: return synthetic analytics.                                       | default `false`                            | `true`                            |
-| `MODEL_STUB_MODE` / `EMBEDDING_MODEL`                       | retrieval-mcp query embedding now uses the shared `libs/embeddings.py` (same vars as Stage-1 above) — `SENTENCE_TRANSFORMER_MODEL` is gone. | see Stage-1 section                        | —                                 |
+| `MODEL_STUB_MODE` / `EMBEDDING_MODEL`                       | retrieval-mcp query embedding now uses the shared `src/defense/libs/embeddings.py` (same vars as Stage-1 above) — `SENTENCE_TRANSFORMER_MODEL` is gone. | see Stage-1 section                        | —                                 |
 | `CLICKHOUSE_HOST`                                           | analytics-mcp ClickHouse host (note: **not** `CLICKHOUSE_URL`).                  | default `localhost`                        | `<ch-ip>`                         |
 | `CLICKHOUSE_PORT`                                           | analytics-mcp ClickHouse native TCP port.                                        | default `9000`                             | `9000`                            |
 | `CLICKHOUSE_DB` / `CLICKHOUSE_USER` / `CLICKHOUSE_PASSWORD` | analytics-mcp ClickHouse db/creds.                                               | defaults `defense` / `default` / _(empty)_ | `defense` / `defense` / `defense` |

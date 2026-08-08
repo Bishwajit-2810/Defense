@@ -33,11 +33,12 @@ import pytest
 # unable to run against a copy of the tree, which is what a mutation-testing
 # pass (§9.12) does to check they fail when a fix is reverted.
 _REPO = Path(__file__).resolve().parents[1]
-sys.path.insert(0, str(_REPO))
+sys.path.insert(0, str(_REPO / 'src'))
 
 import mcp_servers.analytics_mcp.server as analytics  # noqa: E402
-_CH_INIT = (_REPO / 'services' / 'workers' / 'assembler' / 'clickhouse_init.sql').read_text(encoding='utf-8')
-_USAGE_SRC = (_REPO / 'services' / 'api' / 'routers' / 'usage.py').read_text(encoding='utf-8')
+_CH_INIT = (_REPO / 'src' / 'defense' / 'services' / 'workers' / 'assembler' / 'clickhouse_init.sql').read_text(encoding='utf-8')
+_USAGE_SRC = (_REPO / 'src' / 'defense' / 'services' / 'api' / 'routers' / 'usage.py').read_text(encoding='utf-8')
+
 _INIT_DB = (_REPO / 'deploy' / 'init-db.sql').read_text(encoding='utf-8')
 
 _DATES = {"from_date": "2026-01-01", "to_date": "2026-12-31"}

@@ -11,11 +11,11 @@ import json
 import sys
 import os
 
-sys.path.insert(0, "/home/bk/code/defense")
+sys.path.insert(0, '/home/bk/code/defense/src')
 
 import pytest
 
-from libs.schemas import validate_input, validate_output, assert_valid_output
+from defense.contracts.schemas import validate_input, validate_output, assert_valid_output
 from libs.common import platform_from_url, content_hash, compute_coverage
 from services.ingestion.normalizer import normalize_post
 from services.workers.stage1_nlp.fusion import fuse_sentiment

@@ -119,7 +119,7 @@ Prometheus/Grafana). The Postgres image is `pgvector/pgvector:pg16`; `deploy/ini
 runs `CREATE EXTENSION vector` to enable the extension. **DoD:** `docker compose up`
 brings everything healthy; `GET /v1/health` returns 200.
 
-**Task 0.2 — Lock the two contracts (`/libs/schemas`).**
+**Task 0.2 — Lock the two contracts (`/src/defense/libs/schemas`).**
 
 - **Input schema** = the post-with-details object ([data_contract.md](data_contract.md)
   §1/§1.1/§1.2/§2). Validate against `posts_with_details.json` (all 50 must pass). The **working**
@@ -137,7 +137,7 @@ brings everything healthy; `GET /v1/health` returns 200.
 - **DoD:** both schemas exist; a validator lib rejects malformed objects; the 50
   sample posts validate as input.
 
-**Task 0.3 — LLM backend client (`/libs/llm`).** One OpenAI-compatible client
+**Task 0.3 — LLM backend client (`/src/defense/libs/llm`).** One OpenAI-compatible client
 selectable by `LLM_BACKEND=local|groq`, with role→model-ID mapping (LLM-A/LLM-B/VLM),
 a per-request override, and **tenant policy enforcement** (a `local`-pinned tenant
 can never be sent to `groq`). **DoD:** unit test flips backend via env + per-request

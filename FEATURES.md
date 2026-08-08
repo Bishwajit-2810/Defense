@@ -18,8 +18,8 @@ and what the image modality was before §9.3.
 | 📋 **Planned** | Designed, not built |
 
 **Scale (measured 5 Aug 2026):** **27,537 lines of Python across 124 files** —
-`services/` 14,477, `tests/` 6,351, `libs/` 3,475, `eval/` 1,109,
-`mcp_servers/` 1,160, `run_all.py` 671. **673 tests** across 40 files. Working
+`src/defense/services/` 14,477, `tests/` 6,351, `src/defense/libs/` 3,475, `eval/` 1,109,
+`src/defense/mcp_servers/` 1,160, `run_all.py` 671. **673 tests** across 40 files. Working
 corpus: 43 posts, 8,965 comments.
 
 Test code is now 23% of the Python in the repository, up from 14%. That ratio is
@@ -90,7 +90,7 @@ reverted.
 | **Post summary in the original language** | A Bangla post gets a Bangla summary. `post_summary_grounding` records which inputs informed it. | ✅ Measured |
 | **Separate `summary` role** | Summarization and classification resolve to **different models**: classification picks from a fixed vocabulary and wants a cheap constrained model; summarization writes prose and wants a fluent one. The expensive model is spent once per post, not on every classification call. | ✅ Measured |
 | **Truncation recovery** | `finish_reason` is inspected; a reply that hit the token ceiling is auto-continued (up to `LLM_MAX_CONTINUATIONS`), trimmed to its last complete sentence, flagged `post_summary_truncated`, and **never cached**. Truncation is language-correlated — Bangla costs far more tokens per character — so this was silently biased against Bangla. | ✅ Measured |
-| **Post-type classification** | Nine-label taxonomy shared from `libs/labels.py` so Stage 1, the Stage-2 prompt and the router cannot drift apart. | ✅ Measured |
+| **Post-type classification** | Nine-label taxonomy shared from `src/defense/libs/labels.py` so Stage 1, the Stage-2 prompt and the router cannot drift apart. | ✅ Measured |
 | **Insight / topic refinement** | Refines topics and intents, and writes a short one-line `insight`. **This row was wrong until 5 Aug 2026:** the LLM call ran and was paid for, but the assembler read `topics`/`intents` from Stage 1 only and never read `insight` at all, which was also absent from `output_schema.json` — so the entire task's output was discarded before it reached the API, the stores or the dashboard. Merged now (`builder._merge_stage2_labels`, schema `1.3`), pinned by `tests/test_stage2_insight_survives.py`. Pass 5 carried it the last hop: it reached the dashboard only as an untitled row in the bottom "All Fields" dump, and now has its own section beside the summary plus a Trace-tab row (§12.4d). | 🟡 Works, unmeasured |
 | **Context-aware comment stance** | Re-labels comments by stance *toward the post*, with the post as context — a different and better signal than standalone comment sentiment. | ✅ Measured |
 | **Comment-thread summary** | A short natural-language account of how commenters reacted, grounded on the recomputed breakdowns. | 🟡 Works, unmeasured |
@@ -173,7 +173,7 @@ Full design: **[stance_targets.md](stance_targets.md)**.
 | **Password verification** | PBKDF2-SHA256, 200k iterations, salted. `POST /v1/auth/token` used to issue a signed 24-hour token to **anybody**. | 🟡 Built; needs rows seeded |
 | **SSE tickets** | `POST /v1/auth/sse-ticket` returns a single-use, ~60-second, hash-stored ticket. `EventSource` cannot send headers, so *something* must go in the URL — a ticket makes that harmless. | ✅ Measured |
 | **Sliding session** | `/refresh` allows `exp` to be 1 hour instead of 24; `/me` lets a client distinguish "no token" from "expired token". The dashboard tears down every stream on a 401, closing the split state where the UI said "logged out" while streams kept working. | ✅ Measured |
-| **One secret, one source** | `JWT_SECRET` is read per call through `libs/common/config.py` by both issuer and verifier, so it can be rotated without a restart and cannot drift. A fingerprint is logged at boot in each. Placeholder values are refused outside dev. | ✅ Measured |
+| **One secret, one source** | `JWT_SECRET` is read per call through `src/defense/libs/common/config.py` by both issuer and verifier, so it can be rotated without a restart and cannot drift. A fingerprint is logged at boot in each. Placeholder values are refused outside dev. | ✅ Measured |
 
 ---
 
@@ -207,7 +207,7 @@ Full design: **[stance_targets.md](stance_targets.md)**.
 | Feature | What it does | State |
 | ------- | ------------ | ----- |
 | **Queue-based, stage-isolated workers** | Redis Streams between ingestion → Stage 1 → router → Stage 2 → assembler. Each stage scales independently; nothing is a monolith with a `main()`. | ✅ Measured |
-| **Single source of truth for identifiers** | `libs/streams.py` owns every stream and consumer-group name, and a test asserts the KEDA manifests agree. Four separate bugs in this system have been one component writing a string and another reading a different one. | ✅ Measured |
+| **Single source of truth for identifiers** | `src/defense/libs/streams.py` owns every stream and consumer-group name, and a test asserts the KEDA manifests agree. Four separate bugs in this system have been one component writing a string and another reading a different one. | ✅ Measured |
 | **KEDA autoscaling** | One `ScaledObject` per worker, triggering on consumer-group **lag** (`lagCount`). `pendingEntriesCount` cannot scale from zero — with no replicas there is no consumer, so nothing is ever delivered and the count stays 0 forever. | 🟡 Manifests correct + test-asserted; **not run in a cluster** |
 | **Docker Compose + Kubernetes** | Compose for the MVP, 10 K8s manifests with network policies, secrets and ingress for production. | 🟡 Works, unmeasured |
 | **Dev orchestrator** | `run_all.py` brings the whole stack up locally and loads the sample corpus. | ✅ Measured |

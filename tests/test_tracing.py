@@ -3,7 +3,7 @@
 import importlib
 import sys
 
-sys.path.insert(0, '/home/bk/code/defense')
+sys.path.insert(0, '/home/bk/code/defense/src/defense')
 
 
 def test_disabled_by_default(monkeypatch):

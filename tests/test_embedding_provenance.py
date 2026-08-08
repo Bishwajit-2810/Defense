@@ -24,10 +24,10 @@ was right, and the column was wrong, because nobody checked that the two agreed.
 import asyncio
 import sys
 
-sys.path.insert(0, '/home/bk/code/defense')
-sys.path.insert(0, '/home/bk/code/defense/libs')
-sys.path.insert(0, '/home/bk/code/defense/services/workers/stage1_nlp')
-sys.path.insert(0, '/home/bk/code/defense/services/workers/assembler')
+sys.path.insert(0, '/home/bk/code/defense/src/defense')
+sys.path.insert(0, '/home/bk/code/defense/src/defense/libs')
+sys.path.insert(0, '/home/bk/code/defense/src/defense/services/workers/stage1_nlp')
+sys.path.insert(0, '/home/bk/code/defense/src/defense/services/workers/assembler')
 
 import pytest
 

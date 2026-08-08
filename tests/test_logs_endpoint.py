@@ -13,10 +13,10 @@ import asyncio
 import json
 import sys
 
-sys.path.insert(0, '/home/bk/code/defense')
-sys.path.insert(0, '/home/bk/code/defense/services/api')
+sys.path.insert(0, '/home/bk/code/defense/src/defense')
+sys.path.insert(0, '/home/bk/code/defense/src/defense/services/api')
 
-from routers import logs as L  # noqa: E402
+from defense.services.api.routers import logs as L  # noqa: E402
 
 
 class FakeRedis:

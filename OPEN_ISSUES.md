@@ -47,10 +47,10 @@ Fixed in the order below; see [What changed](#what-changed) for the per-issue la
 
 ### Where
 
-- [deps.py:413](services/api/deps.py#L413) — `check_llm_backend_policy`
-- [config.py:87](services/api/routers/config.py#L87) — `PUT /v1/config/llm`
-- [stage2_llm/worker.py:991](services/workers/stage2_llm/worker.py#L991) — reads `config:llm_backend`
-- [stage1_nlp/worker.py:89](services/workers/stage1_nlp/worker.py#L89) — same key
+- [deps.py:413](src/defense/services/api/deps.py#L413) — `check_llm_backend_policy`
+- [config.py:87](src/defense/services/api/routers/config.py#L87) — `PUT /v1/config/llm`
+- [stage2_llm/worker.py:991](src/defense/services/workers/stage2_llm/worker.py#L991) — reads `config:llm_backend`
+- [stage1_nlp/worker.py:89](src/defense/services/workers/stage1_nlp/worker.py#L89) — same key
 
 ### What's wrong
 
@@ -58,7 +58,7 @@ Two halves that do not meet.
 
 **The guarded knob is dead.** `check_llm_backend_policy` returns immediately
 unless `options["llm_backend"] == "groq"`. `POST /v1/analysis` and `POST /v1/ingest`
-both call it with the request options — but grepping `services/workers/` for
+both call it with the request options — but grepping `src/defense/services/workers/` for
 `llm_backend` shows **no consumer**. Stage 1 and Stage 2 each resolve their backend
 from the global Redis key `config:llm_backend`, falling back to the `LLM_BACKEND`
 env var. The per-request option is accepted, policy-checked, written into the job
@@ -77,7 +77,7 @@ returns a 403 that reads as the guarantee working.
 ### Reproduce
 
 ```bash
-grep -rn "llm_backend" services/workers/ | grep -v '_llm_backend"'
+grep -rn "llm_backend" src/defense/services/workers/ | grep -v '_llm_backend"'
 # → only config:llm_backend reads and processing-provenance writes.
 #   No worker reads options["llm_backend"].
 ```
@@ -97,7 +97,7 @@ comment on `check_llm_backend_policy` naming what it does and does not cover.
    it on an admin role. A global switch should not be settable by a tenant user.
 2. Carry the tenant through the pipeline: add `tenant_id` to the ingestion/analysis
    envelope, and have the Stage-2 worker resolve `enforce_policy(tenant_policy,
-   config:llm_backend)` per message via [libs/llm/policy.py](libs/llm/policy.py)
+   config:llm_backend)` per message via [src/defense/libs/llm/policy.py](src/defense/libs/llm/policy.py)
    — which already exists and is already used by the agent runner.
 3. Then either delete `options["llm_backend"]` or make Stage 1/2 honour it.
 
@@ -107,7 +107,7 @@ is exactly the shape of the bug.
 ### Test to leave behind
 
 Assert the *contract*, per §11.6: for every knob `check_llm_backend_policy`
-inspects, some worker must read it. A test that greps `services/workers/` for the
+inspects, some worker must read it. A test that greps `src/defense/services/workers/` for the
 option key and fails when nothing consumes it would have caught this on the day it
 was introduced.
 
@@ -122,8 +122,8 @@ was introduced.
 
 ### Where
 
-- [stage2_llm/worker.py:210](services/workers/stage2_llm/worker.py#L210) — `_track_usage`, the only writer
-- [usage.py](services/api/routers/usage.py) — the reader and its `scope_note`
+- [stage2_llm/worker.py:210](src/defense/services/workers/stage2_llm/worker.py#L210) — `_track_usage`, the only writer
+- [usage.py](src/defense/services/api/routers/usage.py) — the reader and its `scope_note`
 
 ### What's wrong
 
@@ -133,11 +133,11 @@ file. Five other LLM call sites never touch a counter:
 
 | Call site | When it runs | Volume |
 | --------- | ------------ | ------ |
-| [chat.py:202](services/api/routers/chat.py#L202), [:260](services/api/routers/chat.py#L260) | every chatbot turn | unbounded, user-driven |
-| [reports.py:216](services/api/routers/reports.py#L216) `_llm_narrative` | every grounded report (the default) | 1 per report |
-| [reports.py:354](services/api/routers/reports.py#L354) `_summarize_cluster` | every grounded report | up to 8 per report |
-| [llm_analyzer.py:225](services/workers/stage1_nlp/llm_analyzer.py#L225), [:292](services/workers/stage1_nlp/llm_analyzer.py#L292) | when `STAGE1_LLM=true` — **the shipped config** | per post |
-| [runner.py:409](services/agents/runner.py#L409) `_llm_chat_with_tools` | every agent turn | per tool-calling turn |
+| [chat.py:202](src/defense/services/api/routers/chat.py#L202), [:260](src/defense/services/api/routers/chat.py#L260) | every chatbot turn | unbounded, user-driven |
+| [reports.py:216](src/defense/services/api/routers/reports.py#L216) `_llm_narrative` | every grounded report (the default) | 1 per report |
+| [reports.py:354](src/defense/services/api/routers/reports.py#L354) `_summarize_cluster` | every grounded report | up to 8 per report |
+| [llm_analyzer.py:225](src/defense/services/workers/stage1_nlp/llm_analyzer.py#L225), [:292](src/defense/services/workers/stage1_nlp/llm_analyzer.py#L292) | when `STAGE1_LLM=true` — **the shipped config** | per post |
+| [runner.py:409](src/defense/services/agents/runner.py#L409) `_llm_chat_with_tools` | every agent turn | per tool-calling turn |
 
 Meanwhile `UsageResponse.total_tokens` says *"Total tokens spent"*, the endpoint
 docstring says *"Every token/cost/cache figure therefore comes from Redis"*, and
@@ -151,8 +151,8 @@ the total there.
 ### Reproduce
 
 ```bash
-grep -rn "_track_usage" --include=*.py services/ libs/ | grep -v tests/
-# → services/workers/stage2_llm/worker.py only.
+grep -rn "_track_usage" --include=*.py src/defense/services/ src/defense/libs/ | grep -v tests/
+# → src/defense/services/workers/stage2_llm/worker.py only.
 ```
 
 ### Fix
@@ -194,8 +194,8 @@ shrinking the cost figure.
 
 ### Where
 
-- [persistence.py:55](services/workers/assembler/persistence.py#L55) — `_resolve_embedding`, writes the DB column
-- [assembler.py:295](services/workers/assembler/assembler.py#L295) — the trace frame, computes the *same flag differently*
+- [persistence.py:55](src/defense/services/workers/assembler/persistence.py#L55) — `_resolve_embedding`, writes the DB column
+- [assembler.py:295](src/defense/services/workers/assembler/assembler.py#L295) — the trace frame, computes the *same flag differently*
 
 ### What's wrong
 
@@ -263,10 +263,10 @@ test would catch only half of this — which is precisely how it survived §9.11
 
 ### Where
 
-- [reports.py:240](services/api/routers/reports.py#L240) — `_embedding_clusters` (the producer)
-- [reports.py:472](services/api/routers/reports.py#L472) — writes `content["embedding_clusters"]`
-- [models.py:367](services/api/models.py#L367) — `ReportResponse` (no such field)
-- [reports.py:53](services/api/routers/reports.py#L53) — `_row_to_report` (never reads it)
+- [reports.py:240](src/defense/services/api/routers/reports.py#L240) — `_embedding_clusters` (the producer)
+- [reports.py:472](src/defense/services/api/routers/reports.py#L472) — writes `content["embedding_clusters"]`
+- [models.py:367](src/defense/services/api/models.py#L367) — `ReportResponse` (no such field)
+- [reports.py:53](src/defense/services/api/routers/reports.py#L53) — `_row_to_report` (never reads it)
 
 ### What's wrong
 
@@ -319,7 +319,7 @@ Assert the consumer, not the producer: build a report `content` dict containing
 
 ### Where
 
-[service.py:263](services/ingestion/service.py#L263) — `_reuse_analysis`
+[service.py:263](src/defense/services/ingestion/service.py#L263) — `_reuse_analysis`
 
 ### What's wrong
 
@@ -387,7 +387,7 @@ includes `embedding_is_stub`, in the style of
 
 ### Where
 
-[runner.py:409](services/agents/runner.py#L409) — `_llm_chat_with_tools`
+[runner.py:409](src/defense/services/agents/runner.py#L409) — `_llm_chat_with_tools`
 
 ### What's wrong
 
@@ -414,7 +414,7 @@ would reach for the private helpers again.
 
 ### Test to leave behind
 
-Assert no module outside `libs/llm/` references `_get_client`, `_resolve_model` or
+Assert no module outside `src/defense/libs/llm/` references `_get_client`, `_resolve_model` or
 `_breakers`. A private-helper firewall is the general form of this bug.
 
 ---
@@ -425,7 +425,7 @@ Assert no module outside `libs/llm/` references `_get_client`, `_resolve_model` 
 
 ### 7a — `config.py`'s model table is missing the `summary` role
 
-[config.py:36](services/api/routers/config.py#L36) `_MODEL_ENVS` is a
+[config.py:36](src/defense/services/api/routers/config.py#L36) `_MODEL_ENVS` is a
 hand-maintained mirror of `client.py`'s role→model tables (its comment says so).
 It carries `stage1`/`stage2`/`llm_a`/`llm_b`/`vlm` and **omits `summary`** — the
 role §6.5 added so summaries get a stronger model. So `GET /v1/config/llm` cannot
@@ -439,9 +439,9 @@ that already exists. **Test:** assert the endpoint's role set equals
 
 ### 7b — `pipeline.py` hardcodes stream and consumer-group names
 
-[pipeline.py:34](services/api/routers/pipeline.py#L34) `_STAGES` hardcodes all five
+[pipeline.py:34](src/defense/services/api/routers/pipeline.py#L34) `_STAGES` hardcodes all five
 stream **and** group names as string literals instead of importing
-[libs/streams.py](libs/streams.py). They match the defaults today, but every name
+[src/defense/libs/streams.py](src/defense/libs/streams.py). They match the defaults today, but every name
 is env-overridable *by design* ("deployments legitimately shard streams"), and
 under any override `_stage_stats` swallows the `xinfo_groups` error and returns
 zeros — so the dashboard's Pipeline tab renders an **idle, healthy** pipeline while
@@ -454,7 +454,7 @@ this file — extend it. It is the last un-pinned copy of those identifiers.
 
 ### 7c — An ingestion docstring describes the opposite of its code
 
-[service.py:657](services/ingestion/service.py#L657) `_ensure_consumer_group`'s
+[service.py:657](src/defense/services/ingestion/service.py#L657) `_ensure_consumer_group`'s
 docstring says it uses `"$"` *"so we only process messages that arrive after the
 service starts"*, and offers `"0"` as the change to make for reprocessing. The code
 passes `id="0"`. The comment describes the opposite of the behaviour, and its
@@ -465,7 +465,7 @@ what lets a restarted service pick up a backlog).
 
 ### 7d — `lane_split` serializes token counts as floats
 
-[usage.py:109](services/api/routers/usage.py#L109) `UsageResponse.lane_split` is
+[usage.py:109](src/defense/services/api/routers/usage.py#L109) `UsageResponse.lane_split` is
 typed `Dict[str, Dict[str, float]]`, so the integer call and token counts inside it
 serialize as `{"calls": 123.0, "tokens": 45678.0}`.
 
@@ -507,7 +507,7 @@ enqueue paths stamp the decision and both workers prefer it.
 
 ### What landed (2) — usage counters, moved down a layer
 
-`libs/llm/usage.py` is new and `LLMClient.chat` / `chat_stream` record every call
+`src/defense/libs/llm/usage.py` is new and `LLMClient.chat` / `chat_stream` record every call
 themselves, so a **new call site is counted without its author knowing a counter
 exists** — which is the only version of this that stays true, since §13.4 happened
 because five call sites accumulated and nothing made the omission visible. Lanes
@@ -517,7 +517,7 @@ inflated by a chatbot session. §12.4b's deliberate asymmetry is preserved and
 pinned: `usage:llm_calls` stays fresh-only, `usage:calls:task:{task}` counts both.
 
 `tests/test_usage_covers_every_caller.py` (20 tests): an AST check that nothing
-outside `libs/llm/` calls the OpenAI SDK or touches the client's private helpers,
+outside `src/defense/libs/llm/` calls the OpenAI SDK or touches the client's private helpers,
 plus behavioural tests that drive the real `chat()` and watch the counters fire.
 
 ### What landed (3) — provenance carried, not inferred
@@ -592,7 +592,7 @@ rather than assumed correct. Three gaps, all §13.8's rule:
 
 | Gap | Fixed by |
 | --- | -------- |
-| The "Cost split" card read 2 of 5 lanes, and its comment-share denominator silently grew to span chat and agent traffic while still being labelled post-vs-comment | Share computed over pipeline lanes only; a "Spend by lane" breakdown names every lane with a hint table mirroring `libs/llm/usage.py` |
+| The "Cost split" card read 2 of 5 lanes, and its comment-share denominator silently grew to span chat and agent traffic while still being labelled post-vs-comment | Share computed over pipeline lanes only; a "Spend by lane" breakdown names every lane with a hint table mirroring `src/defense/libs/llm/usage.py` |
 | `pipeline_tokens` unrendered — the token card showed a total that now includes per-question chat/agent spend | Its own stat card, with a subtitle stating what the total covers that it does not |
 | `processing.reused_from` rendered nowhere — a reused post was indistinguishable from a cheap analysis, and its `0 analyzed` comment section gave no reason | `near-dup` tag in the post list, a "Reused Analysis" block in the modal, a `reused` row in the Trace tab, and a "thread was not analysed" note from `comment_analysis.provenance.note` |
 
@@ -635,7 +635,7 @@ consumer, walk back to the producer — would have caught all four.
 # Open Issues — Pass 7 audit
 
 **Found:** 7 August 2026, full-codebase audit across five parallel reviewers
-(API, workers/pipeline, libs/agents, dashboard/config, test suite) with every
+(API, workers/pipeline, src/defense/libs/agents, dashboard/config, test suite) with every
 finding verified against the source.
 
 **Status: ALL TEN ARE FIXED**, 7 August 2026.
@@ -685,9 +685,9 @@ finding verified against the source.
 
 ### Where
 
-- [ingest.py:223](services/api/routers/ingest.py#L223) — `delete_post`
-- [analysis.py:513](services/api/routers/analysis.py#L513) — `get_analysis`
-- [reports.py:567](services/api/routers/reports.py#L567) — `get_report`
+- [ingest.py:223](src/defense/services/api/routers/ingest.py#L223) — `delete_post`
+- [analysis.py:513](src/defense/services/api/routers/analysis.py#L513) — `get_analysis`
+- [reports.py:567](src/defense/services/api/routers/reports.py#L567) — `get_report`
 
 ### What's wrong
 
@@ -733,13 +733,13 @@ file should hold.
 
 ### Where
 
-- [bus.py:56](libs/bus.py#L56) — `RedisStreamBus.consume`
-- Every worker's main loop: [stage1_nlp/worker.py:536](services/workers/stage1_nlp/worker.py#L536),
-  [stage2_llm/worker.py:1277](services/workers/stage2_llm/worker.py#L1277),
-  [router/router.py:213](services/workers/router/router.py#L213),
-  [assembler/assembler.py:505](services/workers/assembler/assembler.py#L505),
-  [ingestion/service.py:792](services/ingestion/service.py#L792)
-- [ingestion/service.py:585](services/ingestion/service.py#L585) — early return without ACK
+- [bus.py:56](src/defense/libs/bus.py#L56) — `RedisStreamBus.consume`
+- Every worker's main loop: [stage1_nlp/worker.py:536](src/defense/services/workers/stage1_nlp/worker.py#L536),
+  [stage2_llm/worker.py:1277](src/defense/services/workers/stage2_llm/worker.py#L1277),
+  [router/router.py:213](src/defense/services/workers/router/router.py#L213),
+  [assembler/assembler.py:505](src/defense/services/workers/assembler/assembler.py#L505),
+  [ingestion/service.py:792](src/defense/services/ingestion/service.py#L792)
+- [ingestion/service.py:585](src/defense/services/ingestion/service.py#L585) — early return without ACK
 
 ### What's wrong
 
@@ -782,15 +782,15 @@ would have caught it on day one.
 
 ### Where
 
-- [assembler/assembler.py:299](services/workers/assembler/assembler.py#L299) — `ValueError`/`KeyError` → ACK + return
-- [stage1_nlp/worker.py:602](services/workers/stage1_nlp/worker.py#L602) — `JSONDecodeError` → ACK
-- [router/router.py:88](services/workers/router/router.py#L88) — `JSONDecodeError` → return (outer loop ACKs)
-- [dlq.py:170](libs/dlq.py#L170) — `replay_dlq` loops forever on `data is None`
+- [assembler/assembler.py:299](src/defense/services/workers/assembler/assembler.py#L299) — `ValueError`/`KeyError` → ACK + return
+- [stage1_nlp/worker.py:602](src/defense/services/workers/stage1_nlp/worker.py#L602) — `JSONDecodeError` → ACK
+- [router/router.py:88](src/defense/services/workers/router/router.py#L88) — `JSONDecodeError` → return (outer loop ACKs)
+- [dlq.py:170](src/defense/libs/dlq.py#L170) — `replay_dlq` loops forever on `data is None`
 
 ### What's wrong
 
 **Three workers ACK and discard messages that fail processing, instead of routing
-them to the DLQ.** The DLQ infrastructure (`libs/dlq.py`, `record_failure`) exists
+them to the DLQ.** The DLQ infrastructure (`src/defense/libs/dlq.py`, `record_failure`) exists
 and works — these paths just don't use it:
 
 | Worker | Failure | What happens | Should happen |
@@ -825,7 +825,7 @@ containing one `data=None` entry and assert it is removed, not retried.
 
 ### Where
 
-[deps.py:251](services/api/deps.py#L251) — `_principal_from_api_key`
+[deps.py:251](src/defense/services/api/deps.py#L251) — `_principal_from_api_key`
 
 ### What's wrong
 
@@ -850,7 +850,7 @@ authenticated users are unaffected, so the failure is partial and easy to miss.
 
 Remove the global caching of the failure state entirely, or replace it with a
 short-TTL cache (e.g., retry after 30 seconds). A circuit-breaker pattern would
-be ideal — the LLM client already uses one (`libs/llm/client.py`), so the
+be ideal — the LLM client already uses one (`src/defense/libs/llm/client.py`), so the
 pattern is in-tree.
 
 ### Test to leave behind
@@ -865,7 +865,7 @@ persists.
 
 ### Where
 
-[client.py:581](libs/llm/client.py#L581) — `chat_stream`'s `_open` helper
+[client.py:581](src/defense/libs/llm/client.py#L581) — `chat_stream`'s `_open` helper
 
 ### What's wrong
 
@@ -873,7 +873,7 @@ persists.
 creating the streaming completion. The code comment says this is intentional
 ("some Ollama builds reject unknown params"), but the effect is that **every
 streamed response reports zero token usage**. Since `chat_stream` feeds through
-the same `libs/llm/usage.py` tracking that issue 2 fixed, the counters are
+the same `src/defense/libs/llm/usage.py` tracking that issue 2 fixed, the counters are
 incremented — by zero.
 
 Chat and agent interactions are the primary streaming callers, so interactive
@@ -903,7 +903,7 @@ chunk, and assert the tracked token count is non-zero.
 
 ### Where
 
-[client.py:426](libs/llm/client.py#L426) — JSON-mode degeneracy retry
+[client.py:426](src/defense/libs/llm/client.py#L426) — JSON-mode degeneracy retry
 
 ### What's wrong
 
@@ -939,8 +939,8 @@ on the second. Assert the client falls back to local rather than crashing.
 
 ### Where
 
-- [models.py:195](services/api/models.py#L195) — `EngagementResult`
-- [analysis.py:816](services/api/routers/analysis.py#L816) — populates from `r.get("engagement", {})`
+- [models.py:195](src/defense/services/api/models.py#L195) — `EngagementResult`
+- [analysis.py:816](src/defense/services/api/routers/analysis.py#L816) — populates from `r.get("engagement", {})`
 
 ### What's wrong
 
@@ -973,8 +973,8 @@ serializes without raising, returning zeros.
 
 ### Where
 
-- [reports.py:37](services/api/routers/reports.py#L37) — `_get_report_row` selects the `error` column
-- [models.py:427](services/api/models.py#L427) — `ReportResponse` has no `error` field
+- [reports.py:37](src/defense/services/api/routers/reports.py#L37) — `_get_report_row` selects the `error` column
+- [models.py:427](src/defense/services/api/models.py#L427) — `ReportResponse` has no `error` field
 
 ### What's wrong
 
@@ -1005,7 +1005,7 @@ survives.
 ### Where
 
 - [harness.py:169](eval/harness.py#L169) — `if coverage > 1.0: over_one += 1`
-- [utils.py:182](libs/common/utils.py#L182) — `return min(1.0, max(0.0, analyzed / total_comment_count))`
+- [utils.py:182](src/defense/libs/common/utils.py#L182) — `return min(1.0, max(0.0, analyzed / total_comment_count))`
 
 ### What's wrong
 
@@ -1035,7 +1035,7 @@ then call the new anomaly check with the same inputs and assert it flags it.
 
 ### 17a — Schema validator crashes on mixed-type path sorting
 
-[validator.py:48](libs/schemas/validator.py#L48) `_collect_errors` sorts
+[validator.py:48](src/defense/libs/schemas/validator.py#L48) `_collect_errors` sorts
 validation errors by `key=lambda e: list(e.absolute_path)`. JSON Schema paths
 contain both strings (object keys) and integers (array indices). Python 3 raises
 `TypeError: '<' not supported between instances of 'int' and 'str'` when
@@ -1045,7 +1045,7 @@ comparing them, so the validator crashes on any schema with nested arrays.
 
 ### 17b — ClickHouse client never closed on shutdown
 
-[assembler/__main__.py:159](services/workers/assembler/__main__.py#L159) The
+[assembler/__main__.py:159](src/defense/services/workers/assembler/__main__.py#L159) The
 `finally` block closes Redis and disposes the SQLAlchemy engine, but never
 calls `ch_client.disconnect()`. ClickHouse connections leak on every graceful
 shutdown or restart.
@@ -1054,8 +1054,8 @@ shutdown or restart.
 
 ### 17c — Resource cleanup not in `try/finally`
 
-[router/router.py:277](services/workers/router/router.py#L277) and
-[stage2_llm/worker.py:1341](services/workers/stage2_llm/worker.py#L1341) have
+[router/router.py:277](src/defense/services/workers/router/router.py#L277) and
+[stage2_llm/worker.py:1341](src/defense/services/workers/stage2_llm/worker.py#L1341) have
 `await redis.aclose()` at the bottom of the function, **outside** any
 `try/finally`. An unhandled exception in the consumer loop bypasses cleanup.
 
@@ -1089,7 +1089,7 @@ parses as the literal string `sk-1234 # my key`, silently breaking LLM auth.
 
 ### 17g — Rate limiter ignores reverse proxy headers
 
-[deps.py:400](services/api/deps.py#L400) The anonymous rate limiter uses
+[deps.py:400](src/defense/services/api/deps.py#L400) The anonymous rate limiter uses
 `request.client.host`. Behind a reverse proxy or load balancer, all anonymous
 traffic appears to come from the proxy's IP, applying a single shared rate
 limit to every user.
@@ -1099,7 +1099,7 @@ proxy allowlist to prevent spoofing).
 
 ### 17h — `PUT /v1/config/llm` allows non-admins to set backend to `local`
 
-[config.py:92](services/api/routers/config.py#L92) The admin-role gate only
+[config.py:92](src/defense/services/api/routers/config.py#L92) The admin-role gate only
 fires when `backend == "groq"`. Any authenticated user can set the global LLM
 backend to `"local"` or clear the override entirely, affecting all tenants.
 

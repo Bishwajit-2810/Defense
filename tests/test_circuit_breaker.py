@@ -2,7 +2,7 @@
 
 import sys
 
-sys.path.insert(0, '/home/bk/code/defense')
+sys.path.insert(0, '/home/bk/code/defense/src/defense')
 
 from libs.llm.circuit import CircuitBreaker
 

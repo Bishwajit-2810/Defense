@@ -26,9 +26,9 @@ repost takes it.
 
 import sys
 
-sys.path.insert(0, '/home/bk/code/defense')
-sys.path.insert(0, '/home/bk/code/defense/libs')
-sys.path.insert(0, '/home/bk/code/defense/services/workers/assembler')
+sys.path.insert(0, '/home/bk/code/defense/src/defense')
+sys.path.insert(0, '/home/bk/code/defense/src/defense/libs')
+sys.path.insert(0, '/home/bk/code/defense/src/defense/services/workers/assembler')
 
 import pytest
 
@@ -197,7 +197,7 @@ def test_a_reused_result_claims_no_stage_time(reused):
 
 def test_the_composed_document_is_schema_valid(reused):
     """build_reused_result validates before returning; assert the guarantee."""
-    from libs.schemas.validator import assert_valid_output  # noqa: PLC0415
+    from defense.contracts.schemas.validator import assert_valid_output  # noqa: PLC0415
 
     assert_valid_output(reused)
 

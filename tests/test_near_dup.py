@@ -8,8 +8,8 @@ import asyncio
 import os
 import sys
 
-sys.path.insert(0, '/home/bk/code/defense')
-sys.path.insert(0, '/home/bk/code/defense/services/ingestion')
+sys.path.insert(0, '/home/bk/code/defense/src/defense')
+sys.path.insert(0, '/home/bk/code/defense/src/defense/services/ingestion')
 os.environ.setdefault("MODEL_STUB_MODE", "true")
 
 from services.ingestion.service import (

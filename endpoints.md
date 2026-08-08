@@ -5,7 +5,7 @@ system** (post summary, sentiment, topics, toxicity, comment analysis — the
 full canonical result) and for **testing every API endpoint with curl**.
 
 The canonical schema lives in
-[libs/schemas/output_schema.json](libs/schemas/output_schema.json); the field
+[src/defense/libs/schemas/output_schema.json](src/defense/libs/schemas/output_schema.json); the field
 meanings are specified in [data_contract.md](data_contract.md) §4. This file
 shows what actually comes over the wire and how to reshape it.
 
@@ -153,7 +153,7 @@ Field-level rules worth knowing when consuming this JSON:
 | `comment_analysis.target_stances` | Per-watchlist-entity stance rollup. A **separate measurement** from `sentiment_breakdown` — a comment can be positive in tone while opposing a listed entity, so the two must never be summed or merged. Entities nobody mentioned are **absent**, not zero-filled. |
 | `comment_analysis.comments[].emotion_method` | `heuristic` \| `llm`. Comment emotion is the free emoji+lexicon heuristic at Stage 1 **even in real mode**; only comments Stage 2 re-labelled carry a model emotion. |
 | `language_method` | `fasttext` \| `script_heuristic` \| `stub`. fastText is optional; without it the pipeline degrades to script detection rather than failing the post. |
-| `processing.llm_used` | Only routed posts ([router rules](services/workers/router/rules.py)) carry Stage-2 latency/cost. Note this is **not** the whole cost lever any more: comment labelling runs for every post and is 85–96% of LLM calls (PROJECT_ASSESSMENT §6.8). |
+| `processing.llm_used` | Only routed posts ([router rules](src/defense/services/workers/router/rules.py)) carry Stage-2 latency/cost. Note this is **not** the whole cost lever any more: comment labelling runs for every post and is 85–96% of LLM calls (PROJECT_ASSESSMENT §6.8). |
 
 ---
 

@@ -1,7 +1,7 @@
 """Unit tests for libs/common/utils.py"""
 
 import sys
-sys.path.insert(0, '/home/bk/code/defense')
+sys.path.insert(0, '/home/bk/code/defense/src/defense')
 
 import pytest
 

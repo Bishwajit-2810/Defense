@@ -289,8 +289,8 @@ block). Full reference in [run.md](run.md).
   leftovers, then re-run:
 
   ```bash
-  pkill -f "[p]ython -m services" ; pkill -f "[p]ython __main__.py"
-  pkill -f "[u]vicorn" ; pkill -f "http.server 8080"
+  pkill -f "[p]ython -m defense" ; pkill -f "[p]ython __main__.py"
+  pkill -f "[u]vicorn" ; pkill -f "vite"
   ```
 
 - **Dashboard says "Cannot reach API" / browser shows CORS errors for `localhost:8000`** →
@@ -325,7 +325,7 @@ for i in $(seq 1 30); do
 done
 docker exec -i deploy-clickhouse-1 clickhouse-client \
   --user defense --password defense --database defense --multiquery \
-  < /home/bk/code/defense/services/workers/assembler/clickhouse_init.sql
+  < /home/bk/code/defense/src/defense/services/workers/assembler/clickhouse_init.sql
 ```
 
 **B) Environment** (resolves container IPs — keep this shell)
@@ -350,12 +350,12 @@ export MODEL_STUB_MODE=true JWT_SECRET=demo APP_ENV=dev PYTHONPATH=$REPO
 
 ```bash
 cd $REPO
-python -m services.workers.stage1_nlp        > /tmp/stage1.log    2>&1 &
-python -m services.workers.router            > /tmp/router.log    2>&1 &
-python -m services.workers.stage2_llm        > /tmp/stage2.log    2>&1 &
-( cd $REPO/services/workers/assembler && python __main__.py ) > /tmp/assembler.log 2>&1 &
-python -m services.ingestion                 > /tmp/ingestion.log 2>&1 &
-( cd $REPO/services/api && uvicorn main:app --host 127.0.0.1 --port 8001 --log-level warning ) > /tmp/api.log 2>&1 &
+python -m defense.services.workers.stage1_nlp        > /tmp/stage1.log    2>&1 &
+python -m defense.services.workers.router            > /tmp/router.log    2>&1 &
+python -m defense.services.workers.stage2_llm        > /tmp/stage2.log    2>&1 &
+( cd $REPO/src/defense/services/workers/assembler && python __main__.py ) > /tmp/assembler.log 2>&1 &
+python -m defense.services.ingestion                 > /tmp/ingestion.log 2>&1 &
+python -m uvicorn defense.services.api.main:app --host 127.0.0.1 --port 8001 --log-level warning > /tmp/api.log 2>&1 &
 sleep 2 && curl -s http://127.0.0.1:8001/v1/health
 ```
 
@@ -380,17 +380,17 @@ done
 
 ```bash
 cd $REPO/dashboard
-python -m http.server 8080      # open http://127.0.0.1:8080
+npm install
+npm run dev -- --port 8080      # open http://127.0.0.1:8080
 ```
 
 The dashboard targets the dev API on `http://127.0.0.1:8001` by default
-(`dashboard/app.js`). To point it elsewhere, set `window.API_BASE` in `index.html`
-before the `app.js` `<script>` tag (there's a commented example near the top).
+(configured in `dashboard/src/config.js` or via `.env`).
 
 **Stop (manual):**
 
 ```bash
-pkill -f "[p]ython -m services" ; pkill -f "[p]ython __main__.py"
-pkill -f "[u]vicorn main:app"   ; pkill -f "http.server 8080"
+pkill -f "[p]ython -m defense" ; pkill -f "[p]ython __main__.py"
+pkill -f "[u]vicorn"           ; pkill -f "vite"
 ( cd /home/bk/code/defense/deploy && docker compose down )   # add -v to wipe data
 ```

@@ -1,12 +1,12 @@
-"""Unit tests for libs/schemas/validator.py"""
+"""Unit tests for defense.contracts.schemas/validator.py"""
 
 import json
 import sys
-sys.path.insert(0, '/home/bk/code/defense')
+sys.path.insert(0, '/home/bk/code/defense/src')
 
 import pytest
 
-from libs.schemas import validate_input, validate_output, assert_valid_input
+from defense.contracts.schemas import validate_input, validate_output, assert_valid_input
 
 # ---------------------------------------------------------------------------
 # Load the real gold-set sample data

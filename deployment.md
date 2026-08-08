@@ -197,7 +197,7 @@ Two things still reach outside the compose network:
 >    `redis-streams` trigger pointed at a nonexistent group reports **no
 >    backlog** — so ingestion, the router and **Stage 2, the only stage where
 >    scaling changes cost or latency**, never scaled, while the manifests read as
->    correct. Names now come from `libs/streams.py` and `tests/test_streams.py`
+>    correct. Names now come from `src/defense/libs/streams.py` and `tests/test_streams.py`
 >    asserts the manifests agree with the workers.
 > 2. **`pendingEntriesCount` cannot scale from zero.** Pending entries are
 >    messages *delivered to a consumer and not yet ACKed*; with

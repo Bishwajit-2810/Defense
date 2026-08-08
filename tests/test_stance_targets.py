@@ -19,7 +19,7 @@ sentiment. A comment can be positive in tone while opposing a listed entity.
 import sys
 import textwrap
 
-sys.path.insert(0, '/home/bk/code/defense')
+sys.path.insert(0, '/home/bk/code/defense/src/defense')
 
 import pytest
 

@@ -34,10 +34,9 @@ from pathlib import Path
 import pytest
 
 _REPO = Path(__file__).resolve().parents[1]
-sys.path.insert(0, str(_REPO))
-sys.path.insert(0, str(_REPO / "libs"))
+sys.path.insert(0, str(_REPO / 'src'))
 
-from schemas.validator import assert_valid_output  # noqa: E402
+from defense.contracts.schemas.validator import assert_valid_output  # noqa: E402
 
 
 def _strip_line_comments(block: str) -> str:

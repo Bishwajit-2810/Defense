@@ -4,8 +4,8 @@
 
 | Part | State |
 | ---- | ----- |
-| `libs/stance_targets.py` — loader + alias matcher | **done**, 36 tests |
-| `libs/stance_scoring.py` — deterministic scorer + aggregation | **done** |
+| `src/defense/libs/stance_targets.py` — loader + alias matcher | **done**, 36 tests |
+| `src/defense/libs/stance_scoring.py` — deterministic scorer + aggregation | **done** |
 | Stage-1 matching on every comment of every post | **done** |
 | Stage-2 LLM target stance, inside the existing stance call | **done** — adds **no** LLM calls |
 | Output: per-comment `target_stances` + per-post rollup, own field | **done**, in the schema and the API |
@@ -36,7 +36,7 @@ scores positive.
 
 **What existed before this:** nothing like it. Sentiment was document-level, and
 the Stage-2 stance prompt judged stance *toward the post*
-([prompts.py](services/workers/stage2_llm/prompts.py)) — never toward a named
+([prompts.py](src/defense/services/workers/stage2_llm/prompts.py)) — never toward a named
 entity. The system could tell you a comment was angry. It could not tell you
 **who it was angry at**, which for political monitoring is the entire question.
 That is what this adds.
@@ -177,7 +177,7 @@ Concretely, expect for a single person:
 
 ## 4. Components
 
-### 4.1 `libs/stance_targets.py`
+### 4.1 `src/defense/libs/stance_targets.py`
 
 Loader plus matcher. **Pure functions, no I/O beyond reading the YAML, no
 framework.** Unit-testable and reusable, which matters because the offline test
@@ -200,7 +200,7 @@ it is what makes a wrong verdict debuggable in a demo.
 
 **(b) Deterministic fallback** — alias proximity plus polarity cues, using the
 existing emoji and lexicon tables in
-[comment_analyzer.py](services/workers/stage1_nlp/comment_analyzer.py). Cruder,
+[comment_analyzer.py](src/defense/services/workers/stage1_nlp/comment_analyzer.py). Cruder,
 but it runs in stub mode and in CI. **Without it, the offline suite cannot cover
 this feature at all**, which for a capstone means the one novel component is also
 the one with no tests.
@@ -301,7 +301,7 @@ Sampling notes:
 them.
 
 The need is one config file, one prompt slot, and one parser. This repository
-already has all three: [prompts.py](services/workers/stage2_llm/prompts.py),
+already has all three: [prompts.py](src/defense/services/workers/stage2_llm/prompts.py),
 `_safe_json_parse`, and the role-based `LLMClient`. LangChain would add a large
 dependency tree and a second prompt-templating system, and — the deciding factor
 — **it would not run in the offline stub path** that the entire test suite and

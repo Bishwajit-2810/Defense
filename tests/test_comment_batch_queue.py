@@ -21,7 +21,7 @@ bounded-concurrency queue with per-batch retry. The cost is stated, not hidden:
 import asyncio
 import sys
 
-sys.path.insert(0, '/home/bk/code/defense')
+sys.path.insert(0, '/home/bk/code/defense/src/defense')
 
 import pytest
 

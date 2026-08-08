@@ -18,7 +18,7 @@ which is why §6.5 says to fix the key in the same change, not after it.
 
 import sys
 
-sys.path.insert(0, '/home/bk/code/defense')
+sys.path.insert(0, '/home/bk/code/defense/src/defense')
 
 import pytest
 

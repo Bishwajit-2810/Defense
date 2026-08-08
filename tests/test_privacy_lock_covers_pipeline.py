@@ -26,14 +26,14 @@ flipped a switch they do not control).
 import asyncio
 import sys
 
-sys.path.insert(0, '/home/bk/code/defense')
-sys.path.insert(0, '/home/bk/code/defense/services/api')
+sys.path.insert(0, '/home/bk/code/defense/src/defense')
+sys.path.insert(0, '/home/bk/code/defense/src/defense/services/api')
 
 import pytest
 from fastapi import HTTPException
 
 import deps
-from deps import resolve_llm_backend, tenant_is_privacy_locked
+from defense.services.api.deps import resolve_llm_backend, tenant_is_privacy_locked
 
 
 class _Row(tuple):

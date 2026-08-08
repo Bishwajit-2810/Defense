@@ -120,7 +120,7 @@ report bursts, or fail over local→Groq under load.
 
 ### Pipeline roles `stage1` / `stage2` / `summary` (implementation)
 
-The per-post pipeline binds three concrete roles in `libs/llm/client.py`, each
+The per-post pipeline binds three concrete roles in `src/defense/libs/llm/client.py`, each
 with its own model id so the stages and tasks run on **different models**:
 
 | Role | env (`local` / `groq`) | default (Ollama / Groq) | Serves |

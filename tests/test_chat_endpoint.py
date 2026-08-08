@@ -9,15 +9,15 @@ explicit per-request override.
 import sys
 
 # The API app is written to run with services/api on sys.path (it does
-# `from routers import ...` / `from deps import ...`), so mirror that here.
-sys.path.insert(0, "/home/bk/code/defense")
-sys.path.insert(0, "/home/bk/code/defense/services/api")
+# `from defense.services.api.routers import ...` / `from defense.services.api.deps import ...`), so mirror that here.
+sys.path.insert(0, '/home/bk/code/defense/src/defense')
+sys.path.insert(0, '/home/bk/code/defense/src/defense/services/api')
 
 import pytest
 from fastapi.testclient import TestClient
 
-import main  # noqa: E402
-from deps import get_current_user, get_db, get_redis, rate_limit  # noqa: E402
+import defense.services.api.main as main  # noqa: E402
+from defense.services.api.deps import get_current_user, get_db, get_redis, rate_limit  # noqa: E402
 
 
 class FakeRedis:

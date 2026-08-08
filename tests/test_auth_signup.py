@@ -24,8 +24,8 @@ stub makes the SQL the endpoint issues directly inspectable.
 
 import sys
 
-sys.path.insert(0, "/home/bk/code/defense")
-sys.path.insert(0, "/home/bk/code/defense/services/api")
+sys.path.insert(0, '/home/bk/code/defense/src/defense')
+sys.path.insert(0, '/home/bk/code/defense/src/defense/services/api')
 
 import pytest
 from fastapi import HTTPException
@@ -36,7 +36,7 @@ from libs.common.config import JWT_ALGORITHM, get_jwt_secret  # noqa: E402
 from jose import jwt  # noqa: E402
 
 from models import MIN_PASSWORD_LENGTH, SignupRequest, TokenRequest  # noqa: E402
-from routers import auth as auth_router  # noqa: E402
+from defense.services.api.routers import auth as auth_router  # noqa: E402
 
 
 # ---------------------------------------------------------------------------

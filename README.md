@@ -168,7 +168,7 @@ target (the routing rate) are flagged inline in each document.
   classifiers, spaCy/GLiNER) run over the post and every comment. An LLM is invoked
   **selectively** — for the original-language summary, insight, and the
   low-confidence / unclassified / high-toxicity / long-code-mixed cases the router's
-  six gates single out ([rules.py](services/workers/router/rules.py)). This is the
+  six gates single out ([rules.py](src/defense/services/workers/router/rules.py)). This is the
   central cost-control idea, and the routing rate it produces is reported from the
   router's own counters rather than assumed.
 - **Two LLM roles, a pluggable backend (local ⇄ Groq), switchable at runtime.**

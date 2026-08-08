@@ -161,7 +161,7 @@ def reap_stale() -> None:
         cmdline = b" ".join(argv).decode("utf-8", "replace")
         # Skip run_all.py itself and editor tooling (e.g. the black LSP server)
         # that merely happen to share the venv interpreter.
-        if "run_all.py" in cmdline or "lsp_server" in cmdline:
+        if "run_all.py" in cmdline or "lsp_server" in cmdline or "pytest" in cmdline:
             continue
         victims.append(pid)
     if not victims:
@@ -267,7 +267,7 @@ def start_infra() -> None:
         die("datastores did not become healthy in time (check `docker compose ps`)")
 
     log("creating ClickHouse tables …")
-    sql = (REPO / "services/workers/assembler/clickhouse_init.sql").read_bytes()
+    sql = (REPO / "src/defense/services/workers/assembler/clickhouse_init.sql").read_bytes()
     subprocess.run(
         ["docker", "exec", "-i", "deploy-clickhouse-1", "clickhouse-client",
          "--user", "defense", "--password", "defense", "--database", "defense", "--multiquery"],
@@ -313,23 +313,20 @@ def build_env() -> dict:
         #   stage1 = gemma3:4b (fast/light) carries the high-volume per-post +
         #            per-comment NLP; stage2 = qwen2.5:7b (quality) does the
         #            selective summary/insight + context-aware comment stance.
-        "STAGE1_LOCAL_MODEL": os.environ.get("STAGE1_LOCAL_MODEL", "gemma3:4b"),
-        "STAGE2_LOCAL_MODEL": os.environ.get("STAGE2_LOCAL_MODEL", "qwen2.5:7b"),
-        # STAGE1_LLM=true → Stage-1 NLP runs on the stage1 LLM (embeddings stay
-        # stubbed under MODEL_STUB_MODE; any LLM failure falls back to the stub).
-        "STAGE1_LLM": os.environ.get("STAGE1_LLM", "true"),
-        "STAGE1_LLM_COMMENT_MAX": os.environ.get("STAGE1_LLM_COMMENT_MAX", "60"),
-        # llm_a / llm_b = the agents + report roles; kept on the quality model.
+        "STAGE1_LOCAL_MODEL": "gemma3:4b",
+        "STAGE2_LOCAL_MODEL": "qwen2.5:7b",
+        "STAGE1_LLM": "true",
+        "STAGE1_LLM_COMMENT_MAX": "60",
         "LLM_A_LOCAL_MODEL": "qwen2.5:7b",
-        "LLM_B_LOCAL_MODEL": os.environ.get("LLM_B_LOCAL_MODEL", "qwen2.5:7b"),
+        "LLM_B_LOCAL_MODEL": "qwen2.5:7b",
         "VLM_LOCAL_MODEL": "qwen3-vl:4b",
         # Per-post context-aware comment labelling. Every comment is ALWAYS
         # analysed by the instant Stage-1 heuristic (full coverage); this only
         # bounds the slow premium LLM pass to the top-N most-liked comments so a
         # post with thousands of comments can't stall Stage-2. Set 0 to LLM-label
         # EVERY comment (only practical on Groq / a GPU — slow on local CPU).
-        "COMMENT_STANCE_MAX_PER_POST": os.environ.get("COMMENT_STANCE_MAX_PER_POST", "40"),
-        "COMMENT_STANCE_BATCH": os.environ.get("COMMENT_STANCE_BATCH", "40"),
+        "COMMENT_STANCE_MAX_PER_POST": "40",
+        "COMMENT_STANCE_BATCH": "40",
         "MODEL_STUB_MODE": "true",
         "JWT_SECRET": "demo",
         "LOG_LEVEL": _LOG_LEVEL,
@@ -337,7 +334,7 @@ def build_env() -> dict:
         # drawer (and GET /v1/logs) can show them — the services don't share a
         # filesystem, but they do share a Redis. --no-server-logs turns it off.
         "LOG_TO_REDIS": "true" if _LOG_TO_REDIS else "false",
-        "LOG_REDIS_MAX": os.environ.get("LOG_REDIS_MAX", "3000"),
+        "LOG_REDIS_MAX": "3000",
         "PYTHONPATH": str(REPO),
         # The API proxies /v1/agents/* to the agents service; its default
         # (http://agents:8010) is the compose hostname, which doesn't resolve
@@ -385,9 +382,9 @@ def apply_fast_preset(env: dict) -> None:
         "LLM_BACKEND": "groq",
         "GROQ_API_KEY": key,
         # Fast Groq models per role; override any of these via env to taste.
-        "LLM_A_GROQ_MODEL": os.environ.get("LLM_A_GROQ_MODEL", "llama-3.3-70b-versatile"),
-        "LLM_B_GROQ_MODEL": os.environ.get("LLM_B_GROQ_MODEL", "llama-3.1-8b-instant"),
-        "VLM_GROQ_MODEL": os.environ.get("VLM_GROQ_MODEL", "meta-llama/llama-4-scout-17b-16e-instruct"),
+        "LLM_A_GROQ_MODEL": "llama-3.3-70b-versatile",
+        "LLM_B_GROQ_MODEL": "llama-3.1-8b-instant",
+        "VLM_GROQ_MODEL": "meta-llama/llama-4-scout-17b-16e-instruct",
     })
     # The dashboard LLM toggle persists a runtime backend override in Redis that
     # Stage-2 reads BEFORE the env default — pin it to groq so --fast always wins,
@@ -414,13 +411,13 @@ def apply_ollama_preset(env: dict) -> None:
 
 
 def start_pipeline(py: str, env: dict) -> None:
-    start("stage1", [py, "-m", "services.workers.stage1_nlp"], env, REPO)
-    start("router", [py, "-m", "services.workers.router"], env, REPO)
-    start("stage2", [py, "-m", "services.workers.stage2_llm"], env, REPO)
-    start("assembler", [py, "__main__.py"], env, REPO / "services/workers/assembler")
-    start("ingestion", [py, "-m", "services.ingestion"], env, REPO)
-    start("api", [py, "-m", "uvicorn", "main:app", "--host", "127.0.0.1",
-                  "--port", str(API_PORT), "--log-level", _uvicorn_level()], env, REPO / "services/api")
+    start("stage1", [py, "-m", "defense.services.workers.stage1_nlp"], env, REPO)
+    start("router", [py, "-m", "defense.services.workers.router"], env, REPO)
+    start("stage2", [py, "-m", "defense.services.workers.stage2_llm"], env, REPO)
+    start("assembler", [py, "__main__.py"], env, REPO / "src/defense/services/workers/assembler")
+    start("ingestion", [py, "-m", "defense.services.ingestion"], env, REPO)
+    start("api", [py, "-m", "uvicorn", "defense.services.api.main:app", "--host", "127.0.0.1",
+                  "--port", str(API_PORT), "--log-level", _uvicorn_level()], env, REPO)
 
     log("waiting for the API to answer …")
     for _ in range(30):
@@ -446,10 +443,10 @@ def start_agents(py: str, env: dict) -> None:
     # analytics_mcp + agents launch by module path from the repo root; retrieval/
     # ingest run from their own dir (server:app). Each FastMCP server exposes the
     # streamable-HTTP MCP endpoint at /mcp.
-    start("analytics_mcp", uvi + ["mcp_servers.analytics_mcp.server:app", "--port", "8110"], a, REPO)
-    start("retrieval_mcp", uvi + ["server:app", "--port", "8101"], a, REPO / "mcp_servers/retrieval_mcp")
-    start("ingest_mcp", uvi + ["server:app", "--port", "8102"], a, REPO / "mcp_servers/ingest_mcp")
-    start("agents", uvi + ["services.agents.main:app", "--port", "8010"], a, REPO)
+    start("analytics_mcp", uvi + ["defense.mcp_servers.analytics_mcp.server:app", "--port", "8110"], a, REPO)
+    start("retrieval_mcp", uvi + ["server:app", "--port", "8101"], a, REPO / "src/defense/mcp_servers/retrieval_mcp")
+    start("ingest_mcp", uvi + ["server:app", "--port", "8102"], a, REPO / "src/defense/mcp_servers/ingest_mcp")
+    start("agents", uvi + ["defense.services.agents.main:app", "--port", "8010"], a, REPO)
     ok("agent layer started (analytics :8110, retrieval :8101, ingest :8102, agents :8010)")
 
 
@@ -463,14 +460,20 @@ def _free_port(start_port: int, tries: int = 10) -> int:
 
 
 def serve_dashboard(py: str, env: dict) -> int:
-    # The dashboard defaults to the dev API on :8001 (dashboard/app.js), so we
-    # just serve the static files — no patching needed. If 8080 is held by a
-    # stale process / another run, fall back to the next free port instead of
-    # crashing with "Address already in use".
+    # The dashboard defaults to the dev API on :8001 (dashboard/src/App.jsx/AppConfig),
+    # we run the Vite dev server. If 8080 is held, fall back to next free port.
     port = _free_port(DASH_PORT)
     if port != DASH_PORT:
         warn(f"port {DASH_PORT} is in use — serving the dashboard on {port} instead")
-    start("dashboard", [py, "-m", "http.server", str(port)], env, REPO / "dashboard" / "dist")
+    
+    # We use npx vite (or npm run dev) to start the dashboard
+    # The user must have run `npm install` in dashboard/ previously.
+    dash_dir = REPO / "dashboard"
+    if not (dash_dir / "node_modules").exists():
+        warn("node_modules not found in dashboard/. Running 'npm install' first ...")
+        subprocess.run(["npm", "install"], cwd=dash_dir, check=False)
+        
+    start("dashboard", ["npm", "run", "dev", "--", "--port", str(port)], env, dash_dir)
     return port
 
 

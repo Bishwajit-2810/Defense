@@ -1,3 +1,7 @@
+[build-system]
+requires = ["hatchling"]
+build-backend = "hatchling.build"
+
 [project]
 name = "defense"
 version = "0.1.0"
@@ -22,9 +26,11 @@ dependencies = [
     "pydantic-settings>=2.7.0",
     "python-dotenv>=1.0.0",
     "structlog>=24.0.0",
-    "loguru>=0.7.2",
     "tenacity>=9.0.0",
     "openai>=1.58.0",
+    "pytest>=8.3.2",
+    "pytest-asyncio>=0.23.8",
+    "testcontainers[postgres,redis]>=4.8.0",
     "httpx>=0.28.0",
     "numpy>=2.0.0",
     "python-jose[cryptography]>=3.3.0",
@@ -32,6 +38,8 @@ dependencies = [
     "python-multipart>=0.0.12",
     "prometheus-fastapi-instrumentator>=7.0.0,<8",  # 8.x pulls an incompatible starlette
     "fastmcp>=3.4.0",
+    "pgvector>=0.5.0",
+    "msgpack>=1.2.1",
 ]
 
 [project.optional-dependencies]
@@ -68,10 +76,8 @@ kafka = [
 ]
 
 [tool.uv]
-# The code runs via PYTHONPATH (libs/, services/, mcp/ are not an installed
-# package and there is no build backend) — manage dependencies only, don't try
-# to build/install this project itself.
-package = false
+# Manage dependencies and build as a standard package.
+package = true
 
 [tool.pytest.ini_options]
 testpaths = ["tests"]

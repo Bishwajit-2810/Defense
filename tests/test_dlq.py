@@ -4,7 +4,7 @@ import asyncio
 import json
 import sys
 
-sys.path.insert(0, '/home/bk/code/defense')
+sys.path.insert(0, '/home/bk/code/defense/src/defense')
 
 from libs.dlq import ATTEMPTS_FIELD, dlq_stream, record_failure, replay_dlq
 

@@ -30,10 +30,10 @@ import asyncio
 import json
 import sys
 
-sys.path.insert(0, '/home/bk/code/defense')
-sys.path.insert(0, '/home/bk/code/defense/libs')
-sys.path.insert(0, '/home/bk/code/defense/services/workers/stage1_nlp')
-sys.path.insert(0, '/home/bk/code/defense/services/api')
+sys.path.insert(0, '/home/bk/code/defense/src/defense')
+sys.path.insert(0, '/home/bk/code/defense/src/defense/libs')
+sys.path.insert(0, '/home/bk/code/defense/src/defense/services/workers/stage1_nlp')
+sys.path.insert(0, '/home/bk/code/defense/src/defense/services/api')
 
 import pytest
 
@@ -190,7 +190,7 @@ def test_the_assembler_can_read_back_the_key_it_depends_on(result_pair):
 def test_canonical_result_is_schema_valid(result_pair):
     """build_canonical_result validates internally; assert it did not regress
     now that ten more keys flow through `processing`."""
-    from libs.schemas.validator import validate_output
+    from defense.contracts.schemas.validator import validate_output
 
     _s1, canonical = result_pair
     valid, errors = validate_output(canonical)

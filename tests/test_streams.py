@@ -23,10 +23,10 @@ disabling an autoscaler.
 import sys
 from pathlib import Path
 
-sys.path.insert(0, '/home/bk/code/defense')
+sys.path.insert(0, '/home/bk/code/defense/src/defense')
 # The assembler runs as a standalone container and imports its siblings flatly
 # (`from builder import ...`), so its own directory has to be importable here.
-sys.path.insert(0, '/home/bk/code/defense/services/workers/assembler')
+sys.path.insert(0, '/home/bk/code/defense/src/defense/services/workers/assembler')
 
 import pytest
 import yaml
@@ -133,8 +133,8 @@ def test_the_monitoring_view_reads_the_same_names_the_workers_use():
     the §5.5 KEDA failure mode, reproduced in the view you would use to notice
     it (PROJECT_ASSESSMENT §13.7b).
     """
-    sys.path.insert(0, '/home/bk/code/defense/services/api')
-    sys.path.insert(0, '/home/bk/code/defense/services/api/routers')
+    sys.path.insert(0, '/home/bk/code/defense/src/defense/services/api')
+    sys.path.insert(0, '/home/bk/code/defense/src/defense/services/api/routers')
     from routers.pipeline import _STAGES  # noqa: PLC0415
 
     seen = {stream: group for _key, _label, stream, group in _STAGES}

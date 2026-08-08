@@ -41,6 +41,8 @@ import json
 import os
 import sys
 from pathlib import Path
+from defense.libs.llm.client import LLMClient
+from defense.libs.common.config import get_settings
 
 ROOT = Path(__file__).resolve().parent.parent
 for _p in (ROOT, ROOT / "libs", ROOT / "services" / "workers" / "stage1_nlp"):
@@ -80,7 +82,7 @@ async def _measure(corpus: Path, max_comments: int) -> dict:
     stance_batches = 0
     non_emoji_total = 0
     routed_with_comments = 0
-    batch = int(os.environ.get("STAGE1_LLM_BATCH", "25"))
+    batch = get_settings().stage1_llm_batch
 
     def _batches(n: int) -> int:
         return -(-n // batch) if n > 0 else 0

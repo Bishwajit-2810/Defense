@@ -19,9 +19,9 @@ throughout, which is exactly why the bug survived.
 
 import sys
 
-sys.path.insert(0, '/home/bk/code/defense')
-sys.path.insert(0, '/home/bk/code/defense/services/api')
-sys.path.insert(0, '/home/bk/code/defense/services/api/routers')
+sys.path.insert(0, '/home/bk/code/defense/src/defense')
+sys.path.insert(0, '/home/bk/code/defense/src/defense/services/api')
+sys.path.insert(0, '/home/bk/code/defense/src/defense/services/api/routers')
 
 import pytest
 
