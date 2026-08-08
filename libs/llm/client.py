@@ -428,14 +428,48 @@ class LLMClient:
                 "llm_json_mode_degenerate_retrying_unconstrained backend={} role={} model={}",
                 effective_backend, role, model_id,
             )
-            completion = await self._call_api(
-                client=self._get_client(effective_backend),
-                model=model_id,
-                messages=messages,
-                response_format=None,
-                max_tokens=max_tokens,
-                temperature=temperature,
-            )
+            try:
+                completion = await self._call_api(
+                    client=self._get_client(effective_backend),
+                    model=model_id,
+                    messages=messages,
+                    response_format=None,
+                    max_tokens=max_tokens,
+                    temperature=temperature,
+                )
+                self._breakers[effective_backend].record_success()
+            except Exception as exc:
+                self._breakers[effective_backend].record_failure()
+                if effective_backend == "groq":
+                    log.warning(
+                        "llm_json_retry_groq_failed_falling_back_to_local role={} model={} error={}",
+                        role, model_id, exc,
+                    )
+                    effective_backend = "local"
+                    model_id = self._resolve_model(role, "local")
+                    try:
+                        completion = await self._call_api(
+                            client=self._get_client("local"),
+                            model=model_id,
+                            messages=messages,
+                            response_format=None,
+                            max_tokens=max_tokens,
+                            temperature=temperature,
+                        )
+                    except Exception as local_exc:
+                        self._breakers["local"].record_failure()
+                        log.error(
+                            "llm_json_retry_local_fallback_failed role={} model={} error={}",
+                            role, model_id, local_exc,
+                        )
+                        raise
+                    self._breakers["local"].record_success()
+                else:
+                    log.error(
+                        "llm_json_retry_failed backend={} role={} model={} error={}",
+                        effective_backend, role, model_id, exc,
+                    )
+                    raise
             choice = completion.choices[0]
             _accumulate(completion.usage)
 
@@ -579,16 +613,19 @@ class LLMClient:
             model_id = self._resolve_model(role, "local")
 
         async def _open(backend: str, model: str):
-            # stream_options is intentionally omitted: some Ollama builds reject
-            # unknown params. Usage is therefore best-effort on streams (exact
-            # counts are available via the non-streaming chat()).
-            return await self._get_client(backend).chat.completions.create(
+            kwargs = dict(
                 model=model,
                 messages=messages,
                 max_tokens=max_tokens,
                 temperature=temperature,
                 stream=True,
             )
+            # Ollama (local backend) may reject stream_options, so only request
+            # streaming usage for remote backends. Without this, streamed
+            # responses report zero token usage and cost tracking under-counts.
+            if backend != "local":
+                kwargs["stream_options"] = {"include_usage": True}
+            return await self._get_client(backend).chat.completions.create(**kwargs)
 
         t0 = time.perf_counter()
         try:

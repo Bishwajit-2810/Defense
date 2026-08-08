@@ -2657,7 +2657,7 @@ async function search(query, semantic) {
       // SearchResult wraps the full analysis under .result
       var res = r.result || r;
       var sentiment = res.overall_sentiment || res.sentiment || 'neutral';
-      var caption   = r.snippet || res.post_summary || res.caption || res.text || '';
+      var caption   = r.snippet || res.post_summary || res.post_text || res.caption || res.text || '';
 
       html += '<div class="search-result-item" onclick="openPostModal(\'' + escAttr(r.post_id || res.post_id || r.id) + '\')">'
         + '<div class="search-result-header">'
@@ -5043,6 +5043,31 @@ async function verifySession() {
   }
 }
 
+function initThemeToggle() {
+  var toggleBtn = document.getElementById('theme-toggle');
+  if (!toggleBtn) return;
+  toggleBtn.addEventListener('click', function() {
+    var meta = document.querySelector('meta[name="color-scheme"]');
+    var current = meta ? meta.content : 'light dark';
+    
+    // Check if the system is dark
+    var systemIsDark = window.matchMedia && window.matchMedia('(prefers-color-scheme: dark)').matches;
+    
+    var newScheme;
+    if (current === 'light dark') {
+      // Currently using system preference, switch to the opposite
+      newScheme = systemIsDark ? 'light' : 'dark';
+    } else {
+      // Currently pinned to 'light' or 'dark', switch to the opposite
+      newScheme = current === 'dark' ? 'light' : 'dark';
+    }
+    
+    // Save preference and apply
+    localStorage.setItem("color-scheme", newScheme);
+    if (meta) meta.content = newScheme;
+  });
+}
+
 function init() {
   // Status bar API base display
   var apiBaseEl = document.getElementById('status-api-base');
@@ -5052,6 +5077,8 @@ function init() {
   // Optimistic, then corrected by verifySession() below.
   updateAuthStatus(!!(authToken || apiKey));
   verifySession();
+
+  initThemeToggle();
 
   // Set up nav tab click handlers
   document.querySelectorAll('.nav-tab').forEach(function(btn) {

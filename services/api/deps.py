@@ -11,6 +11,7 @@ from __future__ import annotations
 
 import os
 import sys
+import time
 from typing import Any, AsyncGenerator
 
 import redis.asyncio as aioredis
@@ -205,9 +206,11 @@ def _principal_from_claims(payload: dict) -> dict:
 
 _bearer_scheme = HTTPBearer(auto_error=False)
 
-#: Flipped false the first time the api_keys lookup fails, so a missing table
-#: costs one warning rather than one per request. Reset by a process restart.
-_API_KEY_TABLE_USABLE = True
+#: After a hard lookup failure, suppress retries for this many seconds so a
+#: missing table costs one warning burst rather than one per request. Recovers
+#: automatically when the DB comes back — unlike the old boolean flag that
+#: permanently disabled lookups until a process restart (§P7.11).
+_API_KEY_TABLE_RETRY_AFTER: float = 0.0
 
 
 async def _principal_from_api_key(db: AsyncSession, raw_key: str) -> dict | None:
@@ -216,11 +219,10 @@ async def _principal_from_api_key(db: AsyncSession, raw_key: str) -> dict | None
     Returns None when the key is unknown — the caller decides whether that is a
     401 or, in dev, a fall-through to the permissive MVP behaviour.
     """
-    global _API_KEY_TABLE_USABLE
-    if not _API_KEY_TABLE_USABLE:
-        # A previous lookup failed hard (no table on a fresh checkout, most
-        # likely). Do not re-query and re-log on every single request — that was
-        # one warning per authenticated call, which buries real problems.
+    global _API_KEY_TABLE_RETRY_AFTER
+    if time.time() < _API_KEY_TABLE_RETRY_AFTER:
+        # A recent lookup failed hard (no table, DB down). Suppress retries
+        # for 30 s to avoid one warning per request, then try again.
         return None
 
     key_hash = hash_api_key(raw_key)
@@ -248,7 +250,7 @@ async def _principal_from_api_key(db: AsyncSession, raw_key: str) -> dict | None
         # mode this branch exists to avoid. Only the first request per process
         # showed it (the flag below skips the lookup afterwards), which is what
         # made it easy to miss.
-        _API_KEY_TABLE_USABLE = False
+        _API_KEY_TABLE_RETRY_AFTER = time.time() + 30
         try:
             await db.rollback()
         except Exception:
@@ -397,7 +399,16 @@ async def rate_limit(
     if not RATE_LIMIT_ENABLED:
         return
 
-    ident = current_user.get("sub") or (request.client.host if request.client else "anon")
+    # Prefer X-Forwarded-For / X-Real-IP behind a reverse proxy so that all
+    # anonymous traffic doesn't share one rate-limit bucket (§P7.17g).
+    if current_user.get("sub"):
+        ident = current_user["sub"]
+    elif request.headers.get("x-forwarded-for"):
+        ident = request.headers["x-forwarded-for"].split(",")[0].strip()
+    elif request.headers.get("x-real-ip"):
+        ident = request.headers["x-real-ip"]
+    else:
+        ident = request.client.host if request.client else "anon"
     result = await check_rate_limit(
         redis, ident, limit=RATE_LIMIT_PER_MIN, window_seconds=60
     )

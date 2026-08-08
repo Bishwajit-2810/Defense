@@ -303,8 +303,20 @@ async def _process_message(
                 redis_client, engine, job_id,
                 post_id=post_id, failed=True, error=str(exc),
             )
-        # ACK anyway so the message does not loop indefinitely
-        await redis_client.xack(STREAM_KEY, CONSUMER_GROUP, msg_id)
+        # Route to DLQ instead of silently dropping (§P7.10).  record_failure
+        # handles the ACK so the message leaves the PEL.
+        try:
+            await record_failure(
+                redis_client,
+                stream=STREAM_KEY,
+                group=CONSUMER_GROUP,
+                msg_id=msg_id,
+                fields=fields,
+                error=exc,
+                max_retries=ASSEMBLER_MAX_RETRIES,
+            )
+        except Exception as dlq_exc:
+            bound_log.error("build_failed_dlq_error", error=str(dlq_exc))
         return
 
     # --- Persist (fan-out, parallel) ----------------------------------------

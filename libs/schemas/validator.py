@@ -48,7 +48,7 @@ _output_validator = Draft7Validator(_OUTPUT_SCHEMA)
 def _collect_errors(validator: Draft7Validator, data: Any) -> list[str]:
     """Return all validation errors as human-readable strings."""
     errors: list[str] = []
-    for error in sorted(validator.iter_errors(data), key=lambda e: list(e.absolute_path)):
+    for error in sorted(validator.iter_errors(data), key=lambda e: [str(p) for p in e.absolute_path]):
         path = " -> ".join(str(p) for p in error.absolute_path)
         location = f"[{path}] " if path else ""
         errors.append(f"{location}{error.message}")

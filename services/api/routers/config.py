@@ -115,16 +115,19 @@ async def put_llm_config(
     Locked tenants are unaffected by whatever the switch ends up saying: the API
     pins them to ``local`` when it resolves each job's backend.
     """
-    if body.backend == "groq":
+    # Any modification of the global LLM backend is an operator action — not
+    # just switching to groq (§P7.17h). The privacy check is groq-specific.
+    if body.backend is not None:
         role = (current_user.get("role") or "user").lower()
         if role not in _ADMIN_ROLES:
             raise HTTPException(
                 status_code=status.HTTP_403_FORBIDDEN,
                 detail=(
-                    "Switching the global LLM backend to 'groq' requires an admin "
-                    "role — it routes every tenant's analysis off-box."
+                    "Changing the global LLM backend requires an admin role — "
+                    "it affects every tenant's analysis pipeline."
                 ),
             )
+    if body.backend == "groq":
         if await tenant_is_privacy_locked(db, current_user):
             raise HTTPException(
                 status_code=status.HTTP_403_FORBIDDEN,

@@ -169,6 +169,7 @@ async def main() -> None:
         log.info("assembler_stopping")
         await redis_client.aclose()
         await engine.dispose()
+        ch_client.disconnect()
         log.info("assembler_stopped")
 
 

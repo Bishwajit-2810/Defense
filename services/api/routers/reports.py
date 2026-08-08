@@ -33,8 +33,8 @@ router = APIRouter(prefix="/v1/reports", tags=["reports"])
 # ---------------------------------------------------------------------------
 
 
-async def _get_report_row(db: AsyncSession, report_id: str) -> dict | None:
-    """Fetch a report job row by ID; returns None when not found."""
+async def _get_report_row(db: AsyncSession, report_id: str, *, tenant_id: str = "default") -> dict | None:
+    """Fetch a report job row by ID, scoped to *tenant_id*; returns None when not found."""
     row = (
         await db.execute(
             text(
@@ -42,9 +42,10 @@ async def _get_report_row(db: AsyncSession, report_id: str) -> dict | None:
                 SELECT id, selector, options, status, created_at, updated_at, error
                 FROM jobs
                 WHERE id = :id AND type = 'report'
+                  AND (selector->>'tenant_id' = :tid OR selector->>'tenant_id' IS NULL)
                 """
             ),
-            {"id": report_id},
+            {"id": report_id, "tid": tenant_id},
         )
     ).mappings().first()
     return dict(row) if row else None
@@ -61,6 +62,7 @@ def _row_to_report(row: dict) -> ReportResponse:
         type=options.get("type"),
         title=options.get("title"),
         status=row["status"],
+        error=row.get("error"),
         created_at=row.get("created_at"),
         updated_at=row.get("updated_at"),
         download_url=options.get("download_url"),
@@ -570,7 +572,8 @@ async def get_report(
     current_user: dict = Depends(get_current_user),
 ) -> ReportResponse:
     """Return the current status and metadata for *report_id*."""
-    row = await _get_report_row(db, report_id)
+    tenant_id = current_user.get("tenant_id", "default")
+    row = await _get_report_row(db, report_id, tenant_id=tenant_id)
     if row is None:
         raise HTTPException(
             status_code=status.HTTP_404_NOT_FOUND,

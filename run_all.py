@@ -360,7 +360,13 @@ def _dotenv_value(key: str) -> str:
     for line in f.read_text().splitlines():
         s = line.strip()
         if s.startswith(f"{key}=") and not s.startswith("#"):
-            return s.split("=", 1)[1].strip().strip('"').strip("'")
+            val = s.split("=", 1)[1].strip()
+            # Strip surrounding quotes first, then inline comments (§P7.17f).
+            # Quoted values are taken as-is; unquoted values have # comments.
+            if (val.startswith('"') and val.endswith('"')) or \
+               (val.startswith("'") and val.endswith("'")):
+                return val[1:-1]
+            return val.split("#", 1)[0].strip()
     return ""
 
 
@@ -464,7 +470,7 @@ def serve_dashboard(py: str, env: dict) -> int:
     port = _free_port(DASH_PORT)
     if port != DASH_PORT:
         warn(f"port {DASH_PORT} is in use — serving the dashboard on {port} instead")
-    start("dashboard", [py, "-m", "http.server", str(port)], env, REPO / "dashboard")
+    start("dashboard", [py, "-m", "http.server", str(port)], env, REPO / "dashboard" / "dist")
     return port
 
 

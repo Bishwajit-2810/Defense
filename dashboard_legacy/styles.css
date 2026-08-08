@@ -106,6 +106,8 @@
   --font-mono: 'SFMono-Regular', Consolas, 'Liberation Mono', Menlo, monospace;
 
   --transition: 150ms ease;
+
+  color-scheme: light dark;
 }
 
 /* ---- Dark mode — a deep NAVY, not neutral slate --------------------------

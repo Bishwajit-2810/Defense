@@ -57,6 +57,21 @@ class RedisStreamBus:
         self, stream: str, *, group: str, consumer: str, block_ms: int = 2000, count: int = 1
     ) -> AsyncIterator[tuple[str, dict]]:
         await self.ensure_group(stream, group)
+        # Phase 1: drain pending (un-ACKed) messages from a previous life.
+        # Without this, any message read but not ACKed before a crash/restart
+        # is stranded in the PEL forever — the standard Redis Streams pitfall
+        # (§P7.9).
+        while True:
+            pending = await self._redis.xreadgroup(
+                groupname=group, consumername=consumer,
+                streams={stream: "0"}, count=count,
+            )
+            if not pending or not pending[0][1]:
+                break
+            for _stream, entries in pending:
+                for msg_id, fields in entries:
+                    yield msg_id, fields
+        # Phase 2: read new messages.
         while True:
             messages = await self._redis.xreadgroup(
                 groupname=group, consumername=consumer,

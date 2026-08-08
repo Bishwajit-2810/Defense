@@ -288,6 +288,8 @@ async def list_analysis_jobs(
                 "type": r["type"],
                 "status": r["status"],
                 "post_count": len(post_ids) or None,
+                "campaign_id": selector.get("campaign_id"),
+                "post_ids": post_ids,
                 "created_at": r["created_at"].isoformat() if r["created_at"] else None,
                 "updated_at": r["updated_at"].isoformat() if r["updated_at"] else None,
             }
@@ -525,8 +527,11 @@ async def get_analysis(
     """
     job_row = (
         await db.execute(
-            text("SELECT id, status, selector, created_at FROM jobs WHERE id = :id"),
-            {"id": analysis_id},
+            text(
+                "SELECT id, status, selector, created_at FROM jobs "
+                "WHERE id = :id AND (selector->>'tenant_id' = :tid OR selector->>'tenant_id' IS NULL)"
+            ),
+            {"id": analysis_id, "tid": current_user.get("tenant_id", "default")},
         )
     ).mappings().first()
 

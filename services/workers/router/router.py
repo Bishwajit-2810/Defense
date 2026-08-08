@@ -92,7 +92,9 @@ async def _process_message(
             message_id=message_id,
             error=str(exc),
         )
-        return
+        # Re-raise so the outer loop's except block routes to record_failure /
+        # DLQ instead of silently ACKing the corrupt message (§P7.10).
+        raise
 
     post_id: str = payload.get("post_id", "unknown")
     # Route on the stage-1 result; the rest of the envelope is passed through.
@@ -205,73 +207,75 @@ async def run() -> None:
     for sig in (signal.SIGINT, signal.SIGTERM):
         loop.add_signal_handler(sig, _handle_signal)
 
-    while not shutdown.is_set():
-        try:
-            results = await redis.xreadgroup(
-                groupname=CONSUMER_GROUP,
-                consumername=CONSUMER_NAME,
-                streams={ROUTER_QUEUE: ">"},
-                count=COUNT,
-                block=BLOCK_MS,
-            )
-        except asyncio.CancelledError:
-            break
-        except Exception as exc:
-            msg = str(exc)
-            # An idle BLOCK window with no new messages surfaces as a redis
-            # TimeoutError — that's normal when the queue is empty, not an error.
-            # Re-block quietly instead of spamming ERROR every few seconds.
-            if isinstance(exc, asyncio.TimeoutError) or "Timeout" in msg:
-                logger.debug("router_read_idle")
-                continue
-            logger.error("router_read_error", error=msg)
-            if "NOGROUP" in str(exc):
-                # Stream/group wiped at runtime (e.g. FLUSHALL) — re-create
-                # the group instead of error-looping forever.
-                try:
-                    await _ensure_group(redis, ROUTER_QUEUE, CONSUMER_GROUP)
-                except Exception as group_exc:
-                    logger.error("router_group_recreate_failed", error=str(group_exc))
-            await asyncio.sleep(1)
-            continue
-
-        if not results:
-            continue
-
-        for _stream, messages in results:
-            for message_id, fields in messages:
-                try:
-                    await _process_message(redis, message_id, fields)
-                    await redis.xack(ROUTER_QUEUE, CONSUMER_GROUP, message_id)
-                except Exception as exc:
-                    logger.error(
-                        "router_message_error",
-                        message_id=message_id,
-                        error=str(exc),
-                    )
-                    # Bounded retry, then dead-letter (§8) — never silently drop
-                    # a failed message (record_failure ACKs the original).
+    try:
+        while not shutdown.is_set():
+            try:
+                results = await redis.xreadgroup(
+                    groupname=CONSUMER_GROUP,
+                    consumername=CONSUMER_NAME,
+                    streams={ROUTER_QUEUE: ">"},
+                    count=COUNT,
+                    block=BLOCK_MS,
+                )
+            except asyncio.CancelledError:
+                break
+            except Exception as exc:
+                msg = str(exc)
+                # An idle BLOCK window with no new messages surfaces as a redis
+                # TimeoutError — that's normal when the queue is empty, not an error.
+                # Re-block quietly instead of spamming ERROR every few seconds.
+                if isinstance(exc, asyncio.TimeoutError) or "Timeout" in msg:
+                    logger.debug("router_read_idle")
+                    continue
+                logger.error("router_read_error", error=msg)
+                if "NOGROUP" in str(exc):
+                    # Stream/group wiped at runtime (e.g. FLUSHALL) — re-create
+                    # the group instead of error-looping forever.
                     try:
-                        outcome = await record_failure(
-                            redis,
-                            stream=ROUTER_QUEUE,
-                            group=CONSUMER_GROUP,
-                            msg_id=message_id,
-                            fields=fields,
-                            error=exc,
-                            max_retries=ROUTER_MAX_RETRIES,
-                        )
-                        logger.warning(
-                            "router_failure_handled",
-                            message_id=message_id,
-                            outcome=outcome,
-                        )
-                    except Exception as dlq_exc:
-                        logger.error(
-                            "router_dlq_failed",
-                            message_id=message_id,
-                            error=str(dlq_exc),
-                        )
+                        await _ensure_group(redis, ROUTER_QUEUE, CONSUMER_GROUP)
+                    except Exception as group_exc:
+                        logger.error("router_group_recreate_failed", error=str(group_exc))
+                await asyncio.sleep(1)
+                continue
 
-    logger.info("router_stopped")
-    await redis.aclose()
+            if not results:
+                continue
+
+            for _stream, messages in results:
+                for message_id, fields in messages:
+                    try:
+                        await _process_message(redis, message_id, fields)
+                        await redis.xack(ROUTER_QUEUE, CONSUMER_GROUP, message_id)
+                    except Exception as exc:
+                        logger.error(
+                            "router_message_error",
+                            message_id=message_id,
+                            error=str(exc),
+                        )
+                        # Bounded retry, then dead-letter (§8) — never silently drop
+                        # a failed message (record_failure ACKs the original).
+                        try:
+                            outcome = await record_failure(
+                                redis,
+                                stream=ROUTER_QUEUE,
+                                group=CONSUMER_GROUP,
+                                msg_id=message_id,
+                                fields=fields,
+                                error=exc,
+                                max_retries=ROUTER_MAX_RETRIES,
+                            )
+                            logger.warning(
+                                "router_failure_handled",
+                                message_id=message_id,
+                                outcome=outcome,
+                            )
+                        except Exception as dlq_exc:
+                            logger.error(
+                                "router_dlq_failed",
+                                message_id=message_id,
+                                error=str(dlq_exc),
+                            )
+    finally:
+        logger.info("router_stopped")
+        await redis.aclose()
+

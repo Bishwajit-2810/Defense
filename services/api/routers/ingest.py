@@ -231,6 +231,26 @@ async def delete_post(
     ClickHouse analytics events are append-only and age out via TTL/partition
     drops, matching the data-retention design.
     """
+    # --- Tenant scoping (§P7.8): verify the post belongs to the caller's
+    # tenant before touching anything.  Without this, any authenticated user
+    # could delete another tenant's posts by ID.
+    tenant_id = current_user.get("tenant_id", "default")
+    ownership = (
+        await db.execute(
+            text(
+                "SELECT 1 FROM posts p "
+                "JOIN campaigns c ON p.campaign_id = c.id "
+                "WHERE p.id = :pid AND c.tenant_id = :tid"
+            ),
+            {"pid": post_id, "tid": tenant_id},
+        )
+    ).first()
+    if ownership is None:
+        raise HTTPException(
+            status_code=status.HTTP_404_NOT_FOUND,
+            detail=f"Post '{post_id}' not found",
+        )
+
     deleted: dict[str, int] = {}
     for table, column in (
         ("comments", "post_id"),
@@ -243,11 +263,6 @@ async def delete_post(
         )
         deleted[table] = res.rowcount or 0
 
-    if deleted["posts"] == 0:
-        raise HTTPException(
-            status_code=status.HTTP_404_NOT_FOUND,
-            detail=f"Post '{post_id}' not found",
-        )
-
-    log.info("post_deleted", post_id=post_id, **deleted)
+    log.info("post_deleted", post_id=post_id, tenant_id=tenant_id, **deleted)
     return {"post_id": post_id, "deleted": deleted}
+

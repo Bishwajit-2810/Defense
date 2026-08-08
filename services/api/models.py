@@ -193,10 +193,10 @@ class AnalysisRunResponse(BaseModel):
 
 
 class EngagementResult(BaseModel):
-    comment_count: int
-    stored_comments: int
-    total_reactions: int
-    share_count: int
+    comment_count: int = 0
+    stored_comments: int = 0
+    total_reactions: int = 0
+    share_count: int = 0
 
 
 class CommentAnalysisResult(BaseModel):
@@ -453,6 +453,9 @@ class ReportResponse(BaseModel):
     # a reader is never invited to treat a summary of noise as a finding (§13.2).
     embedding_clusters_are_stub: bool = False
     metrics: Optional[Dict[str, Any]] = None
+    # Error message when status == "failed" — selected from the DB but previously
+    # stripped by response_model because it was not declared here (§P7.15).
+    error: Optional[str] = None
 
 
 # ---------------------------------------------------------------------------

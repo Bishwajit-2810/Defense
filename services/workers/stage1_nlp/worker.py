@@ -605,7 +605,19 @@ async def run_worker() -> None:
                             post_id=post_id,
                             error=str(exc),
                         )
-                        await redis.xack(INPUT_STREAM, CONSUMER_GROUP, msg_id)
+                        # Route to DLQ instead of silently dropping (§P7.10).
+                        try:
+                            await record_failure(
+                                redis,
+                                stream=INPUT_STREAM,
+                                group=CONSUMER_GROUP,
+                                msg_id=msg_id,
+                                fields=fields,
+                                error=exc,
+                                max_retries=STAGE1_MAX_RETRIES,
+                            )
+                        except Exception as dlq_exc:
+                            log.error("stage1_json_dlq_failed", msg_id=msg_id, error=str(dlq_exc))
                         continue
 
                     job_id = envelope.get("job_id")

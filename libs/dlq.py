@@ -168,6 +168,9 @@ async def replay_dlq(redis: Any, stream: str, *, count: int = 100, trim: bool = 
         target = f.get("orig_stream") or stream
         data = f.get("data")
         if data is None:
+            # Remove the malformed entry so it doesn't loop forever (§P7.10).
+            if trim:
+                await redis.xdel(dlq, entry_id)
             continue
         await redis.xadd(target, {"data": data})
         replayed += 1

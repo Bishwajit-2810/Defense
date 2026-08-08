@@ -583,6 +583,8 @@ async def _process_message(
 
     if not raw_json:
         log.warning("ingestion.empty_message", message_id=msg_id_str)
+        # ACK so the empty message doesn't sit in the PEL forever (§P7.9).
+        await redis.xack(stream_name, CONSUMER_GROUP, message_id)
         return
 
     raw: dict[str, Any] = json.loads(raw_json)

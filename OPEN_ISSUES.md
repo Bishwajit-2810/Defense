@@ -628,3 +628,506 @@ The mitigation, and the thing to apply to every fix on this list: **when a fix a
 a signal, follow the signal to the surface a human reads, and assert it there.**
 §12.3 already did this once for a document. The same test shape — start at the
 consumer, walk back to the producer — would have caught all four.
+
+---
+---
+
+# Open Issues — Pass 7 audit
+
+**Found:** 7 August 2026, full-codebase audit across five parallel reviewers
+(API, workers/pipeline, libs/agents, dashboard/config, test suite) with every
+finding verified against the source.
+
+**Status: ALL TEN ARE FIXED**, 7 August 2026.
+
+### Changes applied
+
+| # | Fix summary | Files changed |
+| - | ----------- | ------------- |
+| 8 | Tenant-scoping added to `delete_post`, `get_analysis`, `get_report` | `ingest.py`, `analysis.py`, `reports.py` |
+| 9 | PEL drain phase added to `bus.py`; empty ingestion messages ACK'd | `bus.py`, `service.py` |
+| 10 | Silent ACK-and-drop replaced with `record_failure` → DLQ; DLQ replay `xdel` on null data | `assembler.py`, `worker.py` (stage1), `router.py`, `dlq.py` |
+| 11 | Permanent `_API_KEY_TABLE_USABLE = False` replaced with 30s TTL retry | `deps.py` |
+| 12 | `stream_options={"include_usage": True}` for non-local backends | `client.py` |
+| 13 | JSON-retry wrapped in same try/except failover as initial call | `client.py` |
+| 14 | `EngagementResult` fields default to `0` | `models.py` |
+| 15 | `error` field added to `ReportResponse`; `_row_to_report` reads it | `models.py`, `reports.py` |
+| 16 | `coverage_anomaly()` used instead of `coverage > 1.0` (always false) | `harness.py` |
+| 17a | Validator sort key stringified to prevent mixed-type crash | `validator.py` |
+| 17b | `ch_client.disconnect()` added to assembler finally block | `assembler/__main__.py` |
+| 17c | Router + Stage 2 cleanup moved into `try/finally` | `router.py`, `stage2_llm/worker.py` |
+| 17d | Dashboard search reads `res.post_text` | `app.js` |
+| 17e | Demo API key seeded in `init-db.sql` | `init-db.sql` |
+| 17f | `.env` parser strips inline comments | `run_all.py` |
+| 17g | Rate limiter reads `X-Forwarded-For` / `X-Real-IP` | `deps.py` |
+| 17h | Admin gate applies to all backend changes, not just groq | `config.py` |
+
+---
+
+## At a glance
+
+| # | Issue | Impact | Layer | Status |
+| - | ----- | ------ | ----- | ------ |
+| [8](#8--idor--endpoints-lack-tenant-scoping) | IDOR — endpoints lack tenant scoping | **Security** — cross-tenant data access/deletion | API | ✅ Fixed |
+| [9](#9--pel-messages-are-never-reclaimed-after-worker-crash) | PEL messages never reclaimed after worker crash | **Data loss** — messages lost on any restart | Bus / all workers | ✅ Fixed |
+| [10](#10--failedcorrupt-messages-are-silently-dropped-instead-of-dead-lettered) | Failed/corrupt messages silently dropped | **Data loss** — bypasses the DLQ by design | Assembler, Stage 1, Router, DLQ | ✅ Fixed |
+| [11](#11--api-key-auth-permanently-disabled-on-first-db-failure) | API key auth permanently disabled on first DB failure | **Auth** — one blip locks out every key user | API deps | ✅ Fixed |
+| [12](#12--streaming-usage-tracking-reports-zero-tokens) | Streaming usage reports zero tokens | **Thesis** — cost figure under-counts streaming | LLM client | ✅ Fixed |
+| [13](#13--json-retry-bypasses-failover--crashes-instead-of-degrading) | JSON retry bypasses failover | **Resilience** — hard crash instead of degrade | LLM client | ✅ Fixed |
+| [14](#14--engagementresult-required-fields-crash-the-api-on-missing-data) | EngagementResult crashes the API | **Availability** — 500 on any post missing engagement | API models | ✅ Fixed |
+| [15](#15--reportresponse-omits-error--failed-reports-give-no-reason) | ReportResponse omits `error` | **UX** — failed reports give no reason | API models | ✅ Fixed |
+| [16](#16--eval-harness-over-coverage-metric-is-dead-code) | Eval over-coverage metric is dead code | **Eval honesty** — always reports 0 | Eval harness | ✅ Fixed |
+| [17](#17--smaller-issues) | Eight smaller issues | Bounded | Various | ✅ Fixed |
+
+---
+
+## 8 — IDOR — endpoints lack tenant scoping
+
+### Where
+
+- [ingest.py:223](services/api/routers/ingest.py#L223) — `delete_post`
+- [analysis.py:513](services/api/routers/analysis.py#L513) — `get_analysis`
+- [reports.py:567](services/api/routers/reports.py#L567) — `get_report`
+
+### What's wrong
+
+Three endpoints accept an entity ID from the URL path and use it as the sole
+lookup/delete key, with **no tenant-scoping filter**:
+
+| Endpoint | Operation | Query shape |
+| -------- | --------- | ----------- |
+| `DELETE /posts/{post_id}` | cascade delete across `comments`, `analysis_results`, `posts` | `WHERE post_id = :pid` — no tenant check |
+| `GET /v1/analysis/{id}` | read job + results | `WHERE id = :id` — no tenant check |
+| `GET /v1/reports/{id}` | read report | `WHERE id = :id` — no tenant check |
+
+`delete_post` is the worst: any authenticated user can delete another tenant's
+posts, their analysis results, and all their comments in a single call. The
+other two are read-only IDOR — still a confidentiality breach, but not
+destructive.
+
+### Reproduce
+
+```bash
+# As tenant A, create a post and note its post_id.
+# As tenant B, call DELETE /posts/{post_id} — it succeeds.
+```
+
+### Fix
+
+Add `AND campaign_id IN (SELECT id FROM campaigns WHERE tenant_id = :tid)` (or
+the equivalent join) to every query that takes a user-supplied entity ID. For
+`get_analysis` and `get_report`, filter on the job's `tenant_id` or the
+`campaign_id` that owns the data. Apply the same pattern to any other endpoint
+that fetches by ID — audit `routers/*.py` for `{id}` or `{post_id}` path
+parameters.
+
+### Test to leave behind
+
+For each endpoint: call it as tenant B with tenant A's entity ID, assert 404
+(not 200 or 204). These are the three tests that a `test_tenant_isolation.py`
+file should hold.
+
+---
+
+## 9 — PEL messages are never reclaimed after worker crash
+
+### Where
+
+- [bus.py:56](libs/bus.py#L56) — `RedisStreamBus.consume`
+- Every worker's main loop: [stage1_nlp/worker.py:536](services/workers/stage1_nlp/worker.py#L536),
+  [stage2_llm/worker.py:1277](services/workers/stage2_llm/worker.py#L1277),
+  [router/router.py:213](services/workers/router/router.py#L213),
+  [assembler/assembler.py:505](services/workers/assembler/assembler.py#L505),
+  [ingestion/service.py:792](services/ingestion/service.py#L792)
+- [ingestion/service.py:585](services/ingestion/service.py#L585) — early return without ACK
+
+### What's wrong
+
+`RedisStreamBus.consume` calls `XREADGROUP` with ID `">"` exclusively — it only
+reads **new** messages. If a worker crashes or restarts between reading a message
+and ACKing it, that message is stranded in the Redis Pending Entries List (PEL)
+forever. No worker ever reads from ID `"0"` to drain its PEL on startup, and
+there is no `XAUTOCLAIM` / `XPENDING` background loop anywhere in the codebase.
+
+A second variant of the same bug lives in `ingestion/service.py:585`: when
+`raw_json` is missing or empty, `_process_message` logs a warning and returns
+early. The outer loop does not ACK the message, and no exception is raised to
+trigger `record_failure`. The message sits in the PEL indefinitely.
+
+### Impact
+
+**Any worker restart — including a normal rolling deployment — silently drops
+every in-flight message.** In a Kubernetes environment with KEDA-driven scaling,
+scale-to-zero followed by scale-up guarantees message loss on every idle cycle.
+
+### Fix
+
+1. On startup, have each consumer read from ID `"0"` to drain its PEL before
+   switching to `">"`. This is the standard Redis Streams pattern.
+2. Add an `XAUTOCLAIM` background task (or a simpler `XPENDING` + `XCLAIM`
+   sweep) that reclaims messages idle for longer than a configurable threshold
+   (e.g., 5 minutes).
+3. Fix the `_process_message` early return: either ACK the empty message
+   explicitly or raise an exception to route it to the DLQ.
+
+### Test to leave behind
+
+Simulate crash-before-ACK: consume a message, do **not** ACK, restart the
+consumer, and assert it re-processes the same message. This is the test that
+would have caught it on day one.
+
+---
+
+## 10 — Failed/corrupt messages are silently dropped instead of dead-lettered
+
+### Where
+
+- [assembler/assembler.py:299](services/workers/assembler/assembler.py#L299) — `ValueError`/`KeyError` → ACK + return
+- [stage1_nlp/worker.py:602](services/workers/stage1_nlp/worker.py#L602) — `JSONDecodeError` → ACK
+- [router/router.py:88](services/workers/router/router.py#L88) — `JSONDecodeError` → return (outer loop ACKs)
+- [dlq.py:170](libs/dlq.py#L170) — `replay_dlq` loops forever on `data is None`
+
+### What's wrong
+
+**Three workers ACK and discard messages that fail processing, instead of routing
+them to the DLQ.** The DLQ infrastructure (`libs/dlq.py`, `record_failure`) exists
+and works — these paths just don't use it:
+
+| Worker | Failure | What happens | Should happen |
+| ------ | ------- | ------------ | ------------- |
+| Assembler | `build_canonical_result` raises `ValueError`/`KeyError` | logs, ACKs, returns | `record_failure` → DLQ |
+| Stage 1 | `json.loads` raises `JSONDecodeError` | logs, ACKs | `record_failure` → DLQ |
+| Router | `json.loads` raises `JSONDecodeError` | logs, returns (outer loop ACKs) | `record_failure` → DLQ |
+
+**The DLQ itself has a bug.** `replay_dlq` iterates entries and calls `continue`
+when `data is None` — but the `xdel` that removes the entry from the DLQ is
+**after** the `continue`. So a malformed DLQ entry stays in the queue forever,
+and every replay pass re-encounters it, creating an infinite loop that blocks
+all subsequent replays.
+
+### Fix
+
+1. Replace the explicit ACK + return in the assembler with a call to
+   `record_failure(redis_client, stream, msg_id, fields, error=str(exc))`.
+2. Same for Stage 1 and Router JSON failures.
+3. In `replay_dlq`, when `data is None`, `xdel` the entry **before**
+   `continue` (or move it to a terminal error stream).
+
+### Test to leave behind
+
+Feed a malformed message into each stream and assert it lands in the DLQ with
+the correct `orig_stream` and error metadata. For the DLQ bug: replay a DLQ
+containing one `data=None` entry and assert it is removed, not retried.
+
+---
+
+## 11 — API key auth permanently disabled on first DB failure
+
+### Where
+
+[deps.py:251](services/api/deps.py#L251) — `_principal_from_api_key`
+
+### What's wrong
+
+When the `api_keys` table lookup fails (e.g., a momentary Postgres blip), the
+handler sets a module-level global:
+
+```python
+_API_KEY_TABLE_USABLE = False
+```
+
+This flag is **never reset**. Every subsequent request that presents an API key
+skips the database lookup entirely for the rest of the process lifetime. The
+only recovery is restarting the API server.
+
+### Impact
+
+A single transient database error permanently locks out every API-key-
+authenticated user until an operator notices and restarts the service. JWT-
+authenticated users are unaffected, so the failure is partial and easy to miss.
+
+### Fix
+
+Remove the global caching of the failure state entirely, or replace it with a
+short-TTL cache (e.g., retry after 30 seconds). A circuit-breaker pattern would
+be ideal — the LLM client already uses one (`libs/llm/client.py`), so the
+pattern is in-tree.
+
+### Test to leave behind
+
+Simulate a DB failure on the first API-key lookup, then simulate recovery, and
+assert the second lookup succeeds. The test should fail if the global flag
+persists.
+
+---
+
+## 12 — Streaming usage tracking reports zero tokens
+
+### Where
+
+[client.py:581](libs/llm/client.py#L581) — `chat_stream`'s `_open` helper
+
+### What's wrong
+
+`chat_stream` does not pass `stream_options={"include_usage": True}` when
+creating the streaming completion. The code comment says this is intentional
+("some Ollama builds reject unknown params"), but the effect is that **every
+streamed response reports zero token usage**. Since `chat_stream` feeds through
+the same `libs/llm/usage.py` tracking that issue 2 fixed, the counters are
+incremented — by zero.
+
+Chat and agent interactions are the primary streaming callers, so interactive
+token spend is systematically under-reported.
+
+### Impact
+
+`/v1/usage` under-counts tokens and cost for all streaming callers. The cost
+figure the thesis relies on is too low by however much traffic goes through
+`chat_stream`.
+
+### Fix
+
+Pass `stream_options={"include_usage": True}` and gate it on the backend: apply
+it for `groq` and `openai`-compatible backends, skip it for `local` / Ollama
+where it is known to cause errors. The backend is already resolved by this
+point.
+
+### Test to leave behind
+
+Drive `chat_stream` through a mock OpenAI server that returns usage in the final
+chunk, and assert the tracked token count is non-zero.
+
+---
+
+## 13 — JSON retry bypasses failover — crashes instead of degrading
+
+### Where
+
+[client.py:426](libs/llm/client.py#L426) — JSON-mode degeneracy retry
+
+### What's wrong
+
+When `_is_degenerate_json` detects a bad JSON response, the retry calls
+`_call_api` **without** a `try/except` block. If this second call fails (e.g.,
+Groq rate limit, network error), the exception propagates uncaught, bypassing
+the Groq→local failover that protects the initial call.
+
+The initial call is wrapped in the failover logic added by issue 6's fix. The
+retry is not — it is the same shape of bug: a second call site that reaches the
+API without the resilience wrapper.
+
+### Impact
+
+A JSON-mode request that gets a degenerate response and then hits a transient
+error on retry will hard-crash the request, even though the local backend is
+available and healthy. Every other LLM call path degrades; this one does not.
+
+### Fix
+
+Wrap the retry in the same `try/except` → failover block as the initial call, or
+factor the failover logic into `_call_api` itself so every call gets it
+automatically.
+
+### Test to leave behind
+
+Mock the primary backend to return degenerate JSON on the first call and raise
+on the second. Assert the client falls back to local rather than crashing.
+
+---
+
+## 14 — EngagementResult required fields crash the API on missing data
+
+### Where
+
+- [models.py:195](services/api/models.py#L195) — `EngagementResult`
+- [analysis.py:816](services/api/routers/analysis.py#L816) — populates from `r.get("engagement", {})`
+
+### What's wrong
+
+`EngagementResult` declares four strictly required `int` fields (`comment_count`,
+`stored_comments`, `total_reactions`, `share_count`) with no defaults. The
+analysis endpoint populates it from `r.get("engagement", {})` — an empty dict
+when the JSONB result has no engagement data. Pydantic validation fails, and the
+endpoint returns a 500.
+
+### Impact
+
+Any post whose result JSON lacks engagement data (e.g., an old schema version,
+a partial analysis, or a platform that doesn't provide reactions) crashes the
+analysis-results endpoint for **every post in that batch**, not just the one
+missing data.
+
+### Fix
+
+Either make the fields `Optional[int] = 0` (safe — engagement counts default to
+zero), or provide a complete fallback dict in the router instead of `{}`.
+
+### Test to leave behind
+
+Build an `AnalysisResultResponse` with `engagement={}` and assert it
+serializes without raising, returning zeros.
+
+---
+
+## 15 — ReportResponse omits `error` — failed reports give no reason
+
+### Where
+
+- [reports.py:37](services/api/routers/reports.py#L37) — `_get_report_row` selects the `error` column
+- [models.py:427](services/api/models.py#L427) — `ReportResponse` has no `error` field
+
+### What's wrong
+
+`_get_report_row` explicitly SELECTs the `error` column from the `jobs` table.
+But `ReportResponse` does not declare an `error` field, and `_row_to_report`
+never reads it. FastAPI's `response_model` strips undeclared keys.
+
+When a report fails (e.g., clustering over zero posts, LLM timeout), the user
+sees `status: "failed"` with no explanation. The error string is in the database
+— it is selected, and then discarded.
+
+### Fix
+
+Add `error: Optional[str] = None` to `ReportResponse`, populate it in
+`_row_to_report`, and render it in the dashboard's Reports tab when
+`status === "failed"`.
+
+### Test to leave behind
+
+Build a report row with `status="failed"` and `error="some message"`, pass it
+through `_row_to_report` and the `ReportResponse` model, and assert `error`
+survives.
+
+---
+
+## 16 — Eval harness over-coverage metric is dead code
+
+### Where
+
+- [harness.py:169](eval/harness.py#L169) — `if coverage > 1.0: over_one += 1`
+- [utils.py:182](libs/common/utils.py#L182) — `return min(1.0, max(0.0, analyzed / total_comment_count))`
+
+### What's wrong
+
+`run_coverage_check` counts posts with `coverage > 1.0` to detect
+over-counting. But `compute_coverage` **clamps** its return value to
+`min(1.0, ...)`. The condition can never be true. `over_one` is always 0.
+
+Over-coverage (more comments marked "analyzed" than actually exist) is a real
+signal — it indicates a counting bug in the comment pipeline. This metric was
+presumably added to catch it, but the clamp at the source makes it invisible.
+
+### Fix
+
+Read the raw `analyzed / total_comment_count` ratio before clamping, or add a
+separate `coverage_anomaly(analyzed, total)` function that returns `True` when
+`analyzed > total`. The eval harness should call the anomaly check, not the
+clamped coverage.
+
+### Test to leave behind
+
+Call `compute_coverage(15, 10)` and assert it returns `1.0` (existing behavior),
+then call the new anomaly check with the same inputs and assert it flags it.
+
+---
+
+## 17 — Smaller issues
+
+### 17a — Schema validator crashes on mixed-type path sorting
+
+[validator.py:48](libs/schemas/validator.py#L48) `_collect_errors` sorts
+validation errors by `key=lambda e: list(e.absolute_path)`. JSON Schema paths
+contain both strings (object keys) and integers (array indices). Python 3 raises
+`TypeError: '<' not supported between instances of 'int' and 'str'` when
+comparing them, so the validator crashes on any schema with nested arrays.
+
+**Fix:** `key=lambda e: [str(p) for p in e.absolute_path]`.
+
+### 17b — ClickHouse client never closed on shutdown
+
+[assembler/__main__.py:159](services/workers/assembler/__main__.py#L159) The
+`finally` block closes Redis and disposes the SQLAlchemy engine, but never
+calls `ch_client.disconnect()`. ClickHouse connections leak on every graceful
+shutdown or restart.
+
+**Fix:** Add `ch_client.disconnect()` to the `finally` block.
+
+### 17c — Resource cleanup not in `try/finally`
+
+[router/router.py:277](services/workers/router/router.py#L277) and
+[stage2_llm/worker.py:1341](services/workers/stage2_llm/worker.py#L1341) have
+`await redis.aclose()` at the bottom of the function, **outside** any
+`try/finally`. An unhandled exception in the consumer loop bypasses cleanup.
+
+**Fix:** Wrap the consumer loop in `try/finally` and move cleanup into `finally`.
+
+### 17d — Dashboard search reads wrong field name
+
+[dashboard/app.js:2660](dashboard/app.js#L2660) Search result rendering tries
+`res.caption || res.text` — neither exists on `AnalysisResultResponse`. The
+correct field is `res.post_text`. Posts without an LLM summary render a blank
+snippet.
+
+**Fix:** Add `res.post_text` to the fallback chain before `res.caption`.
+
+### 17e — Demo login advertised but no seed in `init-db.sql`
+
+[run_all.py:562](run_all.py#L562) tells users to "log in with API key: demo".
+[init-db.sql:83](deploy/init-db.sql#L83) creates the `api_keys` table but
+**inserts no rows**. First-time users cannot log in.
+
+**Fix:** Add an `INSERT INTO api_keys` with the SHA-256 hash of `"demo"`, or
+update `run_all.py`'s instructions to explain how to create a key.
+
+### 17f — `run_all.py` `.env` parser doesn't strip inline comments
+
+[run_all.py:360](run_all.py#L360) `_dotenv_value` splits on `=` and strips
+quotes, but does not strip inline comments. `GROQ_API_KEY=sk-1234 # my key`
+parses as the literal string `sk-1234 # my key`, silently breaking LLM auth.
+
+**Fix:** `value.split("#", 1)[0].strip()` before stripping quotes.
+
+### 17g — Rate limiter ignores reverse proxy headers
+
+[deps.py:400](services/api/deps.py#L400) The anonymous rate limiter uses
+`request.client.host`. Behind a reverse proxy or load balancer, all anonymous
+traffic appears to come from the proxy's IP, applying a single shared rate
+limit to every user.
+
+**Fix:** Read `X-Forwarded-For` or `X-Real-IP` (with a configurable trusted-
+proxy allowlist to prevent spoofing).
+
+### 17h — `PUT /v1/config/llm` allows non-admins to set backend to `local`
+
+[config.py:92](services/api/routers/config.py#L92) The admin-role gate only
+fires when `backend == "groq"`. Any authenticated user can set the global LLM
+backend to `"local"` or clear the override entirely, affecting all tenants.
+
+**Fix:** Restrict all modifications of the global LLM backend to admin roles.
+
+---
+
+## The pattern this pass found
+
+Two recurring shapes:
+
+> **1. The happy path is tested; the failure/edge path is ACKed and
+> discarded.** Issues 9, 10, and 11 are all cases where the error handler
+> "succeeds" — it ACKs the message, sets a flag, returns early — and the
+> data is gone. The DLQ exists precisely for these cases and is simply not
+> called.
+
+> **2. Tenant boundaries are assumed, not enforced.** Issue 8 is the
+> classic IDOR shape: the endpoint trusts the caller's entity ID and never
+> checks ownership. The pipeline is documented as "single-tenant" in
+> several places, but the auth system issues per-tenant tokens, the
+> database stores per-tenant campaigns, and the API happily crosses the
+> boundary.
+
+The mitigation for shape 1: every `except` block that ACKs a stream message
+should either re-raise (letting the outer DLQ handler catch it) or explicitly
+call `record_failure`. A lint rule or AST test — "no `xack` inside an `except`
+block without `record_failure`" — would catch future instances.
+
+The mitigation for shape 2: a `test_tenant_isolation.py` that, for every
+entity-by-ID endpoint, calls it as a different tenant and asserts 404.

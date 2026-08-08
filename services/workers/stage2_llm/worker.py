@@ -1272,70 +1272,72 @@ async def run() -> None:
     for sig in (signal.SIGINT, signal.SIGTERM):
         loop.add_signal_handler(sig, _handle_signal)
 
-    while not shutdown.is_set():
-        try:
-            results = await redis.xreadgroup(
-                groupname=CONSUMER_GROUP,
-                consumername=CONSUMER_NAME,
-                streams={STAGE2_QUEUE: ">"},
-                count=COUNT,
-                block=BLOCK_MS,
-            )
-        except asyncio.CancelledError:
-            break
-        except Exception as exc:
-            msg = str(exc)
-            # Idle BLOCK window with no new messages → redis TimeoutError; normal.
-            if isinstance(exc, asyncio.TimeoutError) or "Timeout" in msg:
-                logger.debug("stage2_read_idle")
-                continue
-            logger.error("stage2_read_error", error=msg)
-            if "NOGROUP" in str(exc):
-                # Stream/group wiped at runtime (e.g. FLUSHALL) — re-create
-                # the group instead of error-looping forever.
-                try:
-                    await _ensure_group(redis, STAGE2_QUEUE, CONSUMER_GROUP)
-                except Exception as group_exc:
-                    logger.error("stage2_group_recreate_failed", error=str(group_exc))
-            await asyncio.sleep(1)
-            continue
-
-        if not results:
-            continue
-
-        for _stream, messages in results:
-            for message_id, fields in messages:
-                try:
-                    await _process_message(llm, redis, message_id, fields)
-                    await redis.xack(STAGE2_QUEUE, CONSUMER_GROUP, message_id)
-                except Exception as exc:
-                    logger.error(
-                        "stage2_message_error",
-                        message_id=message_id,
-                        error=str(exc),
-                    )
-                    # Bounded retry, then dead-letter (§8) — never silently drop.
+    try:
+        while not shutdown.is_set():
+            try:
+                results = await redis.xreadgroup(
+                    groupname=CONSUMER_GROUP,
+                    consumername=CONSUMER_NAME,
+                    streams={STAGE2_QUEUE: ">"},
+                    count=COUNT,
+                    block=BLOCK_MS,
+                )
+            except asyncio.CancelledError:
+                break
+            except Exception as exc:
+                msg = str(exc)
+                # Idle BLOCK window with no new messages → redis TimeoutError; normal.
+                if isinstance(exc, asyncio.TimeoutError) or "Timeout" in msg:
+                    logger.debug("stage2_read_idle")
+                    continue
+                logger.error("stage2_read_error", error=msg)
+                if "NOGROUP" in str(exc):
+                    # Stream/group wiped at runtime (e.g. FLUSHALL) — re-create
+                    # the group instead of error-looping forever.
                     try:
-                        outcome = await record_failure(
-                            redis,
-                            stream=STAGE2_QUEUE,
-                            group=CONSUMER_GROUP,
-                            msg_id=message_id,
-                            fields=fields,
-                            error=exc,
-                            max_retries=STAGE2_MAX_RETRIES,
-                        )
-                        logger.warning(
-                            "stage2_failure_handled",
-                            message_id=message_id,
-                            outcome=outcome,
-                        )
-                    except Exception as dlq_exc:
-                        logger.error(
-                            "stage2_dlq_failed",
-                            message_id=message_id,
-                            error=str(dlq_exc),
-                        )
+                        await _ensure_group(redis, STAGE2_QUEUE, CONSUMER_GROUP)
+                    except Exception as group_exc:
+                        logger.error("stage2_group_recreate_failed", error=str(group_exc))
+                await asyncio.sleep(1)
+                continue
 
-    logger.info("stage2_llm_stopped")
-    await redis.aclose()
+            if not results:
+                continue
+
+            for _stream, messages in results:
+                for message_id, fields in messages:
+                    try:
+                        await _process_message(llm, redis, message_id, fields)
+                        await redis.xack(STAGE2_QUEUE, CONSUMER_GROUP, message_id)
+                    except Exception as exc:
+                        logger.error(
+                            "stage2_message_error",
+                            message_id=message_id,
+                            error=str(exc),
+                        )
+                        # Bounded retry, then dead-letter (§8) — never silently drop.
+                        try:
+                            outcome = await record_failure(
+                                redis,
+                                stream=STAGE2_QUEUE,
+                                group=CONSUMER_GROUP,
+                                msg_id=message_id,
+                                fields=fields,
+                                error=exc,
+                                max_retries=STAGE2_MAX_RETRIES,
+                            )
+                            logger.warning(
+                                "stage2_failure_handled",
+                                message_id=message_id,
+                                outcome=outcome,
+                            )
+                        except Exception as dlq_exc:
+                            logger.error(
+                                "stage2_dlq_failed",
+                                message_id=message_id,
+                                error=str(dlq_exc),
+                            )
+    finally:
+        logger.info("stage2_llm_stopped")
+        await redis.aclose()
+

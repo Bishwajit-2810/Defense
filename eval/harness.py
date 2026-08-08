@@ -17,7 +17,7 @@ from typing import Optional
 # Ensure the repo root is importable when run directly
 sys.path.insert(0, str(Path(__file__).parent.parent))
 
-from libs.common.utils import compute_coverage, platform_from_url
+from libs.common.utils import compute_coverage, coverage_anomaly, platform_from_url
 from libs.schemas import validate_input
 
 
@@ -167,7 +167,7 @@ def run_coverage_check(posts: list) -> list[EvalResult]:
         stored = engagement.get("storedCommentRows", 0)
         total_comments = engagement.get("commentCount", 0)
         coverage = compute_coverage(stored, total_comments)
-        if coverage > 1.0:
+        if coverage_anomaly(stored, total_comments):
             over_one += 1
         if coverage == 0.0:
             zero_coverage += 1

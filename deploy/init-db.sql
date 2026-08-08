@@ -102,6 +102,16 @@ CREATE TABLE IF NOT EXISTS api_keys (
 
 CREATE INDEX IF NOT EXISTS idx_api_keys_tenant ON api_keys (tenant_id);
 
+-- Seed a demo API key so first-time users can log in with key "demo"
+-- (as advertised by run_all.py).  SHA-256 of the literal string "demo".
+INSERT INTO api_keys (key_hash, tenant_id, label, role)
+VALUES (
+    '2a97516c354b68848cdbd8f54a226a0a55b21ed138e207ad6c5cbb9c00aa5aea',
+    'default',
+    'demo key (seeded by init-db.sql)',
+    'admin'
+) ON CONFLICT (key_hash) DO NOTHING;
+
 -- Users, for the login endpoint that currently authenticates anybody
 -- (PROJECT_ASSESSMENT §6.6 defect 3). Passwords are salted-hash only.
 CREATE TABLE IF NOT EXISTS users (
