@@ -17,6 +17,8 @@ import signal
 import sys
 import time
 from typing import Any
+import torch
+from transformers import pipeline
 
 import redis.asyncio as aioredis
 import structlog
@@ -614,11 +616,102 @@ def _normalize_stance(parsed: Any, n: int, valid_target_ids: set[str] | None = N
     return out
 
 
-async def _run_comment_stance(
+
+def _map_sentiment_label(label: str) -> str:
+    label = label.lower()
+    if "pos" in label:
+        return "positive"
+    elif "neg" in label:
+        return "negative"
+    return "neutral"
+
+_xlmr_pipeline = None
+_distilbert_pipeline = None
+
+def get_xlmr_pipeline():
+    global _xlmr_pipeline
+    if _xlmr_pipeline is None:
+        try:
+            device = 0 if torch.cuda.is_available() else -1
+            _xlmr_pipeline = pipeline("sentiment-analysis", model=config.stage2_classifier_1, device=device)
+        except Exception as e:
+            logger.error("xlmr_pipeline_load_failed", error=str(e))
+    return _xlmr_pipeline
+
+def get_distilbert_pipeline():
+    global _distilbert_pipeline
+    if _distilbert_pipeline is None:
+        try:
+            device = 0 if torch.cuda.is_available() else -1
+            _distilbert_pipeline = pipeline("sentiment-analysis", model=config.stage2_classifier_2, device=device)
+        except Exception as e:
+            logger.error("distilbert_pipeline_load_failed", error=str(e))
+    return _distilbert_pipeline
+
+async def _run_xlmr_comment_labeling(stage1_result: dict) -> None:
+    ca = stage1_result.get("comment_analysis") or {}
+    comments = ca.get("comments") or []
+    eligible = [c for c in comments if c.get("kind") not in ("emoji", "filtered")]
+    if not eligible:
+        return
+
+    loop = asyncio.get_running_loop()
+    def _run():
+        pipe = get_xlmr_pipeline()
+        if not pipe:
+            return [{"label": "neutral", "score": 0.0}] * len(eligible)
+        texts = [(c.get("text") or "")[:512] for c in eligible]
+        try:
+            return pipe(texts, truncation=True)
+        except Exception as e:
+            logger.error("xlmr_pipeline_inference_failed", error=str(e))
+            return [{"label": "neutral", "score": 0.0}] * len(eligible)
+            
+    results = await loop.run_in_executor(None, _run)
+    
+    for c, res in zip(eligible, results):
+        if "parallel_labels" not in c:
+            c["parallel_labels"] = {}
+        c["parallel_labels"]["xlmr"] = {
+            "sentiment": _map_sentiment_label(res["label"]),
+            "score": res["score"]
+        }
+
+async def _run_distilbert_comment_labeling(stage1_result: dict) -> None:
+    ca = stage1_result.get("comment_analysis") or {}
+    comments = ca.get("comments") or []
+    eligible = [c for c in comments if c.get("kind") not in ("emoji", "filtered")]
+    if not eligible:
+        return
+
+    loop = asyncio.get_running_loop()
+    def _run():
+        pipe = get_distilbert_pipeline()
+        if not pipe:
+            return [{"label": "neutral", "score": 0.0}] * len(eligible)
+        texts = [(c.get("text") or "")[:512] for c in eligible]
+        try:
+            return pipe(texts, truncation=True)
+        except Exception as e:
+            logger.error("distilbert_pipeline_inference_failed", error=str(e))
+            return [{"label": "neutral", "score": 0.0}] * len(eligible)
+            
+    results = await loop.run_in_executor(None, _run)
+    
+    for c, res in zip(eligible, results):
+        if "parallel_labels" not in c:
+            c["parallel_labels"] = {}
+        c["parallel_labels"]["distilbert"] = {
+            "sentiment": _map_sentiment_label(res["label"]),
+            "score": res["score"]
+        }
+
+
+async def _run_llm_comment_labeling(
     llm: LLMClient,
     redis,
     stage1_result: dict,
-    post_context: str,
+    post_summary: str,
     backend_override: str | None,
     progress_cb: Any = None,
 ) -> int:
@@ -650,7 +743,7 @@ async def _run_comment_stance(
     # Emoji-only reactions never enter an LLM batch: there is no text in them to
     # judge stance from, so they are the cheapest possible tokens to waste. They
     # keep their Stage-1 emoji label (❤️/🤬 are real signal — see §6.2).
-    eligible = [c for c in comments if c.get("kind") != "emoji"]
+    eligible = [c for c in comments if c.get("kind") != "emoji" and c.get("kind") != "filtered"]
     if not eligible:
         return 0
 
@@ -678,7 +771,7 @@ async def _run_comment_stance(
 
     async def _fetch_batch(index: int, batch: list[dict]) -> list:
         """Return this batch's labels (cached, fresh, or all-None on failure)."""
-        raw_key = post_context[:1500] + "||" + "|".join(
+        raw_key = post_summary[:1500] + "||" + "|".join(
             (c.get("text") or "")[:_STANCE_MAX_TEXT] for c in batch
         )
         content_hash = hashlib.sha256(raw_key.encode("utf-8")).hexdigest()
@@ -702,7 +795,7 @@ async def _run_comment_stance(
             ]
 
         messages = build_comment_stance_messages(
-            post_context, batch, _STANCE_MAX_TEXT, targets=batch_targets or None
+            post_summary, batch, _STANCE_MAX_TEXT, targets=batch_targets or None
         )
         for attempt in range(_STANCE_BATCH_RETRIES + 1):
             try:
@@ -765,31 +858,19 @@ async def _run_comment_stance(
                 continue
             stance = label.get("s")
             emotion = label.get("e")
+            if "parallel_labels" not in c:
+                c["parallel_labels"] = {}
+            llm_data = {}
             if stance in _STANCE_LABELS:
-                c["sentiment"] = stance
-                c["sentiment_score"] = _STANCE_SCORE[stance]
-                c["method"] = "llm"
+                llm_data["sentiment"] = stance
+                llm_data["sentiment_score"] = _STANCE_SCORE[stance]
                 applied += 1
             if emotion in _EMOTION_LABELS:
-                # Context-aware emotion overwrites the Stage-1 heuristic guess —
-                # and says so, so emotion_breakdown can report its own mix.
-                c["emotion"] = emotion
-                c["emotion_method"] = "llm"
-            # The LLM's target verdicts replace Stage-1's deterministic ones —
-            # but only for targets it actually judged. A target the model stayed
-            # silent on keeps its deterministic verdict rather than vanishing.
+                llm_data["emotion"] = emotion
             llm_targets = label.get("t")
             if llm_targets:
-                existing = {e["target"]: e for e in (c.get("target_stances") or [])}
-                for entry in llm_targets:
-                    # Carry the matched alias forward — the LLM does not report
-                    # it, and it is what makes a miss debuggable.
-                    prior = existing.get(entry["target"])
-                    if prior and prior.get("alias"):
-                        entry["alias"] = prior["alias"]
-                    existing[entry["target"]] = entry
-                c["target_stances"] = list(existing.values())
-            # else: keep the Stage-1 standalone values as a fallback
+                llm_data["target_stances"] = llm_targets
+            c["parallel_labels"]["llm"] = llm_data
 
         async with lock:
             done += 1
@@ -849,7 +930,7 @@ async def _run_comment_summary(
     llm: LLMClient,
     redis,
     stage1_result: dict,
-    post_context: str,
+    post_summary: str,
     target_lang: str,
     backend_override: str | None,
 ) -> str | None:
@@ -1137,7 +1218,8 @@ async def _process_message(
         if not _STANCE_ENABLED:
             return out
         ca = stage1_result.get("comment_analysis") or {}
-        if not ca.get("comments"):
+        comments = ca.get("comments") or []
+        if not comments:
             return out
 
         try:
@@ -1155,12 +1237,46 @@ async def _process_message(
                     log=log,
                 )
 
-            n_labeled = await _run_comment_stance(
-                llm, redis, stage1_result, post_context, backend_override,
+            post_summary = stage1_result.get("post_summary") or "(no summary provided)"
+
+            llm_task = _run_llm_comment_labeling(
+                llm, redis, stage1_result, post_summary, backend_override,
                 _stance_progress,
             )
+            xlmr_task = _run_xlmr_comment_labeling(stage1_result)
+            distilbert_task = _run_distilbert_comment_labeling(stage1_result)
+            
+            n_labeled, _, _ = await asyncio.gather(llm_task, xlmr_task, distilbert_task)
+            
+            # Recompute breakdowns for Stage 2 outputs
+            sentiment_breakdown = {"positive": 0, "negative": 0, "neutral": 0}
+            emotion_breakdown = {}
+            watchlist_alert = False
+            
+            for c in comments:
+                llm_data = c.get("parallel_labels", {}).get("llm", {})
+                
+                # Watchlist
+                for trg in llm_data.get("target_stances", []):
+                    if trg.get("stance") == "opposing":
+                        watchlist_alert = True
+                        break
+                        
+                # Breakdowns for comment summary
+                s = llm_data.get("sentiment")
+                if s in sentiment_breakdown:
+                    sentiment_breakdown[s] += 1
+                e = llm_data.get("emotion")
+                if e:
+                    emotion_breakdown[e] = emotion_breakdown.get(e, 0) + 1
+                    
+            ca["sentiment_breakdown"] = sentiment_breakdown
+            ca["emotion_breakdown"] = emotion_breakdown
+            out["watchlist_alert"] = watchlist_alert
+
             log.info("stage2_comment_stance", labeled=n_labeled,
-                     total=len(ca.get("comments") or []),
+                     total=len(comments),
+                     watchlist_alert=watchlist_alert,
                      reaction_only=ca.get("reaction_only"))
             out["_llm_backend"] = backend_override or get_settings().llm_backend
         except Exception as exc:
@@ -1171,7 +1287,7 @@ async def _process_message(
                 summary_lang = (task_flags.get("target_lang")
                                 or stage1_result.get("language") or "English")
                 comment_summary = await _run_comment_summary(
-                    llm, redis, stage1_result, post_context, summary_lang, backend_override
+                    llm, redis, stage1_result, post_summary, summary_lang, backend_override
                 )
                 if comment_summary:
                     ca["summary"] = comment_summary

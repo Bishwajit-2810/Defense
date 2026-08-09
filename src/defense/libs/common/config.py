@@ -113,6 +113,13 @@ class Settings(BaseSettings):
     stage2_batch_size: int = 10
     stage2_max_retries: int = 3
     
+    # Pre-processing
+    filter_emoji_only: bool = True
+    
+    # Stage 2 Parallel Classifiers
+    stage2_classifier_1: str = "xlm-roberta-base-finetuned"
+    stage2_classifier_2: str = "distilbert-base-multilingual"
+    
     # Assembler
     assembler_batch_size: int = 50
     assembler_max_retries: int = 3

@@ -15,6 +15,7 @@ import asyncio
 import json
 import signal
 import time
+import re
 import msgpack
 import redis.asyncio as aioredis
 import structlog
@@ -101,6 +102,16 @@ async def _process_message(
     # Route on the stage-1 result; the rest of the envelope is passed through.
     stage1_result: dict = payload.get("stage1_result", {})
     options: dict = payload.get("options", {})
+
+    if config.filter_emoji_only:
+        ca = stage1_result.get("comment_analysis") or {}
+        comments = ca.get("comments") or []
+        if comments:
+            emoji_pattern = re.compile(r'^[\s\U00010000-\U0010ffff]+$')
+            for c in comments:
+                text = (c.get("text") or "").strip()
+                if c.get("kind") == "emoji" or emoji_pattern.match(text):
+                    c["kind"] = "filtered"
 
     use_llm, reasons = should_use_llm(stage1_result, options)
     job_id = payload.get("job_id")

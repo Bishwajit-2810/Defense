@@ -260,8 +260,19 @@ export default function PostModal({ post, onClose }) {
         {/* Scrollable Body */}
         <div className="p-6 overflow-y-auto" ref={modalRef}>
           
-          {/* Header Chips & Engagement Summary */}
-          <div className="mb-6 flex flex-wrap items-center gap-4">
+          {/* Post Info */}
+          {post.watchlist_alert && (
+            <div className="mb-6 p-4 bg-rose-50 dark:bg-rose-900/20 border border-rose-200 dark:border-rose-800 rounded-xl">
+              <h3 className="text-rose-700 dark:text-rose-400 font-bold flex items-center gap-2 mb-1">
+                ⚠️ Watchlist Under Attack
+              </h3>
+              <p className="text-sm text-rose-600 dark:text-rose-300">
+                This post or its comments are exhibiting negative or hostile behavior toward a watchlist target.
+              </p>
+            </div>
+          )}
+
+          <div className="flex flex-wrap items-center gap-3 mb-6">
             <div className="flex flex-wrap gap-2 flex-1">
               <span className={`chip ${getSentimentColor(post.overall_sentiment)}`}>sentiment {post.overall_sentiment} {post.sentiment_score?.toFixed(2)}</span>
               {post.confidence?.overall !== undefined && <span className="chip bg-blue-50 border-blue-200 text-blue-700 dark:bg-blue-900/30 dark:border-blue-800 dark:text-blue-400">confidence {pct(post.confidence.overall)}</span>}
@@ -434,11 +445,34 @@ export default function PostModal({ post, onClose }) {
                     <div className="divide-y divide-slate-100 dark:divide-zinc-800/60">
                       {commentsData.comments?.map((c, i) => (
                         <div key={c.id || i} className="p-3 md:p-4 flex flex-col md:flex-row md:items-start gap-3 md:gap-4 hover:bg-slate-50 dark:hover:bg-zinc-900 transition-colors">
-                          <div className="w-24 shrink-0 flex items-center">
-                            <span className={`px-2 py-1 rounded text-[10px] font-bold uppercase tracking-wider ${getSentimentColor(c.sentiment || 'neutral')}`}>
-                              {c.sentiment || 'neutral'}
-                            </span>
-                          </div>
+                          {c.parallel_labels ? (
+                            <div className="w-32 shrink-0 flex flex-col gap-1.5">
+                              <div className="flex justify-between items-center bg-slate-50 dark:bg-zinc-900/50 px-2 py-1 rounded border border-slate-100 dark:border-zinc-800">
+                                <span className="text-[9px] font-bold text-slate-500">LLM</span>
+                                <span className={`text-[10px] font-bold uppercase tracking-wider ${getSentimentColor(c.parallel_labels.llm?.sentiment || 'neutral')}`}>
+                                  {c.parallel_labels.llm?.sentiment || 'neutral'}
+                                </span>
+                              </div>
+                              <div className="flex justify-between items-center bg-slate-50 dark:bg-zinc-900/50 px-2 py-1 rounded border border-slate-100 dark:border-zinc-800">
+                                <span className="text-[9px] font-bold text-slate-500">XLM-R</span>
+                                <span className={`text-[10px] font-bold uppercase tracking-wider ${getSentimentColor(c.parallel_labels.xlmr?.sentiment || 'neutral')}`}>
+                                  {c.parallel_labels.xlmr?.sentiment || 'neutral'}
+                                </span>
+                              </div>
+                              <div className="flex justify-between items-center bg-slate-50 dark:bg-zinc-900/50 px-2 py-1 rounded border border-slate-100 dark:border-zinc-800">
+                                <span className="text-[9px] font-bold text-slate-500">DistilBERT</span>
+                                <span className={`text-[10px] font-bold uppercase tracking-wider ${getSentimentColor(c.parallel_labels.distilbert?.sentiment || 'neutral')}`}>
+                                  {c.parallel_labels.distilbert?.sentiment || 'neutral'}
+                                </span>
+                              </div>
+                            </div>
+                          ) : (
+                            <div className="w-24 shrink-0 flex items-center">
+                              <span className={`px-2 py-1 rounded text-[10px] font-bold uppercase tracking-wider ${getSentimentColor(c.sentiment || 'neutral')}`}>
+                                {c.sentiment || 'neutral'}
+                              </span>
+                            </div>
+                          )}
                           <div className="flex-1 text-sm text-slate-800 dark:text-slate-200">{c.text || c.comment_text}</div>
                           <div className="w-full md:w-auto shrink-0 flex flex-wrap items-center gap-4 text-xs font-medium text-slate-500 dark:text-zinc-400 bg-slate-50 dark:bg-zinc-900 px-3 py-1.5 rounded-lg border border-slate-100 dark:border-zinc-800/50">
                             {c.emotion && <span className="flex items-center gap-1"><span className="text-slate-400 text-[10px] uppercase">E:</span> {c.emotion}</span>}
