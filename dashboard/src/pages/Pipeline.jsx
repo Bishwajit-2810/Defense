@@ -88,14 +88,19 @@ export default function Pipeline() {
   }, [logs, isFollowing]);
 
   const defaultNodes = [
-    { label: 'Ingestion' },
-    { label: 'Stage 1 (NLP)' },
-    { label: 'Router' },
-    { label: 'Stage 2 (LLM)' },
-    { label: 'Assembler' }
+    { label: 'Ingestion', desc: 'Consumes raw data from the stream.' },
+    { label: 'Stage 1 (NLP & LLM)', desc: 'Extracts entities, metrics, and generates heavy LLM summarization.' },
+    { label: 'Router', desc: 'Filters emoji-only spam and routes valid comments to Stage 2.' },
+    { label: 'Stage 2 (Parallel)', desc: 'Runs LLM, XLM-R, and DistilBERT concurrently on valid comments. Checks Watchlist Alerts.' },
+    { label: 'Assembler', desc: 'Merges partial results and writes final JSON to the database.' }
   ];
 
-  const stages = pipelineStats?.stages || defaultNodes;
+  const rawStages = pipelineStats?.stages || defaultNodes;
+  const stages = rawStages.map((stg, i) => ({
+    ...stg,
+    label: defaultNodes[i]?.label || stg.label,
+    desc: stg.desc || defaultNodes[i]?.desc || ''
+  }));
 
   return (
     <div className="space-y-8 animate-in fade-in slide-in-from-bottom-4 duration-500">
@@ -130,7 +135,7 @@ export default function Pipeline() {
 
             return (
               <React.Fragment key={i}>
-                <div className={`relative flex flex-col p-4 rounded-xl w-40 min-h-[120px] transition-all duration-500 border ${
+                <div title={stage.desc} className={`relative flex flex-col p-4 rounded-xl w-40 min-h-[120px] transition-all duration-500 border cursor-help ${
                   active ? 'border-brand-500/50 bg-brand-50/50 dark:bg-brand-900/10 shadow-sm' : 
                   'border-slate-200 dark:border-zinc-800 bg-slate-50 dark:bg-[#09090b]'
                 }`}>

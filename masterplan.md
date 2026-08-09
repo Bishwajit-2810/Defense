@@ -210,23 +210,24 @@ object per thread, reporting comment **coverage** since only a sample is shipped
                                 │  (partitioned)    │       │ analytics·retrieval·ingest│
                                 └─────────┬─────────┘       └─────────┬─────────────────┘
                                           │ consume                  │ read
-        ┌─────────────────────────────────┼──────────────────────────────────┐
-        │  STAGE 1 — Fast NLP workers (CPU + small GPU), horizontally scaled   │
-        │  lang detect · sentiment · emotion · topic · toxicity · NER · embed  │
+
+
+        │  STAGE 1 — Heavy LLM worker (GPU/Ollama), horizontally scaled      │
+        │  lang detect · NER · summarization (gemma) · text features         │
         └─────────────────────────────────┬──────────────────────────────────┘
-                                          │ writes features + confidence
+                                          │ writes features + summary
                                 ┌─────────▼─────────┐
-                                │ Router / Triage   │  decides: done? or → LLM?
-                                │ (confidence gate, │
-                                │  task flags)      │
-                                └─────┬───────┬─────┘
-                          done│             │needs LLM (selective)
-                              │       ┌─────▼──────────┐
-                              │       │ STAGE 2 — LLM   │  pluggable backend:
-                              │       │ workers         │  local vLLM ⇄ Groq API
-                              │       │ summarize·insight│  roles LLM-A / LLM-B
-                              │       │ ·report·hard NER │  (switchable runtime)
-                              │       └─────┬───────────┘
+                                │ Router / Triage   │  emoji filter &
+                                │ (spam filter,     │  parallel dispatch
+                                │  dispatch)        │
+                                └─────┬─────────────┘
+                                      │
+                              ┌───────▼───────────────────────────┐
+                              │ STAGE 2 — Parallel Execution      │
+                              │ 1. LLM (Target/Watchlist alerts)  │
+                              │ 2. XLM-R Classifier               │
+                              │ 3. DistilBERT Classifier          │
+                              └───────┬───────────────────────────┘
                               └─────────────┤
                                 ┌───────────▼───────────┐
                                 │  Result Assembler      │  builds final JSON
