@@ -130,18 +130,21 @@ export default function AnalysisJobs() {
     const handleEvent = (e) => {
       try {
         const data = JSON.parse(e.data);
-        if (data.status) {
-          setJobs(prev => prev.map(job => {
-            if (job.id === jobId || job.job_id === jobId) {
-              return { 
-                ...job, 
-                status: data.status, 
-                error: data.error || data.detail?.error || job.error
-              };
-            }
-            return job;
-          }));
-        }
+        
+        // Update job state if it's related to this job
+        setJobs(prev => prev.map(job => {
+          if (job.id === jobId || job.job_id === jobId) {
+            return { 
+              ...job, 
+              status: data.status || job.status, 
+              error: data.error || data.detail?.error || job.error,
+              completed: data.completed !== undefined ? data.completed : job.completed,
+              total: data.total !== undefined ? data.total : job.total
+            };
+          }
+          return job;
+        }));
+        
         if (e.type === 'progress' && data.total > 0) {
           const p = Math.round((data.completed / data.total) * 100);
           setLiveProgress(`Progress: ${p}% (${data.completed}/${data.total}) - ${data.status || 'running'}`);
@@ -299,7 +302,7 @@ export default function AnalysisJobs() {
                           </button>
                         ) : '-'}
                       </td>
-                      <td className="px-6 py-4 whitespace-nowrap text-sm text-slate-500">{job.post_count || '-'}</td>
+                      <td className="px-6 py-4 whitespace-nowrap text-sm text-slate-500">{job.total || job.post_count || '-'}</td>
                       <td className="px-6 py-4 whitespace-nowrap text-sm">
                         <span className={`px-2 py-1 rounded-full text-xs font-medium ${
                           isFinished ? 'bg-emerald-100 text-emerald-700 dark:bg-emerald-900/30 dark:text-emerald-400' :

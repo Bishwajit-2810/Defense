@@ -257,6 +257,7 @@ async def analysis_run(
 async def list_analysis_jobs(
     limit: int = Query(20, ge=1, le=200),
     db: AsyncSession = Depends(get_db),
+    redis: aioredis.Redis = Depends(get_redis),
     current_user: dict = Depends(get_current_user),
 ) -> dict:
     """List recent jobs (newest first), excluding reports. Backs the Jobs tab."""
@@ -276,21 +277,34 @@ async def list_analysis_jobs(
     ).mappings().all()
 
     jobs = []
-    for r in rows:
-        selector = r["selector"] or {}
-        post_ids = selector.get("post_ids") or []
-        jobs.append(
-            {
-                "id": r["id"],
-                "type": r["type"],
-                "status": r["status"],
-                "post_count": len(post_ids) or None,
-                "campaign_id": selector.get("campaign_id"),
-                "post_ids": post_ids,
-                "created_at": r["created_at"].isoformat() if r["created_at"] else None,
-                "updated_at": r["updated_at"].isoformat() if r["updated_at"] else None,
-            }
-        )
+    if rows:
+        total_keys = [f"job:{r['id']}:total" for r in rows]
+        completed_keys = [f"job:{r['id']}:completed" for r in rows]
+        
+        totals = await redis.mget(total_keys)
+        completions = await redis.mget(completed_keys)
+        
+        for i, r in enumerate(rows):
+            selector = r["selector"] or {}
+            post_ids = selector.get("post_ids") or []
+            
+            total_val = int(totals[i]) if totals[i] is not None else None
+            completed_val = int(completions[i]) if completions[i] is not None else 0
+            
+            jobs.append(
+                {
+                    "id": r["id"],
+                    "type": r["type"],
+                    "status": r["status"],
+                    "post_count": len(post_ids) or None,
+                    "campaign_id": selector.get("campaign_id"),
+                    "post_ids": post_ids,
+                    "total": total_val,
+                    "completed": completed_val,
+                    "created_at": r["created_at"].isoformat() if r["created_at"] else None,
+                    "updated_at": r["updated_at"].isoformat() if r["updated_at"] else None,
+                }
+            )
     return {"jobs": jobs, "total": len(jobs)}
 
 

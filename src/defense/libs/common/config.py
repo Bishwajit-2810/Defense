@@ -132,7 +132,7 @@ class Settings(BaseSettings):
     log_redis_ttl: int = 86400
     app_env: str = "dev"
     jwt_secret: str = ""
-    jwt_expire_hours: int = 1
+    jwt_expire_hours: int = 12
     sse_ticket_ttl: int = 60
     otel_enabled: bool = False
     otel_exporter_otlp_endpoint: str = ""
