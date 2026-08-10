@@ -41,3 +41,8 @@ neutral:
 # encoded, and if you fill it in, say so out loud in the defense.
 favored: []
 opposed: []
+
+# Always Alert. Entities in this list will trigger a Watchlist Alert whenever
+# they are mentioned in a comment, regardless of whether the sentiment is
+# supportive, opposing, or neutral.
+always: []

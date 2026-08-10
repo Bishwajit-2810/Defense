@@ -225,11 +225,16 @@ def _emoji_counts(text: str) -> tuple[int, int]:
 #: an LLM to read, so sending it is the cheapest possible way to waste tokens.
 KIND_EMOJI = "emoji"              # no word tokens at all
 KIND_SHORT = "short"              # 1-2 word tokens, or < 4 textual characters
+KIND_LINK = "link"                # text is solely a URL
 KIND_SUBSTANTIVE = "substantive"  # enough text to be worth a model
 
+_URL_RE = re.compile(r"^\s*(https?://[^\s]+|www\.[^\s]+)\s*$", re.IGNORECASE)
 
 def _comment_kind(text: str, tokens: list[str] | None = None) -> str:
     """Classify a comment by how much text it actually contains."""
+    if _URL_RE.match(text or ""):
+        return KIND_LINK
+    
     if tokens is None:
         tokens = _WORD_RE.findall(text or "")
     if not tokens:
@@ -296,7 +301,7 @@ async def classify_comment(
             # comments: they carry real crowd signal (❤️ and 🤬 both mean
             # something) so they are kept, but they are excluded from every LLM
             # batch — there is no text in them for an LLM to read.
-            "method": "emoji" if kind == KIND_EMOJI else "fast",
+            "method": "emoji" if kind == KIND_EMOJI else ("link" if kind == KIND_LINK else "fast"),
             "kind": kind,
             # Emotion is always the free heuristic at Stage 1 — never a model.
             "emotion_method": "heuristic",

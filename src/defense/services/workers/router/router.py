@@ -103,15 +103,22 @@ async def _process_message(
     stage1_result: dict = payload.get("stage1_result", {})
     options: dict = payload.get("options", {})
 
-    if config.filter_emoji_only:
-        ca = stage1_result.get("comment_analysis") or {}
-        comments = ca.get("comments") or []
-        if comments:
-            emoji_pattern = re.compile(r'^[\s\U00010000-\U0010ffff]+$')
-            for c in comments:
-                text = (c.get("text") or "").strip()
-                if c.get("kind") == "emoji" or emoji_pattern.match(text):
-                    c["kind"] = "filtered"
+    ca = stage1_result.get("comment_analysis") or {}
+    comments = ca.get("comments") or []
+    if comments:
+        emoji_pattern = re.compile(r'[\U00010000-\U0010ffff]+')
+        for c in comments:
+            text = (c.get("text") or "").strip()
+            
+            # Remove all emojis from the comment text
+            stripped_text = emoji_pattern.sub('', text).strip()
+            
+            # Update the comment text without emojis
+            c["text"] = stripped_text
+            
+            # If the comment was pure emojis or is now empty, mark it as filtered
+            if c.get("kind") == "emoji" or not stripped_text:
+                c["kind"] = "filtered"
 
     use_llm, reasons = should_use_llm(stage1_result, options)
     job_id = payload.get("job_id")

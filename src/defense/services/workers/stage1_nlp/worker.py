@@ -50,6 +50,7 @@ from defense.libs import streams  # noqa: E402
 from .fusion import fuse_sentiment, image_has_signal  # noqa: E402
 from .models import ModelRegistry  # noqa: E402
 from .text_analyzer import analyze_text  # noqa: E402
+from .comment_analyzer import analyze_comments  # noqa: E402
 from . import vision_analyzer as vision  # noqa: E402
 from .vision_analyzer import analyze_image  # noqa: E402
 
@@ -475,7 +476,20 @@ async def _process_message(
         except Exception as e:
             log.error("stage1_post_type_failed", error=str(e))
 
-    comment_analysis = {"analyzed": 0, "comments": comments}
+    # 3. Comment NLP
+    t3 = time.monotonic()
+    comment_analysis = await analyze_comments(
+        comments,
+        registry,
+        sentiment_override=sentiment_override,
+        backend_override=backend_override,
+    )
+    log.info(
+        "stage1_comments_done",
+        post_id=post_id,
+        analyzed=comment_analysis.get("analyzed", 0),
+        ms=round((time.monotonic() - t3) * 1000, 1),
+    )
 
 
     # 4. Sentiment fusion

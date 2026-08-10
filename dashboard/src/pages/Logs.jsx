@@ -119,13 +119,13 @@ export default function Logs() {
             logs.map((log, i) => (
               <div key={i} className="flex gap-4 py-1 hover:bg-slate-50 dark:hover:bg-zinc-900/50 px-2 -mx-2 rounded transition-colors group">
                 <span className="text-slate-400 dark:text-zinc-500 shrink-0 select-none">
-                  {new Date(log.time * 1000).toLocaleTimeString([], { hour12: false, fractionalSecondDigits: 3 })}
+                  {new Date((log.ts || log.time || Date.now() / 1000) * 1000).toLocaleTimeString([], { hour12: false, fractionalSecondDigits: 3 })}
                 </span>
                 <span className={`px-2 py-0.5 rounded text-[10px] font-bold uppercase shrink-0 w-16 text-center select-none ${getLevelColor(log.level)}`}>
                   {log.level}
                 </span>
-                <span className="text-slate-500 dark:text-zinc-400 shrink-0 w-24 truncate select-none" title={log.name}>
-                  {log.name}
+                <span className="text-slate-500 dark:text-zinc-400 shrink-0 w-32 truncate select-none" title={log.service || log.module || log.name}>
+                  {log.service !== '-' ? log.service : (log.module || log.name)}
                 </span>
                 <span className="text-slate-800 dark:text-zinc-300 whitespace-pre-wrap break-words flex-1">
                   {log.message}

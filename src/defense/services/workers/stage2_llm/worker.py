@@ -619,9 +619,9 @@ def _normalize_stance(parsed: Any, n: int, valid_target_ids: set[str] | None = N
 
 def _map_sentiment_label(label: str) -> str:
     label = label.lower()
-    if "pos" in label:
+    if "pos" in label or "4 star" in label or "5 star" in label:
         return "positive"
-    elif "neg" in label:
+    elif "neg" in label or "1 star" in label or "2 star" in label:
         return "negative"
     return "neutral"
 
@@ -953,7 +953,7 @@ async def _run_comment_summary(
     reps = ca.get("representative_comments") or []
 
     raw_key = (
-        post_context[:500]
+        post_summary[:500]
         + "||" + json.dumps(sb, sort_keys=True)
         + "||" + json.dumps(eb, sort_keys=True)
         + "||" + "|".join((c.get("text") or "")[:120] for c in reps[:4])
@@ -966,7 +966,7 @@ async def _run_comment_summary(
         await _track_usage(redis, cache_hit=True, lane=LANE_COMMENT, task="comment_summary")
         return cached.get("summary")
 
-    messages = build_comment_summary_messages(post_context, sb, eb, reps, target_lang)
+    messages = build_comment_summary_messages(post_summary, sb, eb, reps, target_lang)
     resp = await llm.chat(
         # Summarization, not classification — the summary role (§6.5).
         role=_SUMMARY_ROLE,
@@ -1258,6 +1258,11 @@ async def _process_message(
                 
                 # Watchlist
                 for trg in llm_data.get("target_stances", []):
+                    target_id = trg.get("target")
+                    target_obj = watchlist.by_id(target_id) if watchlist else None
+                    if target_obj and target_obj.polarity == "always":
+                        watchlist_alert = True
+                        break
                     if trg.get("stance") == "opposing":
                         watchlist_alert = True
                         break
@@ -1305,6 +1310,7 @@ async def _process_message(
     llm_backend = post_out.pop("_llm_backend", None) or comment_out.pop("_llm_backend", None)
     llm_model = post_out.pop("_llm_model", None)
     stage2_result.update(post_out)
+    stage2_result.update(comment_out)
 
     elapsed_ms = int((time.monotonic() - t0) * 1000)
     stage2_result["processing"] = {

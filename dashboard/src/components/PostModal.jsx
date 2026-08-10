@@ -445,34 +445,41 @@ export default function PostModal({ post, onClose }) {
                     <div className="divide-y divide-slate-100 dark:divide-zinc-800/60">
                       {commentsData.comments?.map((c, i) => (
                         <div key={c.id || i} className="p-3 md:p-4 flex flex-col md:flex-row md:items-start gap-3 md:gap-4 hover:bg-slate-50 dark:hover:bg-zinc-900 transition-colors">
-                          {c.parallel_labels ? (
-                            <div className="w-32 shrink-0 flex flex-col gap-1.5">
-                              <div className="flex justify-between items-center bg-slate-50 dark:bg-zinc-900/50 px-2 py-1 rounded border border-slate-100 dark:border-zinc-800">
-                                <span className="text-[9px] font-bold text-slate-500">LLM</span>
-                                <span className={`text-[10px] font-bold uppercase tracking-wider ${getSentimentColor(c.parallel_labels.llm?.sentiment || 'neutral')}`}>
-                                  {c.parallel_labels.llm?.sentiment || 'neutral'}
-                                </span>
-                              </div>
-                              <div className="flex justify-between items-center bg-slate-50 dark:bg-zinc-900/50 px-2 py-1 rounded border border-slate-100 dark:border-zinc-800">
-                                <span className="text-[9px] font-bold text-slate-500">XLM-R</span>
-                                <span className={`text-[10px] font-bold uppercase tracking-wider ${getSentimentColor(c.parallel_labels.xlmr?.sentiment || 'neutral')}`}>
-                                  {c.parallel_labels.xlmr?.sentiment || 'neutral'}
-                                </span>
-                              </div>
-                              <div className="flex justify-between items-center bg-slate-50 dark:bg-zinc-900/50 px-2 py-1 rounded border border-slate-100 dark:border-zinc-800">
-                                <span className="text-[9px] font-bold text-slate-500">DistilBERT</span>
-                                <span className={`text-[10px] font-bold uppercase tracking-wider ${getSentimentColor(c.parallel_labels.distilbert?.sentiment || 'neutral')}`}>
-                                  {c.parallel_labels.distilbert?.sentiment || 'neutral'}
-                                </span>
-                              </div>
-                            </div>
-                          ) : (
-                            <div className="w-24 shrink-0 flex items-center">
+                          <div className="w-32 shrink-0 flex flex-col gap-1.5">
+                            <div className="flex items-center mb-1">
                               <span className={`px-2 py-1 rounded text-[10px] font-bold uppercase tracking-wider ${getSentimentColor(c.sentiment || 'neutral')}`}>
                                 {c.sentiment || 'neutral'}
                               </span>
                             </div>
-                          )}
+                            {c.parallel_labels && (
+                              <>
+                                {c.parallel_labels.llm && (
+                                  <div className="flex justify-between items-center bg-slate-50 dark:bg-zinc-900/50 px-2 py-1 rounded border border-slate-100 dark:border-zinc-800">
+                                    <span className="text-[9px] font-bold text-slate-500">LLM</span>
+                                    <span className={`text-[10px] font-bold uppercase tracking-wider ${getSentimentColor(c.parallel_labels.llm.sentiment)}`}>
+                                      {c.parallel_labels.llm.sentiment}
+                                    </span>
+                                  </div>
+                                )}
+                                {c.parallel_labels.xlmr && (
+                                  <div className="flex justify-between items-center bg-slate-50 dark:bg-zinc-900/50 px-2 py-1 rounded border border-slate-100 dark:border-zinc-800">
+                                    <span className="text-[9px] font-bold text-slate-500">XLM-R</span>
+                                    <span className={`text-[10px] font-bold uppercase tracking-wider ${getSentimentColor(c.parallel_labels.xlmr.sentiment)}`}>
+                                      {c.parallel_labels.xlmr.sentiment}
+                                    </span>
+                                  </div>
+                                )}
+                                {c.parallel_labels.distilbert && (
+                                  <div className="flex justify-between items-center bg-slate-50 dark:bg-zinc-900/50 px-2 py-1 rounded border border-slate-100 dark:border-zinc-800">
+                                    <span className="text-[9px] font-bold text-slate-500">DistilBERT</span>
+                                    <span className={`text-[10px] font-bold uppercase tracking-wider ${getSentimentColor(c.parallel_labels.distilbert.sentiment)}`}>
+                                      {c.parallel_labels.distilbert.sentiment}
+                                    </span>
+                                  </div>
+                                )}
+                              </>
+                            )}
+                          </div>
                           <div className="flex-1 text-sm text-slate-800 dark:text-slate-200">{c.text || c.comment_text}</div>
                           <div className="w-full md:w-auto shrink-0 flex flex-wrap items-center gap-4 text-xs font-medium text-slate-500 dark:text-zinc-400 bg-slate-50 dark:bg-zinc-900 px-3 py-1.5 rounded-lg border border-slate-100 dark:border-zinc-800/50">
                             {c.emotion && <span className="flex items-center gap-1"><span className="text-slate-400 text-[10px] uppercase">E:</span> {c.emotion}</span>}

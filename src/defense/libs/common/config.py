@@ -117,8 +117,8 @@ class Settings(BaseSettings):
     filter_emoji_only: bool = True
     
     # Stage 2 Parallel Classifiers
-    stage2_classifier_1: str = "xlm-roberta-base-finetuned"
-    stage2_classifier_2: str = "distilbert-base-multilingual"
+    stage2_classifier_1: str = "tabularisai/multilingual-sentiment-analysis"
+    stage2_classifier_2: str = "lxyuan/distilbert-base-multilingual-cased-sentiments-student"
     
     # Assembler
     assembler_batch_size: int = 50

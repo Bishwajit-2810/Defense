@@ -815,6 +815,7 @@ def _row_to_result(row: Any) -> AnalysisResultResponse:
         post_summary_grounding=r.get("post_summary_grounding"),
         post_summary_truncated=r.get("post_summary_truncated"),
         language_method=r.get("language_method"),
+        watchlist_alert=r.get("watchlist_alert", False),
         overall_sentiment=r.get("overall_sentiment", "neutral"),
         sentiment_score=r.get("sentiment_score", 0.0),
         text_sentiment=r.get("text_sentiment"),

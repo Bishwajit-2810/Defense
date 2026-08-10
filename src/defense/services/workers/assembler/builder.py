@@ -451,6 +451,7 @@ def build_canonical_result(
         "processing": processing,
         "created_at": created_at,
         "scraped_at": scraped_at,
+        "watchlist_alert": stage2_result.get("watchlist_alert", False) if stage2_result else False,
     }
 
     # ------------------------------------------------------------------
