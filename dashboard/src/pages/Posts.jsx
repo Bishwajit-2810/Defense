@@ -1,5 +1,5 @@
 import React, { useState, useEffect } from 'react';
-import { apiCall } from '../utils/api.js';
+import { apiCall, API_BASE, getAuthHeaders } from '../utils/api.js';
 import PostModal from '../components/PostModal';
 
 export default function Posts() {
@@ -25,6 +25,27 @@ export default function Posts() {
       setPosts(data.results || (Array.isArray(data) ? data : []));
     } catch (err) {
       console.error(err);
+    }
+  };
+  
+  const downloadZip = async () => {
+    try {
+      const res = await fetch(`${API_BASE}/v1/analysis/export?only_warnings=false`, {
+        headers: getAuthHeaders()
+      });
+      if (!res.ok) throw new Error('Download failed');
+      const blob = await res.blob();
+      const url = window.URL.createObjectURL(blob);
+      const a = document.createElement('a');
+      a.href = url;
+      a.download = `defense_all_analyses.zip`;
+      document.body.appendChild(a);
+      a.click();
+      window.URL.revokeObjectURL(url);
+      document.body.removeChild(a);
+    } catch (err) {
+      console.error(err);
+      alert('Failed to download ZIP');
     }
   };
 
@@ -137,6 +158,7 @@ export default function Posts() {
               onChange={e => setCampaignId(e.target.value)}
               className="px-3 py-1.5 text-sm bg-white dark:bg-zinc-900 border border-slate-200 dark:border-zinc-700 rounded-lg"
             />
+            <button onClick={downloadZip} className="px-3 py-1.5 text-sm bg-white dark:bg-zinc-900 border border-slate-200 dark:border-zinc-700 rounded-lg hover:bg-slate-100 dark:hover:bg-zinc-800">Export ZIP</button>
             <button onClick={fetchPosts} className="px-3 py-1.5 text-sm bg-white dark:bg-zinc-900 border border-slate-200 dark:border-zinc-700 rounded-lg hover:bg-slate-100 dark:hover:bg-zinc-800">Refresh</button>
           </div>
         </div>

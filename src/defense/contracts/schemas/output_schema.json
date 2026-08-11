@@ -123,7 +123,7 @@
             "type":"object",
             "properties": {
               "display":{"type":"string"},
-              "polarity":{"type":"string","enum":["favored","opposed","neutral"],"description":"As declared in the watchlist — an editorial choice by the operator."},
+              "polarity":{"type":"string","enum":["favored","opposed","neutral","always"],"description":"As declared in the watchlist — an editorial choice by the operator."},
               "mentions":{"type":"integer"},
               "supportive":{"type":"integer"},
               "opposing":{"type":"integer"},

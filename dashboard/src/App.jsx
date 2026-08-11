@@ -12,6 +12,7 @@ import Chat from './pages/Chat';
 import Agents from './pages/Agents';
 import Trace from './pages/Trace';
 import Welcome from './pages/Welcome';
+import Warnings from './pages/Warnings';
 import { getAuthToken, logout } from './utils/api';
 
 function App() {
@@ -65,6 +66,7 @@ function App() {
             {activeTab === 'chat' && <Chat />}
             {activeTab === 'pipeline' && <Pipeline />}
             {activeTab === 'trace' && <Trace />}
+            {activeTab === 'warnings' && <Warnings />}
             {activeTab === 'logs' && <Logs />}
           </div>
         </main>

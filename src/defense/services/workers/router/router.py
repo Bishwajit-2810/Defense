@@ -106,12 +106,16 @@ async def _process_message(
     ca = stage1_result.get("comment_analysis") or {}
     comments = ca.get("comments") or []
     if comments:
-        emoji_pattern = re.compile(r'[\U00010000-\U0010ffff]+')
+        import emoji
+        url_pattern = re.compile(r'https?://\S+|www\.\S+')
         for c in comments:
             text = (c.get("text") or "").strip()
             
+            # Mark all links as link
+            text = url_pattern.sub('link', text)
+            
             # Remove all emojis from the comment text
-            stripped_text = emoji_pattern.sub('', text).strip()
+            stripped_text = emoji.replace_emoji(text, replace='').strip()
             
             # Update the comment text without emojis
             c["text"] = stripped_text

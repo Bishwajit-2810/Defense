@@ -64,45 +64,43 @@ export default function PostModal({ post, onClose }) {
       } catch (e) {}
     }
 
+    const headStyles = Array.from(document.head.querySelectorAll('style, link[rel="stylesheet"]'))
+      .map(node => node.outerHTML)
+      .join('\n');
+
     const w = window.open('', '_blank');
     w.document.write('<!DOCTYPE html><html><head><title>Post Analysis - ' + (post.post_id || 'Detail') + '</title>');
+    w.document.write(headStyles);
     w.document.write(`
       <style>
-        body { font-family: system-ui, -apple-system, sans-serif; color: #333; line-height: 1.5; padding: 20px; max-width: 900px; margin: 0 auto; background: white; }
-        h1, h2, h3, h4, h5 { color: #111; margin-bottom: 0.5em; margin-top: 0; }
-        .chip { display: inline-flex; align-items: center; padding: 2px 8px; margin: 2px 4px 2px 0; border-radius: 999px; font-size: 11px; font-weight: 600; text-transform: uppercase; background: #f1f5f9; border: 1px solid #e2e8f0; color: #475569; }
-        .chip-pos { background: #dcfce7; border-color: #bbf7d0; color: #15803d; }
-        .chip-neg { background: #ffe4e6; border-color: #fecdd3; color: #be123c; }
-        .chip-brand { background: #eff6ff; border-color: #bfdbfe; color: #1d4ed8; }
-        .section { margin-bottom: 24px; padding-bottom: 16px; border-bottom: 1px solid #e2e8f0; }
-        .section-title { font-size: 12px; font-weight: 700; text-transform: uppercase; letter-spacing: 0.05em; color: #64748b; margin-bottom: 12px; border-bottom: 1px solid #e2e8f0; padding-bottom: 4px; }
-        .grid-3 { display: grid; grid-template-columns: repeat(3, 1fr); gap: 16px; }
-        .grid-2 { display: grid; grid-template-columns: repeat(2, 1fr); gap: 16px; }
-        .box { background: #f8fafc; border: 1px solid #e2e8f0; border-radius: 8px; padding: 12px; font-size: 14px; }
-        .bar-wrap { margin-bottom: 8px; }
-        .bar-label { display: flex; justify-content: space-between; font-size: 11px; font-weight: 600; margin-bottom: 4px; color: #475569; }
-        .bar-track { height: 6px; background: #e2e8f0; border-radius: 3px; overflow: hidden; }
-        .bar-fill { height: 100%; border-radius: 3px; }
-        .comment-item { padding: 12px; border-bottom: 1px solid #e2e8f0; font-size: 13px; display: flex; gap: 12px; }
-        .comment-meta { font-size: 11px; color: #64748b; min-width: 120px; }
-        .mini-list { font-size: 12px; }
-        .mini-row { display: flex; justify-content: space-between; padding: 4px 0; border-bottom: 1px solid #f1f5f9; }
+        body { 
+          font-family: system-ui, -apple-system, sans-serif; 
+          background: white !important;
+          color: black;
+          padding: 20px; 
+          max-width: 1000px; 
+          margin: 0 auto; 
+          -webkit-print-color-adjust: exact; 
+          print-color-adjust: exact; 
+        }
         @media print {
           body { padding: 0; }
           .section { page-break-inside: avoid; }
         }
       </style>
     `);
-    w.document.write('</head><body>');
-    w.document.write('<h2>Defense Analysis — Post Detail</h2>');
-    w.document.write('<div style="font-size:12px; color:#64748b; margin-bottom: 16px;">Post ID: ' + (post.post_id || 'Unknown') + '</div>');
+    w.document.write('</head><body class="bg-white dark:bg-white text-slate-900">');
+    w.document.write('<div style="margin-bottom: 20px;">');
+    w.document.write('<h2 class="text-2xl font-bold mb-1">Defense Analysis — Post Detail</h2>');
+    w.document.write('<div class="text-sm text-slate-500 mb-4">Post ID: ' + (post.post_id || 'Unknown') + '</div>');
     w.document.write(clone.innerHTML);
+    w.document.write('</div>');
     w.document.write('</body></html>');
     w.document.close();
     
     setTimeout(() => {
       w.print();
-    }, 500);
+    }, 1000);
   };
 
   const pct = (val) => Math.round((val || 0) * 100) + '%';

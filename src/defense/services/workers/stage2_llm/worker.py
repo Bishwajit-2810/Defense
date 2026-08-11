@@ -1252,20 +1252,28 @@ async def _process_message(
             sentiment_breakdown = {"positive": 0, "negative": 0, "neutral": 0}
             emotion_breakdown = {}
             watchlist_alert = False
+            watchlist = _targets()
+            
+            if watchlist:
+                for trg_id in watchlist.matched_ids(stage1_result.get("post_text") or ""):
+                    trg_obj = watchlist.by_id(trg_id)
+                    if trg_obj and trg_obj.polarity == "always":
+                        watchlist_alert = True
+                        break
             
             for c in comments:
                 llm_data = c.get("parallel_labels", {}).get("llm", {})
                 
                 # Watchlist
-                for trg in llm_data.get("target_stances", []):
-                    target_id = trg.get("target")
-                    target_obj = watchlist.by_id(target_id) if watchlist else None
-                    if target_obj and target_obj.polarity == "always":
-                        watchlist_alert = True
-                        break
-                    if trg.get("stance") == "opposing":
-                        watchlist_alert = True
-                        break
+                if watchlist and not watchlist_alert:
+                    for trg in c.get("target_stances", []):
+                        target_obj = watchlist.by_id(trg.get("target"))
+                        if target_obj and target_obj.polarity == "always":
+                            watchlist_alert = True
+                            break
+                        if trg.get("stance") == "opposing":
+                            watchlist_alert = True
+                            break
                         
                 # Breakdowns for comment summary
                 s = llm_data.get("sentiment")

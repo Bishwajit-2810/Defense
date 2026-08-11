@@ -42,6 +42,9 @@ dependencies = [
     "msgpack>=1.2.1",
     "torch>=2.5.0",
     "transformers>=4.47.0",
+    "emoji>=2.15.0",
+    "reportlab>=5.0.0",
+    "weasyprint>=69.0",
 ]
 
 [project.optional-dependencies]
