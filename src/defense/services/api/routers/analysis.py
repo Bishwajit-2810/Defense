@@ -469,6 +469,406 @@ async def analysis_overview(
     )
 
 
+import io
+import zipfile
+try:
+    from weasyprint import HTML
+except ImportError:
+    HTML = None
+
+from datetime import datetime, timezone
+
+from datetime import datetime, timezone
+
+def _result_to_html(res: dict) -> str:
+    # Safely get variables
+    post_id = res.get("post_id", "Unknown")
+    alert = res.get("watchlist_alert", False)
+    
+    # Overview metrics
+    overall_sentiment = str(res.get("overall_sentiment", "neutral")).lower()
+    sentiment_score = res.get("sentiment_score") or 0.0
+    conf = res.get("confidence") or {}
+    conf_overall = conf.get("overall", 0.0)
+    platform = res.get("platform", "Unknown")
+    lang = res.get("language", "und")
+    post_type = res.get("post_type", "Unknown")
+    primary_emotion = (res.get("emotion") or {}).get("primary", "")
+    tox = res.get("toxicity_score") or 0.0
+    hate = res.get("hate_speech_score") or 0.0
+    
+    # Content
+    post_text = str(res.get("post_text") or res.get("text", "")).replace("&", "&amp;").replace("<", "&lt;").replace(">", "&gt;")
+    summary = str(res.get("post_summary", "")).replace("&", "&amp;").replace("<", "&lt;").replace(">", "&gt;")
+    insight = str(res.get("insight", "")).replace("&", "&amp;").replace("<", "&lt;").replace(">", "&gt;")
+    
+    # Sentiments
+    text_sent = (res.get("text_sentiment") or {}).get("label", "neutral")
+    text_score = (res.get("text_sentiment") or {}).get("score", 0.0)
+    img_sent = (res.get("image_sentiment") or {}).get("label", "neutral")
+    img_score = (res.get("image_sentiment") or {}).get("score", 0.0)
+    baseline_sent = res.get("baseline_sentiment") or 0.0
+    
+    # Helper for formatting
+    def pct(val): return f"{round((val or 0) * 100)}%"
+    def get_sev_color(s):
+        if s > 0.5: return "#ef4444"
+        if s > 0.2: return "#f59e0b"
+        return "#10b981"
+    def get_sent_color(s):
+        if s == 'positive': return "color: #059669; background: #d1fae5; border-color: #a7f3d0;"
+        if s == 'negative': return "color: #e11d48; background: #ffe4e6; border-color: #fecdd3;"
+        return "color: #334155; background: #f1f5f9; border-color: #e2e8f0;"
+    
+    def get_sent_class(s):
+        return 'chip-pos' if s == 'positive' else 'chip-neg' if s == 'negative' else 'chip-neutral'
+
+    # Build Chips
+    chips_html = ""
+    chips_html += f'<span class="chip {get_sent_class(overall_sentiment)}">sentiment {overall_sentiment} {sentiment_score:.2f}</span>'
+    if conf_overall is not None:
+        chips_html += f'<span class="chip chip-brand">confidence {pct(conf_overall)}</span>'
+    if platform:
+        chips_html += f'<span class="chip chip-neutral">{platform} &bull; lang: {lang}</span>'
+    if post_type:
+        chips_html += f'<span class="chip chip-indigo">type {post_type}</span>'
+    if primary_emotion:
+        chips_html += f'<span class="chip chip-purple">emotion {primary_emotion}</span>'
+    if tox is not None:
+        chips_html += f'<span class="chip chip-neutral">toxicity {pct(tox)}</span>'
+    if hate is not None:
+        chips_html += f'<span class="chip chip-neutral">hate {pct(hate)}</span>'
+
+    # Alert HTML
+    alert_html = ""
+    if alert:
+        alert_html = """
+        <div class="alert-box">
+            <h3 class="alert-title">⚠️ Watchlist Under Attack</h3>
+            <p class="alert-text">This post or its comments are exhibiting negative or hostile behavior toward a watchlist target.</p>
+        </div>
+        """
+
+    # Summary & Insight HTML
+    summary_html = ""
+    if summary or insight:
+        summary_html += '<div class="grid-2">'
+        if summary:
+            summary_html += f"""
+            <div>
+                <div class="section-title-sm">Post Summary</div>
+                <div class="box box-brand">{summary}</div>
+            </div>
+            """
+        if insight:
+            summary_html += f"""
+            <div>
+                <div class="section-title-sm">Insight (Stage 2)</div>
+                <div class="box box-amber">{insight}</div>
+            </div>
+            """
+        summary_html += '</div>'
+
+    def render_sent_item(label, val, score=None):
+        val_str = str(val or "N/A").lower()
+        color = "#059669" if val_str == "positive" else "#e11d48" if val_str == "negative" else "#64748b"
+        score_html = f'<div class="sent-score">{score:.3f}</div>' if score is not None else ""
+        return f"""
+        <div class="sent-item">
+            <div class="sent-label">{label}</div>
+            <div class="sent-val" style="color: {color};">{val_str}</div>
+            {score_html}
+        </div>
+        """
+        
+    def render_bar(label, val, color):
+        val = val or 0.0
+        return f"""
+        <div class="bar-wrap">
+            <div class="bar-label"><span>{label}</span><span>{pct(val)}</span></div>
+            <div class="bar-track"><div class="bar-fill" style="background-color: {color}; width: {pct(val)};"></div></div>
+        </div>
+        """
+
+    # Signals
+    conf = res.get("confidence") or {}
+    signals_html = f"""
+    <div class="grid-3" style="margin-bottom: 24px; padding: 16px; background: #f8fafc; border: 1px solid #e2e8f0; border-radius: 8px;">
+        <div>
+            <h4 class="sig-title">Emotion</h4>
+            <span class="chip chip-purple" style="display:inline-block;">{primary_emotion.upper() if primary_emotion else "NONE"}</span>
+        </div>
+        <div>
+            <h4 class="sig-title">Confidence</h4>
+            {render_bar('Overall', conf.get('overall', 0), '#3b82f6')}
+            {render_bar('Sentiment', conf.get('sentiment', 0), '#3b82f6')}
+            {render_bar('Language', conf.get('language', 0), '#3b82f6')}
+            {render_bar('Topics', conf.get('topics', 0), '#3b82f6')}
+        </div>
+        <div>
+            <h4 class="sig-title">Safety</h4>
+            {render_bar('Toxicity', tox, get_sev_color(tox))}
+            {render_bar('Hate speech', hate, get_sev_color(hate))}
+        </div>
+    </div>
+    """
+
+    # Comments
+    comments = (res.get("comment_analysis") or {}).get("comments", [])
+    comments_html = ""
+    for c in comments:
+        c_text = str(c.get("text", c.get("comment_text", ""))).replace("&", "&amp;").replace("<", "&lt;").replace(">", "&gt;")
+        c_sent = str(c.get("sentiment", "neutral")).lower()
+        c_score = c.get("sentiment_score", 0.0)
+        c_emo = c.get("emotion", "")
+        
+        tags = []
+        if c_emo: tags.append(f'<span class="c-tag">E: {c_emo}</span>')
+        if c_score is not None: tags.append(f'<span class="c-tag">SCORE: {c_score:.2f}</span>')
+        tags_str = " ".join(tags)
+        
+        comments_html += f"""
+        <table style="width: 100%; border-bottom: 1px solid #e2e8f0; margin-bottom: 12px; padding-bottom: 12px; page-break-inside: avoid;">
+            <tr>
+                <td style="width: 100px; vertical-align: top; padding-right: 12px;">
+                    <div class="c-pill" style="{get_sent_color(c_sent)}">{c_sent.upper()}</div>
+                </td>
+                <td style="vertical-align: top; font-size: 13px; color: #1e293b; line-height: 1.5;">
+                    {c_text}
+                </td>
+            </tr>
+            <tr>
+                <td></td>
+                <td style="padding-top: 6px;">{tags_str}</td>
+            </tr>
+        </table>
+        """
+        
+    if not comments:
+        comments_html = "<div style='color:#64748b; font-size:13px;'>No comments found for this post.</div>"
+
+    return f"""
+    <!DOCTYPE html>
+    <html>
+    <head>
+        <meta charset="utf-8">
+        <style>
+            @page {{
+                size: A4;
+                margin: 20mm;
+                @bottom-center {{
+                    content: "Page " counter(page) " of " counter(pages);
+                    font-size: 9pt;
+                    color: #94a3b8;
+                    font-family: sans-serif;
+                }}
+            }}
+            body {{
+                font-family: system-ui, -apple-system, sans-serif;
+                color: #0f172a;
+                font-size: 13px;
+                line-height: 1.5;
+                margin: 0;
+            }}
+            .header {{
+                border-bottom: 1px solid #e2e8f0;
+                padding-bottom: 16px;
+                margin-bottom: 24px;
+                background: #f8fafc;
+                padding: 16px;
+                border-radius: 8px;
+            }}
+            .header h3 {{ margin: 0 0 4px 0; font-size: 20px; font-weight: 700; }}
+            .header .meta {{ font-size: 12px; color: #64748b; font-family: monospace; }}
+            
+            .alert-box {{
+                background: #fff1f2;
+                border: 1px solid #fecdd3;
+                border-radius: 8px;
+                padding: 16px;
+                margin-bottom: 24px;
+            }}
+            .alert-title {{ margin: 0 0 4px 0; color: #be123c; font-size: 14px; font-weight: 700; }}
+            .alert-text {{ margin: 0; color: #e11d48; font-size: 13px; }}
+            
+            .chips-container {{ margin-bottom: 24px; line-height: 2.2; }}
+            .chip {{
+                display: inline-block;
+                padding: 3px 10px;
+                margin: 0 6px 6px 0;
+                border-radius: 999px;
+                font-size: 11px;
+                font-weight: 600;
+                text-transform: uppercase;
+                border: 1px solid;
+            }}
+            .chip-pos {{ background: #dcfce7; border-color: #bbf7d0; color: #15803d; }}
+            .chip-neg {{ background: #ffe4e6; border-color: #fecdd3; color: #be123c; }}
+            .chip-neutral {{ background: #f1f5f9; border-color: #e2e8f0; color: #475569; }}
+            .chip-brand {{ background: #eff6ff; border-color: #bfdbfe; color: #1d4ed8; }}
+            .chip-indigo {{ background: #eef2ff; border-color: #c7d2fe; color: #4338ca; }}
+            .chip-purple {{ background: #faf5ff; border-color: #e9d5ff; color: #7e22ce; }}
+            
+            .section-title {{
+                font-size: 12px;
+                font-weight: 700;
+                text-transform: uppercase;
+                letter-spacing: 0.05em;
+                color: #94a3b8;
+                border-bottom: 1px solid #e2e8f0;
+                padding-bottom: 8px;
+                margin: 0 0 12px 0;
+            }}
+            .section-title-sm {{
+                font-size: 11px;
+                font-weight: 700;
+                text-transform: uppercase;
+                color: #94a3b8;
+                border-bottom: 1px solid #e2e8f0;
+                padding-bottom: 6px;
+                margin: 0 0 10px 0;
+            }}
+            
+            .box {{
+                background: #f8fafc;
+                border: 1px solid #e2e8f0;
+                border-radius: 8px;
+                padding: 16px;
+                white-space: pre-wrap;
+                margin-bottom: 24px;
+            }}
+            .box-brand {{ background: #f0fdfa; border-color: #ccfbf1; color: #115e59; }}
+            .box-amber {{ background: #fffbeb; border-color: #fef3c7; color: #92400e; }}
+            
+            .grid-2 {{ display: table; width: 100%; table-layout: fixed; margin-bottom: 24px; }}
+            .grid-2 > div {{ display: table-cell; width: 50%; vertical-align: top; }}
+            .grid-2 > div:first-child {{ padding-right: 12px; }}
+            .grid-2 > div:last-child {{ padding-left: 12px; }}
+            
+            .grid-3 {{ display: table; width: 100%; table-layout: fixed; margin-bottom: 24px; }}
+            .grid-3 > div {{ display: table-cell; width: 33.33%; vertical-align: top; padding: 0 8px; }}
+            
+            .grid-4 {{ display: table; width: 100%; table-layout: fixed; margin-bottom: 24px; }}
+            .grid-4 > div {{ display: table-cell; width: 25%; vertical-align: top; padding: 0 6px; }}
+            
+            .sent-item {{
+                background: #f8fafc;
+                border: 1px solid #e2e8f0;
+                border-radius: 8px;
+                padding: 12px;
+                text-align: center;
+            }}
+            .sent-label {{ font-size: 10px; font-weight: 700; text-transform: uppercase; color: #64748b; margin-bottom: 4px; }}
+            .sent-val {{ font-size: 14px; font-weight: 600; text-transform: capitalize; margin-bottom: 2px; }}
+            .sent-score {{ font-size: 11px; color: #94a3b8; }}
+            
+            .sig-title {{ font-size: 13px; font-weight: 600; margin: 0 0 12px 0; color: #0f172a; }}
+            .bar-wrap {{ margin-bottom: 10px; }}
+            .bar-label {{ display: block; font-size: 11px; font-weight: 600; color: #475569; margin-bottom: 4px; }}
+            .bar-label span:last-child {{ float: right; }}
+            .bar-track {{ height: 6px; background: #e2e8f0; border-radius: 3px; overflow: hidden; clear: both; }}
+            .bar-fill {{ height: 100%; border-radius: 3px; }}
+            
+            .c-pill {{ display: inline-block; padding: 2px 6px; border-radius: 4px; font-size: 10px; font-weight: 700; border: 1px solid; }}
+            .c-tag {{ display: inline-block; font-size: 10px; font-weight: 600; color: #64748b; background: #f1f5f9; padding: 2px 6px; border-radius: 4px; border: 1px solid #e2e8f0; margin-right: 6px; text-transform: uppercase; }}
+        </style>
+    </head>
+    <body>
+        <div class="header">
+            <h3>Post Detail</h3>
+            <div class="meta">{post_id} &bull; Generated: {datetime.now(timezone.utc).strftime('%Y-%m-%d %H:%M UTC')}</div>
+        </div>
+
+        {alert_html}
+
+        <div class="chips-container">
+            {chips_html}
+        </div>
+
+        <div class="section-title">Original Post</div>
+        <div class="box">{post_text}</div>
+
+        {summary_html}
+
+        <div class="section-title">Sentiment Breakdown</div>
+        <div class="grid-4">
+            <div>{render_sent_item('Text', text_sent, text_score)}</div>
+            <div>{render_sent_item('Image', img_sent, img_score)}</div>
+            <div>{render_sent_item('Overall', overall_sentiment, sentiment_score)}</div>
+            <div>{render_sent_item('Baseline (Upstream)', 'positive' if baseline_sent > 0.1 else 'negative' if baseline_sent < -0.1 else 'neutral', baseline_sent)}</div>
+        </div>
+
+        <div class="section-title">Signals</div>
+        {signals_html}
+
+        <div class="section-title">Every Comment</div>
+        <div style="background: white; border: 1px solid #e2e8f0; border-radius: 8px; padding: 16px;">
+            {comments_html}
+        </div>
+    </body>
+    </html>
+    """
+
+import asyncio
+
+def _generate_pdfs(rows, only_warnings):
+    zip_buffer = io.BytesIO()
+    with zipfile.ZipFile(zip_buffer, "w", zipfile.ZIP_DEFLATED) as zip_file:
+        count = 0
+        for row in rows:
+            res = row["result"]
+            if only_warnings and not res.get("watchlist_alert"):
+                continue
+            
+            filename = f"{row['post_id']}.pdf"
+            if HTML:
+                html_str = _result_to_html(res)
+                pdf_bytes = HTML(string=html_str).write_pdf()
+                zip_file.writestr(filename, pdf_bytes)
+            else:
+                zip_file.writestr(f"{row['post_id']}.json", json.dumps(res, indent=2))
+            count += 1
+            
+    if count == 0:
+        with zipfile.ZipFile(zip_buffer, "a", zipfile.ZIP_DEFLATED) as zip_file:
+            zip_file.writestr("empty.txt", "No results found.")
+            
+    zip_buffer.seek(0)
+    return zip_buffer
+
+@router.get(
+    "/export",
+    summary="Download analysis results as a ZIP of PDF files",
+)
+async def export_analysis(
+    only_warnings: bool = Query(False, description="Only download posts with watchlist alerts"),
+    db: AsyncSession = Depends(get_db),
+    current_user: dict = Depends(get_current_user),
+):
+    rows = (
+        await db.execute(
+            text(
+                """
+                SELECT ar.post_id, ar.result
+                FROM analysis_results ar
+                ORDER BY ar.created_at DESC
+                LIMIT 5000
+                """
+            )
+        )
+    ).mappings().all()
+    
+    zip_buffer = await asyncio.to_thread(_generate_pdfs, rows, only_warnings)
+    
+    prefix = "warnings" if only_warnings else "all_analyses"
+    filename = f"defense_{prefix}_{datetime.now(timezone.utc).strftime('%Y%m%d_%H%M%S')}.zip"
+    
+    return StreamingResponse(
+        zip_buffer,
+        media_type="application/zip",
+        headers={"Content-Disposition": f"attachment; filename={filename}"}
+    )
+
 @router.get(
     "/latest",
     response_model=AnalysisDetailResponse,
@@ -815,6 +1215,7 @@ def _row_to_result(row: Any) -> AnalysisResultResponse:
         post_summary_grounding=r.get("post_summary_grounding"),
         post_summary_truncated=r.get("post_summary_truncated"),
         language_method=r.get("language_method"),
+        watchlist_alert=r.get("watchlist_alert", False),
         overall_sentiment=r.get("overall_sentiment", "neutral"),
         sentiment_score=r.get("sentiment_score", 0.0),
         text_sentiment=r.get("text_sentiment"),

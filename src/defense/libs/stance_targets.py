@@ -41,7 +41,7 @@ from typing import Any, Iterable
 #   neutral           — monitoring semantics: track stance, impose no framing.
 # `neutral` is the safer default; it yields target-dependent stance without
 # encoding a political preference into the labels.
-POLARITIES: tuple[str, ...] = ("favored", "opposed", "neutral")
+POLARITIES: tuple[str, ...] = ("favored", "opposed", "neutral", "always")
 
 #: Aliases at or below this length must match as a whole token, or an
 #: initialism fires inside unrelated words.

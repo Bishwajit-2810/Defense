@@ -91,7 +91,22 @@ def _parse_json(content: str) -> Any:
         lines = s.splitlines()
         inner = lines[1:-1] if lines and lines[-1].startswith("```") else lines[1:]
         s = "\n".join(inner).strip()
-    return json.loads(s)
+    try:
+        return json.loads(s)
+    except json.JSONDecodeError as e:
+        import re
+        objects = []
+        for match in re.finditer(r'\{[^{}]*"i"\s*:[^{}]*\}', s):
+            obj_str = match.group(0)
+            obj_str = re.sub(r',\s*\}', '}', obj_str)
+            obj_str = re.sub(r',\s*\]', ']', obj_str)
+            try:
+                objects.append(json.loads(obj_str))
+            except Exception:
+                continue
+        if objects:
+            return {"labels": objects}
+        raise e
 
 
 def _clamp(v: Any, lo: float, hi: float, default: float = 0.0) -> float:

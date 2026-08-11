@@ -1,5 +1,5 @@
 import React from 'react';
-import { LayoutDashboard, MessageSquare, Activity, FileText, Search, Bot, MessageCircle, GitCommit, Terminal } from 'lucide-react';
+import { LayoutDashboard, MessageSquare, Activity, FileText, Search, Bot, MessageCircle, GitCommit, Terminal, AlertTriangle } from 'lucide-react';
 
 export default function NavTabs({ activeTab, setActiveTab }) {
   const tabs = [
@@ -12,6 +12,7 @@ export default function NavTabs({ activeTab, setActiveTab }) {
     { id: 'chat', label: 'Chat', icon: MessageCircle },
     { id: 'pipeline', label: 'Pipeline', icon: GitCommit },
     { id: 'trace', label: 'Trace', icon: GitCommit },
+    { id: 'warnings', label: 'Warnings', icon: AlertTriangle },
     { id: 'logs', label: 'Logs', icon: Terminal, badge: 0 },
   ];
 

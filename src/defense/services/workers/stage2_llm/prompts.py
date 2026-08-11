@@ -93,8 +93,9 @@ For EACH numbered comment, return TWO labels:
 Judge the comment IN CONTEXT of the post — sarcasm and mocking emojis under a claim are "negative".
 Comments may be in Bangla, Banglish, or English.
 
-POST being reacted to:
-\"\"\"{post}\"\"\"
+The overarching context of these comments is:
+\"\"\"{post_summary}\"\"\"
+You must evaluate each comment's intent strictly relative to this summary. Do not guess the context. If the comment says 'this is terrible', rely on the summary to determine what 'this' refers to.
 
 COMMENTS:
 {comments}
@@ -132,7 +133,7 @@ With entities, an entry looks like:
 
 
 def build_comment_stance_messages(
-    post: str,
+    post_summary: str,
     batch: list[dict],
     max_text: int = 200,
     targets: list[dict] | None = None,
@@ -148,7 +149,7 @@ def build_comment_stance_messages(
         text = (c.get("text") or "").replace("\n", " ").strip()[:max_text] or "(no text)"
         lines.append(f"{idx}: {text}")
     content = COMMENT_STANCE_PROMPT.format(
-        post=(post or "(no post text)")[:800],
+        post_summary=(post_summary or "(no summary)")[:800],
         comments="\n".join(lines),
     )
     if targets:

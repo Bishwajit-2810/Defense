@@ -7,11 +7,11 @@ import { apiCall, API_BASE, getSseQueryAsync } from '../utils/api.js';
 ChartJS.register(ArcElement, Tooltip, Legend, CategoryScale, LinearScale, BarElement, Title);
 
 const TRACE_LAYERS = [
-  { key: 'ingest', label: 'Ingestion' },
-  { key: 'stage1', label: 'Stage 1 (NLP)' },
-  { key: 'router', label: 'Router' },
-  { key: 'stage2', label: 'Stage 2 (LLM)' },
-  { key: 'assembler', label: 'Assembler' }
+  { key: 'ingest', label: 'Ingestion', desc: 'Consumes raw data from the stream.' },
+  { key: 'stage1', label: 'Stage 1 (NLP & LLM)', desc: 'Extracts entities, metrics, and generates heavy LLM summarization.' },
+  { key: 'router', label: 'Router', desc: 'Filters emoji-only spam and routes valid comments to Stage 2.' },
+  { key: 'stage2', label: 'Stage 2 (Parallel)', desc: 'Runs LLM, XLM-R, and DistilBERT concurrently on valid comments. Checks Watchlist Alerts.' },
+  { key: 'assembler', label: 'Assembler', desc: 'Merges partial results and writes final JSON to the database.' }
 ];
 
 function TraceVisuals({ result, traceState }) {
@@ -287,11 +287,11 @@ export default function Trace() {
               const state = traceState[layer.key] || { status: 'idle' };
               return (
                 <div key={layer.key} className="flex items-center gap-4">
-                  <div className={`w-32 text-right font-medium text-sm ${
+                  <div className={`w-32 text-right font-medium text-sm cursor-help ${
                     state.status === 'completed' ? 'text-emerald-600 dark:text-emerald-400' :
                     state.status === 'processing' ? 'text-brand-600 dark:text-brand-400' :
                     'text-slate-400 dark:text-zinc-600'
-                  }`}>
+                  }`} title={layer.desc}>
                     {layer.label}
                   </div>
                   <div className="flex-grow bg-slate-50 dark:bg-[#121214] rounded px-4 py-2 text-sm font-mono text-slate-600 dark:text-slate-400">

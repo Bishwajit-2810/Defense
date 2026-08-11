@@ -171,9 +171,9 @@ def should_use_llm(partial_result: dict, options: dict) -> tuple[bool, list[str]
                 f"({post_type}, threshold {POST_TYPE_CONFIDENCE_THRESHOLD})"
             )
 
-    # Rule 3: caller explicitly requested a summary
-    if options.get("want_summary", False):
-        reasons.append("want_summary:requested by caller")
+    # Rule 3: every post gets a summary unless explicitly opted out
+    if options.get("want_summary", True):
+        reasons.append("want_summary:default or requested")
 
     # Rule 4: image post with no image sentiment analysed yet
     photo_count = read_photo_count(partial_result)

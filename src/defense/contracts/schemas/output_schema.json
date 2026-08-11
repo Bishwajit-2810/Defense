@@ -17,6 +17,7 @@
     "post_summary_grounding": {"type":["string","null"]},
     "post_summary_source": {"type":["string","null"],"enum":["vlm","llm",null]},
     "post_summary_truncated": {"type":["boolean","null"],"description":"True when the summary still hit the model's token ceiling after auto-continuation; the text was trimmed to its last complete sentence."},
+    "watchlist_alert": {"type":["boolean","null"],"description":"True if the post or its comments mention an 'always' stance target."},
     "language_method": {"type":["string","null"],"enum":["fasttext","script_heuristic","stub",null],"description":"Which detector produced `language`. fastText is optional; without it the pipeline degrades to script detection rather than failing the post, and `language_confidence` should be read accordingly."},
     "overall_sentiment": {"type":"string","enum":["positive","negative","neutral","mixed"]},
     "sentiment_score": {"type":"number","minimum":-1,"maximum":1},
@@ -80,7 +81,7 @@
     },
     "comment_analysis": {
       "type":"object",
-      "required":["analyzed","coverage","sentiment_breakdown"],
+      "required":["analyzed","coverage"],
       "properties": {
         "analyzed":{"type":"integer"},
         "coverage":{"type":"number","minimum":0,"maximum":1,"description":"analyzed / commentCount, clamped to 1.0. When the stored rows exceed the reported count the excess is reported in coverage_anomaly, never as coverage above 100%."},
@@ -122,7 +123,7 @@
             "type":"object",
             "properties": {
               "display":{"type":"string"},
-              "polarity":{"type":"string","enum":["favored","opposed","neutral"],"description":"As declared in the watchlist — an editorial choice by the operator."},
+              "polarity":{"type":"string","enum":["favored","opposed","neutral","always"],"description":"As declared in the watchlist — an editorial choice by the operator."},
               "mentions":{"type":"integer"},
               "supportive":{"type":"integer"},
               "opposing":{"type":"integer"},
@@ -155,7 +156,8 @@
             "model":{"type":"integer"},
             "llm":{"type":"integer"},
             "emoji":{"type":"integer"},
-            "failed":{"type":"integer"}
+            "failed":{"type":"integer"},
+            "link":{"type":"integer"}
           }
         },
         "provenance": {
@@ -182,11 +184,12 @@
               "likes":{"type":"integer"},
               "author":{"type":["string","null"]},
               "parent_id":{"type":["string","null"]},
-              "sentiment":{"type":"string","enum":["positive","negative","neutral"]},
-              "sentiment_score":{"type":"number"},
+              "sentiment":{"type":["string","null"],"enum":["positive","negative","neutral",null]},
+              "sentiment_score":{"type":["number","null"]},
+              "parallel_labels":{"type":"object"},
               "emotion":{"type":"string","enum":["anger","sadness","joy","fear","disgust","surprise","neutral"]},
-              "method":{"type":"string","enum":["fast","stub","model","llm","emoji","failed"],"description":"How this label was produced. 'stub' is the deterministic hash fallback used in MODEL_STUB_MODE or when a model is unavailable — it is reproducible, and it is not sentiment."},
-              "kind":{"type":"string","enum":["emoji","short","substantive"],"description":"How much text the comment contains. 'emoji' comments carry no word tokens and are never sent to an LLM."},
+              "method":{"type":"string","enum":["fast","stub","model","llm","emoji","failed","link"],"description":"How this label was produced. 'stub' is the deterministic hash fallback used in MODEL_STUB_MODE or when a model is unavailable — it is reproducible, and it is not sentiment."},
+              "kind":{"type":"string","enum":["emoji","short","substantive","filtered","link"],"description":"How much text the comment contains. 'emoji' comments carry no word tokens and are never sent to an LLM. 'filtered' are filtered by the router."},
               "emotion_method":{"type":"string","enum":["heuristic","llm"],"description":"Emotion is the free emoji+lexicon heuristic at Stage 1 for EVERY comment, even in real mode where a transformer emotion head is loaded and used for the post. Stage 2 upgrades only the comments it re-labels. Without this field emotion_breakdown looked like model output."},
               "target_stances":{
                 "type":"array",

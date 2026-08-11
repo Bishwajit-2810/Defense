@@ -1,5 +1,5 @@
 import React, { useState, useEffect } from 'react';
-import { apiCall } from '../utils/api.js';
+import { apiCall, API_BASE, getAuthHeaders } from '../utils/api.js';
 import PostModal from '../components/PostModal';
 
 export default function Posts() {
@@ -25,6 +25,27 @@ export default function Posts() {
       setPosts(data.results || (Array.isArray(data) ? data : []));
     } catch (err) {
       console.error(err);
+    }
+  };
+  
+  const downloadZip = async () => {
+    try {
+      const res = await fetch(`${API_BASE}/v1/analysis/export?only_warnings=false`, {
+        headers: getAuthHeaders()
+      });
+      if (!res.ok) throw new Error('Download failed');
+      const blob = await res.blob();
+      const url = window.URL.createObjectURL(blob);
+      const a = document.createElement('a');
+      a.href = url;
+      a.download = `defense_all_analyses.zip`;
+      document.body.appendChild(a);
+      a.click();
+      window.URL.revokeObjectURL(url);
+      document.body.removeChild(a);
+    } catch (err) {
+      console.error(err);
+      alert('Failed to download ZIP');
     }
   };
 
@@ -114,6 +135,16 @@ export default function Posts() {
       </div>
 
       <div className="bg-white dark:bg-[#09090b] border border-slate-200 dark:border-zinc-800 rounded-xl overflow-hidden shadow-sm">
+        {posts.some(p => p.watchlist_alert) && (
+          <div className="p-4 bg-rose-50 dark:bg-rose-900/20 border-b border-rose-200 dark:border-rose-800">
+            <h3 className="text-rose-700 dark:text-rose-400 font-bold flex items-center gap-2">
+              ⚠️ Watchlist Under Attack
+            </h3>
+            <p className="text-sm text-rose-600 dark:text-rose-300">
+              {posts.filter(p => p.watchlist_alert).length} post(s) detected as negative or hostile toward your watchlist targets.
+            </p>
+          </div>
+        )}
         <div className="p-4 border-b border-slate-200 dark:border-zinc-800 bg-slate-50 dark:bg-[#121214] flex justify-between items-center flex-wrap gap-4">
           <div>
             <h3 className="font-semibold">Analysis Results</h3>
@@ -127,6 +158,7 @@ export default function Posts() {
               onChange={e => setCampaignId(e.target.value)}
               className="px-3 py-1.5 text-sm bg-white dark:bg-zinc-900 border border-slate-200 dark:border-zinc-700 rounded-lg"
             />
+            <button onClick={downloadZip} className="px-3 py-1.5 text-sm bg-white dark:bg-zinc-900 border border-slate-200 dark:border-zinc-700 rounded-lg hover:bg-slate-100 dark:hover:bg-zinc-800">Export ZIP</button>
             <button onClick={fetchPosts} className="px-3 py-1.5 text-sm bg-white dark:bg-zinc-900 border border-slate-200 dark:border-zinc-700 rounded-lg hover:bg-slate-100 dark:hover:bg-zinc-800">Refresh</button>
           </div>
         </div>
@@ -162,9 +194,12 @@ export default function Posts() {
                 const summary = post.post_summary || '—';
 
                 return (
-                  <tr key={post.post_id || i} className="hover:bg-slate-50 dark:hover:bg-zinc-900/50 cursor-pointer transition-colors" onClick={() => setSelectedPost(post)}>
+                  <tr key={post.post_id || i} className={`hover:bg-slate-50 dark:hover:bg-zinc-900/50 cursor-pointer transition-colors ${post.watchlist_alert ? 'bg-rose-50/30 dark:bg-rose-900/10' : ''}`} onClick={() => setSelectedPost(post)}>
                     <td className="px-4 py-3">{i + 1}</td>
-                    <td className="px-4 py-3 font-mono text-xs">{String(post.post_id || '').slice(0,8)}...</td>
+                    <td className="px-4 py-3 font-mono text-xs">
+                      {post.watchlist_alert && <span title="Watchlist Under Attack" className="mr-2 text-rose-500">⚠️</span>}
+                      {String(post.post_id || '').slice(0,8)}...
+                    </td>
                     <td className="px-4 py-3">{post.platform || '—'}</td>
                     <td className="px-4 py-3">{langStr}</td>
                     <td className="px-4 py-3">

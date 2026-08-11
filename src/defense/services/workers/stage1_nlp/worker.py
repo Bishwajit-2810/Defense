@@ -47,10 +47,10 @@ from defense.libs.progress import publish_stage  # noqa: E402
 
 from defense.libs import streams  # noqa: E402
 
-from .comment_analyzer import analyze_comments  # noqa: E402
 from .fusion import fuse_sentiment, image_has_signal  # noqa: E402
 from .models import ModelRegistry  # noqa: E402
 from .text_analyzer import analyze_text  # noqa: E402
+from .comment_analyzer import analyze_comments  # noqa: E402
 from . import vision_analyzer as vision  # noqa: E402
 from .vision_analyzer import analyze_image  # noqa: E402
 
@@ -102,6 +102,9 @@ def _build_result(
     text_result: dict,
     image_result: dict | None,
     comment_analysis: dict,
+    post_summary: str | None,
+    post_summary_lang: str | None,
+    post_summary_grounding: list[str] | None,
     overall_sentiment: str,
     sentiment_score: float,
     stage1_ms: float,
@@ -281,10 +284,10 @@ def _build_result(
         # omission that lost `degraded_components` in the assembler).
         "language_method": text_result.get("language_method"),
 
-        # --- Stage-2 placeholders (filled by LLM worker) ---
-        "post_summary": None,
-        "post_summary_lang": None,
-        "post_summary_grounding": None,
+        # --- Stage-1 context (summary + type) ---
+        "post_summary": post_summary,
+        "post_summary_lang": post_summary_lang,
+        "post_summary_grounding": post_summary_grounding,
 
         # --- Provenance ---
         "baseline_isViral": post.get("isViral"),
@@ -421,35 +424,73 @@ async def _process_message(
             ms=round((time.monotonic() - t) * 1000, 1),
         )
 
-    # 3. Comment analysis
-    t = time.monotonic()
-
-    # With the caps lifted (§6.3) a large thread is ~115 LLM batches, which is
-    # minutes of work on one post. Publish a frame per batch so the Trace tab
-    # shows `batch k/N` instead of appearing hung — the analyzer stays free of
-    # Redis, the callback carries it.
-    progress_cb = None
-    if redis is not None and job_id:
-        async def progress_cb(done: int, total: int) -> None:  # noqa: F811
-            await publish_stage(
-                redis, "stage1", "running",
-                job_id=job_id, post_id=post_id,
-                detail={"phase": "comment_llm", "batch": done, "batches": total},
-                log=log,
+    # 3. Contextualizer & Summarizer (LLM)
+    post_summary = None
+    post_summary_lang = None
+    post_summary_grounding = None
+    
+    llm = registry.get_llm_client()
+    if llm:
+        from defense.services.workers.stage2_llm.prompts import build_summary_messages, build_post_type_messages
+        import json
+        
+        target_lang = text_result.get("language") or "unknown"
+        summary_messages = build_summary_messages(
+            caption=caption or "",
+            ocr_text=ocr_text or "",
+            image_description=(image_result or {}).get("description") or "",
+            language=target_lang,
+            target_lang=target_lang,
+        )
+        try:
+            resp = await llm.chat(
+                role="summary",
+                messages=summary_messages,
+                backend_override=backend_override,
+                max_tokens=config.summary_max_tokens,
+                temperature=0.2,
             )
+            post_summary = (resp.get("content") or "").strip()
+            post_summary_lang = target_lang
+            post_summary_grounding = ["caption"] if caption else []
+            if ocr_text: post_summary_grounding.append("ocr")
+        except Exception as e:
+            log.error("stage1_summary_failed", error=str(e))
+            
+        pt_messages = build_post_type_messages(
+            text=caption or ocr_text or "",
+            language=target_lang,
+        )
+        try:
+            pt_resp = await llm.chat(
+                role="stage1",
+                messages=pt_messages,
+                backend_override=backend_override,
+                response_format={"type": "json_object"},
+                max_tokens=config.post_type_max_tokens,
+                temperature=0.0,
+            )
+            parsed = json.loads(pt_resp.get("content") or "{}")
+            text_result["post_type"] = parsed.get("post_type", "other")
+            text_result["post_type_confidence"] = float(parsed.get("confidence", 0.5))
+        except Exception as e:
+            log.error("stage1_post_type_failed", error=str(e))
 
+    # 3. Comment NLP
+    t3 = time.monotonic()
     comment_analysis = await analyze_comments(
-        comments, registry, sentiment_override, backend_override, progress_cb
+        comments,
+        registry,
+        sentiment_override=sentiment_override,
+        backend_override=backend_override,
     )
     log.info(
         "stage1_comments_done",
         post_id=post_id,
-        analyzed=comment_analysis.get("analyzed"),
-        breakdown=comment_analysis.get("sentiment_breakdown"),
-        methods=comment_analysis.get("method_breakdown"),
-        reaction_only=comment_analysis.get("reaction_only"),
-        ms=round((time.monotonic() - t) * 1000, 1),
+        analyzed=comment_analysis.get("analyzed", 0),
+        ms=round((time.monotonic() - t3) * 1000, 1),
     )
+
 
     # 4. Sentiment fusion
     reaction_breakdown = post.get("reactionBreakdown") or {}
@@ -484,7 +525,7 @@ async def _process_message(
         sentiment_score=sentiment_score,
     )
 
-    return text_result, image_result, comment_analysis, overall_sentiment, sentiment_score
+    return text_result, image_result, comment_analysis, post_summary, post_summary_lang, post_summary_grounding, overall_sentiment, sentiment_score
 
 
 # ---------------------------------------------------------------------------
@@ -637,6 +678,9 @@ async def run_worker() -> None:
                             text_result,
                             image_result,
                             comment_analysis,
+                            post_summary,
+                            post_summary_lang,
+                            post_summary_grounding,
                             overall_sentiment,
                             sentiment_score,
                         ) = await _process_message(
@@ -651,6 +695,9 @@ async def run_worker() -> None:
                             text_result=text_result,
                             image_result=image_result,
                             comment_analysis=comment_analysis,
+                            post_summary=post_summary,
+                            post_summary_lang=post_summary_lang,
+                            post_summary_grounding=post_summary_grounding,
                             overall_sentiment=overall_sentiment,
                             sentiment_score=sentiment_score,
                             stage1_ms=stage1_ms,

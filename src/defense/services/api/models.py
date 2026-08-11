@@ -209,7 +209,7 @@ class CommentAnalysisResult(BaseModel):
     coverage_anomaly: Optional[Dict[str, Any]] = None
     summary: Optional[str] = None  # LLM-written natural-language mood of the comments
     summary_source: Optional[str] = None  # "llm" | None
-    sentiment_breakdown: Dict[str, int]          # all comments
+    sentiment_breakdown: Dict[str, int] = {}          # all comments
     # Written comments only — emoji-only reactions excluded. Charting the two
     # side by side separates "what people said" from "how the crowd reacted"
     # instead of blending 17% emoji reactions into one indistinguishable bar.
@@ -309,8 +309,9 @@ class AnalysisResultResponse(BaseModel):
     # Which detector produced `language` — fastText or the script heuristic.
     # `language_confidence` cannot be interpreted without it.
     language_method: Optional[str] = None
-    overall_sentiment: str
-    sentiment_score: float
+    watchlist_alert: Optional[bool] = None
+    overall_sentiment: Optional[str] = None
+    sentiment_score: Optional[float] = None
     # Per-component sentiments, each its own {label, score} (caption / image).
     # null for null-caption (text) / text-only (image) posts respectively.
     text_sentiment: Optional[Dict[str, Any]] = None
