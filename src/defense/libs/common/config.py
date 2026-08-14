@@ -166,6 +166,7 @@ class Settings(BaseSettings):
     #                comments on the corpus post, at the cost of an empty LLM
     #                row on the rest.
     comment_llm_mode: str = "all"
+    comment_stance_max_per_post: int = 50
     # Identical text (after normalisation) reuses its twin's LLM verdict: the
     # prompt would be character-for-character the same. Set false to force a
     # separate call for every comment.

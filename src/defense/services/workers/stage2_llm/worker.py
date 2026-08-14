@@ -1539,12 +1539,8 @@ async def _process_message(
         watchlist = _targets()
 
         try:
-            # Every comment already carries Stage 1's verdict; make it a voter.
-            for c in comments:
-                _seed_heuristic_vote(c)
-
-            # ---- cheap voters: 7 small heads over the whole thread --------
-            voters_used: list[str] = ["heuristic"]
+            # ---- cheap voters: 7 ML heads over the whole thread --------
+            voters_used: list[str] = []
             if _CLASSIFIERS_ENABLED:
                 classifier_specs = [
                     ("xlmr", config.stage2_classifier_1),
