@@ -125,15 +125,6 @@ def test_a_real_vector_is_not_flagged():
 # ---------------------------------------------------------------------------
 
 
-class _CapturingConn:
-    def __init__(self, sink):
-        self._sink = sink
-
-    async def execute(self, _sql, params=None):
-        self._sink.append(params or {})
-        return None
-
-
 class _CapturingEngine:
     """Just enough async SQLAlchemy surface for `persist_postgres`."""
 
@@ -141,11 +132,9 @@ class _CapturingEngine:
         self.params: list[dict] = []
 
     def begin(self):
-        sink = self.params
-
         class _Ctx:
             async def __aenter__(self_inner):
-                return _CapturingConn(sink)
+                return object()      # the repository is patched; nothing runs on it
 
             async def __aexit__(self_inner, *_exc):
                 return False
@@ -153,7 +142,29 @@ class _CapturingEngine:
         return _Ctx()
 
 
-def test_the_flag_stage1_produced_is_the_flag_that_reaches_the_column():
+def _capture_upsert(monkeypatch, engine):
+    """Record the kwargs persist_postgres hands the repository.
+
+    It writes through `PostRepository(AsyncSession(bind=conn))` now, so a fake
+    connection object with an `execute` method is no longer enough surface —
+    SQLAlchemy rejects it before any parameter is bound. Capturing at the
+    repository boundary asserts the same contract (the producer's flag is what
+    gets persisted) without re-implementing SQLAlchemy.
+    """
+    import sqlalchemy.ext.asyncio as sa_async
+
+    from defense.libs.repos.posts import PostRepository
+
+    async def _fake_upsert(self, **kwargs):
+        engine.params.append(kwargs)
+
+    monkeypatch.setattr(PostRepository, "upsert_analysis", _fake_upsert)
+    # persist_postgres builds `AsyncSession(bind=conn)` first, and SQLAlchemy
+    # validates the bind before anything else happens.
+    monkeypatch.setattr(sa_async, "AsyncSession", lambda **kwargs: object())
+
+
+def test_the_flag_stage1_produced_is_the_flag_that_reaches_the_column(monkeypatch):
     """The whole point: producer -> assembler -> persisted parameter.
 
     On the pre-fix code Stage 1 said "stub", the trace frame said "stub", and the
@@ -165,6 +176,7 @@ def test_the_flag_stage1_produced_is_the_flag_that_reaches_the_column():
     flag = asm._embedding_is_stub(result, s1)
 
     engine = _CapturingEngine()
+    _capture_upsert(monkeypatch, engine)
     asyncio.run(
         pers.persist_postgres(
             result, engine,
@@ -179,9 +191,10 @@ def test_the_flag_stage1_produced_is_the_flag_that_reaches_the_column():
     assert engine.params[0]["embedding_is_stub"] == s1["embedding_is_stub"]
 
 
-def test_persist_postgres_without_the_flag_still_marks_a_missing_vector():
+def test_persist_postgres_without_the_flag_still_marks_a_missing_vector(monkeypatch):
     """Callers that pass no flag keep the old dimension fallback."""
     engine = _CapturingEngine()
+    _capture_upsert(monkeypatch, engine)
     asyncio.run(pers.persist_postgres(_canonical(), engine, embedding=None))
     assert engine.params[0]["embedding_is_stub"] is True
 

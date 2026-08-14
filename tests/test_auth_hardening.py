@@ -43,7 +43,7 @@ def _reset_api_key_lookup():
     """`deps._API_KEY_TABLE_USABLE` latches false on the first lookup failure so
     a missing table costs one log line rather than one per request. That makes it
     process-global state a test can poison for later tests, so reset it here."""
-    import deps
+    from defense.services.api import deps
 
     deps._API_KEY_TABLE_USABLE = True
     yield
@@ -184,7 +184,11 @@ async def test_key_is_looked_up_by_hash_never_by_value():
 @pytest.mark.asyncio
 async def test_unknown_key_is_rejected_when_the_mvp_fallback_is_off(monkeypatch):
     """Outside dev, a deployment that forgot to provision keys fails CLOSED."""
-    import deps
+    # Patch the module `get_current_user` is actually imported from. Patching
+    # a bare `import deps` reaches a SECOND module object for the same file
+    # (both `src/defense` and `src/defense/services/api` are importable), and
+    # the assertion then passes or fails for reasons unrelated to the code.
+    from defense.services.api import deps
 
     monkeypatch.setattr(deps, "_ALLOW_UNKNOWN_API_KEYS", False)
     with pytest.raises(HTTPException) as exc:

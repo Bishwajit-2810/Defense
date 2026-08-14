@@ -295,6 +295,8 @@ async def _process_message(
             )
         else:
             result = build_canonical_result(normalized_post, stage1_result, stage2_result)
+        result["tenant_id"] = env.get("tenant_id") or normalized_post.get("tenant_id") or "default"
+
     except (ValueError, KeyError) as exc:
         bound_log.error("build_failed", error=str(exc))
         if job_id:

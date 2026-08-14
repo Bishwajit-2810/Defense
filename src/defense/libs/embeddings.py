@@ -20,7 +20,7 @@ Behaviour
 from __future__ import annotations
 
 import hashlib
-import logging
+import structlog
 import os
 from defense.libs.common.config import get_settings
 
@@ -28,7 +28,7 @@ config = get_settings()
 import struct
 from typing import Any, Optional
 
-log = logging.getLogger(__name__)
+log = structlog.get_logger(__name__)
 
 EMBEDDING_DIM: int = config.embedding_dim
 

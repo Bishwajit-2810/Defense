@@ -11,12 +11,12 @@ spans; ``instrument_app(app)`` is the hook the API calls at startup.
 
 from __future__ import annotations
 
-import logging
+import structlog
 import os
 from defense.libs.common.config import get_settings
 config = get_settings()
 
-log = logging.getLogger(__name__)
+log = structlog.get_logger(__name__)
 
 _initialized = False
 

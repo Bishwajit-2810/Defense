@@ -101,7 +101,10 @@ def test_insight_is_declared_in_the_output_schema():
     import json
     from pathlib import Path
 
-    schema_path = Path(__file__).resolve().parents[1] / "libs" / "schemas" / "output_schema.json"
+    schema_path = (
+        Path(__file__).resolve().parents[1]
+        / "src" / "defense" / "contracts" / "schemas" / "output_schema.json"
+    )
     schema = json.loads(schema_path.read_text(encoding="utf-8"))
 
     assert "insight" in schema["properties"], (

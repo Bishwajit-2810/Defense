@@ -26,6 +26,18 @@ sys.path.insert(0, '/home/bk/code/defense/src/defense')
 import pytest
 
 from services.workers.stage1_nlp import comment_analyzer as ca
+
+
+@pytest.fixture(autouse=True)
+def _enable_stage1_comment_llm(monkeypatch):
+    """This file tests the Stage-1 comment LLM pass itself.
+
+    It ships DISABLED (Stage 2 labels every post's comments with a better model,
+    so running it in Stage 1 too is duplicated spend — see config.py), but the
+    mechanism is still supported and still has to work when switched on.
+    """
+    monkeypatch.setattr(ca, "_LLM_COMMENTS_ENABLED", True, raising=False)
+
 from services.workers.stage1_nlp.comment_analyzer import _apply_labels, analyze_comments
 
 

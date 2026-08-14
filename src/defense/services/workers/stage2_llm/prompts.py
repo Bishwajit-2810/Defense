@@ -146,7 +146,11 @@ def build_comment_stance_messages(
     """
     lines = []
     for idx, c in enumerate(batch, 1):
-        text = (c.get("text") or "").replace("\n", " ").strip()[:max_text] or "(no text)"
+        # `text_norm` is the model-facing form (URLs collapsed, emoji removed);
+        # the original text stays untouched on the comment for display and for
+        # the emoji heuristic, which reads exactly what this drops.
+        raw = c.get("text_norm") or c.get("text") or ""
+        text = raw.replace("\n", " ").strip()[:max_text] or "(no text)"
         lines.append(f"{idx}: {text}")
     content = COMMENT_STANCE_PROMPT.format(
         post_summary=(post_summary or "(no summary)")[:800],

@@ -1,5 +1,10 @@
 # Open Issues — Pass 6 remediation list
 
+> **Superseded in part.** A fourth pass (12–13 August 2026) found eleven more, two of them
+> regressions of items fixed here: the routing gate (below) and issue 4 (report cluster
+> summaries computed, paid for and discarded). It also found that the contract guards this
+> pass left behind had _all_ stopped running. See **[AUDIT_PASS7.md](AUDIT_PASS7.md)**.
+
 **Found:** 5 August 2026, fresh-eyes audit of the whole tree (the third such pass).
 **Status: ALL TEN ARE FIXED** and regression-tested, 5 August 2026.
 **Full write-ups:** [PROJECT_ASSESSMENT.md](PROJECT_ASSESSMENT.md) §13. This file is
@@ -23,15 +28,15 @@ remediation.
 
 ## At a glance
 
-| # | Issue | Impact | Status | Blocked the defense? |
-| - | ----- | ------ | ------ | ------------------- |
-| [1](#1--the-privacy-lock-does-not-cover-the-analysis-pipeline) | Privacy lock doesn't cover the analysis pipeline | **Credibility** — the strongest claim in the deck | ✅ **Fixed** — enforced via the envelope | — |
-| [2](#2--v1usage-counts-stage-2-only) | `/v1/usage` counts Stage 2 only, says otherwise | **Thesis** — undercounts the cost number | ✅ **Fixed** — tracking moved into `LLMClient` | — |
-| [3](#3--embedding_is_stub-is-false-on-every-row-the-pipeline-writes) | `embedding_is_stub` is `FALSE` on every row | Honesty flag reports the inverse | ✅ **Fixed** — flag carried, not inferred | — |
-| [4](#4--report-cluster-summaries-are-computed-paid-for-and-discarded) | Report cluster summaries computed then discarded | Real LLM spend, zero output | ✅ **Fixed** — surfaced through API + dashboard | — |
-| [5](#5--near-duplicate-reuse-copies-the-analysis-but-not-its-provenance) | Near-dup reuse copies the wrong things | Wrong data in a store, on by default | ✅ **Fixed** — composed via the assembler | — |
-| [6](#6--the-agent-runner-bypasses-every-llmclient-resilience-path) | Agent runner bypasses breaker/failover/usage | Agents hard-fail where everything else degrades | ✅ **Fixed** — `tools` passthrough on `chat()` | — |
-| [7a–d](#7--smaller-issues) | Four smaller ones | Bounded | ✅ **All fixed** | — |
+| #                                                                        | Issue                                            | Impact                                            | Status                                          | Blocked the defense? |
+| ------------------------------------------------------------------------ | ------------------------------------------------ | ------------------------------------------------- | ----------------------------------------------- | -------------------- |
+| [1](#1--the-privacy-lock-does-not-cover-the-analysis-pipeline)           | Privacy lock doesn't cover the analysis pipeline | **Credibility** — the strongest claim in the deck | ✅ **Fixed** — enforced via the envelope        | —                    |
+| [2](#2--v1usage-counts-stage-2-only)                                     | `/v1/usage` counts Stage 2 only, says otherwise  | **Thesis** — undercounts the cost number          | ✅ **Fixed** — tracking moved into `LLMClient`  | —                    |
+| [3](#3--embedding_is_stub-is-false-on-every-row-the-pipeline-writes)     | `embedding_is_stub` is `FALSE` on every row      | Honesty flag reports the inverse                  | ✅ **Fixed** — flag carried, not inferred       | —                    |
+| [4](#4--report-cluster-summaries-are-computed-paid-for-and-discarded)    | Report cluster summaries computed then discarded | Real LLM spend, zero output                       | ✅ **Fixed** — surfaced through API + dashboard | —                    |
+| [5](#5--near-duplicate-reuse-copies-the-analysis-but-not-its-provenance) | Near-dup reuse copies the wrong things           | Wrong data in a store, on by default              | ✅ **Fixed** — composed via the assembler       | —                    |
+| [6](#6--the-agent-runner-bypasses-every-llmclient-resilience-path)       | Agent runner bypasses breaker/failover/usage     | Agents hard-fail where everything else degrades   | ✅ **Fixed** — `tools` passthrough on `chat()`  | —                    |
+| [7a–d](#7--smaller-issues)                                               | Four smaller ones                                | Bounded                                           | ✅ **All fixed**                                | —                    |
 
 Fixed in the order below; see [What changed](#what-changed) for the per-issue landing notes.
 
@@ -41,8 +46,8 @@ Fixed in the order below; see [What changed](#what-changed) for the per-issue la
 
 > ✅ **FIXED** — enforced, not merely restated. See [what landed](#what-landed-1--privacy-lock-enforced).
 >
-> §13.5 · **[read]** · the local⇄Groq policy is what §3.3 calls *"the best design
-> decision in the project"*, so this is the one item here that is a credibility
+> §13.5 · **[read]** · the local⇄Groq policy is what §3.3 calls _"the best design
+> decision in the project"_, so this is the one item here that is a credibility
 > risk rather than a correctness one.
 
 ### Where
@@ -89,15 +94,16 @@ The pipeline is single-tenant; the backend policy is enforced on the interactive
 surfaces (`/v1/chat`, agents) and not on batch analysis. This is the same move
 §12.5 already made for `analysis_run`'s missing tenant scoping. Already applied to
 [FEATURES.md](FEATURES.md) §6, [architecture.md](architecture.md) §9 and
-[endpoints.md](endpoints.md) by this pass — but the *code* should say it too, in a
+[endpoints.md](endpoints.md) by this pass — but the _code_ should say it too, in a
 comment on `check_llm_backend_policy` naming what it does and does not cover.
 
 **(b) Enforce it (larger).**
+
 1. Guard the toggle: call `check_llm_backend_policy` in `put_llm_config`, and gate
    it on an admin role. A global switch should not be settable by a tenant user.
 2. Carry the tenant through the pipeline: add `tenant_id` to the ingestion/analysis
    envelope, and have the Stage-2 worker resolve `enforce_policy(tenant_policy,
-   config:llm_backend)` per message via [src/defense/libs/llm/policy.py](src/defense/libs/llm/policy.py)
+config:llm_backend)` per message via [src/defense/libs/llm/policy.py](src/defense/libs/llm/policy.py)
    — which already exists and is already used by the agent runner.
 3. Then either delete `options["llm_backend"]` or make Stage 1/2 honour it.
 
@@ -106,7 +112,7 @@ is exactly the shape of the bug.
 
 ### Test to leave behind
 
-Assert the *contract*, per §11.6: for every knob `check_llm_backend_policy`
+Assert the _contract_, per §11.6: for every knob `check_llm_backend_policy`
 inspects, some worker must read it. A test that greps `src/defense/services/workers/` for the
 option key and fails when nothing consumes it would have caught this on the day it
 was introduced.
@@ -131,16 +137,16 @@ was introduced.
 `usage:tokens:{backend}:{model}` and the lane counters. It exists in exactly one
 file. Five other LLM call sites never touch a counter:
 
-| Call site | When it runs | Volume |
-| --------- | ------------ | ------ |
-| [chat.py:202](src/defense/services/api/routers/chat.py#L202), [:260](src/defense/services/api/routers/chat.py#L260) | every chatbot turn | unbounded, user-driven |
-| [reports.py:216](src/defense/services/api/routers/reports.py#L216) `_llm_narrative` | every grounded report (the default) | 1 per report |
-| [reports.py:354](src/defense/services/api/routers/reports.py#L354) `_summarize_cluster` | every grounded report | up to 8 per report |
-| [llm_analyzer.py:225](src/defense/services/workers/stage1_nlp/llm_analyzer.py#L225), [:292](src/defense/services/workers/stage1_nlp/llm_analyzer.py#L292) | when `STAGE1_LLM=true` — **the shipped config** | per post |
-| [runner.py:409](src/defense/services/agents/runner.py#L409) `_llm_chat_with_tools` | every agent turn | per tool-calling turn |
+| Call site                                                                                                                                                 | When it runs                                    | Volume                 |
+| --------------------------------------------------------------------------------------------------------------------------------------------------------- | ----------------------------------------------- | ---------------------- |
+| [chat.py:202](src/defense/services/api/routers/chat.py#L202), [:260](src/defense/services/api/routers/chat.py#L260)                                       | every chatbot turn                              | unbounded, user-driven |
+| [reports.py:216](src/defense/services/api/routers/reports.py#L216) `_llm_narrative`                                                                       | every grounded report (the default)             | 1 per report           |
+| [reports.py:354](src/defense/services/api/routers/reports.py#L354) `_summarize_cluster`                                                                   | every grounded report                           | up to 8 per report     |
+| [llm_analyzer.py:225](src/defense/services/workers/stage1_nlp/llm_analyzer.py#L225), [:292](src/defense/services/workers/stage1_nlp/llm_analyzer.py#L292) | when `STAGE1_LLM=true` — **the shipped config** | per post               |
+| [runner.py:409](src/defense/services/agents/runner.py#L409) `_llm_chat_with_tools`                                                                        | every agent turn                                | per tool-calling turn  |
 
-Meanwhile `UsageResponse.total_tokens` says *"Total tokens spent"*, the endpoint
-docstring says *"Every token/cost/cache figure therefore comes from Redis"*, and
+Meanwhile `UsageResponse.total_tokens` says _"Total tokens spent"_, the endpoint
+docstring says _"Every token/cost/cache figure therefore comes from Redis"_, and
 `scope_note` — the field §5.8 added **specifically** to state what the numbers
 cover — returns the flat string `"All figures are system-wide."`
 
@@ -165,6 +171,7 @@ dimensions and other callers get a sensible default (`lane="interactive"`,
 `task="chat"` / `"report"` / `"agent"` / `"stage1"`).
 
 Two things to preserve while doing it:
+
 - `usage:llm_calls` must stay **fresh-only** (it is `cache_hit_rate`'s
   denominator); `usage:calls:task:{task}` counts cached and fresh alike. §12.4b
   fixed this distinction — don't undo it.
@@ -195,16 +202,16 @@ shrinking the cost figure.
 ### Where
 
 - [persistence.py:55](src/defense/services/workers/assembler/persistence.py#L55) — `_resolve_embedding`, writes the DB column
-- [assembler.py:295](src/defense/services/workers/assembler/assembler.py#L295) — the trace frame, computes the *same flag differently*
+- [assembler.py:295](src/defense/services/workers/assembler/assembler.py#L295) — the trace frame, computes the _same flag differently_
 
 ### What's wrong
 
 Two independent computations of one flag, and they disagree:
 
-| Site | Rule | Value in stub mode |
-| ---- | ---- | ------------------ |
-| `assembler.py:295` (trace frame / log) | `processing.stub_mode or not stage1_embedding` | **True** ✓ |
-| `_resolve_embedding` (the DB column) | dimension check: `len(embedding) == EMBEDDING_DIM → not a stub` | **False** ✗ |
+| Site                                   | Rule                                                            | Value in stub mode |
+| -------------------------------------- | --------------------------------------------------------------- | ------------------ |
+| `assembler.py:295` (trace frame / log) | `processing.stub_mode or not stage1_embedding`                  | **True** ✓         |
+| `_resolve_embedding` (the DB column)   | dimension check: `len(embedding) == EMBEDDING_DIM → not a stub` | **False** ✗        |
 
 With `MODEL_STUB_MODE=true` — the default — Stage 1 emits `stub_embedding(text)`,
 a 768-dim hash vector. Its dimension is correct, so persistence classifies it as a
@@ -280,7 +287,7 @@ k-means them (`MAX_CLUSTERS = 8`), and spends **one LLM-B call per cluster**. Th
 - `embedding_clusters` appears **nowhere** in `dashboard/app.js`.
 
 Its only existence is the raw `jobs.options` JSONB. The `clusters` field the API
-*does* return is `_generate_report_content`'s topic-count aggregate — pure SQL,
+_does_ return is `_generate_report_content`'s topic-count aggregate — pure SQL,
 zero LLM calls. **The report renders the cheap artefact and discards the expensive
 one.**
 
@@ -301,7 +308,7 @@ labelled as the embedding clusters, so the two are not confused.
 While there: the summaries are only meaningful once issue 3 is fixed. Have the
 report state `embedding_is_stub` for the corpus it clustered, or suppress the
 cluster block entirely when the vectors are stubs. Paying for a summary of noise
-and *labelling* it is honest; paying for it silently is not.
+and _labelling_ it is honest; paying for it silently is not.
 
 ### Test to leave behind
 
@@ -326,7 +333,7 @@ Assert the consumer, not the producer: build a report `content` dict containing
 Three problems in one function:
 
 1. **The stub flag is dropped.** The INSERT column list is `(post_id, campaign_id,
-   result, embedding, schema_version, created_at, updated_at)` — `embedding_is_stub`
+result, embedding, schema_version, created_at, updated_at)` — `embedding_is_stub`
    is not in it, so the copy takes the column `DEFAULT FALSE`, and the
    `ON CONFLICT DO UPDATE` branch doesn't set it either. A source row honestly
    flagged `TRUE` produces a copy claiming `FALSE`:
@@ -342,7 +349,7 @@ Three problems in one function:
    the new row's canonical JSON keeps the **source's** `post_id`, `post_text`,
    `engagement` and `reaction_breakdown`. `/v1/search` returns that raw `result`
    dict, so a hit on the new post carries a document describing a different one.
-   Reactions and comment counts are per-post *facts*, not analysis — two posts can
+   Reactions and comment counts are per-post _facts_, not analysis — two posts can
    share a caption and have nothing else in common, which is the normal case for a
    repost.
 
@@ -360,7 +367,7 @@ with the same caption takes it.
 1. Add `embedding_is_stub` to both the INSERT column list and the `DO UPDATE` set.
 2. Rewrite the identity and engagement fields in the copied `result` before
    insert — `post_id`, `post_text`, `engagement`, `reaction_breakdown`,
-   `created_at`, `platform_post_id`, `url` all belong to the *new* post; only the
+   `created_at`, `platform_post_id`, `url` all belong to the _new_ post; only the
    analysis (sentiment, topics, summary, comment analysis) is legitimately reused.
    Add a `reused_from: {source_post_id, score}` provenance block, so the result
    says it was reused rather than looking like a fresh analysis.
@@ -393,8 +400,8 @@ includes `embedding_is_stub`, in the style of
 
 It reaches past `LLMClient.chat` into `self.llm._get_client(...)` and calls
 `oai_client.chat.completions.create` directly, because `chat()` does not forward
-tool definitions. The docstring is accurate about what that preserves — *"policy
-enforcement and model resolution"* — and silent about what it drops:
+tool definitions. The docstring is accurate about what that preserves — _"policy
+enforcement and model resolution"_ — and silent about what it drops:
 
 - **the circuit breaker** — no `record_success` / `record_failure`, so agent
   traffic can neither open Groq's breaker nor respect it. §11.4b and §12.4a were
@@ -442,7 +449,7 @@ that already exists. **Test:** assert the endpoint's role set equals
 [pipeline.py:34](src/defense/services/api/routers/pipeline.py#L34) `_STAGES` hardcodes all five
 stream **and** group names as string literals instead of importing
 [src/defense/libs/streams.py](src/defense/libs/streams.py). They match the defaults today, but every name
-is env-overridable *by design* ("deployments legitimately shard streams"), and
+is env-overridable _by design_ ("deployments legitimately shard streams"), and
 under any override `_stage_stats` swallows the `xinfo_groups` error and returns
 zeros — so the dashboard's Pipeline tab renders an **idle, healthy** pipeline while
 work is queued. That is the §5.5 KEDA failure mode reproduced in the monitoring
@@ -455,8 +462,8 @@ this file — extend it. It is the last un-pinned copy of those identifiers.
 ### 7c — An ingestion docstring describes the opposite of its code
 
 [service.py:657](src/defense/services/ingestion/service.py#L657) `_ensure_consumer_group`'s
-docstring says it uses `"$"` *"so we only process messages that arrive after the
-service starts"*, and offers `"0"` as the change to make for reprocessing. The code
+docstring says it uses `"$"` _"so we only process messages that arrive after the
+service starts"_, and offers `"0"` as the change to make for reprocessing. The code
 passes `id="0"`. The comment describes the opposite of the behaviour, and its
 remediation advice describes the state it is already in.
 
@@ -527,7 +534,7 @@ it on its result, and the assembler computes **one** value used for both the
 trace frame and the database column — the two independent computations that
 disagreed are gone. `_resolve_embedding` takes the producer's answer and keeps
 the dimension heuristic only as a fallback. A failed real model now returns a
-stub *and says so*, where it used to return an empty vector that silently became
+stub _and says so_, where it used to return an empty vector that silently became
 a different, `post_id`-seeded stub; the prototype topic classifier is gated on
 the flag rather than on that emptiness, so it still never runs on hash noise.
 
@@ -556,7 +563,7 @@ contributes fake latency. Ingestion hands it to the **assembler**
 and reused posts stop being invisible to every ClickHouse aggregate. The stub
 flag is read explicitly from the source row and carried.
 
-**The comment thread is not reused.** A near-duplicate is a *caption* match; the
+**The comment thread is not reused.** A near-duplicate is a _caption_ match; the
 two threads are different people saying different things, so inheriting the
 source's per-comment labels would be fabricated data about comments nobody read.
 The new post's thread is reported unanalysed, with a provenance note saying why.
@@ -575,14 +582,14 @@ retry and usage tracking — all four things the bypass cost them.
 
 ### What landed (7)
 
-* **7a** — `config.py`'s mirrored model table is deleted; `_models()` derives
+- **7a** — `config.py`'s mirrored model table is deleted; `_models()` derives
   from `LLMClient.default_model` over `VALID_ROLES`, so `summary` appears and any
   future role does too, automatically.
-* **7b** — `pipeline.py::_STAGES` is built from `streams.ALL`, and
+- **7b** — `pipeline.py::_STAGES` is built from `streams.ALL`, and
   `tests/test_streams.py` now covers it — the last un-pinned copy of those names.
-* **7c** — the `_ensure_consumer_group` docstring describes `"0"`, which is what
+- **7c** — the `_ensure_consumer_group` docstring describes `"0"`, which is what
   the code does, and says why.
-* **7d** — `lane_split` entries are a `LaneUsage` model: `calls` and `tokens` are
+- **7d** — `lane_split` entries are a `LaneUsage` model: `calls` and `tokens` are
   `int`, shares are `float`.
 
 ## UI sync
@@ -590,11 +597,11 @@ retry and usage tracking — all four things the bypass cost them.
 The fixes changed the API surface, so `dashboard/app.js` was audited against it
 rather than assumed correct. Three gaps, all §13.8's rule:
 
-| Gap | Fixed by |
-| --- | -------- |
-| The "Cost split" card read 2 of 5 lanes, and its comment-share denominator silently grew to span chat and agent traffic while still being labelled post-vs-comment | Share computed over pipeline lanes only; a "Spend by lane" breakdown names every lane with a hint table mirroring `src/defense/libs/llm/usage.py` |
-| `pipeline_tokens` unrendered — the token card showed a total that now includes per-question chat/agent spend | Its own stat card, with a subtitle stating what the total covers that it does not |
-| `processing.reused_from` rendered nowhere — a reused post was indistinguishable from a cheap analysis, and its `0 analyzed` comment section gave no reason | `near-dup` tag in the post list, a "Reused Analysis" block in the modal, a `reused` row in the Trace tab, and a "thread was not analysed" note from `comment_analysis.provenance.note` |
+| Gap                                                                                                                                                                | Fixed by                                                                                                                                                                               |
+| ------------------------------------------------------------------------------------------------------------------------------------------------------------------ | -------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- |
+| The "Cost split" card read 2 of 5 lanes, and its comment-share denominator silently grew to span chat and agent traffic while still being labelled post-vs-comment | Share computed over pipeline lanes only; a "Spend by lane" breakdown names every lane with a hint table mirroring `src/defense/libs/llm/usage.py`                                      |
+| `pipeline_tokens` unrendered — the token card showed a total that now includes per-question chat/agent spend                                                       | Its own stat card, with a subtitle stating what the total covers that it does not                                                                                                      |
+| `processing.reused_from` rendered nowhere — a reused post was indistinguishable from a cheap analysis, and its `0 analyzed` comment section gave no reason         | `near-dup` tag in the post list, a "Reused Analysis" block in the modal, a `reused` row in the Trace tab, and a "thread was not analysed" note from `comment_analysis.provenance.note` |
 
 Pinned by `tests/test_dashboard_renders_api_fields.py`. Mutation-testing that
 file exposed a flaw in **the test**: it scanned the raw source, and this codebase
@@ -621,8 +628,8 @@ Four of the six main issues are one thing:
 column users read (issue 3). §5.9 marked the row and left the reuse path that
 copies rows (issue 5). §11.1 carried Stage 2's `insight` to the API and §12.4d had
 to carry it the last hop to the dashboard — the report layer's cluster summaries
-never got that second pass (issue 4). §5.6 hardened how a tenant is *identified*
-and never checked whether anything downstream *uses* the identity (issue 1).
+never got that second pass (issue 4). §5.6 hardened how a tenant is _identified_
+and never checked whether anything downstream _uses_ the identity (issue 1).
 
 The mitigation, and the thing to apply to every fix on this list: **when a fix adds
 a signal, follow the signal to the surface a human reads, and assert it there.**
@@ -630,6 +637,7 @@ a signal, follow the signal to the surface a human reads, and assert it there.**
 consumer, walk back to the producer — would have caught all four.
 
 ---
+
 ---
 
 # Open Issues — Pass 7 audit
@@ -642,42 +650,42 @@ finding verified against the source.
 
 ### Changes applied
 
-| # | Fix summary | Files changed |
-| - | ----------- | ------------- |
-| 8 | Tenant-scoping added to `delete_post`, `get_analysis`, `get_report` | `ingest.py`, `analysis.py`, `reports.py` |
-| 9 | PEL drain phase added to `bus.py`; empty ingestion messages ACK'd | `bus.py`, `service.py` |
-| 10 | Silent ACK-and-drop replaced with `record_failure` → DLQ; DLQ replay `xdel` on null data | `assembler.py`, `worker.py` (stage1), `router.py`, `dlq.py` |
-| 11 | Permanent `_API_KEY_TABLE_USABLE = False` replaced with 30s TTL retry | `deps.py` |
-| 12 | `stream_options={"include_usage": True}` for non-local backends | `client.py` |
-| 13 | JSON-retry wrapped in same try/except failover as initial call | `client.py` |
-| 14 | `EngagementResult` fields default to `0` | `models.py` |
-| 15 | `error` field added to `ReportResponse`; `_row_to_report` reads it | `models.py`, `reports.py` |
-| 16 | `coverage_anomaly()` used instead of `coverage > 1.0` (always false) | `harness.py` |
-| 17a | Validator sort key stringified to prevent mixed-type crash | `validator.py` |
-| 17b | `ch_client.disconnect()` added to assembler finally block | `assembler/__main__.py` |
-| 17c | Router + Stage 2 cleanup moved into `try/finally` | `router.py`, `stage2_llm/worker.py` |
-| 17d | Dashboard search reads `res.post_text` | `app.js` |
-| 17e | Demo API key seeded in `init-db.sql` | `init-db.sql` |
-| 17f | `.env` parser strips inline comments | `run_all.py` |
-| 17g | Rate limiter reads `X-Forwarded-For` / `X-Real-IP` | `deps.py` |
-| 17h | Admin gate applies to all backend changes, not just groq | `config.py` |
+| #   | Fix summary                                                                              | Files changed                                               |
+| --- | ---------------------------------------------------------------------------------------- | ----------------------------------------------------------- |
+| 8   | Tenant-scoping added to `delete_post`, `get_analysis`, `get_report`                      | `ingest.py`, `analysis.py`, `reports.py`                    |
+| 9   | PEL drain phase added to `bus.py`; empty ingestion messages ACK'd                        | `bus.py`, `service.py`                                      |
+| 10  | Silent ACK-and-drop replaced with `record_failure` → DLQ; DLQ replay `xdel` on null data | `assembler.py`, `worker.py` (stage1), `router.py`, `dlq.py` |
+| 11  | Permanent `_API_KEY_TABLE_USABLE = False` replaced with 30s TTL retry                    | `deps.py`                                                   |
+| 12  | `stream_options={"include_usage": True}` for non-local backends                          | `client.py`                                                 |
+| 13  | JSON-retry wrapped in same try/except failover as initial call                           | `client.py`                                                 |
+| 14  | `EngagementResult` fields default to `0`                                                 | `models.py`                                                 |
+| 15  | `error` field added to `ReportResponse`; `_row_to_report` reads it                       | `models.py`, `reports.py`                                   |
+| 16  | `coverage_anomaly()` used instead of `coverage > 1.0` (always false)                     | `harness.py`                                                |
+| 17a | Validator sort key stringified to prevent mixed-type crash                               | `validator.py`                                              |
+| 17b | `ch_client.disconnect()` added to assembler finally block                                | `assembler/__main__.py`                                     |
+| 17c | Router + Stage 2 cleanup moved into `try/finally`                                        | `router.py`, `stage2_llm/worker.py`                         |
+| 17d | Dashboard search reads `res.post_text`                                                   | `app.js`                                                    |
+| 17e | Demo API key seeded in `init-db.sql`                                                     | `init-db.sql`                                               |
+| 17f | `.env` parser strips inline comments                                                     | `run_all.py`                                                |
+| 17g | Rate limiter reads `X-Forwarded-For` / `X-Real-IP`                                       | `deps.py`                                                   |
+| 17h | Admin gate applies to all backend changes, not just groq                                 | `config.py`                                                 |
 
 ---
 
 ## At a glance
 
-| # | Issue | Impact | Layer | Status |
-| - | ----- | ------ | ----- | ------ |
-| [8](#8--idor--endpoints-lack-tenant-scoping) | IDOR — endpoints lack tenant scoping | **Security** — cross-tenant data access/deletion | API | ✅ Fixed |
-| [9](#9--pel-messages-are-never-reclaimed-after-worker-crash) | PEL messages never reclaimed after worker crash | **Data loss** — messages lost on any restart | Bus / all workers | ✅ Fixed |
-| [10](#10--failedcorrupt-messages-are-silently-dropped-instead-of-dead-lettered) | Failed/corrupt messages silently dropped | **Data loss** — bypasses the DLQ by design | Assembler, Stage 1, Router, DLQ | ✅ Fixed |
-| [11](#11--api-key-auth-permanently-disabled-on-first-db-failure) | API key auth permanently disabled on first DB failure | **Auth** — one blip locks out every key user | API deps | ✅ Fixed |
-| [12](#12--streaming-usage-tracking-reports-zero-tokens) | Streaming usage reports zero tokens | **Thesis** — cost figure under-counts streaming | LLM client | ✅ Fixed |
-| [13](#13--json-retry-bypasses-failover--crashes-instead-of-degrading) | JSON retry bypasses failover | **Resilience** — hard crash instead of degrade | LLM client | ✅ Fixed |
-| [14](#14--engagementresult-required-fields-crash-the-api-on-missing-data) | EngagementResult crashes the API | **Availability** — 500 on any post missing engagement | API models | ✅ Fixed |
-| [15](#15--reportresponse-omits-error--failed-reports-give-no-reason) | ReportResponse omits `error` | **UX** — failed reports give no reason | API models | ✅ Fixed |
-| [16](#16--eval-harness-over-coverage-metric-is-dead-code) | Eval over-coverage metric is dead code | **Eval honesty** — always reports 0 | Eval harness | ✅ Fixed |
-| [17](#17--smaller-issues) | Eight smaller issues | Bounded | Various | ✅ Fixed |
+| #                                                                               | Issue                                                 | Impact                                                | Layer                           | Status   |
+| ------------------------------------------------------------------------------- | ----------------------------------------------------- | ----------------------------------------------------- | ------------------------------- | -------- |
+| [8](#8--idor--endpoints-lack-tenant-scoping)                                    | IDOR — endpoints lack tenant scoping                  | **Security** — cross-tenant data access/deletion      | API                             | ✅ Fixed |
+| [9](#9--pel-messages-are-never-reclaimed-after-worker-crash)                    | PEL messages never reclaimed after worker crash       | **Data loss** — messages lost on any restart          | Bus / all workers               | ✅ Fixed |
+| [10](#10--failedcorrupt-messages-are-silently-dropped-instead-of-dead-lettered) | Failed/corrupt messages silently dropped              | **Data loss** — bypasses the DLQ by design            | Assembler, Stage 1, Router, DLQ | ✅ Fixed |
+| [11](#11--api-key-auth-permanently-disabled-on-first-db-failure)                | API key auth permanently disabled on first DB failure | **Auth** — one blip locks out every key user          | API deps                        | ✅ Fixed |
+| [12](#12--streaming-usage-tracking-reports-zero-tokens)                         | Streaming usage reports zero tokens                   | **Thesis** — cost figure under-counts streaming       | LLM client                      | ✅ Fixed |
+| [13](#13--json-retry-bypasses-failover--crashes-instead-of-degrading)           | JSON retry bypasses failover                          | **Resilience** — hard crash instead of degrade        | LLM client                      | ✅ Fixed |
+| [14](#14--engagementresult-required-fields-crash-the-api-on-missing-data)       | EngagementResult crashes the API                      | **Availability** — 500 on any post missing engagement | API models                      | ✅ Fixed |
+| [15](#15--reportresponse-omits-error--failed-reports-give-no-reason)            | ReportResponse omits `error`                          | **UX** — failed reports give no reason                | API models                      | ✅ Fixed |
+| [16](#16--eval-harness-over-coverage-metric-is-dead-code)                       | Eval over-coverage metric is dead code                | **Eval honesty** — always reports 0                   | Eval harness                    | ✅ Fixed |
+| [17](#17--smaller-issues)                                                       | Eight smaller issues                                  | Bounded                                               | Various                         | ✅ Fixed |
 
 ---
 
@@ -694,11 +702,11 @@ finding verified against the source.
 Three endpoints accept an entity ID from the URL path and use it as the sole
 lookup/delete key, with **no tenant-scoping filter**:
 
-| Endpoint | Operation | Query shape |
-| -------- | --------- | ----------- |
+| Endpoint                  | Operation                                                     | Query shape                              |
+| ------------------------- | ------------------------------------------------------------- | ---------------------------------------- |
 | `DELETE /posts/{post_id}` | cascade delete across `comments`, `analysis_results`, `posts` | `WHERE post_id = :pid` — no tenant check |
-| `GET /v1/analysis/{id}` | read job + results | `WHERE id = :id` — no tenant check |
-| `GET /v1/reports/{id}` | read report | `WHERE id = :id` — no tenant check |
+| `GET /v1/analysis/{id}`   | read job + results                                            | `WHERE id = :id` — no tenant check       |
+| `GET /v1/reports/{id}`    | read report                                                   | `WHERE id = :id` — no tenant check       |
 
 `delete_post` is the worst: any authenticated user can delete another tenant's
 posts, their analysis results, and all their comments in a single call. The
@@ -793,11 +801,11 @@ would have caught it on day one.
 them to the DLQ.** The DLQ infrastructure (`src/defense/libs/dlq.py`, `record_failure`) exists
 and works — these paths just don't use it:
 
-| Worker | Failure | What happens | Should happen |
-| ------ | ------- | ------------ | ------------- |
-| Assembler | `build_canonical_result` raises `ValueError`/`KeyError` | logs, ACKs, returns | `record_failure` → DLQ |
-| Stage 1 | `json.loads` raises `JSONDecodeError` | logs, ACKs | `record_failure` → DLQ |
-| Router | `json.loads` raises `JSONDecodeError` | logs, returns (outer loop ACKs) | `record_failure` → DLQ |
+| Worker    | Failure                                                 | What happens                    | Should happen          |
+| --------- | ------------------------------------------------------- | ------------------------------- | ---------------------- |
+| Assembler | `build_canonical_result` raises `ValueError`/`KeyError` | logs, ACKs, returns             | `record_failure` → DLQ |
+| Stage 1   | `json.loads` raises `JSONDecodeError`                   | logs, ACKs                      | `record_failure` → DLQ |
+| Router    | `json.loads` raises `JSONDecodeError`                   | logs, returns (outer loop ACKs) | `record_failure` → DLQ |
 
 **The DLQ itself has a bug.** `replay_dlq` iterates entries and calls `continue`
 when `data is None` — but the `xdel` that removes the entry from the DLQ is
@@ -1045,7 +1053,9 @@ comparing them, so the validator crashes on any schema with nested arrays.
 
 ### 17b — ClickHouse client never closed on shutdown
 
-[assembler/__main__.py:159](src/defense/services/workers/assembler/__main__.py#L159) The
+[assembler/**main**e client never closed on shutdown
+
+[assembler/**main**.py:159](src/defense/services/workers/assembler/__main__.py#L159) The
 `finally` block closes Redis and disposes the SQLAlchemy engine, but never
 calls `ch_client.disconnect()`. ClickHouse connections leak on every graceful
 shutdown or restart.

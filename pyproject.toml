@@ -84,7 +84,19 @@ package = true
 
 [tool.pytest.ini_options]
 testpaths = ["tests"]
-pythonpath = ["."]
+# The tree moved under src/defense/, but the workers still use bare imports
+# (`from libs.… import`, `from services.… import`) because each one is launched
+# with its own package root. Tests import both spellings — `defense.x` for the
+# installed package and the bare `libs.x` / `services.x` the workers themselves
+# use — so both roots have to be importable or a whole class of contract test
+# silently stops collecting.
+pythonpath = [".", "src", "src/defense"]
+markers = [
+    "e2e: needs a full Docker + Ollama stack, not just the venv.",
+    # Wipes datastores. Skipped unless RUN_DESTRUCTIVE_E2E=1 — a bare `pytest`
+    # must never be able to destroy the developer's live dev environment.
+    "destructive: mutates or wipes live datastores; opt-in only.",
+]
 
 [tool.ruff]
 line-length = 100

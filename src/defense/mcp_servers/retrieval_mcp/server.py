@@ -125,14 +125,15 @@ async def semantic_search(
     sentiment_filter: Annotated[
         str | None, Field(description="Optional overall_sentiment filter (positive/negative/neutral/mixed).")
     ] = None,
+    tenant_id: Annotated[str | None, Field(description="Optional tenant ID filter.")] = None,
 ) -> list[dict]:
     """Vector (pgvector cosine) search over analyzed posts; returns post_id, score,
     campaign_id, overall_sentiment, and post_summary. Falls back to recency in stub mode."""
     limit = min(int(limit), 50)
-    log.info("tool_call", tool="semantic_search", campaign_id=campaign_id, stub=_STUB_MODE)
+    log.info("tool_call", tool="semantic_search", campaign_id=campaign_id, tenant_id=tenant_id, stub=_STUB_MODE)
 
     if _STUB_MODE:
-        return await _stub_semantic_search(campaign_id, limit, sentiment_filter)
+        return await _stub_semantic_search(campaign_id, limit, sentiment_filter, tenant_id=tenant_id)
 
     # --- Real path: embed query and run a pgvector cosine-similarity search ---
     qvec = to_pgvector_literal(embed_text(query))
@@ -142,6 +143,9 @@ async def semantic_search(
     if campaign_id:
         where_parts.append("ar.campaign_id = :campaign_id")
         params["campaign_id"] = campaign_id
+    if tenant_id:
+        where_parts.append("ar.tenant_id = :tenant_id")
+        params["tenant_id"] = tenant_id
     if sentiment_filter:
         where_parts.append("ar.result->>'overall_sentiment' = :sentiment")
         params["sentiment"] = sentiment_filter
@@ -184,6 +188,7 @@ async def _stub_semantic_search(
     campaign_id: str | None,
     limit: int,
     sentiment_filter: str | None,
+    tenant_id: str | None = None,
 ) -> list[dict]:
     """Stub: return first N analysis_results from Postgres matching filters."""
     params: dict[str, Any] = {"limit": limit}
@@ -192,6 +197,9 @@ async def _stub_semantic_search(
     if campaign_id:
         where_parts.append("ar.campaign_id = :campaign_id")
         params["campaign_id"] = campaign_id
+    if tenant_id:
+        where_parts.append("ar.tenant_id = :tenant_id")
+        params["tenant_id"] = tenant_id
     if sentiment_filter:
         where_parts.append("ar.result->>'overall_sentiment' = :sentiment")
         params["sentiment"] = sentiment_filter
@@ -233,17 +241,23 @@ async def _stub_semantic_search(
 @mcp.tool
 async def get_post(
     post_id: Annotated[str, Field(description="Post id (CUID) to fetch the analysis result for.")],
+    tenant_id: Annotated[str | None, Field(description="Optional tenant ID filter.")] = None,
 ) -> dict:
     """Return the latest stored analysis result for a single post."""
-    log.info("tool_call", tool="get_post", post_id=post_id)
-    return await _get_post(post_id)
+    log.info("tool_call", tool="get_post", post_id=post_id, tenant_id=tenant_id)
+    return await _get_post(post_id, tenant_id=tenant_id)
 
 
-async def _get_post(post_id: str) -> dict:
+async def _get_post(post_id: str, tenant_id: str | None = None) -> dict:
     """SELECT result FROM analysis_results WHERE post_id=$1 (latest)."""
-    # scraped_at lives on the posts table (analysis_results has no such column).
+    where_parts = ["ar.post_id = :post_id"]
+    params: dict[str, Any] = {"post_id": post_id}
+    if tenant_id:
+        where_parts.append("ar.tenant_id = :tenant_id")
+        params["tenant_id"] = tenant_id
+
     sql = text(
-        """
+        f"""
         SELECT
             ar.id,
             ar.post_id,
@@ -253,14 +267,14 @@ async def _get_post(post_id: str) -> dict:
             p.scraped_at
         FROM analysis_results ar
         JOIN posts p ON p.id = ar.post_id
-        WHERE ar.post_id = :post_id
+        WHERE {' AND '.join(where_parts)}
         ORDER BY ar.created_at DESC
         LIMIT 1
         """
     )
 
     async with _AsyncSessionLocal() as session:
-        row = (await session.execute(sql, {"post_id": post_id})).mappings().first()
+        row = (await session.execute(sql, params)).mappings().first()
 
     if row is None:
         log.warning("get_post_not_found", post_id=post_id)
@@ -285,11 +299,12 @@ async def _get_post(post_id: str) -> dict:
 async def get_thread(
     post_id: Annotated[str, Field(description="Post id (CUID) whose thread to fetch.")],
     include_comments: Annotated[bool, Field(description="Include all stored comments.")] = True,
+    tenant_id: Annotated[str | None, Field(description="Optional tenant ID filter.")] = None,
 ) -> dict:
     """Fetch a post's analysis result plus (optionally) all of its stored comments,
     ordered by likes."""
-    log.info("tool_call", tool="get_thread", post_id=post_id, include_comments=include_comments)
-    post = await _get_post(post_id)
+    log.info("tool_call", tool="get_thread", post_id=post_id, include_comments=include_comments, tenant_id=tenant_id)
+    post = await _get_post(post_id, tenant_id=tenant_id)
 
     if not include_comments:
         return {"post": post, "comments": None}
@@ -344,24 +359,31 @@ async def representative_comments(
         str, Field(description="Sentiment bucket filter: positive/negative/neutral, or 'all'.")
     ] = "all",
     limit: Annotated[int, Field(description="Max comments to return.", ge=1, le=50)] = 5,
+    tenant_id: Annotated[str | None, Field(description="Optional tenant ID filter.")] = None,
 ) -> list[dict]:
     """Return representative comments for a post (from the stored analysis JSON,
     falling back to the comments table), filtered by sentiment and ranked by likes."""
-    log.info("tool_call", tool="representative_comments", post_id=post_id, sentiment=sentiment)
+    log.info("tool_call", tool="representative_comments", post_id=post_id, sentiment=sentiment, tenant_id=tenant_id)
+
+    where_parts = ["ar.post_id = :post_id"]
+    params: dict[str, Any] = {"post_id": post_id}
+    if tenant_id:
+        where_parts.append("ar.tenant_id = :tenant_id")
+        params["tenant_id"] = tenant_id
 
     # First try: pull from stored analysis JSON
     sql_result = text(
-        """
+        f"""
         SELECT ar.result->'comment_analysis'->'representative_comments' AS rcs
         FROM analysis_results ar
-        WHERE ar.post_id = :post_id
+        WHERE {' AND '.join(where_parts)}
         ORDER BY ar.created_at DESC
         LIMIT 1
         """
     )
 
     async with _AsyncSessionLocal() as session:
-        row = (await session.execute(sql_result, {"post_id": post_id})).mappings().first()
+        row = (await session.execute(sql_result, params)).mappings().first()
 
     if row is None:
         raise ValueError(f"Post not found: {post_id!r}")
@@ -376,6 +398,7 @@ async def representative_comments(
     # Fallback: query comments table directly
     log.info("representative_comments_fallback_to_table", post_id=post_id, sentiment=sentiment)
     return await _representative_comments_from_table(post_id, sentiment, limit)
+
 
 
 def _filter_representative_comments(

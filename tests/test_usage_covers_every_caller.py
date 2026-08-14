@@ -37,7 +37,11 @@ from libs.llm.usage import (
     track_usage,
 )
 
-_REPO = pathlib.Path('/home/bk/code/defense')
+# Module paths below are bare-import names (`libs/llm/usage.py`), which now
+# live under src/defense/. Deriving the root keeps this working from any
+# checkout — a hardcoded path is how these greps came to scan directories
+# that no longer exist and report 'no caller found' for every caller.
+_REPO = pathlib.Path(__file__).resolve().parents[1] / 'src' / 'defense'
 
 #: Modules permitted to call the OpenAI SDK directly. Exactly one: the client
 #: that provides the breaker, the failover, truncation recovery and the counters.

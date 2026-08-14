@@ -1,4 +1,6 @@
 import asyncio
+import pathlib
+import sys
 import pytest
 import pytest_asyncio
 from sqlalchemy.ext.asyncio import create_async_engine, AsyncSession
@@ -10,9 +12,94 @@ from testcontainers.redis import RedisContainer
 import os
 import subprocess
 
+# ---------------------------------------------------------------------------
+# Import roots
+# ---------------------------------------------------------------------------
+# REPO is derived, never hardcoded: the contract tests that grep the source have
+# to keep working from any checkout, and a stale absolute path is exactly how
+# they came to point at directories that no longer exist after the move into
+# src/defense/.
+REPO = pathlib.Path(__file__).resolve().parents[1]
+SRC = REPO / "src"
+PKG = SRC / "defense"
+for _p in (REPO, SRC, PKG):
+    if str(_p) not in sys.path:
+        sys.path.insert(0, str(_p))
+
+
+def src_file(rel: str) -> pathlib.Path:
+    """Absolute path of a module inside the package, from its bare-import name.
+
+    ``src_file("services/api/routers/chat.py")`` → ``src/defense/services/api/
+    routers/chat.py``. The grep-the-source contract tests name modules the way
+    the workers import them; this is the one place that mapping lives.
+    """
+    return PKG / rel
+
+
 # Pytest configuration to use asyncio
 def pytest_configure(config):
     config.addinivalue_line("markers", "asyncio: mark test as asyncio")
+    config.addinivalue_line("markers", "timeout(seconds): advisory; no-op without pytest-timeout")
+
+
+def pytest_sessionstart(session):
+    """No test may reach the network for model weights.
+
+    Several files spent 25-200 seconds each waiting on Hugging Face — for
+    models whose ABSENCE was the thing being asserted. Offline mode makes the
+    loaders fail immediately, which is both the intended test condition and the
+    difference between a 5-second file and a 200-second one. Set
+    DEFENSE_TEST_ALLOW_DOWNLOADS=1 to opt out.
+    """
+    if os.environ.get("DEFENSE_TEST_ALLOW_DOWNLOADS") == "1":
+        return
+    os.environ.setdefault("HF_HUB_OFFLINE", "1")
+    os.environ.setdefault("TRANSFORMERS_OFFLINE", "1")
+    # Same rule for the LLM. STAGE1_LLM defaults to true, so a bare
+    # ModelRegistry() in a unit test tries to reach Ollama and spends the full
+    # retry-with-backoff budget failing — 65 seconds for one assertion about a
+    # stub embedding. Tests that exercise the LLM path set this themselves.
+    os.environ.setdefault("STAGE1_LLM", "false")
+
+
+@pytest.fixture(scope="session", autouse=True)
+def _ignore_dotenv():
+    """Keep the developer's .env out of the test run.
+
+    `Settings` reads `.env` by default, so config assertions silently became
+    assertions about whatever the machine's local file happened to contain —
+    e.g. the JWT tests were checking a real deployment secret rather than the
+    documented fallback. Tests configure their own environment or get the
+    declared defaults.
+    """
+    try:
+        from defense.libs.common.config import Settings
+    except Exception:  # pragma: no cover
+        yield
+        return
+    original = Settings.model_config.get("env_file")
+    Settings.model_config["env_file"] = None
+    yield
+    Settings.model_config["env_file"] = original
+
+
+@pytest.fixture(autouse=True)
+def _fresh_settings():
+    """Drop the cached Settings around every test.
+
+    ``get_settings()`` is ``lru_cache``d, so the first import in a session
+    freezes the environment for the whole run and every test that monkeypatches
+    an env var silently asserts against the snapshot instead of its own setup.
+    """
+    try:
+        from defense.libs.common.config import get_settings
+    except Exception:  # pragma: no cover - config import failures surface elsewhere
+        yield
+        return
+    get_settings.cache_clear()
+    yield
+    get_settings.cache_clear()
 
 @pytest.fixture(scope="session")
 def event_loop():

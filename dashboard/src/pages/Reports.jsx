@@ -155,7 +155,10 @@ export default function Reports() {
         </div>
       </div>
 
-      {viewReport && (
+      {viewReport && (() => {
+        // Cluster summaries may sit on the report body or on its embedded data.
+        const rep = viewReport.data || viewReport;
+        return (
         <div className="fixed inset-0 bg-black/50 z-50 flex items-center justify-center p-4">
           <div className="bg-white dark:bg-[#121214] border border-slate-200 dark:border-zinc-800 rounded-xl shadow-xl w-full max-w-3xl max-h-[80vh] flex flex-col overflow-hidden">
             <div className="p-4 border-b border-slate-200 dark:border-zinc-800 flex justify-between items-center bg-slate-50 dark:bg-zinc-900">
@@ -171,6 +174,41 @@ export default function Reports() {
                   <div className="text-slate-700 dark:text-slate-300 whitespace-pre-wrap leading-relaxed">{viewReport.summary}</div>
                 </div>
               )}
+              {/* Cluster summaries cost a real LLM call each. They were being
+                  computed, paid for and then dropped before reaching any
+                  surface (OPEN_ISSUES #4); the dashboard rewrite lost the fix,
+                  so they are rendered here again — with their honesty flag. */}
+              {Array.isArray(rep.embedding_clusters) && rep.embedding_clusters.length > 0 && (
+                <div className="mb-6">
+                  <h4 className="font-semibold mb-2 flex items-center gap-2">
+                    Embedding clusters
+                    <span className="text-xs font-normal text-slate-500">({rep.embedding_clusters.length})</span>
+                    {rep.embedding_clusters_are_stub && (
+                      <span
+                        title="These clusters were computed over STUB embedding vectors — the grouping is reproducible, but it is not semantic."
+                        className="text-[10px] font-semibold px-2 py-0.5 bg-amber-100 dark:bg-amber-900/30 text-amber-700 dark:text-amber-400 rounded-full uppercase"
+                      >
+                        stub vectors
+                      </span>
+                    )}
+                  </h4>
+                  <div className="space-y-3">
+                    {rep.embedding_clusters.map((cluster, ci) => (
+                      <div key={ci} className="border border-slate-200 dark:border-zinc-800 rounded-lg p-3 bg-slate-50 dark:bg-[#09090b]">
+                        <div className="flex justify-between items-center mb-1">
+                          <span className="text-xs font-semibold text-slate-500 uppercase tracking-wider">
+                            Cluster {cluster.cluster_id ?? ci}
+                          </span>
+                          <span className="text-xs text-slate-500">{cluster.size ?? 0} posts</span>
+                        </div>
+                        <div className="text-sm text-slate-700 dark:text-slate-300">
+                          {cluster.summary || cluster.label || '—'}
+                        </div>
+                      </div>
+                    ))}
+                  </div>
+                </div>
+              )}
               {viewReport.data && (
                 <div>
                   <h4 className="font-semibold mb-2">Raw Data</h4>
@@ -182,7 +220,8 @@ export default function Reports() {
             </div>
           </div>
         </div>
-      )}
+        );
+      })()}
     </div>
   );
 }

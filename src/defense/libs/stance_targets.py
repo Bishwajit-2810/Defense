@@ -201,14 +201,36 @@ def _parse_entry(raw: Any, polarity: str, seen_ids: set[str]) -> Target:
     )
 
 
-def load_targets(path: str | Path) -> Targets:
+#: Operator entries live beside the shipped example, under a name git ignores.
+#: The example file is documentation — naming real people in it commits an
+#: editorial choice to the repository and hands it to everyone who clones it.
+#: When the sibling `<name>.local.yml` exists it is loaded INSTEAD.
+LOCAL_SUFFIX = ".local.yml"
+
+
+def local_path_for(path: str | Path) -> Path:
+    """The operator-owned override path for a given watchlist file."""
+    p = Path(path)
+    return p.with_name(p.name.replace(".yml", "").replace(".yaml", "") + LOCAL_SUFFIX)
+
+
+def load_targets(path: str | Path, *, prefer_local: bool = True) -> Targets:
     """Load and validate a watchlist. Returns an empty Targets when absent.
 
     An absent file is not an error — the feature is opt-in, and a deployment
     without a watchlist should behave exactly as before. A *malformed* file is an
     error, loudly.
+
+    A sibling ``*.local.yml`` wins when present: that is where an operator's real
+    entries belong, so the tracked example stays an example. Pass
+    ``prefer_local=False`` to read exactly the file named — used by the test
+    that asserts the SHIPPED example declares no real entities, which must not
+    be answered by whatever the local machine happens to have.
     """
     p = Path(path)
+    local = local_path_for(p)
+    if prefer_local and local.exists():
+        p = local
     if not p.exists():
         return Targets()
 
@@ -260,6 +282,58 @@ def unmatched_targets(targets: Targets, matched_ids: Iterable[str]) -> list[str]
     return [t.id for t in targets.targets if t.id not in seen]
 
 
+def watchlist_verdict(
+    targets: Targets | None,
+    post_text: str | None,
+    comments: Iterable[dict],
+) -> tuple[bool, str | None]:
+    """Should this post raise a watchlist alert, and why? ``(alert, reason)``.
+
+    Two rules, both in the config's own words:
+
+    * an ``always`` target mentioned anywhere — post text or a comment — alerts
+      regardless of stance, because that is what the bucket means;
+    * a comment OPPOSING a ``favored`` target alerts, because that is the "under
+      attack" case the dashboard names.
+
+    Opposition to a target the operator did NOT declare favoured is not an
+    alert. Firing on every listed entity made a *monitoring* watchlist
+    (``neutral`` polarity — "report stance, impose no framing") behave like an
+    advocacy one.
+
+    Lives here, and not in its two callers, because it has two callers: Stage 2
+    computes it when it ran (it has the LLM's per-entity stances) and the
+    assembler computes it for every post so the alert does not go quiet exactly
+    when the router starts bypassing post-level work. Those two were verbatim
+    copies of this logic in different modules — and a rule duplicated across the
+    cheap path and the expensive path is one that eventually disagrees with
+    itself about whether to alert, which is the failure mode the two-path design
+    was introduced to fix.
+
+    The reason string names the target and the rule that fired: an ``always``
+    match is a plain mention, not hostility, and a UI that describes every alert
+    as an attack is misreading its own watchlist.
+    """
+    if not targets:
+        return False, None
+
+    for target_id in targets.matched_ids(post_text or ""):
+        target = targets.by_id(target_id)
+        if target and target.polarity == "always":
+            return True, f"always:{target.id} mentioned in post text"
+
+    for comment in comments or ():
+        for entry in comment.get("target_stances") or []:
+            target = targets.by_id(entry.get("target"))
+            if not target:
+                continue
+            if target.polarity == "always":
+                return True, f"always:{target.id} mentioned in a comment"
+            if target.polarity == "favored" and entry.get("stance") == "opposing":
+                return True, f"opposing:{target.id} opposed in a comment"
+    return False, None
+
+
 __all__ = [
     "POLARITIES",
     "Match",
@@ -267,5 +341,7 @@ __all__ = [
     "Target",
     "Targets",
     "load_targets",
+    "local_path_for",
     "unmatched_targets",
+    "watchlist_verdict",
 ]

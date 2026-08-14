@@ -100,15 +100,15 @@ async def _int_key(redis: aioredis.Redis, key: str) -> int:
         return 0
 
 
-async def _completed_count(db: AsyncSession) -> int:
+async def _completed_count(db: AsyncSession, tenant_id: str = "default") -> int:
     try:
-        row = (await db.execute(text("SELECT count(*) AS n FROM analysis_results"))).mappings().first()
+        row = (await db.execute(text("SELECT count(*) AS n FROM analysis_results WHERE tenant_id = :tid"), {"tid": tenant_id})).mappings().first()
         return int(row["n"]) if row else 0
     except Exception:
         return 0
 
 
-async def collect_stats(redis: aioredis.Redis, db: AsyncSession) -> dict:
+async def collect_stats(redis: aioredis.Redis, db: AsyncSession, tenant_id: str = "default") -> dict:
     """Assemble the full pipeline snapshot."""
     stages = []
     for key, label, stream, group in _STAGES:
@@ -118,7 +118,7 @@ async def collect_stats(redis: aioredis.Redis, db: AsyncSession) -> dict:
 
     return {
         "stages": stages,
-        "completed": await _completed_count(db),
+        "completed": await _completed_count(db, tenant_id=tenant_id),
         "total_processed": await _int_key(redis, "stats:total_processed"),
         "llm_routed": await _int_key(redis, "stats:llm_routed"),
         "dlq_total": sum(s["dlq"] for s in stages),
@@ -133,17 +133,18 @@ async def pipeline_stats(
     db: AsyncSession = Depends(get_db),
     current_user: dict = Depends(get_current_user),
 ) -> dict:
-    return await collect_stats(redis, db)
+    tenant_id = current_user.get("tenant_id", "default")
+    return await collect_stats(redis, db, tenant_id=tenant_id)
 
 
-async def _stats_sse(redis: aioredis.Redis, db: AsyncSession) -> AsyncGenerator[str, None]:
+async def _stats_sse(redis: aioredis.Redis, db: AsyncSession, tenant_id: str = "default") -> AsyncGenerator[str, None]:
     """Poll the pipeline state and push it as SSE ``stats`` events."""
     yield "event: connected\ndata: {}\n\n"
     loop = asyncio.get_event_loop()
     deadline = loop.time() + _STREAM_MAX_SECONDS
     try:
         while loop.time() < deadline:
-            stats = await collect_stats(redis, db)
+            stats = await collect_stats(redis, db, tenant_id=tenant_id)
             yield f"event: stats\ndata: {json.dumps(stats, default=str)}\n\n"
             await asyncio.sleep(_POLL_SECONDS)
         yield "event: timeout\ndata: {}\n\n"
@@ -169,8 +170,10 @@ async def pipeline_stream(
     Auth accepts ``?api_key=`` (EventSource can't set headers). The dashboard
     Pipeline tab opens this and animates each stage's backlog/in-flight/DLQ.
     """
+    tenant_id = current_user.get("tenant_id", "default")
     return StreamingResponse(
-        _stats_sse(redis, db),
+        _stats_sse(redis, db, tenant_id=tenant_id),
         media_type="text/event-stream",
         headers={"Cache-Control": "no-cache", "X-Accel-Buffering": "no"},
     )
+

@@ -39,7 +39,7 @@ async def _get_report_row(db: AsyncSession, report_id: str, *, tenant_id: str = 
                 SELECT id, selector, options, status, created_at, updated_at, error
                 FROM jobs
                 WHERE id = :id AND type = 'report'
-                  AND (selector->>'tenant_id' = :tid OR selector->>'tenant_id' IS NULL)
+                  AND (tenant_id = :tid OR selector->>'tenant_id' = :tid)
                 """
             ),
             {"id": report_id, "tid": tenant_id},
@@ -76,7 +76,7 @@ def _row_to_report(row: dict) -> ReportResponse:
     )
 
 
-async def _generate_report_content(db: AsyncSession, campaign_id: str) -> dict:
+async def _generate_report_content(db: AsyncSession, campaign_id: str, tenant_id: str = "default") -> dict:
     """Aggregate stored analysis results into report content.
 
     Synchronous-at-request-time generation: the corpus is aggregated with a few
@@ -84,8 +84,8 @@ async def _generate_report_content(db: AsyncSession, campaign_id: str) -> dict:
     of waiting on a queue consumer.
     """
     scoped = campaign_id not in ("", "all")
-    where = "WHERE ar.campaign_id = :cid" if scoped else ""
-    params: dict = {"cid": campaign_id} if scoped else {}
+    where = "WHERE ar.tenant_id = :tid" + (" AND ar.campaign_id = :cid" if scoped else "")
+    params: dict = {"tid": tenant_id, "cid": campaign_id} if scoped else {"tid": tenant_id}
 
     # --- Headline metrics -----------------------------------------------
     head = (
@@ -129,6 +129,7 @@ async def _generate_report_content(db: AsyncSession, campaign_id: str) -> dict:
     ).mappings().all()
 
     # --- Topic clusters: count + dominant sentiment per topic -------------
+    topic_filter = "WHERE ar.tenant_id = :tid" + (" AND ar.campaign_id = :cid" if scoped else "")
     topic_rows = (
         await db.execute(
             text(
@@ -138,7 +139,7 @@ async def _generate_report_content(db: AsyncSession, campaign_id: str) -> dict:
                        count(*)                           AS n
                 FROM analysis_results ar,
                      jsonb_array_elements_text(ar.result->'topics') AS t(topic)
-                {where}
+                {topic_filter}
                 GROUP BY 1, 2
                 """
             ),
@@ -248,6 +249,7 @@ async def _embedding_clusters(
     db: AsyncSession,
     campaign_id: str,
     backend_override: str | None,
+    tenant_id: str = "default",
 ) -> tuple[list[dict], bool]:
     """Cluster post embeddings (pgvector → k-means) and summarize one slice per
     cluster with a single LLM-B call each — N posts, ~k LLM calls (§5).
@@ -269,8 +271,8 @@ async def _embedding_clusters(
         return [], False
 
     scoped = campaign_id not in ("", "all")
-    where = "WHERE ar.embedding IS NOT NULL"
-    params: dict = {"lim": _CLUSTER_SAMPLE_CAP}
+    where = "WHERE ar.embedding IS NOT NULL AND ar.tenant_id = :tid"
+    params: dict = {"lim": _CLUSTER_SAMPLE_CAP, "tid": tenant_id}
     if scoped:
         where += " AND ar.campaign_id = :cid"
         params["cid"] = campaign_id
@@ -412,17 +414,19 @@ async def list_reports(
     current_user: dict = Depends(get_current_user),
 ) -> list[ReportResponse]:
     """Return all report jobs ordered by creation time (newest first)."""
+    tenant_id = current_user.get("tenant_id", "default")
     rows = (
         await db.execute(
             text(
                 """
                 SELECT id, selector, options, status, created_at, updated_at, error
                 FROM jobs
-                WHERE type = 'report'
+                WHERE type = 'report' AND (tenant_id = :tid OR selector->>'tenant_id' = :tid)
                 ORDER BY created_at DESC
                 LIMIT 100
                 """
-            )
+            ),
+            {"tid": tenant_id},
         )
     ).mappings().all()
 
@@ -455,6 +459,7 @@ async def create_report(
     """
     report_id = str(uuid.uuid4())
     now = datetime.now(tz=timezone.utc)
+    tenant_id = current_user.get("tenant_id", "default")
 
     # Corpus-wide reports (the dashboard) omit campaign_id → default to "all".
     campaign_id = body.campaign_id or "all"
@@ -462,6 +467,7 @@ async def create_report(
     selector = {
         "campaign_id": campaign_id,
         "filters": body.filters.model_dump(exclude_none=True) if body.filters else {},
+        "tenant_id": tenant_id,
     }
     options = {
         "title": body.title,
@@ -470,13 +476,14 @@ async def create_report(
         "include_engagement": body.include_engagement,
         "include_topics": body.include_topics,
         "requested_by": current_user.get("sub"),
+        "tenant_id": tenant_id,
         **(body.options or {}),
     }
 
     # Generate the report content inline — the aggregation is a handful of SQL
     # queries, so reports complete at request time (no queue consumer needed).
     try:
-        content = await _generate_report_content(db, campaign_id)
+        content = await _generate_report_content(db, campaign_id, tenant_id=tenant_id)
         content["summary_source"] = "aggregate"
 
         # Grounded reports (default) get an LLM-B narrative on top of the
@@ -501,7 +508,7 @@ async def create_report(
             # never fail report creation if clustering/LLM is unavailable.
             try:
                 emb_clusters, emb_are_stub = await _embedding_clusters(
-                    db, campaign_id, backend_override
+                    db, campaign_id, backend_override, tenant_id=tenant_id
                 )
                 content["embedding_clusters"] = emb_clusters
                 content["embedding_clusters_are_stub"] = emb_are_stub
@@ -514,12 +521,13 @@ async def create_report(
         await db.execute(
             text(
                 """
-                INSERT INTO jobs (id, type, status, selector, options, created_at, updated_at)
-                VALUES (:id, :type, :status, CAST(:selector AS jsonb), CAST(:options AS jsonb), :created_at, :updated_at)
+                INSERT INTO jobs (id, tenant_id, type, status, selector, options, created_at, updated_at)
+                VALUES (:id, :tenant_id, :type, :status, CAST(:selector AS jsonb), CAST(:options AS jsonb), :created_at, :updated_at)
                 """
             ),
             {
                 "id": report_id,
+                "tenant_id": tenant_id,
                 "type": "report",
                 "status": "done",
                 "selector": json.dumps(selector, default=str),

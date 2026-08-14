@@ -393,6 +393,11 @@ class TestRouterReadsRealStage1Shape:
             text_result=text_result,
             image_result=image_result,
             comment_analysis={"analyzed": 0, "sentiment_breakdown": {}},
+            # Stage 1 writes the summary now, so it is part of the result the
+            # router and the assembler both read.
+            post_summary=None,
+            post_summary_lang=None,
+            post_summary_grounding=None,
             overall_sentiment="neutral",
             sentiment_score=0.0,
             stage1_ms=1.0,
@@ -426,26 +431,65 @@ class TestRouterReadsRealStage1Shape:
         assert any("confidence" in r for r in reasons)
 
     def test_bypass_leg_is_reachable(self):
-        """At least one of the 50 real posts must skip Stage 2.
+        """A confidently-classified post must skip Stage 2.
 
         The whole cost argument rests on this branch existing at runtime. When
         every rule either always fires or can never fire, it is dead code.
-        """
-        bypassed = [
-            p for p in SAMPLE_POSTS
-            if not should_use_llm(self._real_stage1_result(p), {})[0]
-        ]
-        assert bypassed, "no post bypasses Stage 2 — the routing gate does not gate"
 
-    def test_placeholder_post_type_does_not_route_every_post(self):
-        """Rule 2 must fire on *unclassifiable* posts, not on all of them."""
-        routed = [
-            p for p in SAMPLE_POSTS
-            if should_use_llm(self._real_stage1_result(p), {})[0]
-        ]
-        assert len(routed) < len(SAMPLE_POSTS), (
-            f"{len(routed)}/{len(SAMPLE_POSTS)} posts routed — Rule 2 is firing "
-            "on a Stage-2 placeholder again"
+        Driven from a real Stage-1 result with a classification attached,
+        because in MODEL_STUB_MODE Stage 1 has no post-type classifier for
+        Bangla and legitimately returns None for every post — see
+        test_stub_mode_routes_everything_for_a_stated_reason.
+        """
+        result = self._real_stage1_result(FIRST_POST)
+        result.update({
+            "confidence": 0.95,
+            "post_type": "news",
+            "post_type_confidence": 0.95,
+            "toxicity_score": 0.0,
+            "photo_urls": [],
+            "caption_chars": 100,
+            "script": "bengali",
+            "is_banglish": False,
+        })
+        use_llm, reasons = should_use_llm(result, {})
+        assert not use_llm, f"gate does not gate — fired: {reasons}"
+
+    def test_summary_alone_no_longer_routes_every_post(self):
+        """Rule 3 must not fire on an unqualified request.
+
+        It defaulted to True for a while, and one rule firing is enough to
+        route: `estimated_llm_share` became the constant 1.0 while the docs
+        still quoted a measured 16%. Every post still gets a summary — Stage 1
+        writes it (see the assembler's post_summary fallback).
+        """
+        result = self._real_stage1_result(FIRST_POST)
+        result.update({
+            "confidence": 0.95, "post_type": "news", "post_type_confidence": 0.95,
+            "toxicity_score": 0.0, "photo_urls": [], "caption_chars": 100,
+            "script": "bengali", "is_banglish": False,
+        })
+        assert not should_use_llm(result, {})[0]
+        # An explicit request still routes.
+        assert should_use_llm(result, {"want_summary": True})[0]
+
+    def test_stub_mode_routes_everything_for_a_stated_reason(self):
+        """In stub mode every post routes — and the reason must be honest.
+
+        Stage 1's stub post-type classifier is English seed words, so it cannot
+        type a Bangla caption and returns None. Rule 2 firing on that is
+        CORRECT (the field has to be filled by someone). What must never happen
+        again is Rule 2 firing because it misread a field name, or Rule 3
+        firing on a default nobody asked for.
+        """
+        reasons_seen = set()
+        for post in SAMPLE_POSTS[:10]:
+            use_llm, reasons = should_use_llm(self._real_stage1_result(post), {})
+            assert use_llm
+            reasons_seen.update(r.split(":")[0] for r in reasons)
+        assert "post_type" in reasons_seen
+        assert "want_summary" not in reasons_seen, (
+            "Rule 3 is firing on its default again — the gate stops gating"
         )
 
     def test_long_mixed_rule_reads_stage1_script_field(self):
@@ -552,6 +596,9 @@ class TestBypassLegEndToEnd:
                 text_result,
                 image_result,
                 comment_analysis,
+                post_summary,
+                post_summary_lang,
+                post_summary_grounding,
                 overall_sentiment,
                 sentiment_score,
             ) = await s1._process_message(post, registry)
@@ -560,6 +607,9 @@ class TestBypassLegEndToEnd:
                 text_result=text_result,
                 image_result=image_result,
                 comment_analysis=comment_analysis,
+                post_summary=post_summary,
+                post_summary_lang=post_summary_lang,
+                post_summary_grounding=post_summary_grounding,
                 overall_sentiment=overall_sentiment,
                 sentiment_score=sentiment_score,
                 stage1_ms=1.0,
@@ -568,21 +618,42 @@ class TestBypassLegEndToEnd:
         return normalize_post(post), asyncio.run(_go())
 
     def test_bypassed_post_yields_schema_valid_output(self):
-        for raw_post in SAMPLE_POSTS:
-            normalized, stage1 = self._run_stage1(raw_post)
-            if should_use_llm(stage1, {})[0]:
-                continue
-            # This is the branch router.py takes when no rule fires.
-            result = build_canonical_result(normalized, stage1, None)
-            valid, errors = validate_output(result)
-            assert valid is True, f"bypass-leg output invalid: {errors}"
-            assert result["post_summary"] is None
-            assert result["processing"]["llm_used"] is False
-            # Stage 1's own classification must survive to the canonical result —
-            # otherwise a bypassed post carries no post_type at all.
-            assert result["post_type"] is not None
-            return
-        pytest.fail("no sample post bypassed Stage 2 — cannot test the bypass leg")
+        """The no-Stage-2 branch must produce a complete, schema-valid result.
+
+        Stage 1's classification and its summary both have to survive: a
+        bypassed post used to reach the API with `post_summary: null` even
+        though Stage 1 had generated (and paid for) one, which is what pushed
+        the router into sending every post to Stage 2 just to fill the field.
+        """
+        normalized, stage1 = self._run_stage1(SAMPLE_POSTS[0])
+        # A confidently-typed post with a Stage-1 summary — the shipped
+        # STAGE1_LLM=true shape. Stub mode cannot type Bangla (see
+        # TestRouterReadsRealStage1Shape), so it is supplied here.
+        stage1.update({
+            "confidence": 0.95,
+            "post_type": "news",
+            "post_type_confidence": 0.95,
+            "toxicity_score": 0.0,
+            "photo_urls": [],
+            "caption_chars": 100,
+            "script": "bengali",
+            "is_banglish": False,
+            "post_summary": "একটি সংক্ষিপ্ত সারাংশ।",
+            "post_summary_lang": "bn",
+            "post_summary_grounding": ["caption"],
+        })
+        assert not should_use_llm(stage1, {})[0], "fixture should bypass Stage 2"
+
+        # This is the branch router.py takes when no rule fires.
+        result = build_canonical_result(normalized, stage1, None)
+        valid, errors = validate_output(result)
+        assert valid is True, f"bypass-leg output invalid: {errors}"
+        assert result["processing"]["llm_used"] is False
+        # Stage 1's own classification and summary must survive to the
+        # canonical result — otherwise a bypassed post carries neither.
+        assert result["post_type"] is not None
+        assert result["post_summary"] == "একটি সংক্ষিপ্ত সারাংশ।"
+        assert result["post_summary_source"] == "stage1"
 
 
 # ---------------------------------------------------------------------------
@@ -809,14 +880,18 @@ class TestEvalHarness:
         over_one = next((r for r in results if r.metric == "over_1_count"), None)
         assert over_one is not None
 
-        # Manually verify
+        # Manually verify. compute_coverage is CLAMPED to 1.0, so `> 1.0` can
+        # never be true — the over-coverage cases are surfaced by
+        # coverage_anomaly(), which is what the harness counts.
+        from libs.common.utils import coverage_anomaly
+
         expected_over_one = sum(
             1
             for p in SAMPLE_POSTS
-            if compute_coverage(
+            if coverage_anomaly(
                 p["engagement"].get("storedCommentRows", 0),
                 p["engagement"].get("commentCount", 0),
             )
-            > 1.0
         )
+        assert expected_over_one > 0, "corpus should contain the known anomalies"
         assert over_one.value == pytest.approx(float(expected_over_one))

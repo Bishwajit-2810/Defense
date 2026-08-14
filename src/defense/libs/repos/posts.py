@@ -15,16 +15,19 @@ class PostRepository:
     def __init__(self, session: AsyncSession):
         self._session = session
 
-    async def upsert_post(self, normalized: Dict[str, Any], raw: Dict[str, Any]) -> str:
+    async def upsert_post(self, normalized: Dict[str, Any], raw: Dict[str, Any], tenant_id: str = "default") -> str:
         """Upsert a post and its comments from the normalized payload."""
         post_id = normalized.get("post_id")
         if not post_id:
             raise ValueError("Post missing 'id'")
 
+        tid = tenant_id or normalized.get("tenant_id") or raw.get("tenantId") or "default"
+
         # Prepare Post dict
         post_dict = {
             "id": post_id,
             "campaign_id": raw.get("campaignId"),
+            "tenant_id": tid,
             "platform": normalized.get("platform"),
             "platform_post_id": normalized.get("platform_post_id"),
             "url": raw.get("url"),
@@ -118,12 +121,14 @@ class PostRepository:
         result_json: Dict[str, Any], 
         embedding: List[float], 
         embedding_is_stub: bool, 
-        schema_version: str
+        schema_version: str,
+        tenant_id: str = "default"
     ):
         """Upsert an AnalysisResult."""
         analysis_dict = {
             "post_id": post_id,
             "campaign_id": campaign_id,
+            "tenant_id": tenant_id,
             "result": result_json,
             "embedding": embedding,
             "embedding_is_stub": embedding_is_stub,
@@ -150,3 +155,4 @@ class PostRepository:
         await self._session.execute(post_update)
 
         await self._session.commit()
+

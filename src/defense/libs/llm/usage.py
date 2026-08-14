@@ -42,14 +42,14 @@ Add a dimension BEFORE a measurement run, or the run has to be repeated.
 
 from __future__ import annotations
 
-import logging
+import structlog
 import os
 from defense.libs.common.config import get_settings
 
 config = get_settings()
 from typing import Any, Optional
 
-log = logging.getLogger(__name__)
+log = structlog.get_logger(__name__)
 
 # ---------------------------------------------------------------------------
 # Lanes

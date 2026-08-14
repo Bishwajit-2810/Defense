@@ -19,7 +19,7 @@ In real mode the pipeline calls:
 
 from __future__ import annotations
 
-import logging
+import structlog
 import re
 import sys
 import os
@@ -36,7 +36,7 @@ from defense.libs.sentiment_models import resolve as _resolve_sentiment  # noqa:
 from .llm_analyzer import analyze_text_llm  # noqa: E402
 from .models import ModelRegistry  # noqa: E402
 
-logger = logging.getLogger(__name__)
+logger = structlog.get_logger(__name__)
 
 # ---------------------------------------------------------------------------
 # Bengali negative / positive seed words used by the stub heuristic

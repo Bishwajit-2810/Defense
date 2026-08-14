@@ -42,25 +42,15 @@ neutral:
 favored: []
 opposed: []
 
-# Always Alert. Entities in this list will trigger a Watchlist Alert whenever
-# they are mentioned in a comment, regardless of whether the sentiment is
-# supportive, opposing, or neutral.
-always:
-  - id: tarek_rahman
-    display: "Tarek Rahman"
-    aliases:
-      - "tarek rahman"
-      - "tarique rahman"
-      - "তারেক রহমান"
-    notes: "Added per request"
-  - id: positive
-    display: "Positive"
-    aliases:
-      - "positive"
-    notes: "Added per request"
-  - id: negative
-    display: "Negative"
-    aliases:
-      - "negative"
-      - "negetive"
-    notes: "Added per request"
+# Always Alert. Entities in this list trigger a Watchlist Alert whenever they
+# are mentioned — in the post text or in a comment — regardless of whether the
+# stance is supportive, opposing or neutral. That is a deliberately blunt rule,
+# so the entries have to be specific: this list briefly contained the words
+# "positive" and "negative" as entities, which raised "Watchlist Under Attack"
+# on every comment that happened to contain either word, and put both words in
+# the LLM's prompt as named entities to judge stance toward.
+#
+# PUT YOUR REAL ENTRIES IN config/stance_targets.local.yml — it is gitignored
+# and loaded INSTEAD of this file when present (libs/stance_targets.load_targets).
+# Naming a real person here commits an editorial choice to the repository.
+always: []

@@ -2,208 +2,861 @@
   "$schema": "http://json-schema.org/draft-07/schema#",
   "title": "AnalysisResult",
   "type": "object",
-  "required": ["post_id","campaign_id","platform","platform_post_id","media_type","language","overall_sentiment","sentiment_score","baseline_sentiment","engagement","comment_analysis","confidence","processing","created_at","scraped_at"],
+  "required": [
+    "post_id",
+    "campaign_id",
+    "platform",
+    "platform_post_id",
+    "media_type",
+    "language",
+    "overall_sentiment",
+    "sentiment_score",
+    "baseline_sentiment",
+    "engagement",
+    "comment_analysis",
+    "confidence",
+    "processing",
+    "created_at",
+    "scraped_at"
+  ],
   "properties": {
-    "post_id": {"type":"string"},
-    "campaign_id": {"type":"string"},
-    "platform": {"type":"string"},
-    "platform_post_id": {"type":"string"},
-    "media_type": {"type":"string","enum":["TEXT","PHOTO","PHOTO_TEXT"]},
-    "language": {"type":"string"},
-    "post_text": {"type":["string","null"],"description":"Original post caption/text as ingested."},
-    "post_type": {"type":["string","null"]},
-    "post_summary": {"type":["string","null"]},
-    "post_summary_lang": {"type":["string","null"]},
-    "post_summary_grounding": {"type":["string","null"]},
-    "post_summary_source": {"type":["string","null"],"enum":["vlm","llm",null]},
-    "post_summary_truncated": {"type":["boolean","null"],"description":"True when the summary still hit the model's token ceiling after auto-continuation; the text was trimmed to its last complete sentence."},
-    "watchlist_alert": {"type":["boolean","null"],"description":"True if the post or its comments mention an 'always' stance target."},
-    "language_method": {"type":["string","null"],"enum":["fasttext","script_heuristic","stub",null],"description":"Which detector produced `language`. fastText is optional; without it the pipeline degrades to script detection rather than failing the post, and `language_confidence` should be read accordingly."},
-    "overall_sentiment": {"type":"string","enum":["positive","negative","neutral","mixed"]},
-    "sentiment_score": {"type":"number","minimum":-1,"maximum":1},
+    "post_id": {
+      "type": "string"
+    },
+    "campaign_id": {
+      "type": "string"
+    },
+    "platform": {
+      "type": "string"
+    },
+    "platform_post_id": {
+      "type": "string"
+    },
+    "media_type": {
+      "type": "string",
+      "enum": [
+        "TEXT",
+        "PHOTO",
+        "PHOTO_TEXT"
+      ]
+    },
+    "language": {
+      "type": "string"
+    },
+    "post_text": {
+      "type": [
+        "string",
+        "null"
+      ],
+      "description": "Original post caption/text as ingested."
+    },
+    "post_type": {
+      "type": [
+        "string",
+        "null"
+      ]
+    },
+    "post_summary": {
+      "type": [
+        "string",
+        "null"
+      ]
+    },
+    "post_summary_lang": {
+      "type": [
+        "string",
+        "null"
+      ]
+    },
+    "post_summary_grounding": {
+      "type": [
+        "string",
+        "null"
+      ]
+    },
+    "post_summary_source": {
+      "type": [
+        "string",
+        "null"
+      ],
+      "enum": [
+        "vlm",
+        "llm",
+        "stage1",
+        null
+      ],
+      "description": "Which stage wrote the summary. 'stage1' means the fast model summarised it and Stage 2 was not asked to redo it — the default path, and the reason a bypassed post still has a summary."
+    },
+    "post_summary_truncated": {
+      "type": [
+        "boolean",
+        "null"
+      ],
+      "description": "True when the summary still hit the model's token ceiling after auto-continuation; the text was trimmed to its last complete sentence."
+    },
+    "watchlist_alert": {
+      "type": [
+        "boolean",
+        "null"
+      ],
+      "description": "True if the post or its comments mention an 'always' stance target, or a comment opposes a favored target. Computed in the assembler from the deterministic matcher so a post that never reached Stage 2 can still raise one; Stage 2's LLM verdict upgrades it when available."
+    },
+    "watchlist_alert_reason": {
+      "type": [
+        "string",
+        "null"
+      ],
+      "description": "Why the alert fired — which target, and which rule. Null when no alert."
+    },
+    "language_method": {
+      "type": [
+        "string",
+        "null"
+      ],
+      "enum": [
+        "fasttext",
+        "script_heuristic",
+        "stub",
+        null
+      ],
+      "description": "Which detector produced `language`. fastText is optional; without it the pipeline degrades to script detection rather than failing the post, and `language_confidence` should be read accordingly."
+    },
+    "overall_sentiment": {
+      "type": "string",
+      "enum": [
+        "positive",
+        "negative",
+        "neutral",
+        "mixed"
+      ]
+    },
+    "sentiment_score": {
+      "type": "number",
+      "minimum": -1,
+      "maximum": 1
+    },
     "text_sentiment": {
-      "type":["object","null"],
-      "description":"Caption sentiment with its own score; null for null-caption posts.",
-      "properties": {"label":{"type":["string","null"]},"score":{"type":["number","null"]}}
-    },
-    "image_sentiment": {
-      "type":["object","null"],
-      "description":"Aggregate image sentiment with its own score; null for text-only posts.",
-      "properties": {"label":{"type":["string","null"]},"score":{"type":["number","null"]}}
-    },
-    "baseline_sentiment": {"type":["number","null"]},
-    "baseline_viral_potential": {"type":["number","null"]},
-    "emotion": {
-      "type":"object",
+      "type": [
+        "object",
+        "null"
+      ],
+      "description": "Caption sentiment with its own score; null for null-caption posts.",
       "properties": {
-        "primary":{"type":"string"},
-        "scores":{"type":"object"}
-      }
-    },
-    "intents": {"type":"array","items":{"type":"string"}},
-    "topics": {"type":"array","items":{"type":"string"}},
-    "insight": {"type":["string","null"]},
-    "entities": {
-      "type":"array",
-      "items": {
-        "type":"object",
-        "properties": {
-          "text":{"type":"string"},
-          "label":{"type":"string"},
-          "confidence":{"type":"number"}
+        "label": {
+          "type": [
+            "string",
+            "null"
+          ]
+        },
+        "score": {
+          "type": [
+            "number",
+            "null"
+          ]
         }
       }
     },
-    "brand_mentions": {"type":"array","items":{"type":"string"}},
-    "keywords": {"type":"array","items":{"type":"string"}},
-    "toxicity_score": {"type":"number","minimum":0,"maximum":1},
-    "hate_speech_score": {"type":"number","minimum":0,"maximum":1},
-    "engagement": {
-      "type":"object",
-      "required":["comment_count","stored_comments","total_reactions","share_count"],
+    "image_sentiment": {
+      "type": [
+        "object",
+        "null"
+      ],
+      "description": "Aggregate image sentiment with its own score; null for text-only posts.",
       "properties": {
-        "comment_count":{"type":"integer"},
-        "stored_comments":{"type":"integer"},
-        "total_reactions":{"type":"integer"},
-        "share_count":{"type":"integer"}
+        "label": {
+          "type": [
+            "string",
+            "null"
+          ]
+        },
+        "score": {
+          "type": [
+            "number",
+            "null"
+          ]
+        }
       }
     },
-    "reaction_breakdown": {"type":"object"},
-    "shares": {"type":"array"},
-    "image_analysis": {
-      "type":["object","null"],
+    "baseline_sentiment": {
+      "type": [
+        "number",
+        "null"
+      ]
+    },
+    "baseline_viral_potential": {
+      "type": [
+        "number",
+        "null"
+      ]
+    },
+    "emotion": {
+      "type": "object",
       "properties": {
-        "ocr_text":{"type":["string","null"]},
-        "image_sentiment":{"type":["string","null"]},
-        "image_sentiment_score":{"type":["number","null"]},
-        "description":{"type":["string","null"]}
+        "primary": {
+          "type": "string"
+        },
+        "scores": {
+          "type": "object"
+        }
+      }
+    },
+    "intents": {
+      "type": "array",
+      "items": {
+        "type": "string"
+      }
+    },
+    "topics": {
+      "type": "array",
+      "items": {
+        "type": "string"
+      }
+    },
+    "insight": {
+      "type": [
+        "string",
+        "null"
+      ]
+    },
+    "entities": {
+      "type": "array",
+      "items": {
+        "type": "object",
+        "properties": {
+          "text": {
+            "type": "string"
+          },
+          "label": {
+            "type": "string"
+          },
+          "confidence": {
+            "type": "number"
+          }
+        }
+      }
+    },
+    "brand_mentions": {
+      "type": "array",
+      "items": {
+        "type": "string"
+      }
+    },
+    "keywords": {
+      "type": "array",
+      "items": {
+        "type": "string"
+      }
+    },
+    "toxicity_score": {
+      "type": "number",
+      "minimum": 0,
+      "maximum": 1
+    },
+    "hate_speech_score": {
+      "type": "number",
+      "minimum": 0,
+      "maximum": 1
+    },
+    "engagement": {
+      "type": "object",
+      "required": [
+        "comment_count",
+        "stored_comments",
+        "total_reactions",
+        "share_count"
+      ],
+      "properties": {
+        "comment_count": {
+          "type": "integer"
+        },
+        "stored_comments": {
+          "type": "integer"
+        },
+        "total_reactions": {
+          "type": "integer"
+        },
+        "share_count": {
+          "type": "integer"
+        }
+      }
+    },
+    "reaction_breakdown": {
+      "type": "object"
+    },
+    "shares": {
+      "type": "array"
+    },
+    "image_analysis": {
+      "type": [
+        "object",
+        "null"
+      ],
+      "properties": {
+        "ocr_text": {
+          "type": [
+            "string",
+            "null"
+          ]
+        },
+        "image_sentiment": {
+          "type": [
+            "string",
+            "null"
+          ]
+        },
+        "image_sentiment_score": {
+          "type": [
+            "number",
+            "null"
+          ]
+        },
+        "description": {
+          "type": [
+            "string",
+            "null"
+          ]
+        }
       }
     },
     "comment_analysis": {
-      "type":"object",
-      "required":["analyzed","coverage"],
+      "type": "object",
+      "required": [
+        "analyzed",
+        "coverage"
+      ],
       "properties": {
-        "analyzed":{"type":"integer"},
-        "coverage":{"type":"number","minimum":0,"maximum":1,"description":"analyzed / commentCount, clamped to 1.0. When the stored rows exceed the reported count the excess is reported in coverage_anomaly, never as coverage above 100%."},
-        "coverage_anomaly":{
-          "type":["object","null"],
-          "description":"Set when analyzed > the platform's reported commentCount — an upstream data-quality event, not a coverage figure.",
-          "properties":{
-            "kind":{"type":"string"},
-            "analyzed":{"type":"integer"},
-            "reported_comment_count":{"type":"integer"},
-            "raw_ratio":{"type":"number"}
+        "analyzed": {
+          "type": "integer"
+        },
+        "coverage": {
+          "type": "number",
+          "minimum": 0,
+          "maximum": 1,
+          "description": "analyzed / commentCount, clamped to 1.0. When the stored rows exceed the reported count the excess is reported in coverage_anomaly, never as coverage above 100%."
+        },
+        "coverage_anomaly": {
+          "type": [
+            "object",
+            "null"
+          ],
+          "description": "Set when analyzed > the platform's reported commentCount — an upstream data-quality event, not a coverage figure.",
+          "properties": {
+            "kind": {
+              "type": "string"
+            },
+            "analyzed": {
+              "type": "integer"
+            },
+            "reported_comment_count": {
+              "type": "integer"
+            },
+            "raw_ratio": {
+              "type": "number"
+            }
           }
         },
-        "summary":{"type":["string","null"],"description":"LLM-written natural-language summary of the comment reactions."},
-        "summary_source":{"type":["string","null"],"description":"How the comment summary was produced (e.g. 'llm')."},
+        "summary": {
+          "type": [
+            "string",
+            "null"
+          ],
+          "description": "LLM-written natural-language summary of the comment reactions."
+        },
+        "summary_source": {
+          "type": [
+            "string",
+            "null"
+          ],
+          "description": "How the comment summary was produced (e.g. 'llm')."
+        },
         "sentiment_breakdown": {
-          "type":"object",
-          "description":"Counts over ALL comments, including emoji-only reactions.",
+          "type": "object",
+          "description": "Counts over ALL comments, including emoji-only reactions.",
           "properties": {
-            "positive":{"type":"integer"},
-            "negative":{"type":"integer"},
-            "neutral":{"type":"integer"}
+            "positive": {
+              "type": "integer"
+            },
+            "negative": {
+              "type": "integer"
+            },
+            "neutral": {
+              "type": "integer"
+            },
+            "uncertain": {
+              "type": "integer",
+              "description": "Abstentions — the voters split. Counted separately so the three real buckets stay honest."
+            }
           }
         },
         "sentiment_breakdown_substantive": {
-          "type":"object",
-          "description":"The same counts over written comments only (emoji-only reactions excluded) — what people SAID, as opposed to how the crowd reacted.",
+          "type": "object",
+          "description": "The same counts over written comments only (emoji-only reactions excluded) — what people SAID, as opposed to how the crowd reacted.",
           "properties": {
-            "positive":{"type":"integer"},
-            "negative":{"type":"integer"},
-            "neutral":{"type":"integer"}
+            "positive": {
+              "type": "integer"
+            },
+            "negative": {
+              "type": "integer"
+            },
+            "neutral": {
+              "type": "integer"
+            },
+            "uncertain": {
+              "type": "integer",
+              "description": "Abstentions — the voters split. Counted separately so the three real buckets stay honest."
+            }
           }
         },
-        "reaction_only": {"type":"integer","description":"Comments that are emoji/punctuation only. Kept as crowd signal, never sent to an LLM."},
+        "reaction_only": {
+          "type": "integer",
+          "description": "Comments that are emoji/punctuation only. Kept as crowd signal, never sent to an LLM."
+        },
         "target_stances": {
-          "type":"object",
-          "description":"Per-watchlist-entity stance rollup (stance_targets.md). A SEPARATE measurement from sentiment_breakdown — a comment can be positive in tone while opposing a listed entity, and the two must never be summed or merged. Entities nobody mentioned are ABSENT, not zero-filled: 'nobody discussed X' and 'everyone was neutral on X' are different findings. The watchlist itself is a stated bias model, not a neutral measurement.",
+          "type": "object",
+          "description": "Per-watchlist-entity stance rollup (stance_targets.md). A SEPARATE measurement from sentiment_breakdown — a comment can be positive in tone while opposing a listed entity, and the two must never be summed or merged. Entities nobody mentioned are ABSENT, not zero-filled: 'nobody discussed X' and 'everyone was neutral on X' are different findings. The watchlist itself is a stated bias model, not a neutral measurement.",
           "additionalProperties": {
-            "type":"object",
+            "type": "object",
             "properties": {
-              "display":{"type":"string"},
-              "polarity":{"type":"string","enum":["favored","opposed","neutral","always"],"description":"As declared in the watchlist — an editorial choice by the operator."},
-              "mentions":{"type":"integer"},
-              "supportive":{"type":"integer"},
-              "opposing":{"type":"integer"},
-              "neutral":{"type":"integer"},
-              "method":{"type":"string","enum":["llm","deterministic","none"]},
-              "method_breakdown":{"type":"object"},
-              "aliases_matched":{"type":"object","description":"Which spelling matched, and how often — the fastest way to debug alias coverage."}
+              "display": {
+                "type": "string"
+              },
+              "polarity": {
+                "type": "string",
+                "enum": [
+                  "favored",
+                  "opposed",
+                  "neutral",
+                  "always"
+                ],
+                "description": "As declared in the watchlist — an editorial choice by the operator."
+              },
+              "mentions": {
+                "type": "integer"
+              },
+              "supportive": {
+                "type": "integer"
+              },
+              "opposing": {
+                "type": "integer"
+              },
+              "neutral": {
+                "type": "integer"
+              },
+              "method": {
+                "type": "string",
+                "enum": [
+                  "llm",
+                  "deterministic",
+                  "none"
+                ]
+              },
+              "method_breakdown": {
+                "type": "object"
+              },
+              "aliases_matched": {
+                "type": "object",
+                "description": "Which spelling matched, and how often — the fastest way to debug alias coverage."
+              }
             }
           }
         },
         "emotion_breakdown": {
-          "type":"object",
-          "description":"Count of comments per emotion label (full coverage).",
+          "type": "object",
+          "description": "Count of comments per emotion label (full coverage).",
           "properties": {
-            "anger":{"type":"integer"},
-            "sadness":{"type":"integer"},
-            "joy":{"type":"integer"},
-            "fear":{"type":"integer"},
-            "disgust":{"type":"integer"},
-            "surprise":{"type":"integer"},
-            "neutral":{"type":"integer"}
+            "anger": {
+              "type": "integer"
+            },
+            "sadness": {
+              "type": "integer"
+            },
+            "joy": {
+              "type": "integer"
+            },
+            "fear": {
+              "type": "integer"
+            },
+            "disgust": {
+              "type": "integer"
+            },
+            "surprise": {
+              "type": "integer"
+            },
+            "neutral": {
+              "type": "integer"
+            }
           }
         },
         "method_breakdown": {
-          "type":"object",
-          "description":"Count of comments per labelling method. Only the methods that actually ran appear — a zeroed 'model' bucket would imply an inference that never happened.",
+          "type": "object",
+          "description": "Count of comments per labelling method. Only the methods that actually ran appear — a zeroed 'model' bucket would imply an inference that never happened.",
           "properties": {
-            "fast":{"type":"integer"},
-            "stub":{"type":"integer"},
-            "model":{"type":"integer"},
-            "llm":{"type":"integer"},
-            "emoji":{"type":"integer"},
-            "failed":{"type":"integer"},
-            "link":{"type":"integer"}
+            "fast": {
+              "type": "integer"
+            },
+            "stub": {
+              "type": "integer"
+            },
+            "model": {
+              "type": "integer"
+            },
+            "llm": {
+              "type": "integer"
+            },
+            "emoji": {
+              "type": "integer"
+            },
+            "failed": {
+              "type": "integer"
+            },
+            "link": {
+              "type": "integer"
+            },
+            "ensemble": {
+              "type": "integer"
+            },
+            "propagated": {
+              "type": "integer"
+            }
+          }
+        },
+        "ensemble": {
+          "type": "object",
+          "description": "How much the independent labellers agreed on this post's comments, and what that bought. `unanimous_share` is the fraction the expensive model never needed to see; `escalated` is the fraction it did.",
+          "properties": {
+            "comments": {
+              "type": "integer"
+            },
+            "unanimous": {
+              "type": "integer",
+              "description": "Comments every voter labelled the same way. Requires AT LEAST TWO voters: one labeller agreeing with itself is not consensus. Read with `single_voter`."
+            },
+            "unanimous_share": {
+              "type": "number",
+              "minimum": 0,
+              "maximum": 1,
+              "description": "Share of comments that were unanimous — the share the cheap voters settled without the expensive model. Meaningless without `single_voter_share`: a run where only the LLM voted has nothing to agree with."
+            },
+            "abstained": {
+              "type": "integer"
+            },
+            "abstained_share": {
+              "type": "number",
+              "minimum": 0,
+              "maximum": 1
+            },
+            "single_voter": {
+              "type": "integer",
+              "description": "Comments only ONE labeller read. Not agreement — the absence of anything to agree with."
+            },
+            "single_voter_share": {
+              "type": "number",
+              "minimum": 0,
+              "maximum": 1,
+              "description": "Share of comments with a single voter."
+            },
+            "unread": {
+              "type": "integer",
+              "description": "Comments NO labeller read: Stage 1 fell back to the hash stub (which does not vote), no classifier was available and no LLM verdict returned. These carry sentiment 'uncertain' and are counted in sentiment_breakdown.uncertain — never as a measured neutral."
+            },
+            "mean_agreement": {
+              "type": "number",
+              "minimum": 0,
+              "maximum": 1
+            },
+            "escalated": {
+              "type": "integer",
+              "description": "Comments sent to the LLM."
+            },
+            "escalated_share": {
+              "type": "number",
+              "minimum": 0,
+              "maximum": 1
+            },
+            "escalation_reasons": {
+              "type": "object",
+              "description": "Count per reason — the per-comment cost decision, measured."
+            },
+            "llm_labelled": {
+              "type": "integer",
+              "description": "Comments that actually came back with an LLM verdict. Counted from the labels, not from the intent, so a half-failed stance pass cannot report full coverage."
+            },
+            "llm_share": {
+              "type": "number",
+              "minimum": 0,
+              "maximum": 1
+            },
+            "capped_out": {
+              "type": "integer",
+              "description": "Comments the LLM would have judged but COMMENT_STANCE_MAX_PER_POST dropped. Non-zero means 'every comment' is true only up to the cap."
+            },
+            "mode": {
+              "type": [
+                "string",
+                "null"
+              ],
+              "enum": [
+                "all",
+                "escalate",
+                null
+              ],
+              "description": "Which comments were sent to the LLM: all of them, or only the ones the cheap voters disagreed on."
+            },
+            "deduplicated": {
+              "type": "integer",
+              "description": "Comments that took a near-duplicate's label instead of their own call."
+            },
+            "duplicate_share": {
+              "type": "number",
+              "minimum": 0,
+              "maximum": 1
+            },
+            "voters": {
+              "type": "array",
+              "items": {
+                "type": "string"
+              },
+              "description": "Which labellers actually ran on this post."
+            }
           }
         },
         "provenance": {
-          "type":"object",
-          "description":"Where this post's comment labels came from, so a sentiment chart can state its own provenance alongside coverage.",
+          "type": "object",
+          "description": "Where this post's comment labels came from, so a sentiment chart can state its own provenance alongside coverage.",
           "properties": {
-            "total":{"type":"integer"},
-            "inferred":{"type":"integer","description":"Labels produced by a model or an LLM."},
-            "heuristic":{"type":"integer","description":"Labels from the emoji/lexicon fast path or the deterministic hash stub."},
-            "inferred_share":{"type":"number","minimum":0,"maximum":1},
-            "by_method":{"type":"object"}
+            "total": {
+              "type": "integer"
+            },
+            "inferred": {
+              "type": "integer",
+              "description": "Labels produced by a model or an LLM."
+            },
+            "heuristic": {
+              "type": "integer",
+              "description": "Labels from the emoji/lexicon fast path or the deterministic hash stub."
+            },
+            "inferred_share": {
+              "type": "number",
+              "minimum": 0,
+              "maximum": 1
+            },
+            "by_method": {
+              "type": "object"
+            }
           }
         },
-        "themes":{"type":"array","items":{"type":"string"}},
-        "top_keywords":{"type":"array","items":{"type":"string"}},
-        "representative_comments":{"type":"array"},
-        "comments":{
-          "type":"array",
-          "items":{
-            "type":"object",
-            "properties":{
-              "id":{"type":"string"},
-              "text":{"type":"string"},
-              "likes":{"type":"integer"},
-              "author":{"type":["string","null"]},
-              "parent_id":{"type":["string","null"]},
-              "sentiment":{"type":["string","null"],"enum":["positive","negative","neutral",null]},
-              "sentiment_score":{"type":["number","null"]},
-              "parallel_labels":{"type":"object"},
-              "emotion":{"type":"string","enum":["anger","sadness","joy","fear","disgust","surprise","neutral"]},
-              "method":{"type":"string","enum":["fast","stub","model","llm","emoji","failed","link"],"description":"How this label was produced. 'stub' is the deterministic hash fallback used in MODEL_STUB_MODE or when a model is unavailable — it is reproducible, and it is not sentiment."},
-              "kind":{"type":"string","enum":["emoji","short","substantive","filtered","link"],"description":"How much text the comment contains. 'emoji' comments carry no word tokens and are never sent to an LLM. 'filtered' are filtered by the router."},
-              "emotion_method":{"type":"string","enum":["heuristic","llm"],"description":"Emotion is the free emoji+lexicon heuristic at Stage 1 for EVERY comment, even in real mode where a transformer emotion head is loaded and used for the post. Stage 2 upgrades only the comments it re-labels. Without this field emotion_breakdown looked like model output."},
-              "target_stances":{
-                "type":"array",
-                "description":"Stance toward each watchlist entity this comment mentions. Absent when it mentions none. Never merged into 'sentiment'.",
-                "items":{
-                  "type":"object",
-                  "properties":{
-                    "target":{"type":"string"},
-                    "stance":{"type":"string","enum":["supportive","opposing","neutral"]},
-                    "evidence":{"type":"string","description":"The text the verdict was based on — makes a wrong call debuggable."},
-                    "alias":{"type":["string","null"],"description":"Which alias matched."},
-                    "method":{"type":"string","enum":["llm","deterministic"]}
+        "themes": {
+          "type": "array",
+          "items": {
+            "type": "string"
+          }
+        },
+        "top_keywords": {
+          "type": "array",
+          "items": {
+            "type": "string"
+          }
+        },
+        "representative_comments": {
+          "type": "array"
+        },
+        "comments": {
+          "type": "array",
+          "items": {
+            "type": "object",
+            "properties": {
+              "id": {
+                "type": "string"
+              },
+              "text": {
+                "type": "string"
+              },
+              "likes": {
+                "type": "integer"
+              },
+              "author": {
+                "type": [
+                  "string",
+                  "null"
+                ]
+              },
+              "parent_id": {
+                "type": [
+                  "string",
+                  "null"
+                ]
+              },
+              "sentiment": {
+                "type": [
+                  "string",
+                  "null"
+                ],
+                "enum": [
+                  "positive",
+                  "negative",
+                  "neutral",
+                  "uncertain",
+                  null
+                ],
+                "description": "'uncertain' is an abstention: the voters split, so no label is claimed. It is NOT 'neutral', which is a verdict about the comment rather than about our confidence."
+              },
+              "sentiment_score": {
+                "type": [
+                  "number",
+                  "null"
+                ]
+              },
+              "parallel_labels": {
+                "type": "object",
+                "description": "Every independent opinion about this comment, keyed by source (heuristic / xlmr / distilbert / llm). A source that did not run is ABSENT — never present with a fabricated neutral."
+              },
+              "label_agreement": {
+                "type": [
+                  "number",
+                  "null"
+                ],
+                "minimum": 0,
+                "maximum": 1,
+                "description": "Share of the voters that backed the final label. 1.0 = unanimous."
+              },
+              "label_source": {
+                "type": [
+                  "string",
+                  "null"
+                ],
+                "enum": [
+                  "ensemble",
+                  "propagated",
+                  "stage1",
+                  null
+                ],
+                "description": "'propagated' means the label was copied from a near-duplicate comment's representative rather than computed for this one."
+              },
+              "propagated_from": {
+                "type": [
+                  "string",
+                  "null"
+                ],
+                "description": "Comment id whose label was copied, when label_source is 'propagated'."
+              },
+              "escalation_reason": {
+                "type": [
+                  "string",
+                  "null"
+                ],
+                "description": "Why this comment did or did not get an LLM call — the per-comment cost decision, recorded."
+              },
+              "text_norm": {
+                "type": [
+                  "string",
+                  "null"
+                ],
+                "description": "Comparison/model-input form of the text: URLs collapsed, emoji stripped. The original `text` is never overwritten."
+              },
+              "emotion": {
+                "type": "string",
+                "enum": [
+                  "anger",
+                  "sadness",
+                  "joy",
+                  "fear",
+                  "disgust",
+                  "surprise",
+                  "neutral"
+                ]
+              },
+              "method": {
+                "type": "string",
+                "enum": [
+                  "fast",
+                  "stub",
+                  "model",
+                  "llm",
+                  "emoji",
+                  "failed",
+                  "link",
+                  "ensemble",
+                  "propagated"
+                ],
+                "description": "How this label was produced. 'stub' is the deterministic hash fallback used in MODEL_STUB_MODE or when a model is unavailable — it is reproducible, and it is not sentiment."
+              },
+              "kind": {
+                "type": "string",
+                "enum": [
+                  "emoji",
+                  "short",
+                  "substantive",
+                  "filtered",
+                  "link"
+                ],
+                "description": "How much text the comment contains. 'emoji' comments carry no word tokens and are never sent to an LLM. 'filtered' are filtered by the router."
+              },
+              "emotion_method": {
+                "type": "string",
+                "enum": [
+                  "heuristic",
+                  "llm"
+                ],
+                "description": "Emotion is the free emoji+lexicon heuristic at Stage 1 for EVERY comment, even in real mode where a transformer emotion head is loaded and used for the post. Stage 2 upgrades only the comments it re-labels. Without this field emotion_breakdown looked like model output."
+              },
+              "target_stances": {
+                "type": "array",
+                "description": "Stance toward each watchlist entity this comment mentions. Absent when it mentions none. Never merged into 'sentiment'.",
+                "items": {
+                  "type": "object",
+                  "properties": {
+                    "target": {
+                      "type": "string"
+                    },
+                    "stance": {
+                      "type": "string",
+                      "enum": [
+                        "supportive",
+                        "opposing",
+                        "neutral"
+                      ]
+                    },
+                    "evidence": {
+                      "type": "string",
+                      "description": "The text the verdict was based on — makes a wrong call debuggable."
+                    },
+                    "alias": {
+                      "type": [
+                        "string",
+                        "null"
+                      ],
+                      "description": "Which alias matched."
+                    },
+                    "method": {
+                      "type": "string",
+                      "enum": [
+                        "llm",
+                        "deterministic"
+                      ]
+                    }
                   }
                 }
+              },
+              "tie_broken_by": {
+                "type": [
+                  "string",
+                  "null"
+                ],
+                "description": "Set when the voters split exactly evenly and one source decided it — the LLM, which is the only labeller that sees the post. A tie-break is not consensus: label_agreement still reports the tie."
+              },
+              "label_voters": {
+                "type": [
+                  "integer",
+                  "null"
+                ],
+                "description": "How many labellers actually returned a verdict for this comment. `label_agreement` is meaningless without it: 1.0 over a single voter is one opinion, not a consensus."
+              },
+              "label_sources": {
+                "type": "array",
+                "items": {
+                  "type": "string"
+                },
+                "description": "Which labellers voted, by name."
               }
             }
           }
@@ -211,37 +864,167 @@
       }
     },
     "confidence": {
-      "type":"object",
+      "type": "object",
       "properties": {
-        "overall":{"type":"number","minimum":0,"maximum":1},
-        "sentiment":{"type":"number","minimum":0,"maximum":1},
-        "language":{"type":"number","minimum":0,"maximum":1},
-        "topics":{"type":"number","minimum":0,"maximum":1}
+        "overall": {
+          "type": "number",
+          "minimum": 0,
+          "maximum": 1
+        },
+        "sentiment": {
+          "type": "number",
+          "minimum": 0,
+          "maximum": 1
+        },
+        "language": {
+          "type": "number",
+          "minimum": 0,
+          "maximum": 1
+        },
+        "topics": {
+          "type": "number",
+          "minimum": 0,
+          "maximum": 1
+        }
       }
     },
     "processing": {
-      "type":"object",
+      "type": "object",
       "properties": {
-        "stage1_ms":{"type":"number"},
-        "stage2_ms":{"type":["number","null"]},
-        "llm_used":{"type":"boolean"},
-        "llm_backend":{"type":["string","null"]},
-        "llm_model":{"type":["string","null"]},
-        "role_models":{"type":["object","null"],"description":"{role: resolved model id} for this run. Summarization ('summary') and classification ('stage2') can be different models, so a single llm_model cannot attribute the summary."},
-        "degraded_components":{"type":["array","null"],"items":{"type":"string"},"description":"Real-mode components that fell back to a heuristic because their model would not load (language, sentiment, emotion, toxicity, vision, ner, keywords, embedding). nlp_engine says which path was INTENDED; this says what actually ran. A non-empty list here means the output is partly or wholly heuristic despite MODEL_STUB_MODE=false."},
-        "nlp_engine":{"type":["string","null"],"enum":["stub","models","llm",null],"description":"Which Stage-1 engine was INTENDED. Read together with degraded_components, which says what actually ran."},
-        "stub_mode":{"type":["boolean","null"],"description":"MODEL_STUB_MODE. When true, sentiment labels and embeddings are deterministic hashes rather than model output — see comment_analysis.provenance and embedding_is_stub."},
-        "llm_role":{"type":["string","null"]},
-        "unit":{"type":["string","null"],"description":"The unit of analysis, e.g. 'post+thread'."},
-        "vision_used":{"type":["boolean","null"],"description":"A photo post went down the vision path."},
-        "vision_produced_signal":{"type":["boolean","null"],"description":"A vision model actually returned a verdict. Only this licenses a claim about image sentiment; vision_used alone does not."},
-        "vision_model":{"type":["string","null"]},
-        "vision_status":{"type":["string","null"]},
-        "model_versions":{"type":["object","null"],"description":"Concrete model ids that produced this result, for reproducibility."},
-        "schema_version":{"type":"string"}
+        "stage1_ms": {
+          "type": "number"
+        },
+        "stage2_ms": {
+          "type": [
+            "number",
+            "null"
+          ]
+        },
+        "llm_used": {
+          "type": "boolean",
+          "description": "Whether POST-LEVEL LLM work ran (summary / post-type / insight) — i.e. whether the router's gate fired. NOT 'did Stage 2 run': every post reaches Stage 2 for its comments. This is the numerator behind estimated_llm_share."
+        },
+        "llm_backend": {
+          "type": [
+            "string",
+            "null"
+          ]
+        },
+        "llm_model": {
+          "type": [
+            "string",
+            "null"
+          ]
+        },
+        "role_models": {
+          "type": [
+            "object",
+            "null"
+          ],
+          "description": "{role: resolved model id} for this run. Summarization ('summary') and classification ('stage2') can be different models, so a single llm_model cannot attribute the summary."
+        },
+        "degraded_components": {
+          "type": [
+            "array",
+            "null"
+          ],
+          "items": {
+            "type": "string"
+          },
+          "description": "Real-mode components that fell back to a heuristic because their model would not load (language, sentiment, emotion, toxicity, vision, ner, keywords, embedding). nlp_engine says which path was INTENDED; this says what actually ran. A non-empty list here means the output is partly or wholly heuristic despite MODEL_STUB_MODE=false."
+        },
+        "nlp_engine": {
+          "type": [
+            "string",
+            "null"
+          ],
+          "enum": [
+            "stub",
+            "models",
+            "llm",
+            null
+          ],
+          "description": "Which Stage-1 engine was INTENDED. Read together with degraded_components, which says what actually ran."
+        },
+        "stub_mode": {
+          "type": [
+            "boolean",
+            "null"
+          ],
+          "description": "MODEL_STUB_MODE. When true, sentiment labels and embeddings are deterministic hashes rather than model output — see comment_analysis.provenance and embedding_is_stub."
+        },
+        "llm_role": {
+          "type": [
+            "string",
+            "null"
+          ]
+        },
+        "unit": {
+          "type": [
+            "string",
+            "null"
+          ],
+          "description": "The unit of analysis, e.g. 'post+thread'."
+        },
+        "vision_used": {
+          "type": [
+            "boolean",
+            "null"
+          ],
+          "description": "A photo post went down the vision path."
+        },
+        "vision_produced_signal": {
+          "type": [
+            "boolean",
+            "null"
+          ],
+          "description": "A vision model actually returned a verdict. Only this licenses a claim about image sentiment; vision_used alone does not."
+        },
+        "vision_model": {
+          "type": [
+            "string",
+            "null"
+          ]
+        },
+        "vision_status": {
+          "type": [
+            "string",
+            "null"
+          ]
+        },
+        "model_versions": {
+          "type": [
+            "object",
+            "null"
+          ],
+          "description": "Concrete model ids that produced this result, for reproducibility."
+        },
+        "schema_version": {
+          "type": "string"
+        },
+        "comment_llm_used": {
+          "type": [
+            "boolean",
+            "null"
+          ],
+          "description": "Whether the LLM labelled any of this post's comments. Independent of llm_used: comment analysis is not gated by the post-level router."
+        },
+        "post_level_routed": {
+          "type": [
+            "boolean",
+            "null"
+          ],
+          "description": "What the router decided, carried through Stage 2 so llm_used is read from the decision rather than inferred from a payload's existence."
+        }
       }
     },
-    "created_at": {"type":"string","format":"date-time"},
-    "scraped_at": {"type":"string","format":"date-time"}
+    "created_at": {
+      "type": "string",
+      "format": "date-time"
+    },
+    "scraped_at": {
+      "type": "string",
+      "format": "date-time"
+    }
   }
 }

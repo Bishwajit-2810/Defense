@@ -126,7 +126,16 @@ def test_the_dashboard_renders_the_expensive_clusters():
     bottom metadata dump until §12.4d. Assert the last hop here rather than
     discovering it in a later pass.
     """
-    app_js = open('/home/bk/code/defense/dashboard/app.js', encoding='utf-8').read()
+    # The dashboard is a React app now; its sources live under dashboard/src.
+    # `dashboard/app.js` is the pre-rewrite file and no longer exists — reading
+    # it made this guard fail for a reason unrelated to what it guards.
+    import pathlib as _pl
+
+    src_dir = _pl.Path(__file__).resolve().parents[1] / 'dashboard' / 'src'
+    app_js = "\n".join(
+        p.read_text(encoding='utf-8')
+        for p in sorted(src_dir.rglob('*.jsx')) + sorted(src_dir.rglob('*.js'))
+    )
     assert 'rep.embedding_clusters' in app_js
     assert 'embedding_clusters_are_stub' in app_js
 

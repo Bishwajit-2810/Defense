@@ -26,13 +26,13 @@ caller passes a full URL (http / https), it is used as-is.
 from __future__ import annotations
 
 import io
-import logging
+import structlog
 import os
 from defense.libs.common.config import get_settings
 config = get_settings()
 from typing import Any
 
-logger = logging.getLogger(__name__)
+logger = structlog.get_logger(__name__)
 
 _SENTIMENT_LABELS: list[str] = [
     "positive feeling",

@@ -106,12 +106,13 @@ async def _upsert_post(
     session: AsyncSession,
     normalized: dict,
     raw_payload: dict,
+    tenant_id: str = "default",
 ) -> None:
     """
     Upsert the normalized post and its comments into the Postgres posts table using PostRepository.
     """
     repo = PostRepository(session)
-    await repo.upsert_post(normalized, raw_payload)
+    await repo.upsert_post(normalized, raw_payload, tenant_id=tenant_id)
 
 
 # ---------------------------------------------------------------------------
@@ -141,11 +142,12 @@ async def _find_near_duplicate(
     session: AsyncSession,
     caption: str,
     campaign_id: str | None,
+    tenant_id: str = "default",
 ) -> tuple[str, float] | None:
     """Return (source_post_id, score) of a prior analysis within cosine
-    threshold of this caption's embedding, or None. Scoped to the campaign."""
+    threshold of this caption's embedding, or None. Scoped to the campaign and tenant."""
     qvec = to_pgvector_literal(embed_text(caption))
-    params: dict[str, Any] = {"qvec": qvec}
+    params: dict[str, Any] = {"qvec": qvec, "tid": tenant_id}
     
     if campaign_id:
         params["cid"] = campaign_id
@@ -154,7 +156,7 @@ async def _find_near_duplicate(
             SELECT ar.post_id                                    AS post_id,
                    1 - (ar.embedding <=> CAST(:qvec AS vector))  AS score
             FROM analysis_results ar
-            WHERE ar.embedding IS NOT NULL AND ar.campaign_id = :cid
+            WHERE ar.embedding IS NOT NULL AND ar.campaign_id = :cid AND ar.tenant_id = :tid
             ORDER BY ar.embedding <=> CAST(:qvec AS vector)
             LIMIT 1
             """
@@ -165,7 +167,7 @@ async def _find_near_duplicate(
             SELECT ar.post_id                                    AS post_id,
                    1 - (ar.embedding <=> CAST(:qvec AS vector))  AS score
             FROM analysis_results ar
-            WHERE ar.embedding IS NOT NULL
+            WHERE ar.embedding IS NOT NULL AND ar.tenant_id = :tid
             ORDER BY ar.embedding <=> CAST(:qvec AS vector)
             LIMIT 1
             """
@@ -220,6 +222,7 @@ async def _enqueue_reuse(
     src_post_id: str,
     score: float,
     job_id: str | None,
+    tenant_id: str = "default",
 ) -> None:
     """Hand a near-duplicate to the ASSEMBLER rather than copying its DB row.
 
@@ -246,6 +249,7 @@ async def _enqueue_reuse(
         "embedding": source.get("embedding"),
         "embedding_is_stub": source.get("embedding_is_stub", True),
         "job_id": job_id,
+        "tenant_id": tenant_id,
     }
     await redis.xadd(
         ASSEMBLER_STREAM,
@@ -263,6 +267,7 @@ async def _enqueue_nlp(
     raw: dict,
     job_id: str | None = None,
     options: dict | None = None,
+    tenant_id: str = "default",
 ) -> None:
     """
     Push the post onto the NLP stage-1 stream as the canonical envelope.
@@ -279,11 +284,13 @@ async def _enqueue_nlp(
         "normalized_post": normalized,
         "options": options or {},
         "job_id": job_id,
+        "tenant_id": tenant_id,
     }
     await redis.xadd(
         NLP_STREAM,
         {"data": json.dumps(envelope, ensure_ascii=False)},
     )
+
 
     # Opening frame of the dashboard's per-post trace: what normalization
     # derived, before any model has seen the post.
@@ -573,8 +580,9 @@ async def _process_message(
     )
 
     # Step 5 — upsert into Postgres.
+    tenant_id: str = options.get("tenant_id") or raw.get("tenant_id") or raw.get("tenantId") or "default"
     async with session_factory() as session:
-        await _upsert_post(session, normalized, raw)
+        await _upsert_post(session, normalized, raw, tenant_id=tenant_id)
     log.debug("ingestion.upserted", post_id=post_id)
 
     # Step 5b — near-duplicate reuse (§3.2): if this caption is within cosine
@@ -584,14 +592,14 @@ async def _process_message(
     if NEAR_DUP_ENABLED and caption:
         try:
             async with session_factory() as session:
-                dup = await _find_near_duplicate(session, caption, raw.get("campaignId"))
+                dup = await _find_near_duplicate(session, caption, raw.get("campaignId"), tenant_id=tenant_id)
                 source = await _fetch_source_analysis(session, dup[0]) if dup else None
                 if source:
                     # Hand it to the assembler rather than copying the row here.
                     # The assembler owns schema validation and the three-store
                     # fan-out; the old row-copy wrote Postgres only, so reused
                     # posts were missing from every ClickHouse aggregate (§13.3).
-                    await _enqueue_reuse(redis, normalized, source, dup[0], dup[1], job_id)
+                    await _enqueue_reuse(redis, normalized, source, dup[0], dup[1], job_id, tenant_id=tenant_id)
                     log.info(
                         "ingestion.near_duplicate_reused",
                         post_id=post_id,
@@ -610,7 +618,8 @@ async def _process_message(
             log.warning("ingestion.near_dup_check_failed", post_id=post_id, error=str(exc))
 
     # Step 6 — enqueue to NLP stage-1 stream.
-    await _enqueue_nlp(redis, normalized, raw, job_id=job_id, options=options)
+    await _enqueue_nlp(redis, normalized, raw, job_id=job_id, options=options, tenant_id=tenant_id)
+
 
     # Step 7 — ACK the original message.
     await redis.xack(stream_name, CONSUMER_GROUP, message_id)

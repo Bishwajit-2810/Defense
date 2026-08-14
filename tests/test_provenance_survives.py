@@ -73,12 +73,17 @@ async def _pipeline(degraded=None):
     """Run Stage 1 + the assembler and return (stage1_result, canonical_result)."""
     registry = ModelRegistry()
     post = json.loads(json.dumps(_POST))
-    text_result, image_result, comment_analysis, overall, score = (
-        await stage1._process_message(post, registry)
-    )
+    (
+        text_result, image_result, comment_analysis,
+        post_summary, post_summary_lang, post_summary_grounding,
+        overall, score,
+    ) = await stage1._process_message(post, registry)
     s1 = stage1._build_result(
         post=post, text_result=text_result, image_result=image_result,
-        comment_analysis=comment_analysis, overall_sentiment=overall,
+        comment_analysis=comment_analysis,
+        post_summary=post_summary, post_summary_lang=post_summary_lang,
+        post_summary_grounding=post_summary_grounding,
+        overall_sentiment=overall,
         sentiment_score=score, stage1_ms=1.0,
         degraded_components=degraded if degraded is not None else registry.degraded_components(),
     )

@@ -17,8 +17,8 @@ from typing import Optional
 # Ensure the repo root is importable when run directly
 sys.path.insert(0, str(Path(__file__).parent.parent))
 
-from libs.common.utils import compute_coverage, coverage_anomaly, platform_from_url
-from libs.schemas import validate_input
+from defense.libs.common.utils import compute_coverage, coverage_anomaly, platform_from_url
+from defense.contracts.schemas import validate_input
 
 
 # ---------------------------------------------------------------------------
