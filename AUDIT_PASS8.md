@@ -5,11 +5,9 @@ that is, the ~3,000-line uncommitted working diff on `new_updates`, which had ne
 reviewed by anyone. Pass 7's list is [AUDIT_PASS7.md](AUDIT_PASS7.md); Pass 6's is
 [OPEN_ISSUES.md](OPEN_ISSUES.md).
 
-**Status: 4 of 5 FIXED** and regression-tested. The fifth (#3) is a schema-level
-multi-tenant gap that needs a migration and a product decision, so it is reported rather
-than quietly patched.
+**Status: 5 of 5 FIXED** and regression-tested. The fifth (#3) was resolved in Pass 9 via full multi-tenant schema, model, API, worker envelope, and MCP isolation.
 
-**Test suite: 826 passing / 1 failing in 153 s → 830 passing / 1 skipped in ~39 s.**
+**Test suite: 826 passing / 1 failing in 153 s → 832 passing / 1 skipped in ~28 s.**
 
 Two of the five are **incomplete Pass 7 fixes** — the interesting kind, because in both
 cases the fix that shipped was correct as far as it went and the defect survived one layer
@@ -25,7 +23,7 @@ diverging between paths): the fix gave the two paths the same rule by writing it
 | ------------------------------------------------------------- | ----------------------------------------------------- | --------------------------------------------------------------- | -------------- |
 | [1](#1--the-hash-stubs-label-still-had-the-last-word)         | The hash stub's label still had the last word          | **Honesty** — two contradicting aggregates in one payload       | ✅ Fixed       |
 | [2](#2--a-plain-pytest-wipes-the-developers-datastores)       | A plain `pytest` wipes the developer's datastores      | **Destructive** — and 85% of the suite's wall clock             | ✅ Fixed       |
-| [3](#3--analysis_results-is-not-tenant-scoped-anywhere)       | `analysis_results` is not tenant-scoped anywhere       | **Cross-tenant data exposure**                                  | ⚠️ Reported    |
+| [3](#3--analysis_results-is-not-tenant-scoped-anywhere)       | `analysis_results` is not tenant-scoped anywhere       | **Cross-tenant data exposure**                                  | ✅ Fixed (Pass 9) |
 | [4](#4--the-watchlist-rule-shipped-as-two-copies)             | The watchlist rule shipped as two copies               | Divergence between the cheap and expensive paths                | ✅ Fixed       |
 | [5](#5--one-voter-was-counted-as-unanimity)                   | One voter was counted as unanimity                     | **Honesty** — inverts the headline agreement number             | ✅ Fixed       |
 

@@ -17,11 +17,21 @@ from sqlalchemy.orm import Mapped, mapped_column, relationship
 
 from .base import Base
 
+class Campaign(Base):
+    __tablename__ = "campaigns"
+
+    id: Mapped[str] = mapped_column(String, primary_key=True)
+    tenant_id: Mapped[str] = mapped_column(String, nullable=False, default="default")
+    name: Mapped[Optional[str]] = mapped_column(String)
+    created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), server_default=func.now())
+
+
 class Post(Base):
     __tablename__ = "posts"
 
     id: Mapped[str] = mapped_column(String, primary_key=True)
     campaign_id: Mapped[Optional[str]] = mapped_column(String)
+    tenant_id: Mapped[str] = mapped_column(String, nullable=False, default="default")
     platform: Mapped[Optional[str]] = mapped_column(String)
     platform_post_id: Mapped[Optional[str]] = mapped_column(String)
     url: Mapped[Optional[str]] = mapped_column(Text)
@@ -63,6 +73,7 @@ class AnalysisResult(Base):
     id: Mapped[int] = mapped_column(Integer, primary_key=True, autoincrement=True)
     post_id: Mapped[str] = mapped_column(String, ForeignKey("posts.id"), unique=True)
     campaign_id: Mapped[Optional[str]] = mapped_column(String)
+    tenant_id: Mapped[str] = mapped_column(String, nullable=False, default="default")
     result: Mapped[Dict[str, Any]] = mapped_column(JSONB, nullable=False)
     embedding: Mapped[Any] = mapped_column(Vector(768))
     embedding_is_stub: Mapped[bool] = mapped_column(Boolean, default=False)
@@ -71,4 +82,5 @@ class AnalysisResult(Base):
     updated_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), server_default=func.now(), onupdate=func.now())
 
     post: Mapped["Post"] = relationship("Post", back_populates="analysis")
+
 

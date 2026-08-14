@@ -160,10 +160,38 @@ async def persist_postgres(
         component that produced it**. Omit it and the dimension heuristic
         applies, which is wrong for every stub (§13.2).
     """
+async def persist_postgres(
+    result: dict,
+    engine,
+    embedding: list | None = None,
+    embedding_is_stub: bool | None = None,
+) -> None:
+    """Upsert the canonical result + semantic-search embedding into analysis_results.
+
+    The pgvector ``embedding`` column is written in the same upsert (this is the
+    semantic-search index that replaced Qdrant). Uses ON CONFLICT (post_id) DO
+    UPDATE so re-assembling a post is idempotent — the latest result wins.
+
+    Parameters
+    ----------
+    result:
+        Schema-validated AnalysisResult dict.
+    engine:
+        An async SQLAlchemy engine (created with ``create_async_engine``).
+    embedding:
+        The Stage-1 document embedding (``stage1_result["embedding"]``). The
+        canonical result itself stays schema-pure, so the vector is passed
+        alongside it rather than embedded in it.
+    embedding_is_stub:
+        Whether that vector is the deterministic hash stub, **as reported by the
+        component that produced it**. Omit it and the dimension heuristic
+        applies, which is wrong for every stub (§13.2).
+    """
     from sqlalchemy.ext.asyncio import AsyncSession
     
     post_id: str = result["post_id"]
     campaign_id: str = result["campaign_id"]
+    tenant_id: str = result.get("tenant_id") or "default"
     schema_version: str = (result.get("processing") or {}).get("schema_version", "")
     embedding_vec, embedding_is_stub = _resolve_embedding(
         embedding, post_id, embedding_is_stub
@@ -181,7 +209,8 @@ async def persist_postgres(
             result_json=result,
             embedding=embedding_vec,
             embedding_is_stub=embedding_is_stub,
-            schema_version=schema_version
+            schema_version=schema_version,
+            tenant_id=tenant_id
         )
 
     log.debug("postgres: upserted", post_id=post_id, embedding=True)
@@ -226,6 +255,7 @@ def _clickhouse_insert_sync(result: dict, ch_client) -> None:
 
     post_id: str = result["post_id"]
     campaign_id: str = result["campaign_id"]
+    tenant_id: str = result.get("tenant_id") or "default"
     platform: str = result["platform"]
     media_type: str = result["media_type"]
     language: str = result["language"]
@@ -252,6 +282,7 @@ def _clickhouse_insert_sync(result: dict, ch_client) -> None:
     row = {
         "post_id": post_id,
         "campaign_id": campaign_id,
+        "tenant_id": tenant_id,
         "platform": platform,
         "media_type": media_type,
         "language": language,
@@ -286,7 +317,7 @@ def _clickhouse_insert_sync(result: dict, ch_client) -> None:
     # the row dict maps 1:1 to columns.
     ch_client.execute(
         "INSERT INTO analysis_events "
-        "(post_id, campaign_id, platform, media_type, language, overall_sentiment, "
+        "(post_id, campaign_id, tenant_id, platform, media_type, language, overall_sentiment, "
         "sentiment_score, text_sentiment, image_sentiment, toxicity_score, "
         "hate_speech_score, comment_count, stored_comments, total_reactions, coverage, "
         "llm_used, llm_backend, topics, keywords, "
@@ -315,6 +346,7 @@ def _clickhouse_insert_comments_sync(result: dict, ch_client) -> int:
 
     post_id: str = result["post_id"]
     campaign_id: str = result["campaign_id"]
+    tenant_id: str = result.get("tenant_id") or "default"
     platform: str = result["platform"]
 
     rows = [
@@ -329,6 +361,7 @@ def _clickhouse_insert_comments_sync(result: dict, ch_client) -> int:
             "comment_id": str(c.get("id") or "") or f"{post_id}#idx{i}",
             "post_id": post_id,
             "campaign_id": campaign_id,
+            "tenant_id": tenant_id,
             "platform": platform,
             "sentiment": c.get("sentiment") or "neutral",
             "sentiment_score": float(c.get("sentiment_score") or 0.0),
@@ -347,11 +380,12 @@ def _clickhouse_insert_comments_sync(result: dict, ch_client) -> int:
 
     ch_client.execute(
         "INSERT INTO comment_sentiments "
-        "(comment_id, post_id, campaign_id, platform, sentiment, sentiment_score, "
+        "(comment_id, post_id, campaign_id, tenant_id, platform, sentiment, sentiment_score, "
         "emotion, method, likes, author, label_agreement, label_source) VALUES",
         rows,
     )
     return len(rows)
+
 
 
 async def persist_clickhouse(result: dict, ch_client) -> None:

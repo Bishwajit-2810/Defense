@@ -54,18 +54,21 @@ async def _create_analysis_job(
     db: AsyncSession,
     analysis_id: str,
     selector: dict,
+    tenant_id: str = "default",
 ) -> None:
     now = datetime.now(tz=timezone.utc)
+    selector["tenant_id"] = tenant_id
     await db.execute(
         text(
             """
-            INSERT INTO jobs (id, type, status, selector, options, created_at, updated_at)
-            VALUES (:id, :type, :status, CAST(:selector AS jsonb), CAST(:options AS jsonb), :created_at, :updated_at)
+            INSERT INTO jobs (id, tenant_id, type, status, selector, options, created_at, updated_at)
+            VALUES (:id, :tenant_id, :type, :status, CAST(:selector AS jsonb), CAST(:options AS jsonb), :created_at, :updated_at)
             ON CONFLICT (id) DO NOTHING
             """
         ),
         {
             "id": analysis_id,
+            "tenant_id": tenant_id,
             "type": "analysis_run",
             "status": "queued",
             "selector": json.dumps(selector, default=str),
@@ -108,20 +111,14 @@ async def analysis_run(
             detail="Provide at least one of 'post_ids' or 'campaign_id'",
         )
 
+    tenant_id = current_user.get("tenant_id", "default")
     options: dict[str, Any] = dict(body.options or {})
-    # Resolve the backend this job will ACTUALLY run on (request > toggle > env)
-    # and enforce the tenant's privacy lock against it, here where the tenant is
-    # known — the workers have no database and cannot do it themselves.
-    #
-    # The resolved value is then stamped into `options`, which travels in the job
-    # envelope. Without that stamp the check was theatre: it inspected an option
-    # no worker read, while Stage 1 and Stage 2 took their backend from the
-    # global `config:llm_backend` key (PROJECT_ASSESSMENT §13.5).
+    options["tenant_id"] = tenant_id
     options["llm_backend"] = await resolve_llm_backend(db, redis, current_user, options)
 
     analysis_id = str(uuid.uuid4())
 
-    selector: dict[str, Any] = {}
+    selector: dict[str, Any] = {"tenant_id": tenant_id}
     if body.campaign_id:
         selector["campaign_id"] = body.campaign_id
     if body.post_ids:
@@ -129,8 +126,8 @@ async def analysis_run(
     if body.filter:
         selector["filter"] = body.filter.model_dump(exclude_none=True)
 
-    # --- Find the posts to (re-)analyze -------------------------------------
-    where, params = [], {}
+    # --- Find the posts to (re-)analyze (tenant-scoped) --------------------
+    where, params = ["tenant_id = :tenant_id"], {"tenant_id": tenant_id}
     if body.campaign_id:
         where.append("campaign_id = :campaign_id")
         params["campaign_id"] = body.campaign_id
@@ -154,7 +151,7 @@ async def analysis_run(
     from defense.services.ingestion.normalizer import normalize_post  # noqa: PLC0415
 
     try:
-        await _create_analysis_job(db, analysis_id, selector)
+        await _create_analysis_job(db, analysis_id, selector, tenant_id=tenant_id)
         enqueued = 0
         for row in rows:
             raw = row["raw_payload"] or {}
@@ -169,6 +166,7 @@ async def analysis_run(
                 "normalized_post": normalized,
                 "options": options,
                 "job_id": analysis_id,
+                "tenant_id": tenant_id,
             }
             await redis.xadd(
                 _NLP_STAGE1_STREAM,
@@ -264,18 +262,19 @@ async def list_analysis_jobs(
     current_user: dict = Depends(get_current_user),
 ) -> dict:
     """List recent jobs (newest first), excluding reports. Backs the Jobs tab."""
+    tenant_id = current_user.get("tenant_id", "default")
     rows = (
         await db.execute(
             text(
                 """
                 SELECT id, type, status, selector, created_at, updated_at
                 FROM jobs
-                WHERE type <> 'report'
+                WHERE type <> 'report' AND (tenant_id = :tid OR selector->>'tenant_id' = :tid)
                 ORDER BY created_at DESC
                 LIMIT :limit
                 """
             ),
-            {"limit": limit},
+            {"limit": limit, "tid": tenant_id},
         )
     ).mappings().all()
 
@@ -328,10 +327,11 @@ async def analysis_overview(
     Posts tab reads), so no client-side counting is needed. Declared before
     ``/{analysis_id}`` so the literal ``/overview`` path wins.
     """
-    where = ""
-    params: dict[str, Any] = {"top": top}
+    tenant_id = current_user.get("tenant_id", "default")
+    where = "WHERE tenant_id = :tid"
+    params: dict[str, Any] = {"top": top, "tid": tenant_id}
     if campaign_id:
-        where = "WHERE campaign_id = :campaign_id"
+        where += " AND campaign_id = :campaign_id"
         params["campaign_id"] = campaign_id
 
     async def rows(sql: str) -> list:
@@ -376,9 +376,9 @@ async def analysis_overview(
     ]
 
     # --- Top topics (unnest the topics array) -------------------------------
-    # The comma-join puts analysis_results first, so the campaign filter must be
+    # The comma-join puts analysis_results first, so the tenant/campaign filter must be
     # a fresh WHERE clause here (not appended to the scalar `where`).
-    topic_filter = "WHERE campaign_id = :campaign_id" if campaign_id else ""
+    topic_filter = "WHERE tenant_id = :tid" + (" AND campaign_id = :campaign_id" if campaign_id else "")
     top_topics = [
         LabelCount(label=r["k"], count=int(r["c"]))
         for r in await rows(
@@ -394,7 +394,7 @@ async def analysis_overview(
         for r in await rows(
             f"SELECT result->'emotion'->>'primary' AS k, COUNT(*) AS c "
             f"FROM analysis_results {where} "
-            f"{'AND' if where else 'WHERE'} result->'emotion'->>'primary' IS NOT NULL "
+            f"AND result->'emotion'->>'primary' IS NOT NULL "
             f"GROUP BY k ORDER BY c DESC LIMIT :top"
         )
     ]
@@ -416,7 +416,7 @@ async def analysis_overview(
         for r in await rows(
             f"SELECT result->'processing'->>'llm_backend' AS k, COUNT(*) AS c "
             f"FROM analysis_results {where} "
-            f"{'AND' if where else 'WHERE'} result->'processing'->>'llm_backend' IS NOT NULL "
+            f"AND result->'processing'->>'llm_backend' IS NOT NULL "
             f"GROUP BY k ORDER BY c DESC"
         )
     ]
@@ -445,6 +445,7 @@ async def analysis_overview(
             params,
         )
     ).mappings().first()
+
     analyzed_total = int((cov_row or {}).get("analyzed") or 0)
     reported_total = int((cov_row or {}).get("reported") or 0)
     corpus_coverage = CorpusCoverage(
@@ -931,8 +932,9 @@ async def export_analysis(
     fixed 5,000-row fetch — filtering afterwards silently dropped every alert
     older than the newest 5,000 posts and reported the result as complete.
     """
-    where = ["TRUE"]
-    params: dict[str, Any] = {"limit": limit, "offset": offset}
+    tenant_id = current_user.get("tenant_id", "default")
+    where = ["ar.tenant_id = :tid"]
+    params: dict[str, Any] = {"limit": limit, "offset": offset, "tid": tenant_id}
     if only_warnings:
         # JSONB containment: the alert lives inside the canonical result.
         where.append("ar.result @> '{\"watchlist_alert\": true}'::jsonb")
@@ -993,10 +995,11 @@ async def latest_analysis(
     Always embeds results; the dashboard's ``?include=results`` is accepted and
     ignored. Declared before ``/{analysis_id}`` so the literal ``/latest`` wins.
     """
-    params: dict[str, Any] = {"limit": limit}
-    where = ""
+    tenant_id = current_user.get("tenant_id", "default")
+    params: dict[str, Any] = {"limit": limit, "tid": tenant_id}
+    where = "WHERE ar.tenant_id = :tid"
     if campaign_id:
-        where = "WHERE ar.campaign_id = :campaign_id"
+        where += " AND ar.campaign_id = :campaign_id"
         params["campaign_id"] = campaign_id
 
     rows = (
@@ -1044,13 +1047,14 @@ async def get_analysis(
     Pass ``?include=results`` to embed analysis result rows in the response.
     Use ``?limit=N`` to cap the number of result rows returned.
     """
+    tenant_id = current_user.get("tenant_id", "default")
     job_row = (
         await db.execute(
             text(
                 "SELECT id, status, selector, created_at FROM jobs "
-                "WHERE id = :id AND (selector->>'tenant_id' = :tid OR selector->>'tenant_id' IS NULL)"
+                "WHERE id = :id AND (tenant_id = :tid OR selector->>'tenant_id' = :tid)"
             ),
-            {"id": analysis_id, "tid": current_user.get("tenant_id", "default")},
+            {"id": analysis_id, "tid": tenant_id},
         )
     ).mappings().first()
 
@@ -1129,12 +1133,12 @@ async def get_analysis(
                                ar.created_at, p.scraped_at
                         FROM analysis_results ar
                         JOIN posts p ON p.id = ar.post_id
-                        WHERE ar.campaign_id = :campaign_id
+                        WHERE ar.tenant_id = :tid AND ar.campaign_id = :campaign_id
                         ORDER BY ar.created_at DESC
                         LIMIT :limit
                         """
                     ),
-                    {"campaign_id": campaign_id, "limit": limit},
+                    {"campaign_id": campaign_id, "limit": limit, "tid": tenant_id},
                 )
             ).mappings().all()
         elif post_ids:
@@ -1146,12 +1150,12 @@ async def get_analysis(
                                ar.created_at, p.scraped_at
                         FROM analysis_results ar
                         JOIN posts p ON p.id = ar.post_id
-                        WHERE ar.post_id = ANY(:post_ids)
+                        WHERE ar.tenant_id = :tid AND ar.post_id = ANY(:post_ids)
                         ORDER BY ar.created_at DESC
                         LIMIT :limit
                         """
                     ),
-                    {"post_ids": post_ids, "limit": limit},
+                    {"post_ids": post_ids, "limit": limit, "tid": tenant_id},
                 )
             ).mappings().all()
         else:
@@ -1193,12 +1197,14 @@ async def get_post_comments(
     so no extra datastore is needed. ``sentiment`` and ``emotion`` filter the
     returned slice; the breakdown counts always reflect the full set.
     """
+    tenant_id = current_user.get("tenant_id", "default")
     row = (
         await db.execute(
-            text("SELECT result FROM analysis_results WHERE post_id = :pid"),
-            {"pid": post_id},
+            text("SELECT result FROM analysis_results WHERE post_id = :pid AND tenant_id = :tid"),
+            {"pid": post_id, "tid": tenant_id},
         )
     ).mappings().first()
+
 
     if row is None:
         raise HTTPException(
@@ -1452,11 +1458,12 @@ async def analysis_stream(
     ``analysis:progress:{analysis_id}``.  The stream closes automatically
     on a ``done`` or ``error`` event, or after 5 minutes.
     """
+    tenant_id = current_user.get("tenant_id", "default")
     # Verify job exists before opening the stream
     job_row = (
         await db.execute(
-            text("SELECT id FROM jobs WHERE id = :id"),
-            {"id": analysis_id},
+            text("SELECT id FROM jobs WHERE id = :id AND (tenant_id = :tid OR selector->>'tenant_id' = :tid)"),
+            {"id": analysis_id, "tid": tenant_id},
         )
     ).first()
 

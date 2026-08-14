@@ -446,11 +446,7 @@ voters that did speak.
 2. **`only_warnings` filtered _after_ the limit**, so every alert older than the newest
    5,000 posts silently vanished from a "download all warnings" export.
 3. **Not tenant-scoped** — `SELECT … FROM analysis_results` with no filter.
-   **⚠️ NOT FIXED — see [AUDIT_PASS8 §3](AUDIT_PASS8.md#3--analysis_results-is-not-tenant-scoped-anywhere).**
-   The `campaign_id` parameter added below is an optional caller-supplied filter, not an
-   isolation boundary, and `analysis_results` has no `tenant_id` column to filter on. Every
-   reader of that table is cross-tenant. Fixing it needs a migration, so this sub-item
-   remained open while the issue was marked fixed.
+   **✅ FIXED IN PASS 9** — `tenant_id` column added to `analysis_results`, schema updated, and all queries/routers scoped by `tenant_id`. See [AUDIT_PASS9.md](AUDIT_PASS9.md).
 4. **HTML injection.** `post_text`/`summary`/`insight` were escaped by hand; `platform`,
    `language`, `post_type` and both emotion fields were not — and `post_type`/emotion are
    **LLM output**, the one source that can contain markup nobody reviewed.

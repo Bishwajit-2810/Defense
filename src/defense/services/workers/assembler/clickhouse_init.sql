@@ -1,6 +1,7 @@
 CREATE TABLE IF NOT EXISTS analysis_events (
   post_id String,
   campaign_id String,
+  tenant_id LowCardinality(String) DEFAULT 'default',
   platform LowCardinality(String),
   media_type LowCardinality(String),
   language LowCardinality(String),
@@ -38,7 +39,10 @@ CREATE TABLE IF NOT EXISTS analysis_events (
   inserted_at DateTime DEFAULT now()
 ) ENGINE = MergeTree()
 PARTITION BY toYYYYMM(created_at)
-ORDER BY (campaign_id, created_at, post_id);
+ORDER BY (tenant_id, campaign_id, created_at, post_id);
+
+-- Backfill tenant_id on tables created before it existed
+ALTER TABLE analysis_events ADD COLUMN IF NOT EXISTS tenant_id LowCardinality(String) DEFAULT 'default' AFTER campaign_id;
 
 -- Backfill the reaction columns on tables created before they existed
 -- (idempotent — no-ops once present). Additive only: no engine or ORDER BY
@@ -60,6 +64,7 @@ CREATE TABLE IF NOT EXISTS comment_sentiments (
   comment_id String,
   post_id String,
   campaign_id String,
+  tenant_id LowCardinality(String) DEFAULT 'default',
   platform LowCardinality(String),
   sentiment LowCardinality(String),
   sentiment_score Float32,
@@ -75,7 +80,10 @@ CREATE TABLE IF NOT EXISTS comment_sentiments (
   label_source LowCardinality(String) DEFAULT '',
   inserted_at DateTime DEFAULT now()
 ) ENGINE = ReplacingMergeTree(inserted_at)
-ORDER BY (post_id, comment_id);
+ORDER BY (tenant_id, post_id, comment_id);
+
+-- Backfill tenant_id on comment_sentiments
+ALTER TABLE comment_sentiments ADD COLUMN IF NOT EXISTS tenant_id LowCardinality(String) DEFAULT 'default' AFTER campaign_id;
 
 -- Backfill the emotion column on tables created before per-comment emotion
 -- labels existed (idempotent — no-op once the column is present).
@@ -99,3 +107,4 @@ ALTER TABLE comment_sentiments ADD COLUMN IF NOT EXISTS label_source LowCardinal
 -- answered, and unlike this table it has a writer.
 --
 -- Existing deployments can clean it up with:  DROP TABLE IF EXISTS llm_usage;
+

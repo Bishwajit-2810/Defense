@@ -42,7 +42,7 @@ class FakeDB:
     def __init__(self, n):
         self.n = n
 
-    async def execute(self, sql):
+    async def execute(self, sql, *args, **kwargs):
         return _Res({"n": self.n})
 
 

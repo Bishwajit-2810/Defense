@@ -52,13 +52,14 @@ async def search(
       ``uv sync --extra ml``); in stub mode vectors are deterministic hashes,
       so results are stable but not meaning-based.
     """
+    tenant_id = current_user.get("tenant_id", "default")
     if semantic:
-        results = await _semantic_search(db, q=q, campaign_id=campaign_id, limit=limit)
+        results = await _semantic_search(db, q=q, campaign_id=campaign_id, limit=limit, tenant_id=tenant_id)
         log.info("semantic_search_completed", q=q, total=len(results))
         return SearchResponse(query=q, semantic=True, total=len(results), results=results)
 
     # --- Keyword search via Postgres JSONB ---
-    results = await _keyword_search(db, q=q, campaign_id=campaign_id, limit=limit)
+    results = await _keyword_search(db, q=q, campaign_id=campaign_id, limit=limit, tenant_id=tenant_id)
 
     log.info(
         "keyword_search_completed",
@@ -74,6 +75,7 @@ async def _semantic_search(
     q: str,
     campaign_id: str | None,
     limit: int,
+    tenant_id: str = "default",
 ) -> list[SearchResult]:
     """pgvector cosine-similarity search over analysis_results.embedding.
 
@@ -82,8 +84,8 @@ async def _semantic_search(
     query_vec, query_is_stub = embed_text_with_provenance(q)
     qvec = to_pgvector_literal(query_vec)
 
-    params: dict[str, Any] = {"qvec": qvec, "limit": limit}
-    where_parts = ["ar.embedding IS NOT NULL"]
+    params: dict[str, Any] = {"qvec": qvec, "limit": limit, "tid": tenant_id}
+    where_parts = ["ar.embedding IS NOT NULL", "ar.tenant_id = :tid"]
     if campaign_id:
         where_parts.append("ar.campaign_id = :campaign_id")
         params["campaign_id"] = campaign_id
@@ -139,6 +141,7 @@ async def _keyword_search(
     q: str,
     campaign_id: str | None,
     limit: int,
+    tenant_id: str = "default",
 ) -> list[SearchResult]:
     """Run a keyword search against analysis_results using JSONB operators.
 
@@ -159,25 +162,21 @@ async def _keyword_search(
     # clause in each predicate below makes the backslash the escape character.
     escaped = q.lower().replace("\\", "\\\\").replace("%", "\\%").replace("_", "\\_")
     pattern = f"%{escaped}%"
-    params: dict[str, Any] = {"pattern": pattern, "limit": limit}
+    params: dict[str, Any] = {"pattern": pattern, "limit": limit, "tid": tenant_id}
 
     # Base WHERE clause — text fields
     where_clauses = [
         r"LOWER(ar.result->>'post_summary') LIKE :pattern ESCAPE '\'",
-        # `post_text` is the post's own caption. Without it, a post the router
-        # sent straight to the assembler has no `post_summary`, so its actual
-        # words were unsearchable — only its topics/keywords were.
         r"LOWER(ar.result->>'post_text') LIKE :pattern ESCAPE '\'",
         r"EXISTS (SELECT 1 FROM jsonb_array_elements_text(ar.result->'keywords') kw WHERE LOWER(kw) LIKE :pattern ESCAPE '\')",
         r"EXISTS (SELECT 1 FROM jsonb_array_elements_text(ar.result->'topics') t WHERE LOWER(t) LIKE :pattern ESCAPE '\')",
         r"EXISTS (SELECT 1 FROM jsonb_array_elements_text(ar.result->'comment_analysis'->'themes') th WHERE LOWER(th) LIKE :pattern ESCAPE '\')",
     ]
 
+    campaign_filter = "AND ar.tenant_id = :tid"
     if campaign_id:
         params["campaign_id"] = campaign_id
-        campaign_filter = "AND ar.campaign_id = :campaign_id"
-    else:
-        campaign_filter = ""
+        campaign_filter += " AND ar.campaign_id = :campaign_id"
 
     sql = text(
         f"""

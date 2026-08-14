@@ -5,9 +5,21 @@
 -- canonical result in analysis_results.embedding.
 CREATE EXTENSION IF NOT EXISTS vector;
 
+-- Tenant Isolation Migrations & Backfill Policy
+-- Existing rows in posts, analysis_results, and jobs are backfilled to 'default' tenant.
+-- Future rows acquire tenant_id explicitly from current_user / job envelope.
+
+CREATE TABLE IF NOT EXISTS campaigns (
+    id                VARCHAR PRIMARY KEY,
+    tenant_id         VARCHAR NOT NULL DEFAULT 'default',
+    name              VARCHAR,
+    created_at        TIMESTAMPTZ DEFAULT NOW()
+);
+
 CREATE TABLE IF NOT EXISTS posts (
     id                VARCHAR PRIMARY KEY,
     campaign_id       VARCHAR,
+    tenant_id         VARCHAR NOT NULL DEFAULT 'default',
     platform          VARCHAR,
     platform_post_id  VARCHAR,
     url               TEXT,
@@ -24,6 +36,7 @@ CREATE TABLE IF NOT EXISTS analysis_results (
     id              SERIAL PRIMARY KEY,
     post_id         VARCHAR REFERENCES posts(id),
     campaign_id     VARCHAR,
+    tenant_id       VARCHAR NOT NULL DEFAULT 'default',
     result          JSONB NOT NULL,
     embedding       vector(768),   -- pgvector: semantic-search vector (was Qdrant)
     -- TRUE when `embedding` is the deterministic hash-seeded stub rather than a
@@ -53,6 +66,7 @@ CREATE TABLE IF NOT EXISTS comments (
 
 CREATE TABLE IF NOT EXISTS jobs (
     id          VARCHAR PRIMARY KEY,
+    tenant_id   VARCHAR NOT NULL DEFAULT 'default',
     type        VARCHAR,
     status      VARCHAR DEFAULT 'pending',
     selector    JSONB,
@@ -115,16 +129,24 @@ CREATE TABLE IF NOT EXISTS users (
     created_at    TIMESTAMPTZ DEFAULT NOW()
 );
 
--- Backfill for databases created before embedding_is_stub existed.
+-- Idempotent schema updates for existing deployments
+ALTER TABLE posts ADD COLUMN IF NOT EXISTS tenant_id VARCHAR NOT NULL DEFAULT 'default';
+ALTER TABLE analysis_results ADD COLUMN IF NOT EXISTS tenant_id VARCHAR NOT NULL DEFAULT 'default';
 ALTER TABLE analysis_results ADD COLUMN IF NOT EXISTS embedding_is_stub BOOLEAN DEFAULT FALSE;
+ALTER TABLE jobs ADD COLUMN IF NOT EXISTS tenant_id VARCHAR NOT NULL DEFAULT 'default';
 
 -- Indexes
+CREATE INDEX IF NOT EXISTS idx_campaigns_tenant_id   ON campaigns (tenant_id);
+CREATE INDEX IF NOT EXISTS idx_posts_tenant_id          ON posts (tenant_id);
 CREATE INDEX IF NOT EXISTS idx_posts_campaign_id      ON posts (campaign_id);
 CREATE INDEX IF NOT EXISTS idx_posts_content_hash     ON posts (content_hash);
 CREATE INDEX IF NOT EXISTS idx_posts_status           ON posts (status);
 CREATE INDEX IF NOT EXISTS idx_comments_post_id       ON comments (post_id);
+CREATE INDEX IF NOT EXISTS idx_analysis_tenant_id     ON analysis_results (tenant_id);
 CREATE INDEX IF NOT EXISTS idx_analysis_campaign_id   ON analysis_results (campaign_id);
 CREATE INDEX IF NOT EXISTS idx_analysis_created_at    ON analysis_results (created_at);
+CREATE INDEX IF NOT EXISTS idx_jobs_tenant_id         ON jobs (tenant_id);
 -- Approximate nearest-neighbour index for cosine similarity (pgvector / semantic search).
 CREATE INDEX IF NOT EXISTS idx_analysis_embedding_hnsw
     ON analysis_results USING hnsw (embedding vector_cosine_ops);
+

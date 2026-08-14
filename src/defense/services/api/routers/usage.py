@@ -201,6 +201,7 @@ async def get_usage(
     # ------------------------------------------------------------------
     # Query 1: analysis_results — post counts and LLM call counts
     # ------------------------------------------------------------------
+    tenant_id = user.get("tenant_id", "default")
     if campaign_id:
         analysis_row: Any = (
             await db.execute(
@@ -216,10 +217,10 @@ async def get_usage(
                             END
                         )                                                          AS llm_calls
                     FROM analysis_results
-                    WHERE campaign_id = :campaign_id
+                    WHERE tenant_id = :tid AND campaign_id = :campaign_id
                     """
                 ),
-                {"campaign_id": campaign_id},
+                {"tid": tenant_id, "campaign_id": campaign_id},
             )
         ).mappings().first()
     else:
@@ -237,8 +238,10 @@ async def get_usage(
                             END
                         )                                                          AS llm_calls
                     FROM analysis_results
+                    WHERE tenant_id = :tid
                     """
-                )
+                ),
+                {"tid": tenant_id},
             )
         ).mappings().first()
 
