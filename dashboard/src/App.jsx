@@ -18,7 +18,6 @@ import { getAuthToken, logout } from './utils/api';
 function App() {
   const [activeTab, setActiveTab] = useState('overview');
   const [authStatus, setAuthStatus] = useState(!!getAuthToken());
-  const [autoRefresh, setAutoRefresh] = useState(true);
 
   useEffect(() => {
     const handleAuthExpired = () => setAuthStatus(false);
@@ -27,12 +26,11 @@ function App() {
   }, []);
 
   useEffect(() => {
-    if (!autoRefresh) return;
     const intervalId = setInterval(() => {
       window.dispatchEvent(new Event('auto-refresh'));
     }, 15000);
     return () => clearInterval(intervalId);
-  }, [autoRefresh]);
+  }, []);
 
   const handleLogout = () => {
     logout();
@@ -48,8 +46,6 @@ function App() {
       <Header 
         authStatus={authStatus} 
         onLogout={handleLogout} 
-        autoRefresh={autoRefresh}
-        setAutoRefresh={setAutoRefresh}
       />
       
       <div className="flex-1 flex flex-col md:flex-row overflow-hidden">

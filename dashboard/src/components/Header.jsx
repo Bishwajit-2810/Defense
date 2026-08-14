@@ -2,7 +2,7 @@ import React, { useState, useEffect } from 'react';
 import { Moon, Sun, Shield } from 'lucide-react';
 import { apiCall } from '../utils/api';
 
-export default function Header({ authStatus, onLogout, autoRefresh, setAutoRefresh }) {
+export default function Header({ authStatus, onLogout }) {
   const [isDark, setIsDark] = useState(
     document.documentElement.classList.contains('dark')
   );
@@ -51,15 +51,6 @@ export default function Header({ authStatus, onLogout, autoRefresh, setAutoRefre
       </div>
 
       <div className="flex items-center gap-4">
-        <label className="flex items-center gap-2 text-sm text-slate-600 dark:text-zinc-300 font-medium cursor-pointer" title="Automatically refresh the active tab every 15 seconds">
-          <input 
-            type="checkbox" 
-            checked={autoRefresh} 
-            onChange={(e) => setAutoRefresh(e.target.checked)} 
-            className="rounded text-brand-500 focus:ring-brand-500 cursor-pointer" 
-          />
-          Auto-refresh
-        </label>
 
         {llmConfig && llmConfig.backend && (
           <button className="px-3 py-1 rounded-full text-xs font-semibold bg-indigo-500/10 text-indigo-600 dark:text-indigo-400 border border-indigo-500/20 hover:bg-indigo-500/20 transition-colors" title="LLM Backend">

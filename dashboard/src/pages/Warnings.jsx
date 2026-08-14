@@ -1,5 +1,6 @@
 import React, { useState, useEffect } from 'react';
 import { apiCall, API_BASE, getAuthHeaders } from '../utils/api.js';
+import { formatAlertReason } from '../utils/sentiment.js';
 import PostModal from '../components/PostModal';
 
 export default function Warnings() {
@@ -151,8 +152,8 @@ export default function Warnings() {
                     {/* The rule that fired, not a blanket "under attack": an
                         `always` target alerts on a plain mention. */}
                     <td className="px-4 py-3 max-w-[220px] truncate text-xs text-rose-700 dark:text-rose-400"
-                        title={post.watchlist_alert_reason || ''}>
-                      {post.watchlist_alert_reason || '—'}
+                        title={formatAlertReason(post.watchlist_alert_reason) || ''}>
+                      {formatAlertReason(post.watchlist_alert_reason) || '—'}
                     </td>
                     <td className="px-4 py-3">
                       <span className={`px-2 py-1 rounded-full text-xs font-medium ${

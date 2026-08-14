@@ -320,7 +320,8 @@ def watchlist_verdict(
     for target_id in targets.matched_ids(post_text or ""):
         target = targets.by_id(target_id)
         if target and target.polarity == "always":
-            return True, f"always:{target.id} mentioned in post text"
+            display_name = getattr(target, "display", None) or getattr(target, "id", "")
+            return True, f"always:{target.id} — Mention of {display_name} in post text"
 
     for comment in comments or ():
         for entry in comment.get("target_stances") or []:
@@ -328,9 +329,11 @@ def watchlist_verdict(
             if not target:
                 continue
             if target.polarity == "always":
-                return True, f"always:{target.id} mentioned in a comment"
+                display_name = getattr(target, "display", None) or getattr(target, "id", "")
+                return True, f"always:{target.id} — Mention of {display_name} in a comment"
             if target.polarity == "favored" and entry.get("stance") == "opposing":
-                return True, f"opposing:{target.id} opposed in a comment"
+                display_name = getattr(target, "display", None) or getattr(target, "id", "")
+                return True, f"opposing:{target.id} — Hostile comment opposing {display_name}"
     return False, None
 
 

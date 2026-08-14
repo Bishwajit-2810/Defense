@@ -56,3 +56,23 @@ export function orderedBreakdown(breakdown = {}) {
     values: labels.map((k) => Number(breakdown[k]) || 0),
   };
 }
+
+/**
+ * Formats a watchlist alert reason string for display.
+ * Strips technical rule prefix e.g. "always:tarek_rahman — Mention of Tarek Rahman..." -> "Mention of Tarek Rahman..."
+ */
+export function formatAlertReason(reason) {
+  if (!reason) return '';
+  let str = String(reason).trim();
+  if (str.includes(' — ')) {
+    str = str.split(' — ').slice(1).join(' — ');
+  } else if (str.startsWith('always:') || str.startsWith('opposing:')) {
+    const spaceIdx = str.indexOf(' ');
+    if (spaceIdx !== -1) {
+      str = str.slice(spaceIdx + 1);
+    }
+  }
+  str = str.replace(/_/g, ' ');
+  return str.charAt(0).toUpperCase() + str.slice(1);
+}
+

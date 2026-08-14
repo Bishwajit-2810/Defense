@@ -1,5 +1,6 @@
 import React, { useState, useEffect } from 'react';
 import { apiCall, API_BASE, getAuthHeaders } from '../utils/api.js';
+import { formatAlertReason } from '../utils/sentiment.js';
 import PostModal from '../components/PostModal';
 
 export default function Posts() {
@@ -82,6 +83,30 @@ export default function Posts() {
     }
   };
 
+  const downloadReport = async () => {
+    try {
+      const campaign = campaignId.trim() || 'all';
+      const res = await fetch(`${API_BASE}/v1/reports/export_latest?campaign_id=${encodeURIComponent(campaign)}&format=pdf`, {
+        headers: getAuthHeaders()
+      });
+      if (!res.ok) {
+        const errData = await res.json().catch(() => ({}));
+        throw new Error(errData.detail || 'Report export failed');
+      }
+      const blob = await res.blob();
+      const url = window.URL.createObjectURL(blob);
+      const a = document.createElement('a');
+      a.href = url;
+      a.download = `mass_reaction_report_${campaign}.pdf`;
+      document.body.appendChild(a);
+      a.click();
+      window.URL.revokeObjectURL(url);
+      document.body.removeChild(a);
+    } catch (err) {
+      alert('Error generating report: ' + err.message);
+    }
+  };
+
   const renderToxicityBar = (score) => {
     const p = Math.round(score * 100);
     const color = score < 0.33 ? '#10b981' : score < 0.66 ? '#f59e0b' : '#ef4444';
@@ -158,6 +183,7 @@ export default function Posts() {
               onChange={e => setCampaignId(e.target.value)}
               className="px-3 py-1.5 text-sm bg-white dark:bg-zinc-900 border border-slate-200 dark:border-zinc-700 rounded-lg"
             />
+            <button onClick={downloadReport} className="px-3 py-1.5 text-sm bg-brand-500 hover:bg-brand-600 text-white rounded-lg font-medium transition-colors">Download Analysis Report</button>
             <button onClick={downloadZip} className="px-3 py-1.5 text-sm bg-white dark:bg-zinc-900 border border-slate-200 dark:border-zinc-700 rounded-lg hover:bg-slate-100 dark:hover:bg-zinc-800">Export ZIP</button>
             <button onClick={fetchPosts} className="px-3 py-1.5 text-sm bg-white dark:bg-zinc-900 border border-slate-200 dark:border-zinc-700 rounded-lg hover:bg-slate-100 dark:hover:bg-zinc-800">Refresh</button>
           </div>
@@ -197,7 +223,7 @@ export default function Posts() {
                   <tr key={post.post_id || i} className={`hover:bg-slate-50 dark:hover:bg-zinc-900/50 cursor-pointer transition-colors ${post.watchlist_alert ? 'bg-rose-50/30 dark:bg-rose-900/10' : ''}`} onClick={() => setSelectedPost(post)}>
                     <td className="px-4 py-3">{i + 1}</td>
                     <td className="px-4 py-3 font-mono text-xs">
-                      {post.watchlist_alert && <span title={post.watchlist_alert_reason || 'Watchlist alert'} className="mr-2 text-rose-500">⚠️</span>}
+                      {post.watchlist_alert && <span title={formatAlertReason(post.watchlist_alert_reason) || 'Watchlist alert'} className="mr-2 text-rose-500">⚠️</span>}
                       {String(post.post_id || '').slice(0,8)}...
                     </td>
                     <td className="px-4 py-3">{post.platform || '—'}</td>

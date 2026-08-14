@@ -1,6 +1,6 @@
 import React, { useState, useEffect } from 'react';
-import { Play, FileText, CheckCircle2, Clock, AlertCircle } from 'lucide-react';
-import { apiCall, API_BASE, getSseQueryAsync } from '../utils/api.js';
+import { Play, FileText, CheckCircle2, Clock, AlertCircle, Download } from 'lucide-react';
+import { apiCall, API_BASE, getAuthHeaders, getSseQueryAsync } from '../utils/api.js';
 
 export default function AnalysisJobs() {
   const [jobs, setJobs] = useState([]);
@@ -119,6 +119,30 @@ export default function AnalysisJobs() {
       setResultModal({ isOpen: true, data: finalRes });
     } catch (e) {
       console.error(e);
+    }
+  };
+
+  const downloadJobReport = async (campaignId) => {
+    try {
+      const campaign = campaignId || 'all';
+      const res = await fetch(`${API_BASE}/v1/reports/export_latest?campaign_id=${encodeURIComponent(campaign)}&format=pdf`, {
+        headers: getAuthHeaders()
+      });
+      if (!res.ok) {
+        const errData = await res.json().catch(() => ({}));
+        throw new Error(errData.detail || 'Report export failed');
+      }
+      const blob = await res.blob();
+      const url = window.URL.createObjectURL(blob);
+      const a = document.createElement('a');
+      a.href = url;
+      a.download = `analysis_report_${campaign}.pdf`;
+      document.body.appendChild(a);
+      a.click();
+      window.URL.revokeObjectURL(url);
+      document.body.removeChild(a);
+    } catch (err) {
+      alert('Error downloading report: ' + err.message);
     }
   };
 
@@ -324,6 +348,11 @@ export default function AnalysisJobs() {
                           {!isFinished && status !== 'failed' && (
                             <button onClick={() => subscribeToJobProgress(jid)} className="text-brand-500 hover:text-brand-600 text-xs font-semibold text-left">Track</button>
                           )}
+                          {isFinished && (
+                            <button onClick={() => downloadJobReport(job.campaign_id)} className="text-brand-500 hover:text-brand-600 text-xs font-semibold text-left flex items-center gap-1">
+                              <Download size={12} /> Download Report
+                            </button>
+                          )}
                           <button onClick={() => triggerRerunJob(job)} className="text-slate-500 hover:text-brand-500 text-xs font-semibold text-left">Re-run</button>
                         </div>
                       </td>
@@ -396,7 +425,13 @@ export default function AnalysisJobs() {
                 </pre>
               )}
             </div>
-            <div className="p-4 border-t border-slate-200 dark:border-zinc-800 bg-slate-50 dark:bg-zinc-950 flex justify-end">
+            <div className="p-4 border-t border-slate-200 dark:border-zinc-800 bg-slate-50 dark:bg-zinc-950 flex justify-between items-center">
+              <button 
+                onClick={() => downloadJobReport(resultModal.data?.campaign_id)}
+                className="px-4 py-2 bg-slate-100 dark:bg-zinc-800 hover:bg-slate-200 dark:hover:bg-zinc-700 text-slate-700 dark:text-zinc-200 border border-slate-200 dark:border-zinc-700 rounded-lg text-sm font-medium flex items-center gap-2 transition-colors"
+              >
+                <Download size={15} /> Download Mass Reaction Report (PDF)
+              </button>
               <button 
                 onClick={() => setResultModal({ isOpen: false, data: null })}
                 className="px-4 py-2 bg-brand-500 hover:bg-brand-600 text-white rounded-lg text-sm font-medium transition-colors"
