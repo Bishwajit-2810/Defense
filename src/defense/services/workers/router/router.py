@@ -15,12 +15,11 @@ import asyncio
 import json
 import signal
 import time
-import re
-import msgpack
 import redis.asyncio as aioredis
 import structlog
 from defense.libs.common.config import get_settings
 
+from . import rules as rules_module
 from .rules import (
     get_task_flags,
     read_image_sentiment,
@@ -49,7 +48,7 @@ ROUTER_QUEUE: str = streams.ROUTER.name
 STAGE2_QUEUE: str = streams.STAGE2_LLM.name
 ASSEMBLER_QUEUE: str = streams.ASSEMBLER.name
 CONSUMER_GROUP: str = streams.ROUTER.group
-CONSUMER_NAME: str = config.router_consumer or f"router-0"
+CONSUMER_NAME: str = config.router_consumer or "router-0"
 
 # Redis stat keys
 STAT_TOTAL: str = "stats:total_processed"
@@ -103,27 +102,15 @@ async def _process_message(
     stage1_result: dict = payload.get("stage1_result", {})
     options: dict = payload.get("options", {})
 
-    ca = stage1_result.get("comment_analysis") or {}
-    comments = ca.get("comments") or []
-    if comments:
-        import emoji
-        url_pattern = re.compile(r'https?://\S+|www\.\S+')
-        for c in comments:
-            text = (c.get("text") or "").strip()
-            
-            # Mark all links as link
-            text = url_pattern.sub('link', text)
-            
-            # Remove all emojis from the comment text
-            stripped_text = emoji.replace_emoji(text, replace='').strip()
-            
-            # Update the comment text without emojis
-            c["text"] = stripped_text
-            
-            # If the comment was pure emojis or is now empty, mark it as filtered
-            if c.get("kind") == "emoji" or not stripped_text:
-                c["kind"] = "filtered"
-
+    # NOTE: the router does not touch comment text. It used to strip emoji,
+    # rewrite URLs to the literal word "link" and re-label every emoji comment
+    # as `kind: "filtered"` — after Stage 1 had already scored those comments
+    # from the very characters it deleted. The result was a persisted comment
+    # whose text no longer matched the source, an emoji reaction displayed as an
+    # empty row carrying a sentiment, and `reaction_only` pinned to 0 forever
+    # because nothing was left with `kind == "emoji"` to count.
+    # Normalisation now happens in Stage 1, next to the classifier that reads it,
+    # and it adds a field (`text_norm`) rather than overwriting the original.
     use_llm, reasons = should_use_llm(stage1_result, options)
     job_id = payload.get("job_id")
 
@@ -139,7 +126,9 @@ async def _process_message(
         confidence=read_overall_confidence(stage1_result),
         post_type=stage1_result.get("post_type"),
         post_type_confidence=stage1_result.get("post_type_confidence"),
-        want_summary=options.get("want_summary", False),
+        # Read through the same default the rule uses. Logging a different
+        # default is how a firing rule came to be logged as a silent one.
+        want_summary=options.get("want_summary", rules_module.SUMMARY_ROUTES_TO_STAGE2),
         photo_count=read_photo_count(stage1_result),
         image_sentiment=read_image_sentiment(stage1_result),
         toxicity_score=stage1_result.get("toxicity_score"),
@@ -149,57 +138,58 @@ async def _process_message(
         caption_chars=read_text_length(stage1_result),
     )
 
+    # The gate decides POST-LEVEL LLM work (summary, post-type, insight) — not
+    # whether the comments get analysed.
+    #
+    # It used to decide both, by sending bypassed posts straight to the
+    # assembler. But the whole comment ensemble (XLM-R, DistilBERT and the LLM
+    # stance pass) lives in Stage 2, so a bypassed post's comments were left
+    # with their Stage-1 label alone: three empty columns in the UI's
+    # per-comment comparison, on the majority of posts, with nothing saying why.
+    #
+    # Every post now reaches Stage 2 for its comments. Post-level tasks stay
+    # gated, and `stats:llm_routed` still counts only the posts that got them,
+    # so `estimated_llm_share` keeps meaning what it has always meant.
+    task_flags = get_task_flags(stage1_result, options) if use_llm else {
+        "want_summary": False,
+        "want_post_type": False,
+        "want_insight": False,
+        "target_lang": options.get("target_lang") or stage1_result.get("language"),
+    }
+    # Recorded in the envelope so Stage 2, the assembler and the trace can all
+    # tell "no post-level work was asked for" from "the tasks ran and returned
+    # nothing" — `llm_used` on the result is derived from this, not from the
+    # mere presence of a stage2_result.
+    task_flags["post_level_routed"] = bool(use_llm)
+    payload["task_flags"] = task_flags
+
+    await redis.xadd(STAGE2_QUEUE, {"data": json.dumps(payload)})
     if use_llm:
-        task_flags = get_task_flags(stage1_result, options)
-        payload["task_flags"] = task_flags
-        await redis.xadd(STAGE2_QUEUE, {"data": json.dumps(payload)})
         await redis.incr(STAT_LLM)
-        logger.info(
-            "router_decision",
-            post_id=post_id,
-            destination="llm:stage2:queue",
-            reasons=reasons,
-        )
-        await publish_stage(
-            redis, "router", "done",
-            job_id=job_id, post_id=post_id,
-            ms=(time.monotonic() - t0) * 1000.0,
-            detail={
-                "use_llm": True,
-                "reasons": reasons,
-                "task_flags": task_flags,
-                "next_stream": STAGE2_QUEUE,
-            },
-            log=logger,
-        )
-    else:
-        payload["stage2_result"] = None
-        await redis.xadd(ASSEMBLER_QUEUE, {"data": json.dumps(payload)})
-        logger.info(
-            "router_decision",
-            post_id=post_id,
-            destination="assembler:queue",
-            reasons=[],
-        )
-        await publish_stage(
-            redis, "router", "done",
-            job_id=job_id, post_id=post_id,
-            ms=(time.monotonic() - t0) * 1000.0,
-            detail={
-                "use_llm": False,
-                "reasons": [],
-                "next_stream": ASSEMBLER_QUEUE,
-            },
-            log=logger,
-        )
-        # Stage 2 is bypassed entirely — say so explicitly so the trace shows a
-        # skipped layer rather than a silently missing one.
-        await publish_stage(
-            redis, "stage2", "skipped",
-            job_id=job_id, post_id=post_id,
-            detail={"reason": "no routing rule fired"},
-            log=logger,
-        )
+
+    logger.info(
+        "router_decision",
+        post_id=post_id,
+        destination=STAGE2_QUEUE,
+        post_level_routed=use_llm,
+        reasons=reasons,
+    )
+    await publish_stage(
+        redis, "router", "done",
+        job_id=job_id, post_id=post_id,
+        ms=(time.monotonic() - t0) * 1000.0,
+        detail={
+            "use_llm": use_llm,
+            "reasons": reasons,
+            "task_flags": task_flags,
+            "next_stream": STAGE2_QUEUE,
+            # Says what the two halves of the decision were, so the Trace tab
+            # cannot read "no post-level tasks" as "Stage 2 was skipped".
+            "post_level_tasks": bool(use_llm),
+            "comment_analysis": True,
+        },
+        log=logger,
+    )
 
     await redis.incr(STAT_TOTAL)
 

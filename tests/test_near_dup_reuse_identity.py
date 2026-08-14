@@ -212,7 +212,7 @@ def test_reuse_goes_through_the_assembler_so_every_store_is_written():
     absent from every ClickHouse aggregate while counting in Postgres-backed
     reports — the two stores disagreed by construction."""
     src = open(
-        '/home/bk/code/defense/services/ingestion/service.py', encoding='utf-8'
+        '/home/bk/code/defense/src/defense/services/ingestion/service.py', encoding='utf-8'
     ).read()
     assert '_enqueue_reuse' in src
     assert 'ASSEMBLER_STREAM' in src
@@ -224,7 +224,7 @@ def test_reuse_goes_through_the_assembler_so_every_store_is_written():
 
 def test_the_assembler_composes_rather_than_copies():
     asm = open(
-        '/home/bk/code/defense/services/workers/assembler/assembler.py', encoding='utf-8'
+        '/home/bk/code/defense/src/defense/services/workers/assembler/assembler.py', encoding='utf-8'
     ).read()
     assert 'build_reused_result' in asm
     assert 'reused_result' in asm

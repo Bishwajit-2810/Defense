@@ -11,7 +11,7 @@ analyze_comments():
 from __future__ import annotations
 
 import asyncio
-import logging
+import structlog
 import math
 import os
 import re
@@ -28,7 +28,7 @@ from .text_analyzer import analyze_sentiment_batch, analyze_sentiment_engine
 if TYPE_CHECKING:
     from .models import ModelRegistry
 
-logger = logging.getLogger(__name__)
+logger = structlog.get_logger(__name__)
 
 # LLM-backed Stage-1 comment labelling (STAGE1_LLM=true). Only the most-engaged
 # *substantive* comments get the LLM (batched) so a post with thousands of
@@ -42,6 +42,9 @@ logger = logging.getLogger(__name__)
 from defense.libs.common.config import get_settings
 config = get_settings()
 
+#: Whether Stage 1 LLM-labels comments at all. Off by default — Stage 2's
+#: ensemble covers every post's comments with a better model. See config.py.
+_LLM_COMMENTS_ENABLED = config.stage1_llm_comments
 _LLM_COMMENT_MAX = config.stage1_llm_comment_max
 _LLM_COMMENT_BATCH = config.stage1_llm_batch
 _LLM_CONCURRENCY = max(1, config.stage1_llm_concurrency)
@@ -229,6 +232,38 @@ KIND_LINK = "link"                # text is solely a URL
 KIND_SUBSTANTIVE = "substantive"  # enough text to be worth a model
 
 _URL_RE = re.compile(r"^\s*(https?://[^\s]+|www\.[^\s]+)\s*$", re.IGNORECASE)
+#: Any URL anywhere in the text, for the model-input normalisation below.
+_URL_ANY_RE = re.compile(r"https?://\S+|www\.\S+", re.IGNORECASE)
+
+
+def normalize_for_model(text: str) -> str:
+    """The form a model should read: URLs collapsed to "link", emoji removed.
+
+    This is an ADDITIONAL field (`text_norm`), never a replacement for `text`.
+    The router used to do this by overwriting `text` in place — after Stage 1
+    had already scored the comment from the emoji it deleted — so the persisted
+    comment no longer matched the source and an emoji reaction rendered as an
+    empty row that somehow carried a sentiment.
+
+    Emoji are stripped only for the model's input because they are noise to a
+    text encoder; the emoji heuristic reads the ORIGINAL text, where ❤️ and 🤬
+    are the entire signal.
+    """
+    if not text:
+        return ""
+    collapsed = _URL_ANY_RE.sub("link", text)
+    try:
+        import emoji as _emoji  # noqa: PLC0415 — optional, and only for this
+        stripped = _emoji.replace_emoji(collapsed, replace="")
+    except Exception:
+        # No emoji package: fall back to dropping astral-plane symbols, which
+        # covers the pictographic ranges this corpus actually uses.
+        stripped = re.sub(r"[\U00010000-\U0010ffff]+", "", collapsed)
+    return _WS_RE.sub(" ", stripped).strip()
+
+
+_WS_RE = re.compile(r"\s+")
+
 
 def _comment_kind(text: str, tokens: list[str] | None = None) -> str:
     """Classify a comment by how much text it actually contains."""
@@ -466,6 +501,13 @@ async def _llm_upgrade_comments(
     ``progress_cb(done, total)`` is awaited after each batch so the Trace tab can
     show ``batch k/N`` instead of appearing hung.
     """
+    if not _LLM_COMMENTS_ENABLED:
+        # Stage 2 labels every post's comments with a bigger model and two
+        # classifiers. Running this pass as well spends the pipeline's slowest
+        # calls re-deriving a label that is then outvoted — the same
+        # "computed twice, one copy discarded" shape as the double summary.
+        return 0
+
     llm = registry.get_llm_client()
     if llm is None:
         return 0
@@ -636,6 +678,9 @@ async def analyze_comments(
             {
                 "id": comment.get("id", ""),
                 "text": text,
+                # What a model should read. Kept alongside the original, never
+                # instead of it — see normalize_for_model().
+                "text_norm": normalize_for_model(text),
                 "likes": comment.get("likes", 0),
                 "author": comment.get("authorUsername"),
                 "parent_id": comment.get("parentId"),
@@ -717,6 +762,7 @@ async def analyze_comments(
         {
             "id": r["id"],
             "text": r["text"],
+            **({"text_norm": r["text_norm"]} if r.get("text_norm") else {}),
             "likes": r["likes"],
             "author": r["author"],
             "parent_id": r["parent_id"],

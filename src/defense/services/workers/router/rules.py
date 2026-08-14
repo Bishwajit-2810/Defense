@@ -43,6 +43,13 @@ POST_TYPE_CONFIDENCE_THRESHOLD: float = float(
 TOXICITY_THRESHOLD: float = float(config.router_toxicity_threshold)
 LONG_TEXT_CHARS: int = int(config.router_long_text_chars)
 
+#: Whether an unqualified request should route to Stage 2 just to be summarised.
+#: False: Stage 1 writes the summary for every post, so wanting a summary is not
+#: by itself a reason to pay for the bigger model. Set ROUTER_SUMMARY_ROUTES=true
+#: to go back to summarising everything on Stage 2 — and expect the routed share
+#: to become 100%, because this rule alone is enough to route.
+SUMMARY_ROUTES_TO_STAGE2: bool = bool(config.router_summary_routes)
+
 
 # ---------------------------------------------------------------------------
 # Field readers — tolerate every shape the pipeline emits for one concept
@@ -171,9 +178,17 @@ def should_use_llm(partial_result: dict, options: dict) -> tuple[bool, list[str]
                 f"({post_type}, threshold {POST_TYPE_CONFIDENCE_THRESHOLD})"
             )
 
-    # Rule 3: every post gets a summary unless explicitly opted out
-    if options.get("want_summary", True):
-        reasons.append("want_summary:default or requested")
+    # Rule 3: the caller explicitly asked for a Stage-2 summary.
+    #
+    # This defaulted to True for a while, which made the gate a pass-through:
+    # one rule firing is enough to route, so every post went to Stage 2 and
+    # `estimated_llm_share` became the constant 1.0. The product requirement it
+    # was serving — every post gets a summary — is still met, but by Stage 1,
+    # which now writes one itself (stage1_nlp/worker.py) and hands it to the
+    # assembler. Stage 2 re-summarises only when someone asks for the better
+    # model, so the summary is no longer computed twice per post.
+    if options.get("want_summary", SUMMARY_ROUTES_TO_STAGE2):
+        reasons.append("want_summary:requested by caller")
 
     # Rule 4: image post with no image sentiment analysed yet
     photo_count = read_photo_count(partial_result)
@@ -219,10 +234,16 @@ def get_task_flags(partial_result: dict, options: dict) -> dict:
         want_insight   – Refine topics/intents and produce a one-line insight.
         target_lang    – Language code for the summary (None = auto).
     """
-    # Every post gets a summary: the product requirement is a summary +
-    # sentiment for every post, not only image / low-confidence ones. Callers
-    # can still pass want_summary explicitly, but the default is now True.
-    want_summary: bool = options.get("want_summary", True)
+    # Every post gets a summary — but Stage 1 already wrote one, so Stage 2
+    # only writes another when the caller explicitly asks for the bigger model,
+    # or when Stage 1 came back empty (its LLM was off, or its call failed).
+    # Defaulting this to True meant every routed post paid for a second summary
+    # that overwrote an identical first one.
+    # An explicit False always wins — a caller that opted out must not be
+    # overridden by the "Stage 1 has no summary" fallback.
+    stage1_summary = (partial_result.get("post_summary") or "").strip()
+    requested = options.get("want_summary")
+    want_summary: bool = bool(requested) if requested is not None else not stage1_summary
 
     # Need post_type when Stage 1 could not determine one, when it is not
     # confident enough to publish, or when the caller asks. Re-running the LLM

@@ -20,14 +20,15 @@ only covers the classification/extraction fields.
 from __future__ import annotations
 
 import json
-import os
-import sys
+import re
 from typing import Any
 
-
+import structlog
 
 from defense.libs.labels import POST_TYPES, POST_TYPE_SET  # noqa: E402
 from defense.libs.llm.usage import LANE_STAGE1
+
+logger = structlog.get_logger(__name__)
 
 # Label vocabularies — kept in lock-step with the stub/real paths in
 # text_analyzer.py and comment_analyzer.py and with libs/schemas/output_schema.json.
@@ -84,8 +85,23 @@ where "s" is one of positive,negative,neutral; "e" is one of anger,sadness,joy,f
 # Parsing / normalisation helpers
 # ---------------------------------------------------------------------------
 
-def _parse_json(content: str) -> Any:
-    """Parse a JSON object from an LLM response, tolerating ```json fences."""
+#: One `{"i": …}` label object, for salvaging a truncated batch response.
+_LABEL_OBJECT_RE = re.compile(r'\{[^{}]*"i"\s*:[^{}]*\}')
+_TRAILING_COMMA_RE = re.compile(r",\s*([}\]])")
+
+
+def _parse_json(content: str, *, salvage_labels: bool = False) -> Any:
+    """Parse a JSON object from an LLM response, tolerating ```json fences.
+
+    ``salvage_labels`` opts in to recovering whole ``{"i": …}`` entries from a
+    response that was cut off mid-array — worth doing for a 40-comment batch,
+    where losing the last entry should not cost the other 39.
+
+    It is OFF by default and never silent. Applied unconditionally it returned
+    ``{"labels": [...]}`` for *every* task, including the post-level ones that
+    have no `labels` key at all, so a truncated post-type response came back as
+    a well-formed answer to a different question.
+    """
     s = (content or "").strip()
     if s.startswith("```"):
         lines = s.splitlines()
@@ -93,20 +109,24 @@ def _parse_json(content: str) -> Any:
         s = "\n".join(inner).strip()
     try:
         return json.loads(s)
-    except json.JSONDecodeError as e:
-        import re
+    except json.JSONDecodeError:
+        if not salvage_labels:
+            raise
         objects = []
-        for match in re.finditer(r'\{[^{}]*"i"\s*:[^{}]*\}', s):
-            obj_str = match.group(0)
-            obj_str = re.sub(r',\s*\}', '}', obj_str)
-            obj_str = re.sub(r',\s*\]', ']', obj_str)
+        for match in _LABEL_OBJECT_RE.finditer(s):
             try:
-                objects.append(json.loads(obj_str))
+                objects.append(json.loads(_TRAILING_COMMA_RE.sub(r"\1", match.group(0))))
             except Exception:
                 continue
-        if objects:
-            return {"labels": objects}
-        raise e
+        if not objects:
+            raise
+        logger.warning(
+            "llm_json_salvaged",
+            recovered=len(objects),
+            chars=len(s),
+            hint="response was not valid JSON; whole label objects were recovered",
+        )
+        return {"labels": objects}
 
 
 def _clamp(v: Any, lo: float, hi: float, default: float = 0.0) -> float:
@@ -315,7 +335,9 @@ async def classify_comments_llm(
         usage_lane=LANE_STAGE1,
         usage_task="stage1_comments",
     )
-    data = _parse_json(response.get("content", ""))
+    # Batch responses are the one place salvage is right: a cut-off array still
+    # holds valid labels for most of the batch.
+    data = _parse_json(response.get("content", ""), salvage_labels=True)
     labels = data.get("labels") if isinstance(data, dict) else data
     out: list[dict | None] = [None] * len(texts)
     if not isinstance(labels, list):

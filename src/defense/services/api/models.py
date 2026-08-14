@@ -310,6 +310,10 @@ class AnalysisResultResponse(BaseModel):
     # `language_confidence` cannot be interpreted without it.
     language_method: Optional[str] = None
     watchlist_alert: Optional[bool] = None
+    # Which target matched and under which rule. An `always` entry alerts on a
+    # plain mention, which is not hostility — without the reason the dashboard
+    # can only describe every alert the same way, and did.
+    watchlist_alert_reason: Optional[str] = None
     overall_sentiment: Optional[str] = None
     sentiment_score: Optional[float] = None
     # Per-component sentiments, each its own {label, score} (caption / image).

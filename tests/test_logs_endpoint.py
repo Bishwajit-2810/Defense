@@ -165,9 +165,21 @@ def test_clear_logs_reports_how_many_it_dropped():
 # The Redis sink in libs/common/logging.py
 # ---------------------------------------------------------------------------
 
+def _log_record(msg: str = "hello"):
+    """A real LogRecord — the sink is a logging.Handler now, not a loguru sink."""
+    import logging as _logging
+
+    record = _logging.LogRecord(
+        name="mod", level=_logging.INFO, pathname="mod.py", lineno=1,
+        msg=msg, args=(), exc_info=None,
+    )
+    record.service = "test"
+    return record
+
+
 def test_sink_never_raises_when_redis_is_broken(monkeypatch):
     """A logging call must not fail because the log mirror is down."""
-    from libs.common import logging as CL
+    from defense.libs.common import logging as CL
 
     class Boom:
         def pipeline(self, transaction=False):
@@ -175,24 +187,15 @@ def test_sink_never_raises_when_redis_is_broken(monkeypatch):
 
     monkeypatch.setattr(CL, "_sink_client", lambda: Boom())
     monkeypatch.setattr(CL, "_redis_sink_fails", 0)
+    monkeypatch.setattr(CL, "_redis_enabled", lambda: True)
 
-    class FakeMessage:
-        record = {
-            "time": __import__("datetime").datetime.now(),
-            "level": type("L", (), {"name": "INFO"})(),
-            "message": "hello",
-            "name": "mod",
-            "line": 1,
-            "extra": {"service": "test"},
-        }
-
-    CL._redis_sink(FakeMessage())          # must not raise
+    CL.RedisLogHandler().emit(_log_record())   # must not raise
     assert CL._redis_sink_fails == 1
 
 
 def test_sink_gives_up_after_repeated_failures(monkeypatch):
     """Stops trying so a dead Redis costs nothing per log line."""
-    from libs.common import logging as CL
+    from defense.libs.common import logging as CL
 
     calls = {"n": 0}
 
@@ -201,7 +204,8 @@ def test_sink_gives_up_after_repeated_failures(monkeypatch):
         raise Exception("still down")
 
     monkeypatch.setattr(CL, "_sink_client", counting_client)
+    monkeypatch.setattr(CL, "_redis_enabled", lambda: True)
     monkeypatch.setattr(CL, "_redis_sink_fails", CL._REDIS_SINK_GIVE_UP)
 
-    CL._redis_sink(object())
+    CL.RedisLogHandler().emit(_log_record())
     assert calls["n"] == 0                  # short-circuited before touching Redis

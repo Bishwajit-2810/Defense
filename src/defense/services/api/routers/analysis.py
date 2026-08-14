@@ -3,15 +3,13 @@
 from __future__ import annotations
 
 import asyncio
+import io
 import json
-import os
-import sys
 import uuid
+import zipfile
 from datetime import datetime, timezone
+from html import escape as html_escape
 from typing import Any, AsyncGenerator
-
-# Repo root on path so `services.ingestion.normalizer` imports when the API
-# runs from services/api (no-op when PYTHONPATH already provides it).
 
 import structlog
 from fastapi import APIRouter, Depends, HTTPException, Query, Request, status
@@ -35,6 +33,11 @@ from defense.services.api.models import (
 )
 
 log = structlog.get_logger(__name__)
+
+try:  # WeasyPrint is optional — without it /export ships JSON instead of PDFs.
+    from weasyprint import HTML  # type: ignore
+except Exception:  # pragma: no cover - depends on system libs, not just the wheel
+    HTML = None
 
 router = APIRouter(prefix="/v1/analysis", tags=["analysis"])
 
@@ -469,46 +472,65 @@ async def analysis_overview(
     )
 
 
-import io
-import zipfile
-try:
-    from weasyprint import HTML
-except ImportError:
-    HTML = None
+def _esc(value: object) -> str:
+    """HTML-escape anything on its way into the PDF.
 
-from datetime import datetime, timezone
+    Every interpolated value goes through this. Half of them used to be escaped
+    by hand and half not — and the unescaped half (post_type, emotion, platform)
+    is LLM output, i.e. the one source that can contain angle brackets nobody
+    reviewed.
+    """
+    return html_escape("" if value is None else str(value), quote=True)
 
-from datetime import datetime, timezone
+
+def _ensemble_note(res: dict) -> str:
+    """One line describing how this post's comment labels were produced."""
+    ens = (res.get("comment_analysis") or {}).get("ensemble") or {}
+    if not ens:
+        return "single labeller (no ensemble recorded)"
+    voters = ", ".join(ens.get("voters") or []) or "none"
+    return (
+        f"{ens.get('comments', 0)} comments · voters: {voters} · "
+        f"{round((ens.get('unanimous_share') or 0) * 100)}% unanimous · "
+        f"{round((ens.get('escalated_share') or 0) * 100)}% escalated to the LLM · "
+        f"{ens.get('abstained', 0)} abstained"
+    )
+
 
 def _result_to_html(res: dict) -> str:
     # Safely get variables
-    post_id = res.get("post_id", "Unknown")
+    post_id = _esc(res.get("post_id", "Unknown"))
     alert = res.get("watchlist_alert", False)
-    
+    alert_reason = _esc(res.get("watchlist_alert_reason") or "")
+
     # Overview metrics
     overall_sentiment = str(res.get("overall_sentiment", "neutral")).lower()
     sentiment_score = res.get("sentiment_score") or 0.0
     conf = res.get("confidence") or {}
     conf_overall = conf.get("overall", 0.0)
-    platform = res.get("platform", "Unknown")
-    lang = res.get("language", "und")
-    post_type = res.get("post_type", "Unknown")
-    primary_emotion = (res.get("emotion") or {}).get("primary", "")
+    platform = _esc(res.get("platform", "Unknown"))
+    lang = _esc(res.get("language", "und"))
+    post_type = _esc(res.get("post_type") or "")
+    primary_emotion = _esc((res.get("emotion") or {}).get("primary", ""))
     tox = res.get("toxicity_score") or 0.0
     hate = res.get("hate_speech_score") or 0.0
-    
+
     # Content
-    post_text = str(res.get("post_text") or res.get("text", "")).replace("&", "&amp;").replace("<", "&lt;").replace(">", "&gt;")
-    summary = str(res.get("post_summary", "")).replace("&", "&amp;").replace("<", "&lt;").replace(">", "&gt;")
-    insight = str(res.get("insight", "")).replace("&", "&amp;").replace("<", "&lt;").replace(">", "&gt;")
-    
-    # Sentiments
-    text_sent = (res.get("text_sentiment") or {}).get("label", "neutral")
-    text_score = (res.get("text_sentiment") or {}).get("score", 0.0)
-    img_sent = (res.get("image_sentiment") or {}).get("label", "neutral")
-    img_score = (res.get("image_sentiment") or {}).get("score", 0.0)
+    post_text = _esc(res.get("post_text") or res.get("text", ""))
+    summary = _esc(res.get("post_summary", ""))
+    insight = _esc(res.get("insight", ""))
+
+    # Sentiments. A missing component is reported as missing — NOT as neutral.
+    # "Image: neutral 0.000" on a text-only post is the exact claim this project
+    # retracted for the pipeline; a PDF is not allowed to reintroduce it.
+    _text_s = res.get("text_sentiment") or {}
+    _img_s = res.get("image_sentiment") or {}
+    text_sent = _text_s.get("label")
+    text_score = _text_s.get("score")
+    img_sent = _img_s.get("label")
+    img_score = _img_s.get("score")
     baseline_sent = res.get("baseline_sentiment") or 0.0
-    
+
     # Helper for formatting
     def pct(val): return f"{round((val or 0) * 100)}%"
     def get_sev_color(s):
@@ -539,13 +561,15 @@ def _result_to_html(res: dict) -> str:
     if hate is not None:
         chips_html += f'<span class="chip chip-neutral">hate {pct(hate)}</span>'
 
-    # Alert HTML
+    # Alert HTML. The reason is printed, not just the verdict: an `always`
+    # target alerts on a plain mention, which is NOT hostility, and a report
+    # that describes every alert as an attack misreads its own watchlist.
     alert_html = ""
     if alert:
-        alert_html = """
+        alert_html = f"""
         <div class="alert-box">
-            <h3 class="alert-title">⚠️ Watchlist Under Attack</h3>
-            <p class="alert-text">This post or its comments are exhibiting negative or hostile behavior toward a watchlist target.</p>
+            <h3 class="alert-title">⚠️ Watchlist alert</h3>
+            <p class="alert-text">{alert_reason or "A watchlist target was matched in this post or its comments."}</p>
         </div>
         """
 
@@ -569,13 +593,33 @@ def _result_to_html(res: dict) -> str:
             """
         summary_html += '</div>'
 
-    def render_sent_item(label, val, score=None):
-        val_str = str(val or "N/A").lower()
+    def render_sent_item(label, val, score=None, absent_note="not measured"):
+        """One sentiment tile. An absent component says so, and shows no score.
+
+        `val or "N/A"` with a 0.000 underneath it read as a measured neutral —
+        the failure this project already fixed in the pipeline (README: "a
+        failed image fetch now reports as a failure instead of as a neutral
+        verdict"). Absence is rendered as absence.
+        """
+        if not val:
+            return f"""
+        <div class="sent-item">
+            <div class="sent-label">{_esc(label)}</div>
+            <div class="sent-val" style="color: #94a3b8;">—</div>
+            <div class="sent-score">{_esc(absent_note)}</div>
+        </div>
+        """
+        val_str = _esc(str(val).lower())
         color = "#059669" if val_str == "positive" else "#e11d48" if val_str == "negative" else "#64748b"
-        score_html = f'<div class="sent-score">{score:.3f}</div>' if score is not None else ""
+        score_html = ""
+        if score is not None:
+            try:
+                score_html = f'<div class="sent-score">{float(score):.3f}</div>'
+            except (TypeError, ValueError):
+                score_html = ""
         return f"""
         <div class="sent-item">
-            <div class="sent-label">{label}</div>
+            <div class="sent-label">{_esc(label)}</div>
             <div class="sent-val" style="color: {color};">{val_str}</div>
             {score_html}
         </div>
@@ -597,6 +641,8 @@ def _result_to_html(res: dict) -> str:
         <div>
             <h4 class="sig-title">Emotion</h4>
             <span class="chip chip-purple" style="display:inline-block;">{primary_emotion.upper() if primary_emotion else "NONE"}</span>
+            <h4 class="sig-title" style="margin-top:12px;">Comment labels</h4>
+            <div style="font-size:11px;color:#475569;">{_esc(_ensemble_note(res))}</div>
         </div>
         <div>
             <h4 class="sig-title">Confidence</h4>
@@ -617,14 +663,29 @@ def _result_to_html(res: dict) -> str:
     comments = (res.get("comment_analysis") or {}).get("comments", [])
     comments_html = ""
     for c in comments:
-        c_text = str(c.get("text", c.get("comment_text", ""))).replace("&", "&amp;").replace("<", "&lt;").replace(">", "&gt;")
-        c_sent = str(c.get("sentiment", "neutral")).lower()
-        c_score = c.get("sentiment_score", 0.0)
+        c_text = _esc(c.get("text", c.get("comment_text", "")))
+        c_sent = str(c.get("sentiment") or "neutral").lower()
+        c_score = c.get("sentiment_score")
         c_emo = c.get("emotion", "")
-        
+        agreement = c.get("label_agreement")
+
         tags = []
-        if c_emo: tags.append(f'<span class="c-tag">E: {c_emo}</span>')
-        if c_score is not None: tags.append(f'<span class="c-tag">SCORE: {c_score:.2f}</span>')
+        if c_emo:
+            tags.append(f'<span class="c-tag">E: {_esc(c_emo)}</span>')
+        if c_score is not None:
+            try:
+                tags.append(f'<span class="c-tag">SCORE: {float(c_score):.2f}</span>')
+            except (TypeError, ValueError):
+                pass
+        # How many labellers backed this call, and whether it was copied from a
+        # near-duplicate — a report that prints a label owes the reader both.
+        if agreement is not None:
+            try:
+                tags.append(f'<span class="c-tag">AGREEMENT: {round(float(agreement) * 100)}%</span>')
+            except (TypeError, ValueError):
+                pass
+        if c.get("label_source") == "propagated":
+            tags.append('<span class="c-tag">PROPAGATED</span>')
         tags_str = " ".join(tags)
         
         comments_html += f"""
@@ -792,8 +853,8 @@ def _result_to_html(res: dict) -> str:
 
         <div class="section-title">Sentiment Breakdown</div>
         <div class="grid-4">
-            <div>{render_sent_item('Text', text_sent, text_score)}</div>
-            <div>{render_sent_item('Image', img_sent, img_score)}</div>
+            <div>{render_sent_item('Text', text_sent, text_score, 'no caption')}</div>
+            <div>{render_sent_item('Image', img_sent, img_score, 'no image analysed')}</div>
             <div>{render_sent_item('Overall', overall_sentiment, sentiment_score)}</div>
             <div>{render_sent_item('Baseline (Upstream)', 'positive' if baseline_sent > 0.1 else 'negative' if baseline_sent < -0.1 else 'neutral', baseline_sent)}</div>
         </div>
@@ -809,32 +870,48 @@ def _result_to_html(res: dict) -> str:
     </html>
     """
 
-import asyncio
+#: Hard ceiling on one export. Rendering is ~50-150 ms of CPU and a few MB of
+#: peak memory per post, single-threaded inside one request: 5,000 posts is
+#: minutes of blocked worker and gigabytes of ZIP held in RAM, repeatable by any
+#: authenticated caller. Ask for a narrower slice, or page through with `offset`.
+EXPORT_MAX_POSTS = 200
 
-def _generate_pdfs(rows, only_warnings):
+
+def _generate_pdfs(rows) -> tuple[io.BytesIO, int]:
+    """Render already-filtered rows into an in-memory ZIP. Returns (buffer, n)."""
     zip_buffer = io.BytesIO()
+    count = 0
     with zipfile.ZipFile(zip_buffer, "w", zipfile.ZIP_DEFLATED) as zip_file:
-        count = 0
         for row in rows:
-            res = row["result"]
-            if only_warnings and not res.get("watchlist_alert"):
-                continue
-            
-            filename = f"{row['post_id']}.pdf"
-            if HTML:
-                html_str = _result_to_html(res)
-                pdf_bytes = HTML(string=html_str).write_pdf()
-                zip_file.writestr(filename, pdf_bytes)
-            else:
-                zip_file.writestr(f"{row['post_id']}.json", json.dumps(res, indent=2))
-            count += 1
-            
-    if count == 0:
-        with zipfile.ZipFile(zip_buffer, "a", zipfile.ZIP_DEFLATED) as zip_file:
-            zip_file.writestr("empty.txt", "No results found.")
-            
+            res = row["result"] or {}
+            post_id = str(row["post_id"])
+            # A single bad row must not lose the other 199.
+            try:
+                if HTML is not None:
+                    zip_file.writestr(
+                        f"{post_id}.pdf", HTML(string=_result_to_html(res)).write_pdf()
+                    )
+                else:
+                    zip_file.writestr(f"{post_id}.json", json.dumps(res, indent=2, ensure_ascii=False))
+                count += 1
+            except Exception as exc:
+                log.error("export_render_failed", post_id=post_id, error=str(exc))
+                zip_file.writestr(
+                    f"{post_id}.ERROR.txt",
+                    f"Rendering this post failed: {exc}\n"
+                    "The rest of the export is unaffected.",
+                )
+        if count == 0:
+            # Say which it was. An empty ZIP that means "no alerts" and one that
+            # means "nothing analysed yet" are different answers.
+            zip_file.writestr(
+                "empty.txt",
+                "No results matched this export. Either nothing has been analysed "
+                "yet, or no post in the selected range raised a watchlist alert.",
+            )
     zip_buffer.seek(0)
-    return zip_buffer
+    return zip_buffer, count
+
 
 @router.get(
     "/export",
@@ -842,31 +919,62 @@ def _generate_pdfs(rows, only_warnings):
 )
 async def export_analysis(
     only_warnings: bool = Query(False, description="Only download posts with watchlist alerts"),
+    limit: int = Query(50, ge=1, le=EXPORT_MAX_POSTS, description="Posts in this ZIP"),
+    offset: int = Query(0, ge=0, description="Skip this many posts — page through larger sets"),
+    campaign_id: str | None = Query(None, description="Optional campaign filter"),
     db: AsyncSession = Depends(get_db),
     current_user: dict = Depends(get_current_user),
 ):
+    """Export analysed posts as a ZIP of one PDF each.
+
+    Bounded on purpose. `only_warnings` filters in SQL rather than after a
+    fixed 5,000-row fetch — filtering afterwards silently dropped every alert
+    older than the newest 5,000 posts and reported the result as complete.
+    """
+    where = ["TRUE"]
+    params: dict[str, Any] = {"limit": limit, "offset": offset}
+    if only_warnings:
+        # JSONB containment: the alert lives inside the canonical result.
+        where.append("ar.result @> '{\"watchlist_alert\": true}'::jsonb")
+    if campaign_id:
+        where.append("ar.campaign_id = :campaign_id")
+        params["campaign_id"] = campaign_id
+
     rows = (
         await db.execute(
             text(
-                """
+                f"""
                 SELECT ar.post_id, ar.result
                 FROM analysis_results ar
+                WHERE {' AND '.join(where)}
                 ORDER BY ar.created_at DESC
-                LIMIT 5000
+                LIMIT :limit OFFSET :offset
                 """
-            )
+            ),
+            params,
         )
     ).mappings().all()
-    
-    zip_buffer = await asyncio.to_thread(_generate_pdfs, rows, only_warnings)
-    
+
+    zip_buffer, count = await asyncio.to_thread(_generate_pdfs, rows)
+
     prefix = "warnings" if only_warnings else "all_analyses"
     filename = f"defense_{prefix}_{datetime.now(timezone.utc).strftime('%Y%m%d_%H%M%S')}.zip"
-    
+
+    log.info(
+        "analysis_exported",
+        posts=count, only_warnings=only_warnings, limit=limit, offset=offset,
+        renderer="weasyprint" if HTML is not None else "json",
+    )
     return StreamingResponse(
         zip_buffer,
         media_type="application/zip",
-        headers={"Content-Disposition": f"attachment; filename={filename}"}
+        headers={
+            "Content-Disposition": f'attachment; filename="{filename}"',
+            # So a caller can tell a truncated page from a complete export.
+            "X-Export-Count": str(count),
+            "X-Export-Limit": str(limit),
+            "X-Export-Offset": str(offset),
+        },
     )
 
 @router.get(
@@ -1071,7 +1179,10 @@ async def get_post_comments(
     post_id: str,
     limit: int = Query(200, ge=1, le=2000),
     offset: int = Query(0, ge=0),
-    sentiment: str = Query("all", description="all | positive | negative | neutral"),
+    sentiment: str = Query(
+        "all",
+        description="all | positive | negative | neutral | uncertain | disagreed",
+    ),
     emotion: str = Query("all", description="all | anger | sadness | joy | fear | disgust | surprise | neutral"),
     db: AsyncSession = Depends(get_db),
     current_user: dict = Depends(get_current_user),
@@ -1099,7 +1210,15 @@ async def get_post_comments(
     all_comments: list[dict] = ca.get("comments") or []
 
     filtered = all_comments
-    if sentiment != "all":
+    if sentiment == "disagreed":
+        # The review queue: every comment the labellers did not agree on. This
+        # is the set worth a human's time, and the set a gold standard should
+        # be built from.
+        filtered = [
+            c for c in filtered
+            if (c.get("label_agreement") is not None and c["label_agreement"] < 1.0)
+        ]
+    elif sentiment != "all":
         filtered = [c for c in filtered if (c.get("sentiment") or "neutral") == sentiment]
     if emotion != "all":
         filtered = [c for c in filtered if (c.get("emotion") or "neutral") == emotion]
@@ -1140,6 +1259,9 @@ async def get_post_comments(
         "sentiment_breakdown": ca.get("sentiment_breakdown", {}),
         "sentiment_breakdown_substantive": ca.get("sentiment_breakdown_substantive", {}),
         "reaction_only": ca.get("reaction_only", 0),
+        # How the labels were produced and how much the labellers agreed —
+        # reported next to the counts, like coverage and provenance.
+        "ensemble": ca.get("ensemble", {}),
         "target_stances": ca.get("target_stances", {}),
         "emotion_breakdown": ca.get("emotion_breakdown", {}),
         "method_breakdown": ca.get("method_breakdown", {}),
@@ -1216,6 +1338,7 @@ def _row_to_result(row: Any) -> AnalysisResultResponse:
         post_summary_truncated=r.get("post_summary_truncated"),
         language_method=r.get("language_method"),
         watchlist_alert=r.get("watchlist_alert", False),
+        watchlist_alert_reason=r.get("watchlist_alert_reason"),
         overall_sentiment=r.get("overall_sentiment", "neutral"),
         sentiment_score=r.get("sentiment_score", 0.0),
         text_sentiment=r.get("text_sentiment"),

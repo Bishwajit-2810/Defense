@@ -22,7 +22,7 @@ from __future__ import annotations
 import asyncio
 import json
 import os
-from defense.libs.common.config import get_settings
+from defense.libs.common.config import apply_hf_offline_policy, get_settings
 config = get_settings()
 import sys
 import time
@@ -60,6 +60,10 @@ from .vision_analyzer import analyze_image  # noqa: E402
 
 from defense.libs.common.logging import setup_logging  # noqa: E402
 
+# Before ANY model load: transformers reads TRANSFORMERS_OFFLINE at import
+# time, so this has to happen while every transformers import in the tree is
+# still lazy. See libs/common/config.apply_hf_offline_policy.
+apply_hf_offline_policy()
 setup_logging("stage1")
 log = structlog.get_logger(__name__)
 

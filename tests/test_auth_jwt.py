@@ -32,7 +32,13 @@ import pytest
 from fastapi import HTTPException
 from jose import jwt
 
-from libs.common.config import (  # noqa: E402
+# Import through the SAME module path the code under test uses. Both
+# `src/defense` and `src/defense/services/api` are importable, so
+# `libs.common.config` and `defense.libs.common.config` are two distinct module
+# objects for one file — each with its own randomly generated
+# JWT_DEV_DEFAULT_SECRET. Minting through one and verifying through the other
+# fails the signature for reasons that have nothing to do with auth.
+from defense.libs.common.config import (  # noqa: E402
     JWT_ALGORITHM,
     JWT_DEV_DEFAULT_SECRET,
     get_jwt_secret,

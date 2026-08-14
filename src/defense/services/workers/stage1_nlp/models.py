@@ -8,13 +8,13 @@ and caches the instance.
 
 from __future__ import annotations
 
-import logging
+import structlog
 import os
 from defense.libs.common.config import get_settings
 config = get_settings()
 from typing import Any
 
-logger = logging.getLogger(__name__)
+logger = structlog.get_logger(__name__)
 
 
 class ModelRegistry:
@@ -25,6 +25,12 @@ class ModelRegistry:
     """
 
     def __init__(self) -> None:
+        # Read settings HERE, not from the module-level snapshot: get_settings()
+        # is lru_cached, so a registry built after the environment changed went
+        # on reporting the mode that was current when this module was first
+        # imported — which is how a run configured for the model path could
+        # report `engine: "llm"`.
+        config = get_settings()
         self._stub_mode: bool = (
             config.model_stub_mode
         )

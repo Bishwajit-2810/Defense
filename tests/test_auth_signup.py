@@ -32,7 +32,11 @@ from fastapi import HTTPException
 from pydantic import ValidationError
 
 from libs.auth import hash_password, verify_password  # noqa: E402
-from libs.common.config import JWT_ALGORITHM, get_jwt_secret  # noqa: E402
+# Through the same module path the router uses. `libs.common.config` and
+# `defense.libs.common.config` are two module objects for one file (both roots
+# are importable), each generating its own JWT_DEV_DEFAULT_SECRET — verifying a
+# router-minted token through the other one fails the signature.
+from defense.libs.common.config import JWT_ALGORITHM, get_jwt_secret  # noqa: E402
 from jose import jwt  # noqa: E402
 
 from models import MIN_PASSWORD_LENGTH, SignupRequest, TokenRequest  # noqa: E402

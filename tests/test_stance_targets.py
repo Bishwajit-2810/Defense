@@ -394,7 +394,10 @@ async def test_comments_mentioning_nothing_carry_no_target_field(tmp_path, monke
 
 def test_shipped_config_loads_and_is_marked_as_an_example():
     """The repo's own config must parse — and must not ship real politics."""
-    targets = load_targets("config/stance_targets.yml")
+    # prefer_local=False: read the TRACKED example, not an operator's local
+    # override. Without it this asserts a property of whatever is on this
+    # machine rather than of what the repository ships.
+    targets = load_targets("config/stance_targets.yml", prefer_local=False)
     assert targets, "shipped watchlist should parse"
     assert all(t.polarity == "neutral" for t in targets.targets), (
         "the shipped example must not declare favored/opposed entities"

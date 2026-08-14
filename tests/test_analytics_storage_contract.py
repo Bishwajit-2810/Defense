@@ -233,11 +233,15 @@ def test_nothing_writes_a_postgres_llm_cache_table():
 
 
 def _python_sources() -> list[Path]:
-    return [
-        p
-        for d in ('services', 'mcp_servers', 'libs', 'eval')
-        for p in (_REPO / d).rglob('*.py')
-    ]
+    # The packages live under src/defense/ (except `eval`, which stayed at the
+    # root). Globbing the pre-move paths returned an EMPTY list, so this test
+    # reported "no writer exists" for every table in the schema — a scan that
+    # finds nothing must not read as a finding.
+    roots = [_REPO / 'src' / 'defense' / d for d in ('services', 'mcp_servers', 'libs')]
+    roots.append(_REPO / 'eval')
+    found = [p for root in roots if root.is_dir() for p in root.rglob('*.py')]
+    assert found, 'source scan found no Python files — the paths are wrong, not the code'
+    return found
 
 
 def test_every_clickhouse_table_created_has_a_writer():

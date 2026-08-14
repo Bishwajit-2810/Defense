@@ -166,8 +166,8 @@ def test_a_tenant_with_no_policy_row_is_not_locked():
 def test_both_enqueue_paths_stamp_the_resolved_backend_into_the_envelope():
     """Resolving it and not carrying it would leave the original bug intact."""
     for path in (
-        '/home/bk/code/defense/services/api/routers/analysis.py',
-        '/home/bk/code/defense/services/api/routers/ingest.py',
+        '/home/bk/code/defense/src/defense/services/api/routers/analysis.py',
+        '/home/bk/code/defense/src/defense/services/api/routers/ingest.py',
     ):
         src = open(path, encoding='utf-8').read()
         assert 'resolve_llm_backend(' in src, f"{path} does not resolve the backend"
@@ -177,12 +177,12 @@ def test_both_enqueue_paths_stamp_the_resolved_backend_into_the_envelope():
 def test_the_workers_prefer_the_stamped_backend_over_the_global_toggle():
     """The half that was missing: the option was checked and never read."""
     stage2 = open(
-        '/home/bk/code/defense/services/workers/stage2_llm/worker.py', encoding='utf-8'
+        '/home/bk/code/defense/src/defense/services/workers/stage2_llm/worker.py', encoding='utf-8'
     ).read()
     assert 'options.get("llm_backend")' in stage2
 
     stage1 = open(
-        '/home/bk/code/defense/services/workers/stage1_nlp/worker.py', encoding='utf-8'
+        '/home/bk/code/defense/src/defense/services/workers/stage1_nlp/worker.py', encoding='utf-8'
     ).read()
     assert 'stamped_backend' in stage1
     assert '.get("llm_backend")' in stage1
@@ -191,7 +191,7 @@ def test_the_workers_prefer_the_stamped_backend_over_the_global_toggle():
 def test_the_global_toggle_endpoint_is_guarded():
     """`PUT /v1/config/llm` had no policy check and no role check at all."""
     src = open(
-        '/home/bk/code/defense/services/api/routers/config.py', encoding='utf-8'
+        '/home/bk/code/defense/src/defense/services/api/routers/config.py', encoding='utf-8'
     ).read()
     assert 'tenant_is_privacy_locked' in src
     assert '_ADMIN_ROLES' in src

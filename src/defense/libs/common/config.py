@@ -25,8 +25,41 @@ def app_env() -> str:
     return (get_settings().app_env).strip().lower()
 
 
+def apply_hf_offline_policy() -> bool:
+    """Pin Hugging Face model loading to the local cache. Returns whether it did.
+
+    Call this ONCE at worker start-up, before anything imports transformers.
+    That ordering is the whole point: `transformers` reads `TRANSFORMERS_OFFLINE`
+    at *import* time, so setting it later is silently ignored and the loader
+    goes to the network anyway — which is how "MODEL_STUB_MODE downloads
+    nothing" turned into a run that printed *"You are sending unauthenticated
+    requests to the HF Hub"*. Every import of transformers in this tree is lazy,
+    so a call at module top is early enough.
+
+    Defaults to following MODEL_STUB_MODE — that mode already promises no
+    downloads — and `HF_OFFLINE` overrides it either way. An explicit env var
+    already in the environment always wins (`setdefault`).
+    """
+    settings = get_settings()
+    want = settings.hf_offline if settings.hf_offline is not None else settings.model_stub_mode
+    if want:
+        os.environ.setdefault("HF_HUB_OFFLINE", "1")
+        os.environ.setdefault("TRANSFORMERS_OFFLINE", "1")
+    # Telemetry is a network call too, and it is never wanted here.
+    os.environ.setdefault("HF_HUB_DISABLE_TELEMETRY", "1")
+    return bool(want)
+
+
 def get_jwt_secret() -> str:
-    return get_settings().jwt_secret or JWT_DEV_DEFAULT_SECRET
+    """The signing secret, read fresh on every call.
+
+    The environment wins over the cached Settings snapshot on purpose: rotating
+    JWT_SECRET must invalidate previously-issued tokens without a restart, and
+    `get_settings()` is lru_cached, so reading only through it froze the secret
+    at first import — the issuer and the verifier could then be signing and
+    checking with different values for the rest of the process's life.
+    """
+    return os.environ.get("JWT_SECRET") or get_settings().jwt_secret or JWT_DEV_DEFAULT_SECRET
 
 
 def jwt_secret_is_default() -> bool:
@@ -72,6 +105,10 @@ class Settings(BaseSettings):
 
     # Workers shared
     model_stub_mode: bool = True
+    # Load HF checkpoints from the local cache only, never the network.
+    # None = follow MODEL_STUB_MODE (which already promises no downloads).
+    # Set HF_OFFLINE=false to allow fetching even in stub mode.
+    hf_offline: bool | None = None
     redis_block_ms: int = 2000
     
     # Ingestion
@@ -96,6 +133,10 @@ class Settings(BaseSettings):
     router_post_type_confidence_threshold: float = 0.8
     router_toxicity_threshold: float = 0.7
     router_long_text_chars: int = 1000
+    # Does "a summary is wanted" alone justify Stage 2? No: Stage 1 writes a
+    # summary for every post. Leaving this true makes rule 3 fire on every
+    # request and the gate stops gating.
+    router_summary_routes: bool = False
 
     # Stage 2
     llm_backend_key: str = RedisKeys.LLM_BACKEND.value
@@ -116,7 +157,29 @@ class Settings(BaseSettings):
     # Pre-processing
     filter_emoji_only: bool = True
     
-    # Stage 2 Parallel Classifiers
+    # Which comments get the context-aware LLM stance pass.
+    #   "all"      — every comment that has text to read (the default). Gives
+    #                the UI three comparable verdicts (LLM / XLM-R / DistilBERT)
+    #                on every comment.
+    #   "escalate" — only where the cheap voters disagree, have nothing to say,
+    #                or a watchlist entity is mentioned. Measured at ~20% of
+    #                comments on the corpus post, at the cost of an empty LLM
+    #                row on the rest.
+    comment_llm_mode: str = "all"
+    # Identical text (after normalisation) reuses its twin's LLM verdict: the
+    # prompt would be character-for-character the same. Set false to force a
+    # separate call for every comment.
+    comment_dedup_propagate: bool = True
+
+    # Stage 2 Parallel Classifiers — the two cheap voters in the ensemble.
+    # Both are skipped in MODEL_STUB_MODE (no weights are downloaded) and a
+    # failed load is recorded once, never faked as a neutral verdict.
+    stage2_classifiers_enabled: bool = True
+    # Where the two small classifiers run: "auto" tries the GPU and falls back
+    # to CPU, "cpu" skips the GPU entirely, "cuda" insists on it. The GPU is
+    # normally already hosting the LLM — on a 4 GB card serving qwen2.5:7b there
+    # is ~285 MB left, which fits one classifier and not two.
+    stage2_classifier_device: str = "auto"
     stage2_classifier_1: str = "tabularisai/multilingual-sentiment-analysis"
     stage2_classifier_2: str = "lxyuan/distilbert-base-multilingual-cased-sentiments-student"
     
@@ -186,6 +249,19 @@ class Settings(BaseSettings):
     vlm_groq_model: str = "meta-llama/llama-4-scout-17b-16e-instruct"
 
     stage1_llm: bool = True
+    # Should Stage 1 ALSO LLM-label the comments?
+    #
+    # Off by default, because Stage 2 now labels every post's comments with a
+    # bigger model plus two classifiers — so this pass re-does the same work
+    # with the weaker one and its verdict survives only as a single vote that
+    # the others usually outweigh. It is also the pipeline's slowest step:
+    # measured on the live run, one 25-comment batch took 120 s and came back
+    # with invalid JSON (16 labels salvaged out of 25).
+    #
+    # Turn it on when running WITHOUT the Stage-2 ensemble
+    # (COMMENT_STANCE=false / STAGE2_CLASSIFIERS_ENABLED=false), where it is
+    # the only thing giving comments a model-quality label.
+    stage1_llm_comments: bool = False
     stage1_llm_comment_max: int = 0
     stage1_llm_batch: int = 25
     stage1_llm_concurrency: int = 3

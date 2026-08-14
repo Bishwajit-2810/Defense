@@ -30,6 +30,9 @@ CREATE TABLE IF NOT EXISTS analysis_events (
   sad_count Int64 DEFAULT 0,
   angry_count Int64 DEFAULT 0,
   care_count Int64 DEFAULT 0,
+  -- See the ALTERs below for why these two are here.
+  watchlist_alert UInt8 DEFAULT 0,
+  label_agreement Float32 DEFAULT 0,
   created_at DateTime,
   scraped_at DateTime,
   inserted_at DateTime DEFAULT now()
@@ -47,6 +50,11 @@ ALTER TABLE analysis_events ADD COLUMN IF NOT EXISTS wow_count   Int64 DEFAULT 0
 ALTER TABLE analysis_events ADD COLUMN IF NOT EXISTS sad_count   Int64 DEFAULT 0 AFTER wow_count;
 ALTER TABLE analysis_events ADD COLUMN IF NOT EXISTS angry_count Int64 DEFAULT 0 AFTER sad_count;
 ALTER TABLE analysis_events ADD COLUMN IF NOT EXISTS care_count  Int64 DEFAULT 0 AFTER angry_count;
+-- Watchlist alerting over time, and the post's mean label agreement. A watchlist
+-- alert that lives only inside one JSON document cannot answer "is hostility
+-- toward X rising this week?" — which is the actual monitoring question.
+ALTER TABLE analysis_events ADD COLUMN IF NOT EXISTS watchlist_alert UInt8 DEFAULT 0 AFTER keywords;
+ALTER TABLE analysis_events ADD COLUMN IF NOT EXISTS label_agreement Float32 DEFAULT 0 AFTER watchlist_alert;
 
 CREATE TABLE IF NOT EXISTS comment_sentiments (
   comment_id String,
@@ -59,6 +67,12 @@ CREATE TABLE IF NOT EXISTS comment_sentiments (
   method LowCardinality(String),
   likes Int32,
   author Nullable(String),
+  -- Ensemble provenance: how much the independent labellers agreed on this
+  -- comment (1.0 = unanimous), and whether the label was computed for this
+  -- comment or copied from a near-duplicate's representative. Together they
+  -- make "which labels need a human?" a query instead of a guess.
+  label_agreement Float32 DEFAULT 0,
+  label_source LowCardinality(String) DEFAULT '',
   inserted_at DateTime DEFAULT now()
 ) ENGINE = ReplacingMergeTree(inserted_at)
 ORDER BY (post_id, comment_id);
@@ -66,6 +80,8 @@ ORDER BY (post_id, comment_id);
 -- Backfill the emotion column on tables created before per-comment emotion
 -- labels existed (idempotent — no-op once the column is present).
 ALTER TABLE comment_sentiments ADD COLUMN IF NOT EXISTS emotion LowCardinality(String) DEFAULT 'neutral' AFTER sentiment_score;
+ALTER TABLE comment_sentiments ADD COLUMN IF NOT EXISTS label_agreement Float32 DEFAULT 0 AFTER author;
+ALTER TABLE comment_sentiments ADD COLUMN IF NOT EXISTS label_source LowCardinality(String) DEFAULT '' AFTER label_agreement;
 
 -- There is deliberately no `llm_usage` table here.
 --

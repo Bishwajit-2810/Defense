@@ -10,10 +10,12 @@ Golden rule: EVERY object that leaves this module is schema-valid.
 
 from __future__ import annotations
 
-import sys
-import os
+import structlog
 
 from defense.contracts.schemas.validator import assert_valid_output
+from defense.libs.stance_targets import Targets, load_targets, watchlist_verdict
+
+log = structlog.get_logger(__name__)
 
 # ---------------------------------------------------------------------------
 # Schema version — bump when the output schema changes
@@ -23,6 +25,48 @@ from defense.contracts.schemas.validator import assert_valid_output
 # 1.3: Stage-2's insight-task output (refined topics/intents + `insight`) is
 #      merged instead of dropped — see _merge_stage2_labels below
 SCHEMA_VERSION = "1.3"
+
+_TARGETS: Targets | None = None
+
+
+def _watchlist() -> Targets:
+    """The loaded watchlist, cached per process. Failure is never fatal."""
+    global _TARGETS
+    if _TARGETS is None:
+        from defense.libs.common.config import get_settings
+        try:
+            _TARGETS = load_targets(get_settings().stance_targets_file)
+        except Exception as exc:
+            log.error("stance_targets_load_failed", error=str(exc))
+            _TARGETS = Targets()
+    return _TARGETS
+
+
+def _watchlist_alert(
+    stage2_result: dict | None,
+    post_text: str | None,
+    comment_analysis: dict,
+) -> tuple[bool, str | None]:
+    """(alert, reason) for this post.
+
+    Stage 2's verdict wins when Stage 2 ran — it has the LLM's per-entity
+    stances. Otherwise the same rules are evaluated here against the
+    deterministic matcher, so a post the router bypassed still raises an alert
+    instead of silently reporting `false`.
+    """
+    if stage2_result is not None and "watchlist_alert" in stage2_result:
+        return (
+            bool(stage2_result.get("watchlist_alert")),
+            stage2_result.get("watchlist_alert_reason"),
+        )
+
+    # Same rule, one implementation — Stage 2 calls this too. Keeping a second
+    # copy here is how the cheap path and the expensive path come to disagree
+    # about whether a post alerted.
+    return watchlist_verdict(
+        _watchlist(), post_text, comment_analysis.get("comments") or []
+    )
+
 
 #: Stage-1 provenance forwarded verbatim into `processing`. These answer "what
 #: actually produced this result?", which is the question every §5 finding in
@@ -256,18 +300,26 @@ def build_canonical_result(
         post_type = stage1_result.get("post_type")
 
     # ------------------------------------------------------------------
-    # Post summary — Stage 2 only (None when Stage 2 was skipped)
+    # Post summary — Stage 2's when it ran, else Stage 1's
     # ------------------------------------------------------------------
-    post_summary: str | None = None
-    post_summary_lang: str | None = None
-    post_summary_source: str | None = None
-    post_summary_grounding: str | None = None
+    # Stage 1 writes a summary for EVERY post (stage1_nlp/worker.py §3). Reading
+    # only Stage 2's meant a bypassed post reported `post_summary: null` even
+    # though a summary had been generated and paid for one stage earlier — and
+    # it forced the router to send every post to Stage 2 just to get the field
+    # populated. Stage 2's wins when present because it is the better model.
+    post_summary: str | None = stage1_result.get("post_summary")
+    post_summary_lang: str | None = stage1_result.get("post_summary_lang")
+    post_summary_source: str | None = "stage1" if post_summary else None
+    _s1_grounding = stage1_result.get("post_summary_grounding")
+    post_summary_grounding: str | None = (
+        "+".join(_s1_grounding) if isinstance(_s1_grounding, (list, tuple)) else _s1_grounding
+    )
     # True when the summary still ended at the model's token ceiling after
     # LLMClient exhausted its continuation budget (§6.1). A short summary is
     # fine; a half one that claims to be whole is not.
     post_summary_truncated: bool = False
 
-    if stage2_result is not None:
+    if stage2_result is not None and stage2_result.get("post_summary"):
         post_summary = stage2_result.get("post_summary")
         post_summary_lang = stage2_result.get("post_summary_lang")
         post_summary_source = stage2_result.get("post_summary_source")
@@ -381,10 +433,25 @@ def build_canonical_result(
     # is asserted against Stage 1's real output by
     # tests/test_provenance_survives.py, so adding a field there without adding
     # it here breaks a test instead of vanishing.
+    # `llm_used` means POST-LEVEL LLM work (summary / post-type / insight).
+    # Every post reaches Stage 2 now — for its comments — so "a stage2_result
+    # exists" is true of all of them and would report 100% LLM use, wiping out
+    # the measurement `estimated_llm_share` is built on. Stage 2 stamps what
+    # the router decided; older envelopes without the stamp fall back to the
+    # previous meaning.
+    _post_level = (
+        bool(s2_proc.get("post_level_routed"))
+        if stage2_result is not None and "post_level_routed" in s2_proc
+        else stage2_result is not None
+    )
     processing: dict = {
         "stage1_ms": s1_proc.get("stage1_ms"),
         "stage2_ms": s2_proc.get("stage2_ms") if stage2_result is not None else None,
-        "llm_used": stage2_result is not None,
+        "llm_used": _post_level,
+        # Separate fact, separately reported: the comment ensemble runs for
+        # every post, so "did an LLM read the comments?" is not the same
+        # question as "did an LLM summarise the post?".
+        "comment_llm_used": bool(s2_proc.get("comment_llm_used")),
         "llm_backend": s2_proc.get("llm_backend") if stage2_result is not None else None,
         "llm_model": s2_proc.get("llm_model") if stage2_result is not None else None,
         # {role: resolved model id} — summarization and classification no longer
@@ -451,7 +518,14 @@ def build_canonical_result(
         "processing": processing,
         "created_at": created_at,
         "scraped_at": scraped_at,
-        "watchlist_alert": stage2_result.get("watchlist_alert", False) if stage2_result else False,
+        # Computed here, not taken from Stage 2 alone: Stage 2 is skipped for
+        # most posts, and an alert that only exists on the expensive path is an
+        # alert that goes quiet exactly when the router starts doing its job.
+        # Stage 2's verdict wins when it ran (it has the LLM's entity stances);
+        # otherwise the deterministic matcher answers from Stage-1 output.
+        **dict(zip(("watchlist_alert", "watchlist_alert_reason"), _watchlist_alert(
+            stage2_result, post_text, comment_analysis,
+        ))),
     }
 
     # ------------------------------------------------------------------

@@ -87,7 +87,7 @@ def capture_chat(monkeypatch):
             "usage": {"prompt_tokens": 3, "completion_tokens": 2, "total_tokens": 5},
         }
 
-    monkeypatch.setattr("libs.llm.client.LLMClient.chat", fake_chat)
+    monkeypatch.setattr("defense.libs.llm.client.LLMClient.chat", fake_chat)
     return captured
 
 
@@ -156,7 +156,7 @@ def test_stream_emits_delta_and_done(monkeypatch):
         yield {"type": "done", "backend": "local", "model": "qwen2.5:7b",
                "usage": {"total_tokens": 3}}
 
-    monkeypatch.setattr("libs.llm.client.LLMClient.chat_stream", fake_stream)
+    monkeypatch.setattr("defense.libs.llm.client.LLMClient.chat_stream", fake_stream)
     client = _make_client()
     r = client.post("/v1/chat/stream", json={"message": "hi"})
     assert r.status_code == 200
@@ -195,8 +195,8 @@ def test_list_models_endpoint(monkeypatch):
     def fake_default(self, role, backend):
         return defaults[backend]
 
-    monkeypatch.setattr("libs.llm.client.LLMClient.list_models", fake_list)
-    monkeypatch.setattr("libs.llm.client.LLMClient.default_model", fake_default)
+    monkeypatch.setattr("defense.libs.llm.client.LLMClient.list_models", fake_list)
+    monkeypatch.setattr("defense.libs.llm.client.LLMClient.default_model", fake_default)
 
     client = _make_client(toggle="local")
     r = client.get("/v1/chat/models")
@@ -215,8 +215,8 @@ def test_list_models_surfaces_default_when_catalogue_empty(monkeypatch):
     def fake_default(self, role, backend):
         return "qwen2.5:7b" if backend == "local" else "llama-3.3-70b-versatile"
 
-    monkeypatch.setattr("libs.llm.client.LLMClient.list_models", fake_list)
-    monkeypatch.setattr("libs.llm.client.LLMClient.default_model", fake_default)
+    monkeypatch.setattr("defense.libs.llm.client.LLMClient.list_models", fake_list)
+    monkeypatch.setattr("defense.libs.llm.client.LLMClient.default_model", fake_default)
 
     client = _make_client()
     r = client.get("/v1/chat/models")

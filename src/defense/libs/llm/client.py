@@ -168,6 +168,13 @@ class LLMClient:
     """
 
     def __init__(self) -> None:
+        # Settings are read HERE, not from the module-level snapshot taken at
+        # import. `get_settings()` is lru_cached, so a module-level `config`
+        # freezes whatever the environment was when this file was first
+        # imported — a client built after the operator changed a model
+        # override went on serving the old one, and every test that sets one
+        # through the environment asserted against the import-time value.
+        config = get_settings()
         self._default_backend: str = config.llm_backend
 
         # Local vLLM client (no auth required by default, but honour a key if set)

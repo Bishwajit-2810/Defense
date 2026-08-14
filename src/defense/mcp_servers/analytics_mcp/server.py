@@ -468,6 +468,81 @@ def reaction_mix(
     return _handle_reaction_mix(campaign_id, from_date, to_date)
 
 
+def _stub_watchlist_timeline(
+    campaign_id: str, from_date: str, to_date: str, granularity: str
+) -> list[dict]:
+    out = []
+    for i, period in enumerate(_stub_date_series(from_date, to_date, granularity)):
+        posts = 8 + (i % 5)
+        alerts = i % 4
+        out.append({
+            "period": period,
+            "posts": posts,
+            "alerts": alerts,
+            "alert_share": round(alerts / posts, 4),
+            "negative_posts": 2 + (i % 3),
+            "mean_label_agreement": round(0.82 + (i % 5) * 0.02, 4),
+        })
+    return out
+
+
+def _handle_watchlist_timeline(
+    campaign_id: str, from_date: str, to_date: str, granularity: str = "day"
+) -> list[dict]:
+    if STUB_MODE:
+        return _stub_watchlist_timeline(campaign_id, from_date, to_date, granularity)
+
+    interval = _interval(granularity)
+    sql = f"""
+        SELECT
+            period,
+            count() AS posts,
+            countIf(watchlist_alert = 1) AS alerts,
+            countIf(overall_sentiment = 'negative') AS negative_posts,
+            round(avg(label_agreement), 4) AS mean_label_agreement
+        FROM (
+            SELECT
+                toStartOfInterval(created_at, INTERVAL {interval}) AS period,
+                post_id,
+                watchlist_alert,
+                overall_sentiment,
+                label_agreement
+            FROM analysis_events
+            WHERE
+                campaign_id = %(campaign_id)s
+                AND created_at BETWEEN %(from_date)s AND %(to_date)s
+            {_LATEST_PER_POST}
+        )
+        GROUP BY period
+        ORDER BY period
+    """
+    rows = _ch_query(sql, {"campaign_id": campaign_id, "from_date": from_date, "to_date": to_date})
+    for row in rows:
+        if isinstance(row.get("period"), datetime):
+            row["period"] = row["period"].isoformat()
+        posts = row.get("posts") or 0
+        row["alert_share"] = round((row.get("alerts") or 0) / posts, 4) if posts else 0.0
+    return rows
+
+
+@mcp.tool
+def watchlist_timeline(
+    campaign_id: Annotated[str, Field(description="CUID/UUID of the campaign to query.")],
+    from_date: Annotated[str, Field(description="Inclusive start date (YYYY-MM-DD).")],
+    to_date: Annotated[str, Field(description="Inclusive end date (YYYY-MM-DD).")],
+    granularity: Literal["hour", "day", "week"] = "day",
+) -> list[dict]:
+    """Watchlist alerts per time period — the early-warning series.
+
+    A per-post boolean answers "did this post alert?". Monitoring asks a
+    different question: "is this rising?". Returns posts, alerts, alert share,
+    negative-post count and mean label agreement per bucket, so a spike can be
+    read against both volume and how confident the labels behind it were.
+    """
+    log.info("tool_call", tool="watchlist_timeline", campaign_id=campaign_id, stub=STUB_MODE)
+    return _handle_watchlist_timeline(campaign_id, from_date, to_date, granularity)
+
+
 @mcp.custom_route("/health", methods=["GET"])
 async def health(_request: Request) -> JSONResponse:
     """Liveness probe — always returns 200 when the process is running."""

@@ -316,6 +316,13 @@ def build_env() -> dict:
         "STAGE1_LOCAL_MODEL": "gemma3:4b",
         "STAGE2_LOCAL_MODEL": "qwen2.5:7b",
         "STAGE1_LLM": "true",
+        # Stage 1 uses the LLM for the post (summary + post-type) but NOT for
+        # the comments: Stage 2 labels every post's comments with qwen2.5:7b
+        # plus both classifiers, so doing it here as well spends the slowest
+        # calls in the pipeline re-deriving a label that then gets outvoted.
+        # Measured on a live run: one 25-comment gemma3:4b batch took 120 s and
+        # returned invalid JSON (16 of 25 labels salvaged).
+        "STAGE1_LLM_COMMENTS": "false",
         "STAGE1_LLM_COMMENT_MAX": "60",
         "LLM_A_LOCAL_MODEL": "qwen2.5:7b",
         "LLM_B_LOCAL_MODEL": "qwen2.5:7b",
@@ -328,6 +335,24 @@ def build_env() -> dict:
         "COMMENT_STANCE_MAX_PER_POST": "40",
         "COMMENT_STANCE_BATCH": "40",
         "MODEL_STUB_MODE": "true",
+        # The two Stage-2 comment classifiers (XLM-R + DistilBERT) that vote
+        # alongside the LLM. They load from the local HF cache only — stub mode
+        # means "download nothing", not "refuse models you already have" — so a
+        # machine without the checkpoints degrades to LLM-only rather than
+        # stalling on a 1 GB fetch.
+        "STAGE2_CLASSIFIERS_ENABLED": "true",
+        # ...strictly from the local HF cache. Set in the process environment
+        # (not from Python) because transformers reads these at import time, so
+        # anything set later is ignored and the loader quietly hits the network
+        # — which is where the "unauthenticated requests to the HF Hub" warning
+        # came from. Pre-fetch a checkpoint once with HF_OFFLINE=false.
+        "HF_HUB_OFFLINE": "1",
+        "TRANSFORMERS_OFFLINE": "1",
+        "HF_HUB_DISABLE_TELEMETRY": "1",
+        # ...on the CPU: the GPU is already hosting the Ollama models, and on a
+        # 4 GB card there is not room for both. Measured 3× faster end-to-end
+        # than letting them fight Ollama for VRAM.
+        "STAGE2_CLASSIFIER_DEVICE": "cpu",
         "JWT_SECRET": "demo",
         "LOG_LEVEL": _LOG_LEVEL,
         # Mirror every service's log lines into Redis so the dashboard's log

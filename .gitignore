@@ -2,6 +2,11 @@
 # deploy/.env stays tracked: it's the compose env template with dev defaults.
 /.env
 
+# Operator watchlists. The tracked config/stance_targets.yml ships examples;
+# real entries — which name real people and encode an editorial choice — live
+# in a *.local.yml beside it and are loaded instead when present.
+config/*.local.yml
+
 # Python
 __pycache__/
 *.py[cod]
