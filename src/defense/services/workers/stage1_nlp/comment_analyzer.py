@@ -644,7 +644,7 @@ async def analyze_comments(
     if substantive_idx:
         try:
             scored = await analyze_sentiment_batch(
-                [comments[i].get("text") or "" for i in substantive_idx],
+                [normalize_for_model(comments[i].get("text") or "") for i in substantive_idx],
                 registry,
                 sentiment_override,
             )
@@ -674,6 +674,7 @@ async def analyze_comments(
                 "emotion_method": "heuristic",
                 "keywords": [],
             }
+        ckind = nlp.get("kind") or _comment_kind(text)
         records.append(
             {
                 "id": comment.get("id", ""),
@@ -689,7 +690,9 @@ async def analyze_comments(
                 "emotion": nlp.get("emotion") or "neutral",
                 "keywords": nlp.get("keywords", []),
                 "method": nlp.get("method", "fast"),
-                "kind": nlp.get("kind") or _comment_kind(text),
+                "kind": ckind,
+                "is_filtered": ckind == KIND_EMOJI,
+                "filtered": ckind == KIND_EMOJI,
                 "emotion_method": nlp.get("emotion_method", "heuristic"),
             }
         )
