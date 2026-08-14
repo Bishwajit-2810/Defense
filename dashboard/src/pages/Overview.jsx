@@ -1,6 +1,7 @@
 import React, { useState, useEffect } from 'react';
 import { Activity, Database, Zap, HardDrive, Cpu, DollarSign, RefreshCw, BarChart2, MessageCircle, Percent } from 'lucide-react';
 import { apiCall } from '../utils/api';
+import { sentimentColors } from '../utils/sentiment';
 import { Chart as ChartJS, ArcElement, Tooltip, Legend, CategoryScale, LinearScale, BarElement, Title } from 'chart.js';
 import { Doughnut, Bar } from 'react-chartjs-2';
 
@@ -79,11 +80,17 @@ export default function Overview({ isActive }) {
   const langDist = parseDist(overview?.language_distribution);
   const emoDist = parseDist(overview?.comment_emotion_distribution);
 
+  // Colours are keyed on the LABEL, not its position. The API returns
+  // {positive, negative, neutral, mixed} in that order, so the old positional
+  // palette [green, grey, red] painted negative grey and neutral red.
+  const sentimentLabels = sentDist.labels.length
+    ? sentDist.labels
+    : ['positive', 'negative', 'neutral'];
   const sentimentData = {
-    labels: sentDist.labels.length ? sentDist.labels : ['Positive', 'Neutral', 'Negative'],
+    labels: sentimentLabels,
     datasets: [{
       data: sentDist.values.length ? sentDist.values : [0, 0, 0],
-      backgroundColor: ['#10b981', '#64748b', '#ef4444'],
+      backgroundColor: sentimentColors(sentimentLabels),
       borderWidth: 0,
       hoverOffset: 4
     }]

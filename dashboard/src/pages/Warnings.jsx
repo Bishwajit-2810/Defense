@@ -4,6 +4,7 @@ import PostModal from '../components/PostModal';
 
 export default function Warnings() {
   const [posts, setPosts] = useState([]);
+  const [scanned, setScanned] = useState(0);
   const [loading, setLoading] = useState(false);
   const [selectedPost, setSelectedPost] = useState(null);
 
@@ -18,10 +19,13 @@ export default function Warnings() {
   const fetchPosts = async () => {
     try {
       setLoading(true);
-      let url = '/v1/analysis/latest?limit=100&include=results';
+      // 500 is the API's maximum page. This page therefore covers the most
+      // recent 500 analysed posts, not the whole corpus — `scanned` is shown so
+      // an empty list reads as "none in the last N" rather than "none, ever".
+      let url = '/v1/analysis/latest?limit=500&include=results';
       const data = await apiCall(url);
       const allPosts = data.results || (Array.isArray(data) ? data : []);
-      // Filter posts that have a watchlist_alert (triggered by the 'always' parameter in yaml)
+      setScanned(allPosts.length);
       setPosts(allPosts.filter(p => p.watchlist_alert));
     } catch (err) {
       console.error(err);
@@ -32,10 +36,18 @@ export default function Warnings() {
   
   const downloadZip = async () => {
     try {
-      const res = await fetch(`${API_BASE}/v1/analysis/export?only_warnings=true`, {
+      // The export is bounded server-side (rendering N PDFs inside one request).
+      // Ask for the maximum page and tell the user when it was truncated rather
+      // than handing over a partial ZIP that looks complete.
+      const res = await fetch(`${API_BASE}/v1/analysis/export?only_warnings=true&limit=200`, {
         headers: getAuthHeaders()
       });
       if (!res.ok) throw new Error('Download failed');
+      const count = Number(res.headers.get('X-Export-Count'));
+      const limit = Number(res.headers.get('X-Export-Limit'));
+      if (Number.isFinite(count) && Number.isFinite(limit) && count >= limit) {
+        alert(`This ZIP holds the ${count} most recent alerts (the per-request maximum). Use offset= to fetch older ones.`);
+      }
       const blob = await res.blob();
       const url = window.URL.createObjectURL(blob);
       const a = document.createElement('a');
@@ -68,10 +80,11 @@ export default function Warnings() {
     <div className="space-y-6 animate-in fade-in slide-in-from-bottom-4 duration-500">
       <div>
         <h2 className="text-2xl font-bold tracking-tight text-rose-600 dark:text-rose-500 flex items-center gap-2">
-          ⚠️ Watchlist Under Attack
+          ⚠️ Watchlist alerts
         </h2>
         <p className="text-slate-500 dark:text-zinc-400">
-          Showing posts that triggered alerts based on the "always" parameter in the watchlist configuration.
+          Posts matching a watchlist rule: any mention of an <code className="font-mono text-xs">always</code> target,
+          or a comment opposing a <code className="font-mono text-xs">favored</code> one. Each alert states which.
         </p>
       </div>
 
@@ -79,7 +92,7 @@ export default function Warnings() {
         <div className="p-4 border-b border-rose-100 dark:border-rose-900/30 bg-rose-50/50 dark:bg-rose-900/10 flex justify-between items-center flex-wrap gap-4">
           <div>
             <h3 className="font-semibold text-rose-900 dark:text-rose-300">Alert Results</h3>
-            <p className="text-xs text-rose-600/70 dark:text-rose-400/70">{posts.length} active alerts</p>
+            <p className="text-xs text-rose-600/70 dark:text-rose-400/70">{posts.length} active alerts · scanned the {scanned} most recent analysed posts</p>
           </div>
           <div className="flex gap-2 items-center">
             <button 
@@ -106,6 +119,7 @@ export default function Warnings() {
                 <th className="px-4 py-3 font-medium">Post ID</th>
                 <th className="px-4 py-3 font-medium">Platform</th>
                 <th className="px-4 py-3 font-medium">Language</th>
+                <th className="px-4 py-3 font-medium">Why it alerted</th>
                 <th className="px-4 py-3 font-medium">Sentiment</th>
                 <th className="px-4 py-3 font-medium">Toxicity</th>
                 <th className="px-4 py-3 font-medium">Summary</th>
@@ -115,7 +129,7 @@ export default function Warnings() {
             </thead>
             <tbody className="divide-y divide-slate-200 dark:divide-zinc-800">
               {posts.length === 0 ? (
-                <tr><td colSpan="9" className="px-4 py-8 text-center text-slate-500">No alerts found. Everything looks clear.</td></tr>
+                <tr><td colSpan="10" className="px-4 py-8 text-center text-slate-500">No alerts found. Everything looks clear.</td></tr>
               ) : posts.map((post, i) => {
                 const sentiment = post.overall_sentiment || 'neutral';
                 const toxScore = typeof post.toxicity_score === 'number' ? post.toxicity_score : null;
@@ -134,6 +148,12 @@ export default function Warnings() {
                     </td>
                     <td className="px-4 py-3">{post.platform || '—'}</td>
                     <td className="px-4 py-3">{langStr}</td>
+                    {/* The rule that fired, not a blanket "under attack": an
+                        `always` target alerts on a plain mention. */}
+                    <td className="px-4 py-3 max-w-[220px] truncate text-xs text-rose-700 dark:text-rose-400"
+                        title={post.watchlist_alert_reason || ''}>
+                      {post.watchlist_alert_reason || '—'}
+                    </td>
                     <td className="px-4 py-3">
                       <span className={`px-2 py-1 rounded-full text-xs font-medium ${
                         sentiment === 'positive' ? 'bg-emerald-100 text-emerald-700 dark:bg-emerald-900/30 dark:text-emerald-400' :

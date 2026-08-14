@@ -3,6 +3,7 @@ import { Activity, GitCommit, Play, Square } from 'lucide-react';
 import { Chart as ChartJS, ArcElement, Tooltip, Legend, CategoryScale, LinearScale, BarElement, Title } from 'chart.js';
 import { Doughnut, Bar } from 'react-chartjs-2';
 import { apiCall, API_BASE, getSseQueryAsync } from '../utils/api.js';
+import { orderedBreakdown, sentimentColors } from '../utils/sentiment';
 
 ChartJS.register(ArcElement, Tooltip, Legend, CategoryScale, LinearScale, BarElement, Title);
 
@@ -17,14 +18,19 @@ const TRACE_LAYERS = [
 function TraceVisuals({ result, traceState }) {
   if (!result && (!traceState || !traceState.stage1)) return null;
 
-  const breakdown = traceState?.stage1?.detail?.comment_breakdown || result?.comment_analysis?.breakdown;
-  const hasBreakdown = breakdown && (breakdown.positive > 0 || breakdown.negative > 0 || breakdown.neutral > 0);
+  const breakdown = traceState?.stage1?.detail?.comment_breakdown
+    || result?.comment_analysis?.sentiment_breakdown;
+  const hasBreakdown = !!breakdown && Object.values(breakdown).some((v) => Number(v) > 0);
 
+  // Built from the breakdown's own keys so a bucket the pipeline reports —
+  // `uncertain`, added when the labellers abstain — cannot be dropped by a
+  // hardcoded three-slice chart, and every colour is keyed on its label.
+  const sentSlices = orderedBreakdown(hasBreakdown ? breakdown : {});
   const sentimentData = {
-    labels: ['Positive', 'Negative', 'Neutral'],
+    labels: sentSlices.labels,
     datasets: [{
-      data: hasBreakdown ? [breakdown.positive || 0, breakdown.negative || 0, breakdown.neutral || 0] : [0,0,0],
-      backgroundColor: ['#10b981', '#ef4444', '#94a3b8'],
+      data: sentSlices.values,
+      backgroundColor: sentimentColors(sentSlices.labels),
       borderWidth: 0
     }]
   };

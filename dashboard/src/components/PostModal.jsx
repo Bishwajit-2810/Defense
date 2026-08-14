@@ -113,6 +113,10 @@ export default function PostModal({ post, onClose }) {
   const getSentimentColor = (s) => {
     if (s === 'positive') return 'text-emerald-700 bg-emerald-100 border-emerald-200 dark:bg-emerald-900/30 dark:text-emerald-400 dark:border-emerald-800';
     if (s === 'negative') return 'text-rose-700 bg-rose-100 border-rose-200 dark:bg-rose-900/30 dark:text-rose-400 dark:border-rose-800';
+    // `uncertain` is an ABSTENTION, not a neutral verdict. Rendering it in the
+    // same grey as neutral hides the one distinction the ensemble exists to
+    // make — "we could not label this" reading as "we judged this neutral".
+    if (s === 'uncertain') return 'text-amber-700 bg-amber-100 border-amber-200 dark:bg-amber-900/30 dark:text-amber-400 dark:border-amber-800';
     return 'text-slate-700 bg-slate-100 border-slate-200 dark:bg-zinc-800 dark:text-zinc-300 dark:border-zinc-700';
   };
 
@@ -191,12 +195,46 @@ export default function PostModal({ post, onClose }) {
     const topAuthors = (commentsData.top_authors || []).filter(a => a.author && a.author !== '—').slice(0, 5);
     const topLiked = (commentsData.top_liked || []).filter(c => (c.likes || 0) > 0).slice(0, 4);
 
+    const ens = commentsData.ensemble || {};
     return (
+      <>
+      {/* How these labels were produced, and what the agreement bought. Shown
+          next to the counts so a chart never appears without its provenance. */}
+      {ens.comments > 0 && (
+        <div className="mt-6 flex flex-wrap items-center gap-x-6 gap-y-2 text-xs bg-slate-50 dark:bg-zinc-900 border border-slate-200 dark:border-zinc-800 rounded-lg px-4 py-3">
+          <span className="font-semibold text-slate-700 dark:text-slate-300">Label ensemble</span>
+          <span className="text-slate-500">voters: <span className="font-medium text-slate-700 dark:text-slate-300">{(ens.voters || []).join(' · ') || '—'}</span></span>
+          <span className="text-slate-500">unanimous: <span className="font-medium text-emerald-600 dark:text-emerald-400">{Math.round((ens.unanimous_share || 0) * 100)}%</span></span>
+          {/* LLM coverage is counted from the labels that came back, not from
+              what was requested — a half-failed stance pass must not report
+              full coverage. */}
+          <span className="text-slate-500"
+                title={ens.mode === 'all'
+                  ? 'COMMENT_LLM_MODE=all — every comment with text is sent to the LLM'
+                  : 'COMMENT_LLM_MODE=escalate — only comments the cheap labellers disagreed on'}>
+            LLM labelled: <span className="font-medium text-indigo-600 dark:text-indigo-400">
+              {ens.llm_labelled ?? 0}/{ens.comments} ({Math.round((ens.llm_share || 0) * 100)}%)
+            </span>
+          </span>
+          <span className="text-slate-500">abstained: <span className="font-medium text-amber-600 dark:text-amber-500">{ens.abstained || 0}</span></span>
+          {ens.deduplicated > 0 && (
+            <span className="text-slate-500" title="Identical text after normalisation — the twin's verdict was reused rather than re-asked.">
+              near-dup reuse: <span className="font-medium text-sky-600 dark:text-sky-400">{ens.deduplicated}</span>
+            </span>
+          )}
+          {ens.capped_out > 0 && (
+            <span className="text-rose-600 dark:text-rose-400 font-medium"
+                  title="COMMENT_STANCE_MAX_PER_POST dropped these before the LLM saw them. Set it to 0 to label every comment.">
+              ⚠ {ens.capped_out} capped out
+            </span>
+          )}
+        </div>
+      )}
       <div className="grid grid-cols-1 md:grid-cols-3 gap-6 mt-6">
         <div>
           <h4 className="text-sm font-semibold mb-3 flex items-center justify-between">
             Sentiment-score dist
-            {commentsData.avg_sentiment_score !== undefined && <span className="text-xs font-normal text-slate-500">avg {commentsData.avg_sentiment_score.toFixed(2)}</span>}
+            {Number.isFinite(commentsData.avg_sentiment_score) && <span className="text-xs font-normal text-slate-500">avg {commentsData.avg_sentiment_score.toFixed(2)}</span>}
           </h4>
           <div className="h-32"><Bar data={histData} options={{ responsive: true, maintainAspectRatio: false, plugins: { legend: { display: false } }, scales: { x: { display: false }, y: { display: false } } }} /></div>
         </div>
@@ -232,6 +270,7 @@ export default function PostModal({ post, onClose }) {
           ) : <div className="text-sm text-slate-500">—</div>}
         </div>
       </div>
+      </>
     );
   };
 
@@ -262,10 +301,12 @@ export default function PostModal({ post, onClose }) {
           {post.watchlist_alert && (
             <div className="mb-6 p-4 bg-rose-50 dark:bg-rose-900/20 border border-rose-200 dark:border-rose-800 rounded-xl">
               <h3 className="text-rose-700 dark:text-rose-400 font-bold flex items-center gap-2 mb-1">
-                ⚠️ Watchlist Under Attack
+                ⚠️ Watchlist alert
               </h3>
+              {/* The reason, not a blanket "under attack": an `always` target
+                  alerts on a plain mention, which is not hostility. */}
               <p className="text-sm text-rose-600 dark:text-rose-300">
-                This post or its comments are exhibiting negative or hostile behavior toward a watchlist target.
+                {post.watchlist_alert_reason || 'A watchlist target was matched in this post or its comments.'}
               </p>
             </div>
           )}
@@ -426,7 +467,7 @@ export default function PostModal({ post, onClose }) {
                   <h4 className="font-semibold text-slate-800 dark:text-slate-200 text-sm">Every comment <span className="text-xs font-normal text-slate-500 ml-1">(stance toward post · full coverage)</span></h4>
                   <div className="flex items-center gap-2">
                     <div className="flex bg-slate-100 dark:bg-zinc-900 p-1 rounded-lg">
-                      {['all', 'positive', 'negative', 'neutral'].map(f => (
+                      {['all', 'positive', 'negative', 'neutral', 'uncertain', 'disagreed'].map(f => (
                         <button key={f} onClick={() => handleFilterChange(f)} className={`px-3 py-1 text-xs font-medium rounded-md capitalize transition-colors ${commentFilter === f ? 'bg-white dark:bg-zinc-700 shadow-sm text-slate-900 dark:text-white' : 'text-slate-500 hover:text-slate-700 dark:hover:text-zinc-300'}`}>
                           {f}
                         </button>
@@ -449,39 +490,74 @@ export default function PostModal({ post, onClose }) {
                                 {c.sentiment || 'neutral'}
                               </span>
                             </div>
-                            {c.parallel_labels && (
-                              <>
-                                {c.parallel_labels.llm && (
-                                  <div className="flex justify-between items-center bg-slate-50 dark:bg-zinc-900/50 px-2 py-1 rounded border border-slate-100 dark:border-zinc-800">
-                                    <span className="text-[9px] font-bold text-slate-500">LLM</span>
-                                    <span className={`text-[10px] font-bold uppercase tracking-wider ${getSentimentColor(c.parallel_labels.llm.sentiment)}`}>
-                                      {c.parallel_labels.llm.sentiment}
-                                    </span>
-                                  </div>
-                                )}
-                                {c.parallel_labels.xlmr && (
-                                  <div className="flex justify-between items-center bg-slate-50 dark:bg-zinc-900/50 px-2 py-1 rounded border border-slate-100 dark:border-zinc-800">
-                                    <span className="text-[9px] font-bold text-slate-500">XLM-R</span>
-                                    <span className={`text-[10px] font-bold uppercase tracking-wider ${getSentimentColor(c.parallel_labels.xlmr.sentiment)}`}>
-                                      {c.parallel_labels.xlmr.sentiment}
-                                    </span>
-                                  </div>
-                                )}
-                                {c.parallel_labels.distilbert && (
-                                  <div className="flex justify-between items-center bg-slate-50 dark:bg-zinc-900/50 px-2 py-1 rounded border border-slate-100 dark:border-zinc-800">
-                                    <span className="text-[9px] font-bold text-slate-500">DistilBERT</span>
-                                    <span className={`text-[10px] font-bold uppercase tracking-wider ${getSentimentColor(c.parallel_labels.distilbert.sentiment)}`}>
-                                      {c.parallel_labels.distilbert.sentiment}
-                                    </span>
-                                  </div>
-                                )}
-                              </>
-                            )}
+                            {/* All three labellers, ALWAYS rendered. A source
+                                that did not vote shows "—" rather than
+                                vanishing: an absent row and a neutral verdict
+                                must not look the same. */}
+                            {[['LLM', 'llm'], ['XLM-R', 'xlmr'], ['DistilBERT', 'distilbert']].map(([label, key]) => {
+                              const v = (c.parallel_labels || {})[key];
+                              return (
+                                <div key={key}
+                                     title={v ? `${label}: ${v.sentiment}` : `${label} did not label this comment (${c.escalation_reason || 'not run'})`}
+                                     className="flex justify-between items-center bg-slate-50 dark:bg-zinc-900/50 px-2 py-1 rounded border border-slate-100 dark:border-zinc-800">
+                                  <span className="text-[9px] font-bold text-slate-500">{label}</span>
+                                  <span className={`text-[10px] font-bold uppercase tracking-wider ${v ? getSentimentColor(v.sentiment) : 'text-slate-400'}`}>
+                                    {v ? v.sentiment : '—'}
+                                  </span>
+                                </div>
+                              );
+                            })}
                           </div>
                           <div className="flex-1 text-sm text-slate-800 dark:text-slate-200">{c.text || c.comment_text}</div>
                           <div className="w-full md:w-auto shrink-0 flex flex-wrap items-center gap-4 text-xs font-medium text-slate-500 dark:text-zinc-400 bg-slate-50 dark:bg-zinc-900 px-3 py-1.5 rounded-lg border border-slate-100 dark:border-zinc-800/50">
                             {c.emotion && <span className="flex items-center gap-1"><span className="text-slate-400 text-[10px] uppercase">E:</span> {c.emotion}</span>}
-                            {c.sentiment_score !== undefined && <span className="flex items-center gap-1"><span className="text-slate-400 text-[10px] uppercase">Score:</span> {c.sentiment_score.toFixed(2)}</span>}
+                            {/* No score for a comment nobody read. `label_voters:
+                                0` carries `sentiment_score: 0.0`, and "Score:
+                                0.00" beside it reads as a measured neutral —
+                                the exact claim this project retracts. */}
+                            {c.label_voters !== 0 && Number.isFinite(c.sentiment_score) && <span className="flex items-center gap-1"><span className="text-slate-400 text-[10px] uppercase">Score:</span> {c.sentiment_score.toFixed(2)}</span>}
+                            {/* "n/m", never a bare percentage: 100% over a
+                                single voter is one model's opinion, and
+                                rendering it as "100% agree" reads as consensus.
+                                Amber whenever it is not unanimous, or when only
+                                one labeller spoke.
+
+                                Zero voters is not 0% agreement — it is the
+                                absence of a reading. Rendering it as "0%" put a
+                                comment nobody labelled in the same visual class
+                                as one the labellers fought over. */}
+                            {c.label_voters === 0 ? (
+                              <span className="flex items-center gap-1 text-amber-600 dark:text-amber-500"
+                                    title="No labeller read this comment: Stage 1 fell back to the hash stub (which does not vote), no classifier was available, and no LLM verdict returned. Nothing is claimed about it.">
+                                <span className="text-slate-400 text-[10px] uppercase">Agree:</span>
+                                <span className="text-[9px] uppercase">not read</span>
+                              </span>
+                            ) : Number.isFinite(c.label_agreement) && (() => {
+                              const m = c.label_voters ?? null;
+                              const n = m ? Math.round(c.label_agreement * m) : null;
+                              const weak = c.label_agreement < 1 || m === 1;
+                              return (
+                                <span className={`flex items-center gap-1 ${weak ? 'text-amber-600 dark:text-amber-500' : ''}`}
+                                      title={m
+                                        ? `${n} of ${m} labellers agreed (${(c.label_sources || []).join(', ')})`
+                                        : 'agreement among the labellers that voted'}>
+                                  <span className="text-slate-400 text-[10px] uppercase">Agree:</span>
+                                  {m ? `${n}/${m}` : `${Math.round(c.label_agreement * 100)}%`}
+                                  {m === 1 && <span className="text-[9px] uppercase">(1 model only)</span>}
+                                </span>
+                              );
+                            })()}
+                            {c.label_source === 'propagated' && (
+                              <span title={`Label copied from near-duplicate comment ${c.propagated_from || ''}`} className="text-[10px] bg-sky-100 dark:bg-sky-900/40 text-sky-700 dark:text-sky-300 px-1.5 py-0.5 rounded">propagated</span>
+                            )}
+                            {/* Half the voters backed this, and the LLM was one
+                                of them. Not consensus — say so. */}
+                            {c.tie_broken_by && (
+                              <span title={`The labellers split evenly; ${c.tie_broken_by} decided it because it is the only one that reads the post.`}
+                                    className="text-[10px] bg-amber-100 dark:bg-amber-900/40 text-amber-700 dark:text-amber-400 px-1.5 py-0.5 rounded">
+                                {c.tie_broken_by} tie-break
+                              </span>
+                            )}
                             {c.likes !== undefined && c.likes > 0 && <span className="flex items-center gap-1 text-rose-500 bg-rose-50 dark:bg-rose-900/20 px-1.5 py-0.5 rounded"><Heart size={10}/> {formatNumber(c.likes)}</span>}
                             {(c.label_method || c.method) && <span className="text-[10px] bg-slate-200 dark:bg-zinc-800 px-1.5 py-0.5 rounded">{c.label_method || c.method}</span>}
                           </div>
