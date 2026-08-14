@@ -45,7 +45,16 @@ VALID_LABELS: frozenset[str] = frozenset({"positive", "negative", "neutral"})
 UNCERTAIN: str = "uncertain"
 
 #: Voters that cost nothing per comment beyond a forward pass already batched.
-CHEAP_SOURCES: tuple[str, ...] = ("heuristic", "xlmr", "distilbert")
+CHEAP_SOURCES: tuple[str, ...] = (
+    "heuristic",
+    "xlmr",
+    "distilbert",
+    "banglabert",
+    "banglabert_base",
+    "bengali_sentiment_bert",
+    "twitter_xlmr",
+    "distilmbert_bengali",
+)
 
 #: The expensive one.
 LLM_SOURCE: str = "llm"

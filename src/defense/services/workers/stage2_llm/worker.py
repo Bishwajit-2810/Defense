@@ -641,15 +641,8 @@ def _normalize_stance(parsed: Any, n: int, valid_target_ids: set[str] | None = N
 
 
 def _map_sentiment_label(label: str) -> str | None:
-    """Map a HF head's label to the taxonomy — or None when it doesn't map.
-
-    Returning "neutral" for an unrecognised label (``LABEL_0``, ``LABEL_1`` —
-    what a head with no id2label mapping emits) silently turned every comment
-    neutral and called it a model verdict. An unmappable label is not a
-    measurement, so it is not a vote: None means this source abstains and the
-    ensemble carries on with the voters that did speak.
-    """
-    label = (label or "").lower()
+    """Map a HF head's label to the taxonomy — or None when it doesn't map."""
+    label = (label or "").lower().strip()
     if "pos" in label or "4 star" in label or "5 star" in label:
         return "positive"
     if "neg" in label or "1 star" in label or "2 star" in label:
@@ -1550,18 +1543,25 @@ async def _process_message(
             for c in comments:
                 _seed_heuristic_vote(c)
 
-            # ---- cheap voters: two small heads over the whole thread --------
+            # ---- cheap voters: 7 small heads over the whole thread --------
             voters_used: list[str] = ["heuristic"]
             if _CLASSIFIERS_ENABLED:
-                xlmr_n, distil_n = await asyncio.gather(
-                    _run_hf_classifier(comments, "xlmr", config.stage2_classifier_1),
-                    _run_hf_classifier(comments, "distilbert", config.stage2_classifier_2),
+                classifier_specs = [
+                    ("xlmr", config.stage2_classifier_1),
+                    ("distilbert", config.stage2_classifier_2),
+                    ("banglabert", "csebuetnlp/banglabert"),
+                    ("banglabert_base", "sagorsarker/bangla-bert-base"),
+                    ("bengali_sentiment_bert", "l3cube-pune/bengali-sentiment-bert"),
+                    ("twitter_xlmr", "cardiffnlp/twitter-xlm-roberta-base-sentiment"),
+                    ("distilmbert_bengali", "mrm8488/distilmbert-fine-tuned-bengali-sentiment"),
+                ]
+                counts = await asyncio.gather(
+                    *(_run_hf_classifier(comments, name, model_id) for name, model_id in classifier_specs)
                 )
-                if xlmr_n:
-                    voters_used.append("xlmr")
-                if distil_n:
-                    voters_used.append("distilbert")
-                log.info("stage2_cheap_voters", xlmr=xlmr_n, distilbert=distil_n)
+                for (name, _), n in zip(classifier_specs, counts):
+                    if n:
+                        voters_used.append(name)
+                log.info("stage2_cheap_voters", voters=voters_used)
 
             # ---- near-duplicate grouping: label one, propagate to the rest --
             # Grouping is EXACT match after normalisation, so a duplicate's
