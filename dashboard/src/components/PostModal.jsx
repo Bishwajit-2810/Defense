@@ -3,6 +3,7 @@ import { X, Download, Heart, MessageCircle, Share2, ThumbsUp, ThumbsDown, Minus,
 import { Chart as ChartJS, ArcElement, Tooltip, Legend, CategoryScale, LinearScale, BarElement, Title } from 'chart.js';
 import { Doughnut, Bar } from 'react-chartjs-2';
 import { apiCall } from '../utils/api';
+import { formatAlertReason } from '../utils/sentiment';
 
 ChartJS.register(ArcElement, Tooltip, Legend, CategoryScale, LinearScale, BarElement, Title);
 
@@ -306,7 +307,7 @@ export default function PostModal({ post, onClose }) {
               {/* The reason, not a blanket "under attack": an `always` target
                   alerts on a plain mention, which is not hostility. */}
               <p className="text-sm text-rose-600 dark:text-rose-300">
-                {post.watchlist_alert_reason || 'A watchlist target was matched in this post or its comments.'}
+                {formatAlertReason(post.watchlist_alert_reason) || 'A watchlist target was matched in this post or its comments.'}
               </p>
             </div>
           )}

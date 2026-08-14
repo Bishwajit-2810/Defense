@@ -1,6 +1,6 @@
 import React, { useState, useEffect } from 'react';
 import { Download, X } from 'lucide-react';
-import { apiCall } from '../utils/api.js';
+import { apiCall, API_BASE, getAuthHeaders } from '../utils/api.js';
 
 export default function Reports() {
   const [reports, setReports] = useState([]);
@@ -37,6 +37,63 @@ export default function Reports() {
         else if (data && Array.isArray(data.results)) reportsArr = data.results;
         setReports(reportsArr);
       } catch (e) {}
+    }
+  };
+
+  const downloadReport = async (reportId, format = 'pdf') => {
+    try {
+      const isLatest = !reportId || reportId === 'export_latest' || String(reportId).startsWith('Report ');
+      const endpoint = isLatest
+        ? `${API_BASE}/v1/reports/export_latest?campaign_id=all&format=${format}`
+        : `${API_BASE}/v1/reports/${reportId}/export?format=${format}`;
+      const res = await fetch(endpoint, {
+        headers: getAuthHeaders()
+      });
+      if (!res.ok) {
+        const errData = await res.json().catch(() => ({}));
+        throw new Error(errData.detail || 'Report download failed');
+      }
+      const blob = await res.blob();
+      const url = window.URL.createObjectURL(blob);
+      const a = document.createElement('a');
+      a.href = url;
+      const ext = format === 'html' ? 'html' : 'pdf';
+      a.download = `analysis_report_${String(reportId).slice(0, 8)}.${ext}`;
+      document.body.appendChild(a);
+      a.click();
+      window.URL.revokeObjectURL(url);
+      document.body.removeChild(a);
+    } catch (err) {
+      console.error(err);
+      alert('Failed to download report: ' + err.message);
+    }
+  };
+
+  const handleInstantDownload = async () => {
+    setLoading(true);
+    try {
+      const campaign = campaignId.trim() || 'all';
+      const res = await fetch(`${API_BASE}/v1/reports/export_latest?campaign_id=${encodeURIComponent(campaign)}&format=pdf`, {
+        headers: getAuthHeaders()
+      });
+      if (!res.ok) {
+        const errData = await res.json().catch(() => ({}));
+        throw new Error(errData.detail || 'Report export failed');
+      }
+      const blob = await res.blob();
+      const url = window.URL.createObjectURL(blob);
+      const a = document.createElement('a');
+      a.href = url;
+      a.download = `mass_reaction_report_${campaign}.pdf`;
+      document.body.appendChild(a);
+      a.click();
+      window.URL.revokeObjectURL(url);
+      document.body.removeChild(a);
+      fetchReports();
+    } catch (err) {
+      alert('Error generating report: ' + err.message);
+    } finally {
+      setLoading(false);
     }
   };
 
@@ -112,6 +169,13 @@ export default function Reports() {
             >
               {loading ? 'Generating...' : 'Generate Report'}
             </button>
+            <button 
+              onClick={handleInstantDownload}
+              disabled={loading}
+              className="px-4 py-2 bg-slate-100 dark:bg-zinc-800 hover:bg-slate-200 dark:hover:bg-zinc-700 text-slate-700 dark:text-zinc-200 border border-slate-200 dark:border-zinc-700 rounded-lg text-sm font-medium flex items-center gap-1.5 transition-colors"
+            >
+              <Download size={16} /> Download PDF
+            </button>
           </div>
         </div>
       </div>
@@ -145,7 +209,16 @@ export default function Reports() {
                     </p>
                     <div className="flex justify-between items-center text-sm border-t border-slate-200 dark:border-zinc-800 pt-4 mt-auto">
                       <span className="text-slate-400">{report.created_at ? new Date(report.created_at).toLocaleDateString() : ''}</span>
-                      <button onClick={() => handleView(report)} className="text-brand-500 hover:text-brand-600 font-medium">View Report</button>
+                      <div className="flex items-center gap-3">
+                        <button 
+                          onClick={() => downloadReport(rid, 'pdf')} 
+                          className="text-xs font-semibold px-2 py-1 bg-slate-100 dark:bg-zinc-800 hover:bg-slate-200 dark:hover:bg-zinc-700 text-slate-700 dark:text-zinc-300 rounded flex items-center gap-1 transition-colors"
+                          title="Download PDF"
+                        >
+                          <Download size={13} /> PDF
+                        </button>
+                        <button onClick={() => handleView(report)} className="text-brand-500 hover:text-brand-600 font-medium">View Report</button>
+                      </div>
                     </div>
                   </div>
                 );
@@ -163,9 +236,17 @@ export default function Reports() {
           <div className="bg-white dark:bg-[#121214] border border-slate-200 dark:border-zinc-800 rounded-xl shadow-xl w-full max-w-3xl max-h-[80vh] flex flex-col overflow-hidden">
             <div className="p-4 border-b border-slate-200 dark:border-zinc-800 flex justify-between items-center bg-slate-50 dark:bg-zinc-900">
               <h3 className="font-bold text-lg">{viewReport.title || viewReport.type}</h3>
-              <button onClick={() => setViewReport(null)} className="p-1 hover:bg-slate-200 dark:hover:bg-zinc-800 rounded">
-                <X size={20} />
-              </button>
+              <div className="flex items-center gap-2">
+                <button 
+                  onClick={() => downloadReport(viewReport.report_id || viewReport.id, 'pdf')}
+                  className="px-3 py-1.5 bg-brand-500 hover:bg-brand-600 text-white rounded-lg text-xs font-medium flex items-center gap-1.5 transition-colors"
+                >
+                  <Download size={14} /> Download PDF Report
+                </button>
+                <button onClick={() => setViewReport(null)} className="p-1 hover:bg-slate-200 dark:hover:bg-zinc-800 rounded">
+                  <X size={20} />
+                </button>
+              </div>
             </div>
             <div className="p-6 overflow-y-auto">
               {viewReport.summary && (

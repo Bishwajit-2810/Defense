@@ -499,6 +499,13 @@ def _ensemble_note(res: dict) -> str:
 
 
 def _result_to_html(res: dict) -> str:
+    if isinstance(res, str):
+        try:
+            res = json.loads(res)
+        except Exception:
+            res = {}
+    if not isinstance(res, dict):
+        res = {}
     # Safely get variables
     post_id = _esc(res.get("post_id", "Unknown"))
     alert = res.get("watchlist_alert", False)
