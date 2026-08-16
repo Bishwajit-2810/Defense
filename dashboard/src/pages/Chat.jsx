@@ -203,6 +203,8 @@ export default function Chat() {
     model: run.llm_model,
     citations: run.citations || [],
     unverified: run.unverified_citations || [],
+    unverifiedQuotes: run.unverified_quotes || [],
+    unverifiedStats: run.unverified_stats || [],
     error: run.error,
   });
 
@@ -666,7 +668,10 @@ function Citations({ meta }) {
   if (!meta) return null;
   const cites = meta.citations || [];
   const unverified = meta.unverified || [];
-  if (!cites.length && !unverified.length) return null;
+  const unverifiedQuotes = meta.unverifiedQuotes || [];
+  const unverifiedStats = meta.unverifiedStats || [];
+  if (!cites.length && !unverified.length && !unverifiedQuotes.length && !unverifiedStats.length)
+    return null;
 
   return (
     <div className="mt-3 pt-2 border-t border-slate-200 dark:border-zinc-700/60 text-xs space-y-1">
@@ -681,6 +686,20 @@ function Citations({ meta }) {
         <div className="text-amber-600 dark:text-amber-400">
           <span className="font-semibold">Unverified:</span>{' '}
           <span className="font-mono">{unverified.join(', ')}</span> — asserted but not returned by any tool.
+        </div>
+      )}
+      {unverifiedQuotes.length > 0 && (
+        <div className="text-amber-600 dark:text-amber-400">
+          <span className="font-semibold">Unverified quotes:</span>{' '}
+          {unverifiedQuotes.length} quoted passage{unverifiedQuotes.length === 1 ? '' : 's'} above
+          {' '}were not returned by any tool — they are not comment text from the corpus.
+        </div>
+      )}
+      {unverifiedStats.length > 0 && (
+        <div className="text-amber-600 dark:text-amber-400">
+          <span className="font-semibold">Unverified statistics:</span>{' '}
+          {unverifiedStats.length} claim{unverifiedStats.length === 1 ? '' : 's'} about comment
+          {' '}content — no comment-level tool returned data in this run.
         </div>
       )}
     </div>

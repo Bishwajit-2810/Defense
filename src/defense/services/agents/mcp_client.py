@@ -14,6 +14,7 @@ the transport.
 
 from __future__ import annotations
 
+import difflib
 import os
 import re
 from typing import Any
@@ -135,6 +136,65 @@ class MCPClient:
                 params = fn.get("parameters")
                 return params if isinstance(params, dict) else None
         return None
+
+    def drop_unsupported_arguments(
+        self, tool_name: str, arguments: dict
+    ) -> tuple[dict, list[str], list[str]]:
+        """Remove arguments the tool does not declare, before pydantic sees them.
+
+        Returns ``(arguments, dropped, problems)``:
+
+        * ``dropped`` — names removed. The caller must tell the model, because
+          the rows it gets back are not filtered or grouped the way it asked.
+        * ``problems`` — unrepairable, same contract as ``coerce_arguments``:
+          the caller must NOT dispatch.
+
+        fastmcp rejects the WHOLE call over one surplus keyword. A live toxicity
+        run called ``top_posts(metric='toxicity_score', granularity='day')`` —
+        `granularity` belongs to ``trend_query`` — and pydantic threw out the
+        only call in the run that would have returned toxicity data. The model
+        fell back to ``semantic_search``, got post summaries with no toxicity
+        scores in them, and wrote a description of the JSON payload instead of
+        an answer.
+
+        A parameter the tool does not have has no behaviour to lose, so dropping
+        it cannot change what was asked for — the alternative is not "the call
+        with `granularity`", it is no call at all.
+
+        A near-miss on a real parameter name is the exception: ``minimum_toxicity``
+        for ``min_toxicity`` means something, and silently dropping it would
+        return unfiltered rows the model believes are filtered. Those are
+        reported so it can retry with the right name — the same "report, never
+        guess at meaning" rule the shape repair follows.
+        """
+        schema = self.schema_for(tool_name)
+        props = (schema or {}).get("properties")
+        if not isinstance(props, dict) or not props or not isinstance(arguments, dict):
+            return arguments, [], []
+        # A tool that accepts free-form keys has not declared these surplus and
+        # cannot be second-guessed from its schema.
+        if (schema or {}).get("additionalProperties"):
+            return arguments, [], []
+
+        kept = dict(arguments)
+        dropped: list[str] = []
+        problems: list[str] = []
+
+        for key in list(arguments):
+            if key in props:
+                continue
+            near = difflib.get_close_matches(key, list(props), n=1, cutoff=0.8)
+            if near:
+                problems.append(
+                    f"{tool_name} has no parameter {key!r} — the one you mean is "
+                    f"{near[0]!r}. This call did NOT run and returned no data. "
+                    f"Call it again with {near[0]!r}."
+                )
+                continue
+            kept.pop(key, None)
+            dropped.append(key)
+
+        return kept, dropped, problems
 
     def coerce_arguments(self, tool_name: str, arguments: dict) -> tuple[dict, list[str]]:
         """Repair argument shapes and check enum values against the tool's schema.

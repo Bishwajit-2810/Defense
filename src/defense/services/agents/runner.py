@@ -48,6 +48,18 @@ _TEMPERATURE = 0.3
 # How many times one run may recover a tool call the model wrote as text.
 _MAX_TEXT_TOOL_RECOVERIES = 2
 
+# How many times one run may push the model back to retrieval after every call
+# it made so far has failed. Each push costs one LLM turn and buys back a run
+# that would otherwise end with zero rows read; two is enough for the observed
+# failure (one bad post_id, one bad retry) without looping on a broken tool.
+_MAX_RETRIEVAL_RETRIES = 2
+
+# How many times one run may send the model back for the per-post hop it
+# skipped. One: the prompt hands it a real post_id and names the tool, so a
+# model that still will not make the call is not going to on a third ask, and
+# the quote guard catches what comes out either way.
+_MAX_SECOND_HOP_RETRIES = 1
+
 
 @dataclass
 class AgentRun:
@@ -64,6 +76,8 @@ class AgentRun:
     usage: dict = field(default_factory=dict)
     error: str | None = None
     unverified_citations: list[str] = field(default_factory=list)
+    unverified_quotes: list[str] = field(default_factory=list)
+    unverified_stats: list[str] = field(default_factory=list)
     created_at: float = field(default_factory=time.time)
     completed_at: float | None = None
 
@@ -116,20 +130,58 @@ def _is_code_output(text: str) -> bool:
     if not text:
         return False
     lower = text.lower()
-    code_indicators = [
+    # Opening phrases: only meaningful at the top, where they announce that the
+    # whole response is a script.
+    opening_indicators = [
         "here is the code",
         "here is a python",
         "here's the python",
+        "from collections import",
+        "def parse_",
+    ]
+    # Unambiguous code, wherever it appears. Scanning only the first 300
+    # characters let a live answer through that narrated the tool payload for
+    # three paragraphs and THEN offered "here's an example of how you could
+    # parse this JSON data in Python" with a fenced script — the operator's
+    # briefing, from a run that had real comment data in hand.
+    anywhere_indicators = [
+        "```python",
+        "```py\n",
         "import json",
         "import pandas",
-        "from collections import",
-        "```python\nimport",
-        "```python\nfrom",
-        "def parse_",
+        "json.load",
         "with open(",
     ]
-    first_chunk = lower[:300]
-    return any(ind in first_chunk for ind in code_indicators)
+    return any(ind in lower[:300] for ind in opening_indicators) or any(
+        ind in lower for ind in anywhere_indicators
+    )
+
+
+# The other half of the same failure, with no code in it: the model treats the
+# tool result as a dataset to describe rather than evidence to reason over, and
+# writes out its field names. Two live runs did this — one on semantic_search
+# rows, one on real comment rows — and both were recorded as completed answers.
+_PAYLOAD_NARRATION_RE = re.compile(
+    r"appears to be (?:a |an )?(?:json|data|output)"
+    r"|(?:provided|above|following) (?:json|data|text|output|payload)"
+    r"|json (?:dump|output|payload|data)"
+    r"|(?:with|has|contains) the following (?:keys|fields)"
+    r"|(?:each|every) \w+ is represented by"
+    r"|(?:a |the )?unique identifier for (?:the|each)",
+    re.IGNORECASE,
+)
+
+
+def _describes_the_payload(text: str) -> bool:
+    """True when the answer explains the tool output instead of using it.
+
+    Deliberately requires two independent hits: a single phrase like "the
+    following fields" can appear in a legitimate methodology note, whereas an
+    answer that is genuinely a data-structure walkthrough trips several.
+    """
+    if not text:
+        return False
+    return len(set(_PAYLOAD_NARRATION_RE.findall(text))) >= 2
 
 
 # ---------------------------------------------------------------------------
@@ -290,6 +342,17 @@ _CITED_ID_RE = re.compile(
 # ("# Findings") and "#1" ranks are not mistaken for citations.
 _HASH_ID_RE = re.compile(r"#(\d{4,})")
 
+# And a third shape, from a live run that invented an entire briefing: "(Post
+# ID: 12345)". Five digits, so _CITED_ID_RE's six-character minimum missed it,
+# and no "#", so _HASH_ID_RE missed it too — all three fabricated IDs went
+# unflagged. Numeric-only and separate from _CITED_ID_RE on purpose: relaxing
+# that pattern's length instead would flag the words in prose like "the Post ID
+# field", which are not citations at all.
+_CITED_NUMERIC_ID_RE = re.compile(
+    r"post[\s_]*id[\s:=#]*[`'\"\[(]?(\d{4,})",
+    re.IGNORECASE,
+)
+
 # Identifier-shaped tokens in tool output. Matching whole tokens rather than
 # substrings matters: "1234567890" — one of the ids the live run invented — is a
 # substring of the CUID "cm0abcdef12345678901234" that a tool did return, so a
@@ -303,6 +366,7 @@ def _unverified_citations(answer: str, tool_output: str) -> list[str]:
         return []
     claimed = (
         set(_CITED_ID_RE.findall(answer))
+        | set(_CITED_NUMERIC_ID_RE.findall(answer))
         | set(_POST_ID_RE.findall(answer))
         | set(_HASH_ID_RE.findall(answer))
     )
@@ -310,6 +374,156 @@ def _unverified_citations(answer: str, tool_output: str) -> list[str]:
         return []
     returned = set(_TOKEN_RE.findall(tool_output or ""))
     return sorted(claimed - returned)
+
+
+# Quoted spans in the answer. Straight and curly quotes both, 25 characters
+# minimum: shorter runs are argument values ("all", "post_count") and emphasis,
+# not comment text, and flagging those would train an operator to ignore the
+# warning. 400 is above the longest comment the corpus holds.
+_QUOTED_SPAN_RE = re.compile(r"[\"“]([^\"“”]{25,400})[\"”]")
+
+# Ellipsis, either spelling — a model shortening a real quote is still quoting.
+_ELLIPSIS_RE = re.compile(r"\.{3,}|…")
+
+_WHITESPACE_RE = re.compile(r"\s+")
+
+
+def _normalise_quote(text: str) -> str:
+    """Case, whitespace and quote-style folded, so only the words are compared."""
+    folded = text.lower().translate(str.maketrans("‘’“”", "''\"\""))
+    return _WHITESPACE_RE.sub(" ", folded).strip()
+
+
+def _unverified_quotes(answer: str, tool_output: str) -> list[str]:
+    """Quoted comment text in the answer that no tool ever returned.
+
+    The input-side and citation guards both passed on a live toxicity run that
+    retrieved ``top_posts`` and nothing else: the model wrote a Representative
+    Quotes section — "You're just a mindless drone…" — attributed it to post IDs
+    that WERE returned, and closed with "the quotes are exact representations of
+    the toxic comments retrieved from the tool". No comment text was ever
+    retrieved. Real citations around invented quotes is the most credible shape
+    a fabrication can take, and it was the one thing nothing looked at.
+
+    A quote is grounded if its words appear in what some tool returned. Matching
+    is substring-on-normalised-text rather than whole-token: quotes are prose,
+    and a model that re-wraps or re-cases one has not invented it. A quote the
+    model shortened with an ellipsis is checked segment by segment.
+    """
+    if not answer:
+        return []
+    haystack = _normalise_quote(tool_output or "")
+    ungrounded: list[str] = []
+    for raw in _QUOTED_SPAN_RE.findall(answer):
+        segments = [
+            s for s in (_normalise_quote(p) for p in _ELLIPSIS_RE.split(raw)) if len(s) >= 15
+        ]
+        if not segments:
+            continue
+        if all(s in haystack for s in segments):
+            continue
+        ungrounded.append(_WHITESPACE_RE.sub(" ", raw).strip())
+    return ungrounded
+
+
+# A claim about what comments contain, as opposed to how many there are.
+# "comment_count | 1112" is a post-level field top_posts returns; "40% of toxic
+# comments are personal attacks" is a claim about comment CONTENT, which only a
+# comment-level tool can support.
+_COMMENT_CLAIM_RE = re.compile(
+    r"personal attack|hate speech|harassment|toxic comment|hostile comment|"
+    r"abusive|slur|of (?:the )?comments|comments (?:are|were)",
+    re.IGNORECASE,
+)
+
+_PERCENT_RE = re.compile(r"(\d{1,3}(?:\.\d+)?)\s*%")
+
+# A share OF THE COMMENTS — "40% of toxic comments", "30% of the comments" — as
+# opposed to a score about one post. The distinction decides how a figure can be
+# corroborated: no tool in this system returns a category breakdown of comments,
+# so a share cannot be a converted score the way "toxicity 0.95" -> "95%" can.
+# It has to appear in the payload as a percentage or it came from nowhere.
+_COMMENT_SHARE_RE = re.compile(
+    r"%\s*(?:of|in)\s+(?:the\s+|all\s+)?(?:\w+\s+){0,2}comments",
+    re.IGNORECASE,
+)
+
+_NUMBER_RE = re.compile(r"-?\d+(?:\.\d+)?")
+
+
+def _numbers_in(text: str) -> list[float]:
+    """Every number a tool returned, compared numerically rather than as text.
+
+    Substring matching cannot be used here: "4" occurs inside the CUID
+    ``cm0abcdef12345678901234``, so a textual test clears "40%" against a result
+    set containing no such figure — which is exactly how the first version of
+    this guard passed the fabricated line it was written to catch.
+    """
+    out: list[float] = []
+    for token in _NUMBER_RE.findall(text or ""):
+        try:
+            out.append(float(token))
+        except ValueError:  # pragma: no cover — regex guarantees the shape
+            continue
+    return out
+
+
+def _uncorroborated_comment_stats(answer: str, tool_output: str) -> list[str]:
+    """Percentages describing comment content that no tool result supports.
+
+    Deliberately narrow, and only worth running when NO comment-level tool
+    succeeded — the case where every such number is invented by definition. Two
+    live runs, having read only post-level rows, both produced "Personal
+    attacks: 30% / Hate speech: 40% / Harassment: 30%". Nothing looked at
+    numbers, and the quote guard cannot: there is nothing quoted.
+
+    A percentage is treated as grounded if the figure appears in what the tools
+    returned, as a percentage or as the 0-1 fraction the corpus stores it as —
+    a model reading toxicity_score 0.95 and writing "95%" has converted a real
+    number, not invented one.
+    """
+    if not answer:
+        return []
+    returned = _numbers_in(tool_output)
+    # Whether a bare integer match means anything here. It usually does not: in
+    # a payload of ten posts and a comment thread, "30" turns up in a timestamp
+    # or a like count whatever the answer claims, and the live "30% of toxic
+    # comments" cleared this check on exactly that coincidence. Only tools that
+    # actually report percentages — reaction_mix returns a `percentages` object
+    # — make the integer form meaningful.
+    payload_reports_percentages = "percent" in (tool_output or "").lower()
+    flagged: list[str] = []
+    for line in answer.splitlines():
+        if not _COMMENT_CLAIM_RE.search(line):
+            continue
+        percents = _PERCENT_RE.findall(line)
+        if not percents:
+            continue
+        is_share = bool(_COMMENT_SHARE_RE.search(line))
+        for raw in percents:
+            value = float(raw)
+            # Grounded as the 0-1 fraction the corpus stores scores in — a model
+            # reading toxicity_score 0.95 and writing "95%" has converted a real
+            # figure. The tolerance covers the float32 round-trip, which returns
+            # 0.949999988079071 rather than 0.95.
+            #
+            # Not offered to a share of the comments: with ten posts and a
+            # thread in context, SOME score sits within tolerance of 0.30 and
+            # 0.40, which is how the live "Personal attacks: 40% of toxic
+            # comments" corroborated itself against a payload that says nothing
+            # about categories.
+            if not is_share and any(abs(n - value / 100) < 5e-3 for n in returned):
+                continue
+            # …or written out as a percentage by the tool itself.
+            if f"{raw}%" in (tool_output or ""):
+                continue
+            if payload_reports_percentages and any(
+                abs(n - value) < 1e-6 for n in returned
+            ):
+                continue
+            flagged.append(_WHITESPACE_RE.sub(" ", line).strip())
+            break
+    return flagged
 
 
 def _describe_empty(result: Any) -> str | None:
@@ -393,6 +607,146 @@ def _ungrounded_post_id_args(arguments: dict, grounding: str) -> list[str]:
                 "post."
             )
     return problems
+
+
+# Tools worth naming first when telling a model to go back and retrieve: the
+# ones that answer "which posts?" rather than "what about this post?".
+_DISCOVERY_TOOL_PREFERENCE = ("top_posts", "semantic_search", "trend_query")
+
+
+def _discovery_tools(tools: list[dict]) -> list[str]:
+    """Tool names that can run before anything has been retrieved.
+
+    A tool that *requires* a post_id cannot open a run — the model has no post
+    IDs yet, and inventing one is exactly the failure this guards. Read from the
+    manifests rather than hardcoded, so an agent with a different toolset is
+    told about its own tools; the preference order only decides which of the
+    eligible ones is named first.
+    """
+    names: list[str] = []
+    for tool in tools:
+        fn = tool.get("function") or {}
+        name = fn.get("name")
+        required = ((fn.get("parameters") or {}).get("required")) or []
+        if name and not any(key in required for key in _POST_ID_ARG_KEYS):
+            names.append(name)
+
+    def rank(name: str) -> tuple[int, str]:
+        try:
+            return (_DISCOVERY_TOOL_PREFERENCE.index(name), name)
+        except ValueError:
+            return (len(_DISCOVERY_TOOL_PREFERENCE), name)
+
+    return sorted(names, key=rank)
+
+
+def _per_post_tools(tools: list[dict]) -> list[str]:
+    """The complement of _discovery_tools: tools that read ONE post.
+
+    These are the only tools that return comment text. An agent that never
+    reaches one has read post-level aggregates and nothing else, whatever its
+    briefing says about "representative comments".
+    """
+    discovery = set(_discovery_tools(tools))
+    return sorted(
+        name
+        for name in (
+            (tool.get("function") or {}).get("name") for tool in tools
+        )
+        if name and name not in discovery
+    )
+
+
+def _second_hop_prompt(tool_name: str, post_id: str, quotes: list[str]) -> str:
+    """The turn that makes the model go and read the comments it is describing.
+
+    The chain top_posts → representative_comments(post_id from the rows) is the
+    whole point of the toxicity agent, and llama3.1:8b does not make the second
+    hop on its own: it stops at the ranked posts and writes the quotes section
+    from imagination. Handing it a real post_id removes the one step it gets
+    wrong — inventing the argument — and the ID is grounded by construction
+    because it came out of a tool result.
+    """
+    shown = quotes[0][:80] if quotes else ""
+    return (
+        "STOP — do not deliver that answer. You quoted comment text"
+        + (f' ("{shown}…")' if shown else "")
+        + ", but no tool in this run has returned a single comment. Those quotes "
+        "are not from the corpus.\n\n"
+        f"Call `{tool_name}` now with post_id='{post_id}' — that ID came from "
+        "the rows you already retrieved. Repeat it for the other post IDs in "
+        "your table if you need more than one post's comments.\n\n"
+        "Then write the section using ONLY the comment text it returns, quoted "
+        "verbatim. If it returns nothing, say that no comments were retrieved "
+        "and delete the quotes — do not reconstruct them from the post-level "
+        "scores you already have."
+    )
+
+
+def _retrieval_retry_prompt(failures: list[str], discovery: list[str]) -> str:
+    """The turn that sends a model back to retrieval instead of to prose.
+
+    Written as an operator instruction, not a hint: llama3.1:8b read the
+    per-call failure notes, declined to retry, and wrote the briefing anyway.
+    """
+    lines = [
+        "STOP — do not write a briefing. Every tool call you have made in this "
+        "run failed, so you have received NO data from the corpus and there is "
+        "nothing to report on.",
+        "",
+        "What failed:",
+        *(f"- {f}" for f in failures),
+        "",
+    ]
+    if discovery:
+        lines.append(
+            "Call "
+            + " or ".join(f"`{n}`" for n in discovery[:2])
+            + " now, through the tool-call interface. "
+            + (
+                f"These take no post_id — {', '.join(discovery)} can all run "
+                "before anything has been retrieved."
+                if len(discovery) > 1
+                else "It takes no post_id, so it can run before anything has "
+                "been retrieved."
+            )
+        )
+        lines.append(
+            "Use the post IDs it returns for any per-post lookup that follows."
+        )
+    else:
+        lines.append(
+            "Fix the arguments and call a tool again through the tool-call "
+            "interface."
+        )
+    lines.append(
+        "Do NOT invent post IDs, figures, topics, or quotes, and do not answer "
+        "from memory. If the corrected call also fails, say only that the "
+        "retrieval failed."
+    )
+    return "\n".join(lines)
+
+
+def _join_notes(*notes: str | None) -> str | None:
+    """Combine the operator-side notes on one tool result, dropping the absent."""
+    present = [n for n in notes if n]
+    return "\n".join(present) if present else None
+
+
+def _describe_dropped(tool_name: str, dropped: list[str]) -> str:
+    """Say which arguments were ignored, so the rows are not over-read.
+
+    The call ran, which is the point — but it ran WITHOUT these. A model that
+    asked for `min_toxicity` and had it dropped would otherwise read the rows as
+    a filtered set and report a threshold that was never applied.
+    """
+    names = ", ".join(f"`{d}`" for d in dropped)
+    return (
+        f"IGNORED ARGUMENTS — {tool_name} has no parameter {names}, so the call "
+        "ran WITHOUT it. The rows below are not filtered, grouped or ranked by "
+        "it. Do not describe them as if they were; if you need that, use a tool "
+        "that offers it."
+    )
 
 
 def _describe_error(error: str) -> str:
@@ -662,7 +1016,17 @@ class AgentRunner:
         )
         available_tools = {t["function"]["name"] for t in tools}
         text_recoveries = 0
+        retrieval_retries = 0
+        second_hop_retries = 0
         answer_is_tool_call = False
+        answer_is_not_an_answer = False
+        # Tools that have actually returned data. "representative_comments was
+        # called" is not the question — a rejected call is still no comments.
+        succeeded_tools: set[str] = set()
+        # Retrieved post IDs in the order the tools returned them, so the
+        # second-hop prompt can offer the top-ranked post rather than whichever
+        # ID a set happens to yield first.
+        retrieved_post_ids: list[str] = []
 
         while True:
             # Call the LLM with tool definitions via the OpenAI tool_calls API
@@ -740,10 +1104,99 @@ class AgentRunner:
                         continue
 
             if not tool_calls:
+                # Every call so far failed and the model has moved on to writing
+                # the answer. That answer cannot be grounded — nothing was read —
+                # and the run would end discarded (see step 4). The per-call
+                # notes already told it what to fix; a live toxicity run read one
+                # and drafted the briefing regardless, ending with a single
+                # rejected call and no data. Send it back to retrieval once,
+                # naming a tool it can actually open a run with, before spending
+                # the turn on prose nobody can use.
+                attempted_now = [
+                    e for e in run.tools_used if e.get("status") in ("ok", "error")
+                ]
+                if (
+                    attempted_now
+                    and not any(e.get("status") == "ok" for e in attempted_now)
+                    and retrieval_retries < _MAX_RETRIEVAL_RETRIES
+                    and tool_call_count < max_tool_calls
+                ):
+                    retrieval_retries += 1
+                    run_log.warning(
+                        "retrieval_retry",
+                        attempt=retrieval_retries,
+                        failed_calls=len(attempted_now),
+                    )
+                    messages.append({"role": "assistant", "content": content})
+                    messages.append(
+                        {
+                            "role": "user",
+                            "content": _retrieval_retry_prompt(
+                                [
+                                    f"`{e.get('tool_name')}` — "
+                                    f"{e.get('error') or 'unknown error'}"
+                                    for e in attempted_now
+                                ],
+                                _discovery_tools(tools),
+                            ),
+                        }
+                    )
+                    continue
+
+                # The run retrieved something and the model is quoting comment
+                # text anyway — the second hop it never makes on its own. The
+                # quote guard below would flag this after the fact; the flag is
+                # a warning label on a section that should not exist, and the
+                # data to write it properly is one call away. Fetch it instead.
+                ungrounded_now = _unverified_quotes(
+                    content, "\n".join([grounding_seed, *tool_output])
+                )
+                # "Has this run read a comment?", not "has every comment tool
+                # run?". A live run made the hop, `representative_comments`
+                # returned a row — and this pushed again anyway because
+                # `get_thread` was still untouched. The model, asked a second
+                # time to go and read toxic comments, refused outright and the
+                # briefing was lost.
+                comment_tools = _per_post_tools(tools)
+                read_a_comment = bool(succeeded_tools & set(comment_tools))
+                if (
+                    ungrounded_now
+                    and comment_tools
+                    and not read_a_comment
+                    and retrieved_post_ids
+                    and second_hop_retries < _MAX_SECOND_HOP_RETRIES
+                    and tool_call_count < max_tool_calls
+                ):
+                    second_hop_retries += 1
+                    run_log.warning(
+                        "second_hop_retry",
+                        attempt=second_hop_retries,
+                        tool=comment_tools[0],
+                        ungrounded_quotes=len(ungrounded_now),
+                    )
+                    messages.append({"role": "assistant", "content": content})
+                    messages.append(
+                        {
+                            "role": "user",
+                            "content": _second_hop_prompt(
+                                comment_tools[0], retrieved_post_ids[0], ungrounded_now
+                            ),
+                        }
+                    )
+                    continue
+
                 # If the model emitted code, or a tool call we could not recover,
                 # prompt once for direct markdown synthesis
-                if _is_code_output(content) or _recover_text_tool_calls(content):
-                    run_log.info("code_output_detected_requesting_markdown_synthesis")
+                if (
+                    _is_code_output(content)
+                    or _describes_the_payload(content)
+                    or _recover_text_tool_calls(content)
+                ):
+                    run_log.info(
+                        "non_answer_detected_requesting_markdown_synthesis",
+                        code=_is_code_output(content),
+                        payload_narration=_describes_the_payload(content),
+                    )
                     synth_messages = list(messages)
                     synth_messages.append({"role": "assistant", "content": content})
                     synth_messages.append({
@@ -751,6 +1204,14 @@ class AgentRunner:
                         "content": (
                             "CRITICAL OPERATOR DIRECTIVE: Do NOT output Python code, scripts, json parsers, "
                             "or JSON tool calls — no further tools will be executed. "
+                            # The narration case: the model described the shape of
+                            # the payload — its field names, what an `id` is — and
+                            # never touched the question. Restating the question
+                            # here is the only thing that puts it back in view
+                            # after a large tool result.
+                            "Do NOT describe the tool output: the operator can see the data and does not "
+                            "need its fields, keys or formats explained. "
+                            f"Answer this question and nothing else: {query}\n"
                             "Using the retrieved tool data above, write the complete executive intelligence report directly in markdown. "
                             "Include summary findings, structured tables, representative quotes, and post ID citations. "
                             "If the data is insufficient, say so in prose and state what is missing."
@@ -769,6 +1230,7 @@ class AgentRunner:
                         if (
                             synth_content
                             and not _is_code_output(synth_content)
+                            and not _describes_the_payload(synth_content)
                             and not _recover_text_tool_calls(synth_content)
                         ):
                             content = synth_content
@@ -777,6 +1239,20 @@ class AgentRunner:
 
                 # Nothing recovered it: the "answer" is still a tool call. Say so
                 # rather than recording a completed run whose briefing is JSON.
+                # The retry produced another payload walkthrough or another
+                # script. The run retrieved real data, so nothing here is
+                # fabricated — but it answers no question, and reporting it as
+                # `completed` tells the operator a briefing is waiting when what
+                # is waiting is a description of a JSON object.
+                if _is_code_output(content) or _describes_the_payload(content):
+                    run_log.error("answer_is_not_an_answer", chars=len(content or ""))
+                    answer_is_not_an_answer = True
+                    run.error = (
+                        "The model described the tool output instead of answering "
+                        "the question, and did not recover when asked again. The "
+                        "retrieved data is intact — re-run the question."
+                    )
+
                 still_stray = _recover_text_tool_calls(content)
                 if still_stray:
                     names = sorted({n for n, _ in still_stray})
@@ -847,11 +1323,29 @@ class AgentRunner:
                     run_log.info("tool_data_markup_stripped", tool=tool_name)
                     arguments = cleaned
 
+                # Arguments the tool does not declare go first: fastmcp rejects
+                # the whole call over one surplus keyword, and the enum/shape
+                # repair below cannot see a parameter that has no schema entry.
+                shape_errors: list[str] = []
+                dropped_args: list[str] = []
+                dropper = getattr(self.mcp, "drop_unsupported_arguments", None)
+                if dropper is not None:
+                    try:
+                        arguments, dropped_args, name_errors = dropper(tool_name, arguments)
+                        shape_errors += name_errors
+                        if dropped_args:
+                            run_log.info(
+                                "unsupported_arguments_dropped",
+                                tool=tool_name,
+                                dropped=dropped_args,
+                            )
+                    except Exception as exc:
+                        run_log.warning("arg_drop_failed", tool=tool_name, error=str(exc))
+
                 # Repair argument shapes against the tool's own schema before
                 # dispatch, so the trace records what was actually sent. Same
                 # rule as _server_for: substituted MCP clients need not
                 # implement this, and a schema quirk must not kill a run.
-                shape_errors: list[str] = []
                 coerce = getattr(self.mcp, "coerce_arguments", None)
                 if coerce is not None:
                     try:
@@ -882,6 +1376,10 @@ class AgentRunner:
                     "tool_name": tool_name,
                     "mcp_server": self._server_for(tool_name),
                     "arguments": arguments,
+                    # What the model asked for but the tool does not have. The
+                    # trace shows the arguments actually sent, so without this
+                    # an operator cannot see that a filter was silently absent.
+                    "dropped_arguments": dropped_args,
                     "call_number": tool_call_count,
                     "status": "running",
                     "error": None,
@@ -909,6 +1407,9 @@ class AgentRunner:
                         error_str = str(exc)
                         run_log.warning("tool_call_error", tool=tool_name, error=str(exc))
 
+                if not error_str:
+                    succeeded_tools.add(tool_name)
+
                 entry.update(
                     status="error" if error_str else "ok",
                     error=error_str,
@@ -919,6 +1420,8 @@ class AgentRunner:
 
                 # Extract post IDs from the result for citations
                 for pid in _extract_post_ids(result_str):
+                    if pid not in seen_post_ids:
+                        retrieved_post_ids.append(pid)
                     seen_post_ids.add(pid)
                 tool_output.append(result_str)
 
@@ -946,7 +1449,12 @@ class AgentRunner:
                             note=(
                                 _describe_error(error_str)
                                 if error_str
-                                else _describe_empty(result)
+                                else _join_notes(
+                                    _describe_dropped(tool_name, dropped_args)
+                                    if dropped_args
+                                    else None,
+                                    _describe_empty(result),
+                                )
                             ),
                         ),
                     }
@@ -992,11 +1500,17 @@ class AgentRunner:
                 "Nothing above is a statement about the corpus."
             )
 
+        # Every guard below reads THIS, not run.answer: each one appends its
+        # findings to the answer, and the next would then scan the warning text
+        # — a flagged quote containing "30% of toxic comments" was reported a
+        # second time as an invented statistic, quoting the warning about it.
+        model_answer = run.answer or ""
+
         # Citations asserted in prose but never returned by a tool are flagged on
         # the run AND in the answer itself — an operator reads the briefing, not
         # the run record, and an ungrounded post ID in an intelligence product is
         # worse than no citation at all.
-        unverified = _unverified_citations(run.answer or "", "\n".join(tool_output))
+        unverified = _unverified_citations(model_answer, "\n".join(tool_output))
         if unverified:
             run.unverified_citations = unverified
             run_log.warning("unverified_citations", ids=unverified)
@@ -1008,9 +1522,64 @@ class AgentRunner:
                 + "."
             )
 
+        # Quoted comment text nothing returned, flagged the same way and for the
+        # same reason: the operator reads the briefing, and a quote is the part
+        # of it they are most likely to lift into a report verbatim. Not fired
+        # for a discarded answer, which no longer contains anything to check.
+        if not all_calls_failed:
+            ungrounded_quotes = _unverified_quotes(
+                model_answer, "\n".join([grounding_seed, *tool_output])
+            )
+            if ungrounded_quotes:
+                run.unverified_quotes = ungrounded_quotes
+                run_log.warning("unverified_quotes", count=len(ungrounded_quotes))
+                shown = "\n".join(f"- “{q}”" for q in ungrounded_quotes[:5])
+                more = (
+                    f"\n- …and {len(ungrounded_quotes) - 5} more"
+                    if len(ungrounded_quotes) > 5
+                    else ""
+                )
+                run.answer = (run.answer or "") + (
+                    "\n\n---\n**Unverified quotes.** The following quoted text was "
+                    "not returned by any tool call in this run, so it is not "
+                    "comment text from the corpus and must not be reported as "
+                    f"such:\n{shown}{more}"
+                )
+
+        # Statistics about comment content, in a run that never read a comment.
+        # Only checked in that case: once a comment tool has returned rows, a
+        # percentage may legitimately be an aggregate over them, and second-
+        # guessing the model's arithmetic is a different problem from catching
+        # a figure with no data behind it at all.
+        # Also checked when the quotes in the answer are demonstrably invented:
+        # a live run read real comments, then wrote a Representative Quotes
+        # section of three fabricated quotes with "40% / 30% / 30%" above it.
+        # Having retrieved comments is what normally makes a percentage
+        # plausible; an answer caught inventing the quotes beside it has
+        # forfeited that benefit of the doubt.
+        read_comments = bool(succeeded_tools & set(_per_post_tools(tools)))
+        if not all_calls_failed and (not read_comments or run.unverified_quotes):
+            invented_stats = _uncorroborated_comment_stats(
+                model_answer, "\n".join(tool_output)
+            )
+            if invented_stats:
+                run.unverified_stats = invented_stats
+                run_log.warning("unverified_comment_stats", count=len(invented_stats))
+                lines = "\n".join(f"- {s}" for s in invented_stats[:5])
+                run.answer = (run.answer or "") + (
+                    "\n\n---\n**Unverified statistics.** No comment-level tool "
+                    "returned data in this run, so nothing was read about what "
+                    "the comments contain. These figures are not measurements "
+                    f"of the corpus:\n{lines}"
+                )
+
         run.citations = sorted(seen_post_ids)
         run.usage = total_usage
-        run.status = "failed" if (answer_is_tool_call or all_calls_failed) else "completed"
+        run.status = (
+            "failed"
+            if (answer_is_tool_call or all_calls_failed or answer_is_not_an_answer)
+            else "completed"
+        )
         run.completed_at = time.time()
 
         run_log.info(

@@ -186,6 +186,17 @@ class AgentQueryResponse(BaseModel):
         default_factory=list,
         description="Post IDs asserted in the answer that no tool call returned.",
     )
+    unverified_quotes: list[str] = Field(
+        default_factory=list,
+        description="Quoted comment text in the answer that no tool call returned.",
+    )
+    unverified_stats: list[str] = Field(
+        default_factory=list,
+        description=(
+            "Claims about comment content in a run where no comment-level tool "
+            "returned data."
+        ),
+    )
     tools_used: list[Any] = Field(default_factory=list)
     llm_backend: Optional[str] = None
     llm_model: Optional[str] = None
@@ -212,6 +223,8 @@ def _run_to_response(run: AgentRun, base_url: str, want_citations: bool = True) 
         answer=run.answer,
         citations=run.citations if want_citations else [],
         unverified_citations=run.unverified_citations,
+        unverified_quotes=run.unverified_quotes,
+        unverified_stats=run.unverified_stats,
         tools_used=run.tools_used,
         llm_backend=run.llm_backend,
         llm_model=run.llm_model,
