@@ -392,6 +392,15 @@ def _dotenv_value(key: str) -> str:
     return ""
 
 
+def _env_flag(env: dict, key: str, default: str = "false") -> str:
+    """Resolve a boolean env flag from the process env, then .env, then default.
+
+    Same reason as _dotenv_value: services started outside the repo root cannot
+    find .env themselves, so flags they need have to be injected explicitly.
+    """
+    return env.get(key) or os.environ.get(key) or _dotenv_value(key) or default
+
+
 def apply_fast_preset(env: dict) -> None:
     """--fast: route Stage-2 + agents through Groq Cloud instead of local Ollama.
 
@@ -462,7 +471,15 @@ def start_agents(py: str, env: dict) -> None:
         "AGENTS_SERVICE_URL": "http://127.0.0.1:8010",
         "CLICKHOUSE_HOST": ipof("clickhouse"), "CLICKHOUSE_PORT": "9000",
         "CLICKHOUSE_DB": "defense", "CLICKHOUSE_USER": "defense", "CLICKHOUSE_PASSWORD": "defense",
-        "ANALYTICS_MCP_STUB": "true", "RETRIEVAL_MCP_STUB": "true",
+        # Stub mode is a deployment choice, not a launcher one. Hardcoding it to
+        # "true" here silently overrode ANALYTICS_MCP_STUB=false in .env, so an
+        # operator who had configured real ClickHouse got synthetic numbers with
+        # no indication — /health said stub_mode:true and nothing else did.
+        # Injected explicitly rather than left to the settings layer because
+        # retrieval_mcp and ingest_mcp are started from their own directories,
+        # where the repo-root .env is not on the search path.
+        "ANALYTICS_MCP_STUB": _env_flag(env, "ANALYTICS_MCP_STUB"),
+        "RETRIEVAL_MCP_STUB": _env_flag(env, "RETRIEVAL_MCP_STUB"),
     })
     uvi = [py, "-m", "uvicorn", "--host", "127.0.0.1", "--log-level", _uvicorn_level()]
     # analytics_mcp + agents launch by module path from the repo root; retrieval/

@@ -143,3 +143,46 @@ class AgentRunStore:
             if data is not None:
                 runs.append(_dict_to_run(data))
         return runs
+
+    # ------------------------------------------------------------------
+    # Delete & Clear
+    # ------------------------------------------------------------------
+
+    async def delete(self, run_id: str) -> bool:
+        """Delete a single run by ID. Returns whether a run was actually removed."""
+        key = f"{_KEY_PREFIX}{run_id}"
+        deleted = False
+        if self._redis is not None:
+            try:
+                # Report what Redis actually removed — reporting `deleted: true`
+                # for an id that never existed makes a typo look like a success.
+                removed = await self._redis.delete(key)
+                await self._redis.zrem(_LIST_KEY, run_id)
+                deleted = bool(removed)
+            except Exception as exc:
+                log.warning("redis_delete_failed", run_id=run_id, error=str(exc))
+
+        if run_id in self._store:
+            del self._store[run_id]
+            self._index = [(ts, rid) for ts, rid in self._index if rid != run_id]
+            deleted = True
+        return deleted
+
+    async def clear_all(self) -> int:
+        """Clear all agent run history."""
+        count = 0
+        if self._redis is not None:
+            try:
+                run_ids = await self._redis.zrevrange(_LIST_KEY, 0, -1)
+                for rid in run_ids:
+                    await self._redis.delete(f"{_KEY_PREFIX}{rid}")
+                await self._redis.delete(_LIST_KEY)
+                count = len(run_ids)
+            except Exception as exc:
+                log.warning("redis_clear_failed", error=str(exc))
+
+        count = max(count, len(self._store))
+        self._store.clear()
+        self._index.clear()
+        return count
+

@@ -191,9 +191,9 @@ class Settings(BaseSettings):
 
     # MCP
     agents_service_url: str = "http://localhost:8001"
-    ingest_mcp_url: str = "http://ingest-mcp:8102"
-    retrieval_mcp_url: str = "http://retrieval-mcp:8101"
-    analytics_mcp_url: str = "http://analytics-mcp:8100"
+    ingest_mcp_url: str = "http://localhost:8102"
+    retrieval_mcp_url: str = "http://localhost:8101"
+    analytics_mcp_url: str = "http://localhost:8110"
     analytics_mcp_stub: bool = True
     
     # Misc
@@ -225,11 +225,18 @@ class Settings(BaseSettings):
     retrieval_mcp_stub: bool = False
 
     # Model overrides
-    stage1_local_model: str = "gemma3:4b"
+    # Pipeline Model (Stage 1 & Stage 2): Same unified model
+    stage1_local_model: str = "qwen2.5:7b"
     stage2_local_model: str = "qwen2.5:7b"
     summary_local_model: str = "qwen2.5:7b"
+
+    # Agent Model (Dedicated 3rd model for Agentic RAG & reasoning)
+    agent_local_model: str = "llama3.1:8b"
+    agent_groq_model: str = "llama-3.3-70b-versatile"
+
+    # Backward-compatible role models
     llm_a_local_model: str = "qwen2.5:7b"
-    llm_b_local_model: str = "qwen2.5:7b"
+    llm_b_local_model: str = "llama3.1:8b"
     vlm_local_model: str = "qwen3-vl:4b"
 
     fasttext_lang_model: str = "/models/fasttext/lid.176.bin"
@@ -242,11 +249,12 @@ class Settings(BaseSettings):
     clip_model: str = "google/siglip-base-patch16-224"
     ner_model: str = "gliner"
 
-    stage1_groq_model: str = "llama-3.1-8b-instant"
+    # Groq Fallbacks for each tier
+    stage1_groq_model: str = "llama-3.3-70b-versatile"
     stage2_groq_model: str = "llama-3.3-70b-versatile"
     summary_groq_model: str = "llama-3.3-70b-versatile"
-    llm_a_groq_model: str = "llama-3.3-70b-versatile"
-    llm_b_groq_model: str = "llama-3.1-8b-instant"
+    llm_a_groq_model: str = "llama-3.1-8b-instant"
+    llm_b_groq_model: str = "llama-3.3-70b-versatile"
     vlm_groq_model: str = "meta-llama/llama-4-scout-17b-16e-instruct"
 
     stage1_llm: bool = True
