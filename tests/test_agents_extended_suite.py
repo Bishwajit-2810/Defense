@@ -68,7 +68,7 @@ def test_api_uses_registry_budget_when_request_omits_it(agent_api_client, monkey
     seen: dict[str, int] = {}
 
     async def capture(runner, store, agent_name, query, campaign_id, run_id,
-                      max_tool_calls, tenant_policy, backend_override):
+                      max_tool_calls, tenant_policy, backend_override, **kwargs):
         from defense.services.agents.runner import AgentRun
         seen[agent_name] = max_tool_calls
         run = AgentRun(run_id=run_id, agent_name=agent_name, query=query,
@@ -133,7 +133,7 @@ def test_api_submit_query_validation(agent_api_client):
 
 def test_api_query_and_delete_lifecycle(agent_api_client, monkeypatch):
     """Test submitting query, polling status, and deleting the run."""
-    async def mock_run_task(runner, store, agent_name, query, campaign_id, run_id, max_tool_calls, tenant_policy, backend_override):
+    async def mock_run_task(runner, store, agent_name, query, campaign_id, run_id, max_tool_calls, tenant_policy, backend_override, **kwargs):
         from defense.services.agents.runner import AgentRun
         completed_run = AgentRun(
             run_id=run_id,
@@ -188,7 +188,7 @@ def test_api_cancel_active_running_task(agent_api_client, monkeypatch):
     """Test that DELETE /v1/agents/{run_id} cleanly cancels an in-flight background task."""
     cancelled_event = asyncio.Event()
 
-    async def mock_hanging_task(runner, store, agent_name, query, campaign_id, run_id, max_tool_calls, tenant_policy, backend_override):
+    async def mock_hanging_task(runner, store, agent_name, query, campaign_id, run_id, max_tool_calls, tenant_policy, backend_override, **kwargs):
         try:
             # Hang until cancelled
             await asyncio.sleep(100.0)
@@ -509,7 +509,19 @@ class ErrorHandlingLLM:
 
 @pytest.mark.asyncio
 async def test_runner_handles_mcp_tool_exception_gracefully():
-    """When an MCP tool raises an exception, the runner reports it to the LLM without crashing."""
+    """An MCP tool that raises is recorded and survived — but not answered around.
+
+    This test used to assert ``status == "completed"`` and that the model's
+    "here is the fallback assessment" reached the operator. That is the
+    fabrication path: the only tool call failed, so the assessment was written
+    from no data at all. A live run of exactly this shape produced a briefing of
+    invented post IDs and sentiment scores.
+
+    What "gracefully" has to mean is unchanged in the part that mattered — no
+    crash, the error captured on the trace entry and handed to the LLM — plus
+    the run now being honest about having read nothing. See
+    tests/test_agent_ungrounded_answers.py.
+    """
     llm = ErrorHandlingLLM()
     mcp = FailingToolMCP()
     runner = AgentRunner(llm_client=llm, mcp_client=mcp)
@@ -523,11 +535,15 @@ async def test_runner_handles_mcp_tool_exception_gracefully():
 
     run = await runner.run(agent_def=agent_def, query="Test faulty tool")
 
-    assert run.status == "completed"
     assert len(run.tools_used) == 1
     assert "error" in run.tools_used[0]
     assert "MCP backend socket timeout" in run.tools_used[0]["error"]
-    assert "fallback assessment" in run.answer
+
+    assert run.status == "failed", "a run that retrieved nothing is not a completed analysis"
+    assert "fallback assessment" not in run.answer, (
+        "an assessment written with zero rows retrieved must not be presented"
+    )
+    assert "MCP backend socket timeout" in run.answer, "tell the operator what broke"
 
 
 # ---------------------------------------------------------------------------

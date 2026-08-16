@@ -629,8 +629,11 @@ def trend_query(
     granularity: Literal["hour", "day", "week"] = "day",
     metric: Literal["post_count", "avg_sentiment", "avg_toxicity"] = "post_count",
 ) -> list[dict]:
-    """Query analytics time-series for a campaign. Returns period buckets with
-    post count, avg sentiment, and avg toxicity (all three are always returned)."""
+    """Query analytics time-series for a campaign.
+
+    Each row includes: period, count, avg_sentiment, avg_toxicity. All three
+    measures come back on every call regardless of the `metric` argument, so
+    one call covers all of them — do not call this once per metric."""
     log.info("tool_call", tool="trend_query", campaign_id=campaign_id, stub=STUB_MODE)
     return _handle_trend_query(campaign_id, from_date, to_date, granularity, metric)
 
@@ -650,8 +653,12 @@ def sentiment_over_time(
     )] = None,
     granularity: Literal["hour", "day", "week"] = "day",
 ) -> list[dict]:
-    """Returns sentiment breakdown (positive/negative/neutral/mixed counts) per
-    time period for a campaign."""
+    """Returns the sentiment breakdown per time period for a campaign.
+
+    Each row includes: period, positive, negative, neutral, mixed. The four
+    sentiment figures are POST COUNTS in that period, not percentages and not
+    per-post scores — for sentiment attached to individual posts, use
+    top_posts, whose rows carry overall_sentiment."""
     log.info("tool_call", tool="sentiment_over_time", campaign_id=campaign_id, stub=STUB_MODE)
     return _handle_sentiment_over_time(campaign_id, from_date, to_date, granularity)
 
@@ -671,7 +678,13 @@ def top_posts(
     ] = None,
 ) -> list[dict]:
     """Returns the top posts for a campaign ranked by the given metric (descending),
-    optionally restricted to posts at or above a toxicity threshold."""
+    optionally restricted to posts at or above a toxicity threshold.
+
+    Each row includes: post_id, total_reactions, comment_count, toxicity_score,
+    hate_speech_score, overall_sentiment. Ranking is limited to the four numeric
+    metrics above, but every row carries overall_sentiment regardless of how it
+    was ranked — to compare sentiment across top posts, rank by
+    total_reactions and read overall_sentiment from the rows."""
     log.info(
         "tool_call", tool="top_posts", campaign_id=campaign_id, metric=metric,
         min_toxicity=min_toxicity, stub=STUB_MODE,
@@ -685,8 +698,12 @@ def reaction_mix(
     from_date: Annotated[str | None, Field(description="Optional inclusive start date (YYYY-MM-DD).")] = None,
     to_date: Annotated[str | None, Field(description="Optional inclusive end date (YYYY-MM-DD).")] = None,
 ) -> dict:
-    """Returns the aggregated reaction breakdown (LIKE/LOVE/HAHA/WOW/SAD/ANGRY/CARE)
-    totals and percentages for a campaign."""
+    """Returns the aggregated reaction breakdown for a campaign.
+
+    Returns one object (not rows): {"totals": {...}, "percentages": {...},
+    "total_reactions": int}, where totals and percentages are both keyed by
+    LIKE, LOVE, HAHA, WOW, SAD, ANGRY, CARE. Percentages are already computed —
+    do not recompute them from the totals."""
     log.info("tool_call", tool="reaction_mix", campaign_id=campaign_id, stub=STUB_MODE)
     return _handle_reaction_mix(campaign_id, from_date, to_date)
 

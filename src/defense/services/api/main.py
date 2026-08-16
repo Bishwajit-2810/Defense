@@ -15,7 +15,7 @@ from defense.libs.common.config import get_settings
 
 sys_config = get_settings()
 
-from defense.services.api.routers import analysis, auth, chat, config, health, ingest, pipeline, reports, search
+from defense.services.api.routers import analysis, auth, chat, chat_history, config, health, ingest, pipeline, reports, search
 from defense.services.api.routers.agents import router as agents_router
 from defense.services.api.routers.logs import router as logs_router
 from defense.services.api.routers.usage import router as usage_router
@@ -168,6 +168,7 @@ app.include_router(reports.router)
 app.include_router(search.router)
 app.include_router(config.router)
 app.include_router(chat.router)
+app.include_router(chat_history.router)
 app.include_router(pipeline.router)
 app.include_router(agents_router)
 app.include_router(usage_router)

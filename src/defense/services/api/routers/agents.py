@@ -10,7 +10,14 @@ import structlog
 from fastapi import APIRouter, Depends, HTTPException, Query, status
 from pydantic import BaseModel
 
-from defense.services.api.deps import get_current_user, rate_limit
+from sqlalchemy.ext.asyncio import AsyncSession
+
+from defense.services.api.deps import (
+    check_llm_backend_policy,
+    get_current_user,
+    get_db,
+    rate_limit,
+)
 
 log = structlog.get_logger(__name__)
 
@@ -48,6 +55,12 @@ class AgentQueryRequest(BaseModel):
     stream: bool = False
     """When True the agents service should stream partial results."""
 
+    llm_backend: str | None = None
+    """Per-request backend override ("local"/"groq"), subject to tenant policy."""
+
+    history: list[dict[str, str]] | None = None
+    """Prior conversation turns, oldest first, for multi-turn (chat) callers."""
+
 
 # ---------------------------------------------------------------------------
 # POST /v1/agents/query
@@ -63,12 +76,18 @@ class AgentQueryRequest(BaseModel):
 async def query_agent(
     request: AgentQueryRequest,
     user: dict = Depends(get_current_user),
+    db: AsyncSession = Depends(get_db),
 ) -> Any:
     """POST /v1/agents/query — proxy to the agents service.
 
     Returns 202 Accepted with ``run_id`` for async execution, or 200 with a
     full result if the agents service responds within 30 s.
     """
+    # A privacy-locked tenant may not reach Groq by any route. The chat and
+    # analysis endpoints have always enforced that; this proxy did not, so an
+    # agent run was a way around the lock.
+    await check_llm_backend_policy(db, user, {"llm_backend": request.llm_backend})
+
     # Translate the public API shape to the agents-service contract:
     # query → question, agent_type → agent (extras the service doesn't know are dropped).
     payload = request.model_dump(exclude_none=True)

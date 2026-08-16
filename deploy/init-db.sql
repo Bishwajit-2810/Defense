@@ -129,6 +129,35 @@ CREATE TABLE IF NOT EXISTS users (
     created_at    TIMESTAMPTZ DEFAULT NOW()
 );
 
+-- Chat history. A conversation belongs to one operator in one tenant; both are
+-- carried on the row so a query can never accidentally cross either boundary.
+CREATE TABLE IF NOT EXISTS chat_conversations (
+    id         VARCHAR PRIMARY KEY,
+    tenant_id  VARCHAR NOT NULL DEFAULT 'default',
+    username   VARCHAR NOT NULL,
+    title      VARCHAR NOT NULL DEFAULT 'New chat',
+    created_at TIMESTAMPTZ DEFAULT NOW(),
+    updated_at TIMESTAMPTZ DEFAULT NOW()
+);
+
+-- One row per turn. `meta` holds the provenance of an assistant turn — which
+-- agent answered, which MCP servers and tools it called, citations. Reopening a
+-- conversation without it would show the answers and lose the evidence, which
+-- is the half that makes an intelligence briefing checkable.
+CREATE TABLE IF NOT EXISTS chat_messages (
+    id              BIGSERIAL PRIMARY KEY,
+    conversation_id VARCHAR NOT NULL REFERENCES chat_conversations (id) ON DELETE CASCADE,
+    role            VARCHAR NOT NULL,        -- 'user' | 'assistant'
+    content         TEXT NOT NULL,
+    meta            JSONB,
+    created_at      TIMESTAMPTZ DEFAULT NOW()
+);
+
+CREATE INDEX IF NOT EXISTS idx_chat_conv_owner
+    ON chat_conversations (tenant_id, username, updated_at DESC);
+CREATE INDEX IF NOT EXISTS idx_chat_msg_conversation
+    ON chat_messages (conversation_id, id);
+
 -- Idempotent schema updates for existing deployments
 ALTER TABLE posts ADD COLUMN IF NOT EXISTS tenant_id VARCHAR NOT NULL DEFAULT 'default';
 ALTER TABLE analysis_results ADD COLUMN IF NOT EXISTS tenant_id VARCHAR NOT NULL DEFAULT 'default';

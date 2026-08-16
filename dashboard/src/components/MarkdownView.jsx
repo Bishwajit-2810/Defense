@@ -367,6 +367,26 @@ function parseMarkdownBlocks(rawText) {
       continue;
     }
 
+    // Setext heading: a text line underlined with === (h1) or --- (h2).
+    //
+    // The agents emit these, and without this branch the underline fell through
+    // to the paragraph case and rendered as a literal row of "=" characters in
+    // the middle of a briefing. Checked here, at the point where the line is
+    // already known to be an ordinary paragraph, so a list item or table row
+    // followed by dashes cannot be swallowed as a heading. The underline is
+    // consumed with i++ so the "---" form is not then re-read as a horizontal
+    // rule; requiring two dashes keeps a lone "-" bullet out of it.
+    const underline = (lines[i + 1] || '').trim();
+    if (/^=+$/.test(underline) || /^-{2,}$/.test(underline)) {
+      blocks.push({
+        type: 'heading',
+        level: underline[0] === '=' ? 1 : 2,
+        text: trimmed,
+      });
+      i++;
+      continue;
+    }
+
     // Standard Paragraph
     blocks.push({ type: 'paragraph', text: line });
   }

@@ -128,33 +128,47 @@ def test_agent_tools_exist_in_mcp_catalog(agent):
 class MockLLMClient:
     """Simulates LLM tool calling turns followed by a final structured answer."""
 
-    def __init__(self, tool_to_call: str, final_answer: str, tool_args: dict | None = None):
+    def __init__(
+        self,
+        tool_to_call: str,
+        final_answer: str,
+        tool_args: dict | None = None,
+        prelude_tool: str | None = None,
+    ):
         self.tool_to_call = tool_to_call
         self.final_answer = final_answer
         self.tool_args = tool_args or {}
+        # An optional discovery call made before the real one. A post_id
+        # argument has to come from retrieved data or the operator's question —
+        # the runner rejects one that came from nowhere — so an agent whose
+        # tool takes a post_id has to go and fetch ids first, exactly as it
+        # does in production.
+        self.prelude_tool = prelude_tool
         self.call_count = 0
+
+    def _tool_turn(self, name: str, args: dict) -> dict:
+        return {
+            "role": "assistant",
+            "content": "",
+            "tool_calls": [
+                {
+                    "id": f"call_{name}_001",
+                    "type": "function",
+                    "function": {"name": name, "arguments": json.dumps(args)},
+                }
+            ],
+            "backend": "local",
+            "model": "llama3.1:8b",
+            "usage": {"prompt_tokens": 120, "completion_tokens": 30, "total_tokens": 150},
+        }
 
     async def chat(self, role=None, messages=None, tools=None, response_format=None, backend_override=None, tenant_policy=None, **kwargs):
         self.call_count += 1
-        # Turn 1: Return a tool call
-        if self.call_count == 1:
-            return {
-                "role": "assistant",
-                "content": "",
-                "tool_calls": [
-                    {
-                        "id": f"call_{self.tool_to_call}_001",
-                        "type": "function",
-                        "function": {
-                            "name": self.tool_to_call,
-                            "arguments": json.dumps(self.tool_args),
-                        },
-                    }
-                ],
-                "backend": "local",
-                "model": "llama3.1:8b",
-                "usage": {"prompt_tokens": 120, "completion_tokens": 30, "total_tokens": 150},
-            }
+        turns = ([self.prelude_tool] if self.prelude_tool else []) + [self.tool_to_call]
+        if self.call_count <= len(turns):
+            name = turns[self.call_count - 1]
+            args = {} if name == self.prelude_tool else self.tool_args
+            return self._tool_turn(name, args)
         # Turn 2: Return final answer citing a post ID
         return {
             "role": "assistant",
@@ -311,16 +325,22 @@ async def test_coverage_agent_fetch_trigger():
     agent = COVERAGE_AGENT
     assert "fetch_more_comments" in agent.tools
 
+    # top_posts first, then fetch — the coverage agent's actual flow, and the
+    # only way it can be holding a real post_id. Opening with a post_id it was
+    # never given is now rejected, because such an id can only be invented.
     mock_llm = MockLLMClient(
         tool_to_call="fetch_more_comments",
         final_answer="Triggered additional comment collection for viral post cm0abcdef12345678901234 (100 comments enqueued).",
         tool_args={"post_id": "cm0abcdef12345678901234"},
+        prelude_tool="top_posts",
     )
     runner = AgentRunner(llm_client=mock_llm, mcp_client=MockMCPClient())
     run = await runner.run(agent_def=agent, query="Find low coverage viral posts and fetch comments")
 
     assert run.status == "completed"
     assert "cm0abcdef12345678901234" in run.citations
+    assert [e["tool_name"] for e in run.tools_used] == ["top_posts", "fetch_more_comments"]
+    assert all(e["status"] == "ok" for e in run.tools_used)
 
 
 @pytest.mark.asyncio

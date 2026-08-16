@@ -171,9 +171,11 @@ class _OneShotLLM:
     def __init__(self, content: str = "Done.") -> None:
         self.content = content
         self.seen: list[list[dict]] = []
+        self.kwargs: list[dict] = []
 
     async def chat(self, role=None, messages=None, tools=None, **kwargs):
         self.seen.append(list(messages))
+        self.kwargs.append(kwargs)
         return {
             "content": self.content,
             "tool_calls": [],
@@ -214,6 +216,32 @@ async def test_the_system_prompt_states_todays_date():
     assert _TODAY.isoformat() in prompt
     assert "OMIT the date arguments" in prompt
     assert "training data" in prompt
+
+
+@pytest.mark.asyncio
+async def test_the_system_prompt_forbids_underlined_headings():
+    """The renderer shows "=====" literally; the model kept emitting it.
+
+    Fixed on both sides — MarkdownView now parses setext headings, and the
+    shared directive asks for ATX. This pins the prompt half; the renderer half
+    is dashboard/src/components/MarkdownView.test.jsx.
+    """
+    llm = _OneShotLLM()
+    await AgentRunner(llm_client=llm, mcp_client=_StubMCP()).run(
+        agent_def=ANALYST_AGENT, query="Compare sentiment across top posts"
+    )
+    prompt = llm.seen[0][0]["content"]
+    assert "'## Section'" in prompt
+    assert "NEVER underline a heading" in prompt
+
+
+@pytest.mark.asyncio
+async def test_agent_turns_run_at_the_configured_temperature():
+    llm = _OneShotLLM()
+    await AgentRunner(llm_client=llm, mcp_client=_StubMCP()).run(
+        agent_def=ANALYST_AGENT, query="Sentiment trends?"
+    )
+    assert llm.kwargs[0]["temperature"] == 0.3
 
 
 # ---------------------------------------------------------------------------

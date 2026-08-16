@@ -47,7 +47,18 @@ DO NOT output Python code or scripts."""
 
 ANALYST_AGENT = AgentDefinition(
     name="analyst",
-    description="Natural language Q&A over campaign corpus",
+    # The chat router picks an agent by matching the user's words against these
+    # descriptions and nothing else, so this one has to name the general corpus
+    # vocabulary explicitly. When it read only "Natural language Q&A over
+    # campaign corpus" it was the worst lexical match in the catalogue for an
+    # ordinary question, and "sentiment trends across all posts" went to
+    # whichever specialist happened to share a noun with it.
+    description=(
+        "General-purpose Q&A over the corpus: sentiment trends, activity and "
+        "engagement levels, top/most-discussed posts, reaction mix, what people "
+        "are saying. The default when the question is not specifically about "
+        "one of the specialities below"
+    ),
     system_prompt=ANALYST_SYSTEM_PROMPT,
     tools=[
         "trend_query",
@@ -95,7 +106,13 @@ When answering:
 
 STANCE_AGENT = AgentDefinition(
     name="stance",
-    description="Analyze target-dependent stance patterns across campaigns",
+    # "Only when" is load-bearing: without it the router reads "stance patterns"
+    # as covering any opinion question and takes general sentiment traffic.
+    description=(
+        "Stance toward a NAMED target (person, organisation, policy): who "
+        "supports or opposes whom. Only when the question is about "
+        "support/opposition"
+    ),
     system_prompt=STANCE_SYSTEM_PROMPT,
     tools=[
         "stance_by_target",
@@ -172,7 +189,10 @@ When answering:
 
 NARRATIVE_AGENT = AgentDefinition(
     name="narrative",
-    description="Discover emerging narratives, themes, and topic clusters in campaigns",
+    description=(
+        "Topic clusters and emerging vs declining themes. Only when the "
+        "question asks about narratives, themes or clusters by name"
+    ),
     system_prompt=NARRATIVE_SYSTEM_PROMPT,
     tools=[
         "get_clusters",

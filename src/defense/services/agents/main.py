@@ -124,6 +124,11 @@ class DateRange(BaseModel):
     model_config = {"populate_by_name": True}
 
 
+class ChatTurn(BaseModel):
+    role: str = Field(..., description='"user" or "assistant"')
+    content: str
+
+
 class AgentQueryRequest(BaseModel):
     question: Optional[str] = Field(None, description="Natural language question or instruction.")
     query: Optional[str] = Field(None, description="Natural language query alias.")
@@ -150,6 +155,13 @@ class AgentQueryRequest(BaseModel):
         None, description="Per-request backend override (local/groq), subject to tenant policy."
     )
     want_citations: bool = Field(True, description="Whether to extract and return post ID citations.")
+    history: Optional[list[ChatTurn]] = Field(
+        None,
+        description=(
+            "Prior conversation turns, oldest first, excluding the current "
+            "question. Sent by the chat surface so follow-ups keep their context."
+        ),
+    )
 
     @model_validator(mode="after")
     def populate_aliases(self) -> "AgentQueryRequest":
@@ -233,6 +245,7 @@ async def _run_agent_task(
     max_tool_calls: int,
     backend_override: Optional[str],
     tenant_policy: Any,
+    history: Optional[list[dict]] = None,
 ) -> AgentRun:
     """Execute an agent run and persist the result."""
     from .registry import AGENT_REGISTRY
@@ -247,6 +260,10 @@ async def _run_agent_task(
             max_tool_calls=max_tool_calls,
             tenant_policy=tenant_policy,
             backend_override=backend_override,
+            history=history,
+            # Persist each tool call as it starts and finishes, so a poller sees
+            # the trace build up instead of a spinner followed by everything.
+            on_progress=store.save,
         )
         await store.save(run)
         return run
@@ -432,6 +449,7 @@ async def submit_query(
             max_tool_calls=max_tool_calls,
             backend_override=request.llm_backend,
             tenant_policy=tenant_policy,
+            history=[t.model_dump() for t in request.history] if request.history else None,
         )
     )
     _active_tasks[run_id] = task

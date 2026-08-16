@@ -19,6 +19,7 @@ import json
 import re
 import time
 import uuid
+from collections.abc import Awaitable, Callable
 from dataclasses import dataclass, field
 from datetime import date
 from typing import Any, Optional
@@ -39,8 +40,10 @@ _POST_ID_RE = re.compile(r"\b[a-z0-9]{20,}\b")
 # or the final answer).
 _MAX_TOKENS_PER_TURN = 2048
 
-# Temperature for agent reasoning (low = more deterministic tool selection)
-_TEMPERATURE = 0.1
+# Temperature for agent reasoning. Low keeps tool selection deterministic; the
+# same knob also governs the prose turn, where 0.1 made the briefings stilted
+# and repetitive. 0.3 is the operator's setting for readable output.
+_TEMPERATURE = 0.3
 
 # How many times one run may recover a tool call the model wrote as text.
 _MAX_TEXT_TOOL_RECOVERIES = 2
@@ -279,6 +282,14 @@ _CITED_ID_RE = re.compile(
     re.IGNORECASE,
 )
 
+# The other shape a fabricated citation takes: a bare "#12345". It is neither
+# CUID-shaped nor preceded by the words "post id" — in the observed answer the
+# table header "Post ID" was followed by the next column header, so
+# _CITED_ID_RE never reached the invented values underneath it and the whole
+# fabricated table cleared the check. Numeric-only so that markdown headings
+# ("# Findings") and "#1" ranks are not mistaken for citations.
+_HASH_ID_RE = re.compile(r"#(\d{4,})")
+
 # Identifier-shaped tokens in tool output. Matching whole tokens rather than
 # substrings matters: "1234567890" — one of the ids the live run invented — is a
 # substring of the CUID "cm0abcdef12345678901234" that a tool did return, so a
@@ -290,7 +301,11 @@ def _unverified_citations(answer: str, tool_output: str) -> list[str]:
     """Post IDs asserted in the answer that no tool ever returned."""
     if not answer:
         return []
-    claimed = set(_CITED_ID_RE.findall(answer)) | set(_POST_ID_RE.findall(answer))
+    claimed = (
+        set(_CITED_ID_RE.findall(answer))
+        | set(_POST_ID_RE.findall(answer))
+        | set(_HASH_ID_RE.findall(answer))
+    )
     if not claimed:
         return []
     returned = set(_TOKEN_RE.findall(tool_output or ""))
@@ -306,7 +321,11 @@ def _describe_empty(result: Any) -> str | None:
     ambiguity.
     """
     if result is None:
-        return "EMPTY RESULT — the tool returned nothing for these arguments."
+        return (
+            "EMPTY RESULT — the tool returned nothing for these arguments. Report "
+            "this as an absence of data. Do NOT invent figures, post IDs, or "
+            "quotes to fill it."
+        )
     if isinstance(result, (list, dict, str)) and len(result) == 0:
         return (
             "EMPTY RESULT — the tool ran successfully and matched no rows for "
@@ -314,6 +333,96 @@ def _describe_empty(result: Any) -> str | None:
             "figures, post IDs, or quotes to fill it; if a date window was used, "
             "consider that the window may not overlap the corpus."
         )
+    return None
+
+
+# The model reads every tool result inside <tool_data source="..." trust="...">
+# delimiters, and it copies them back out: a live run called
+# representative_comments with post_id='<tool_data>post_12345</tool_data>'.
+# The wrapper is framing the model is shown, never part of a value, so removing
+# it from an argument cannot change what was asked for.
+_TOOL_DATA_TAG_RE = re.compile(r"</?tool_data[^>]*>", re.IGNORECASE)
+
+
+def _strip_tool_data_markup(value: Any) -> Any:
+    """Remove leaked <tool_data> delimiters from an argument, at any depth."""
+    if isinstance(value, str):
+        return _TOOL_DATA_TAG_RE.sub("", value).strip()
+    if isinstance(value, list):
+        return [_strip_tool_data_markup(v) for v in value]
+    if isinstance(value, dict):
+        return {k: _strip_tool_data_markup(v) for k, v in value.items()}
+    return value
+
+
+# Post IDs the model passes INTO a tool, as opposed to the ones it asserts in
+# its answer (see _unverified_citations). Both are fabrication; only the second
+# was ever checked. Two live toxicity runs called representative_comments as
+# their FIRST tool call — holding no retrieved data at all — with
+# post_id='post_12345' (invented) and post_id='all' (a wildcard, which is a
+# real value for that tool's `sentiment` parameter but not for post_id).
+_POST_ID_ARG_KEYS = ("post_id", "post_ids")
+
+
+def _ungrounded_post_id_args(arguments: dict, grounding: str) -> list[str]:
+    """Post-ID arguments that no tool returned and the operator never mentioned.
+
+    ``grounding`` is the run's evidence so far: the operator's question and
+    every tool result already received. Membership is by whole token, matching
+    _unverified_citations — an id that appears nowhere in it was invented.
+
+    An id the operator typed themselves is legitimate even though no tool
+    returned it, which is why the question is part of the grounding.
+    """
+    known = set(_TOKEN_RE.findall(grounding or ""))
+    problems: list[str] = []
+    for key in _POST_ID_ARG_KEYS:
+        if key not in arguments:
+            continue
+        raw = arguments[key]
+        for value in raw if isinstance(raw, list) else [raw]:
+            if not isinstance(value, str) or not value.strip() or value in known:
+                continue
+            problems.append(
+                f"{key}={value!r} is not a post ID that any tool in this run "
+                "returned, and it does not appear in the operator's question, so "
+                "this call did NOT run and returned no data. Post IDs must come "
+                "from retrieved data: call top_posts (or semantic_search) first, "
+                "then pass an id from its rows. Do not invent post IDs, and do "
+                "not pass a wildcard such as 'all' — post_id names exactly one "
+                "post."
+            )
+    return problems
+
+
+def _describe_error(error: str) -> str:
+    """Name a FAILED call as a failed call, with the anti-fabrication warning.
+
+    ``_describe_empty`` used to cover this path by accident: a raised tool sets
+    ``result = None``, which it reported as "the tool returned nothing for these
+    arguments". That is the wrong diagnosis — the tool did not run — and unlike
+    the empty-rows branch it carried no instruction against inventing data. A
+    live run took three validation errors described this way and produced a
+    briefing of invented post IDs, topics and sentiment scores.
+    """
+    return (
+        f"TOOL CALL FAILED — this call did not run and returned NO data: {error}\n"
+        "Fix the arguments and call the tool again. Do NOT invent figures, post "
+        "IDs, quotes, or topics to stand in for data you did not receive, and do "
+        "not describe this as an absence of data in the corpus — nothing was "
+        "queried."
+    )
+
+
+def _result_size(result: Any) -> int | None:
+    """How much a tool returned, for the trace: rows for a list, keys for a dict.
+
+    ``None`` for scalars and errors, where "size" would be a number that means
+    nothing. The point is to let an operator see at a glance that a call
+    returned 0 rows without opening the payload.
+    """
+    if isinstance(result, (list, tuple, dict)):
+        return len(result)
     return None
 
 
@@ -336,6 +445,21 @@ class AgentRunner:
         self.llm = llm_client
         self.mcp = mcp_client
 
+    def _server_for(self, tool_name: str) -> str | None:
+        """Which MCP server advertised this tool. Never fails a run over a label.
+
+        Tests and callers substitute their own MCP client, and not every stub
+        implements ``server_for``; an unlabelled trace entry is a fine outcome,
+        an AttributeError mid-run is not.
+        """
+        getter = getattr(self.mcp, "server_for", None)
+        if getter is None:
+            return None
+        try:
+            return getter(tool_name)
+        except Exception:
+            return None
+
     # ------------------------------------------------------------------
     # Public entry point
     # ------------------------------------------------------------------
@@ -349,6 +473,8 @@ class AgentRunner:
         max_tool_calls: int = 10,
         tenant_policy: Any = None,
         backend_override: str | None = None,
+        history: list[dict] | None = None,
+        on_progress: Callable[[AgentRun], Awaitable[None]] | None = None,
     ) -> AgentRun:
         """Execute the agentic loop with tool use.
 
@@ -368,6 +494,15 @@ class AgentRunner:
             TenantPolicy instance forwarded to LLMClient.enforce_policy.
         backend_override:
             Per-request backend selection ("local" / "groq"), subject to policy.
+        history:
+            Prior conversation turns (``{"role", "content"}``) to place before
+            the question, so a chat follow-up ("and the other campaign?") has
+            the context that made it a sentence.
+        on_progress:
+            Awaited with the partially-filled run each time a tool call starts
+            and finishes. The chat UI polls the run store to show tools as they
+            fire; without this the store only learns about them at the end,
+            which is exactly when nobody needs a live trace any more.
 
         Returns
         -------
@@ -393,6 +528,8 @@ class AgentRunner:
                 max_tool_calls=max_tool_calls,
                 tenant_policy=tenant_policy,
                 backend_override=backend_override,
+                history=history,
+                on_progress=on_progress,
                 run_log=run_log,
             )
         except Exception as exc:
@@ -417,6 +554,8 @@ class AgentRunner:
         tenant_policy: Any,
         backend_override: str | None,
         run_log: Any,
+        history: list[dict] | None = None,
+        on_progress: Callable[[AgentRun], Awaitable[None]] | None = None,
     ) -> None:
         # ----------------------------------------------------------------
         # 1. Build initial messages
@@ -427,6 +566,16 @@ class AgentRunner:
             "- Synthesize and present findings in natural language using Markdown (sections, bullet points, markdown tables, and post citations).\n"
             "- STRICT PROHIBITION: DO NOT write Python scripts, mock datasets, transformers pipelines, or programming code. The user is asking for analytical conclusions from the database, NOT software engineering code.\n"
             "- Answer the user's analytical directive directly using data retrieved from the tools.\n"
+            # Belt and braces with the renderer, which now understands setext
+            # headings too. The model wrote "Section" over "=========" and the
+            # operator read a row of equals signs in the middle of a briefing;
+            # a prompt rule is advisory, so the renderer was fixed as well.
+            "- Write headings as '## Section'. NEVER underline a heading with '===' or '---' — those characters are shown literally.\n"
+            # The toxicity agent's tools are mostly per-post lookups, and it kept
+            # opening a run by calling one with a post_id it had never been
+            # given — inventing 'post_12345' once and passing the wildcard 'all'
+            # the next time. Stating the order costs a line.
+            "- A post_id argument must be a real ID from a tool result you have already received. If you have none yet, call top_posts or semantic_search FIRST to obtain them. Never invent a post ID, and never pass 'all' as a post_id — it names exactly one post.\n"
         )
         system_content = f"{system_directive}\n{agent_def.system_prompt}\n\n{TOOL_DATA_POLICY}"
 
@@ -460,10 +609,29 @@ class AgentRunner:
                 "Never invent an id and never pass a schema description as a value."
             )
 
-        messages: list[dict[str, Any]] = [
-            {"role": "system", "content": system_content},
-            {"role": "user", "content": query},
-        ]
+        messages: list[dict[str, Any]] = [{"role": "system", "content": system_content}]
+
+        # Prior chat turns, if this run came from the chat surface. Only plain
+        # user/assistant text is carried over: a caller-supplied `system` turn
+        # would sit alongside the operator directive above and contradict it,
+        # and replaying old `tool` turns would reference tool_call_ids that
+        # belong to a conversation this run cannot see.
+        for turn in history or []:
+            role = turn.get("role")
+            content = turn.get("content")
+            if role in ("user", "assistant") and isinstance(content, str) and content:
+                messages.append({"role": role, "content": content})
+
+        messages.append({"role": "user", "content": query})
+
+        async def emit() -> None:
+            """Publish the run mid-flight so a poller sees the trace grow."""
+            if on_progress is None:
+                return
+            try:
+                await on_progress(run)
+            except Exception as exc:  # pragma: no cover — progress is best-effort
+                run_log.warning("progress_emit_failed", error=str(exc))
 
         # ----------------------------------------------------------------
         # 2. Fetch and filter tool manifests
@@ -486,6 +654,12 @@ class AgentRunner:
         # Everything every tool returned, verbatim — the ground truth a citation
         # in the final answer has to appear in.
         tool_output: list[str] = []
+        # What the operator themselves supplied. A post ID they typed is
+        # legitimate even before any tool has run, so it grounds a lookup the
+        # same way a tool result does.
+        grounding_seed = "\n".join(
+            [query, *(str(t.get("content") or "") for t in (history or []))]
+        )
         available_tools = {t["function"]["name"] for t in tools}
         text_recoveries = 0
         answer_is_tool_call = False
@@ -666,6 +840,31 @@ class AgentRunner:
                 except json.JSONDecodeError:
                     arguments = {}
 
+                # Strip any wrapper delimiters the model copied out of a tool
+                # result into an argument, before anything else looks at it.
+                cleaned = {k: _strip_tool_data_markup(v) for k, v in arguments.items()}
+                if cleaned != arguments:
+                    run_log.info("tool_data_markup_stripped", tool=tool_name)
+                    arguments = cleaned
+
+                # Repair argument shapes against the tool's own schema before
+                # dispatch, so the trace records what was actually sent. Same
+                # rule as _server_for: substituted MCP clients need not
+                # implement this, and a schema quirk must not kill a run.
+                shape_errors: list[str] = []
+                coerce = getattr(self.mcp, "coerce_arguments", None)
+                if coerce is not None:
+                    try:
+                        arguments, shape_errors = coerce(tool_name, arguments)
+                    except Exception as exc:
+                        run_log.warning("arg_coercion_failed", tool=tool_name, error=str(exc))
+
+                # A post ID that came from nowhere is the input-side twin of an
+                # invented citation, and it costs a whole tool call to discover.
+                shape_errors += _ungrounded_post_id_args(
+                    arguments, "\n".join([grounding_seed, *tool_output])
+                )
+
                 tool_call_count += 1
                 run_log.info(
                     "tool_call",
@@ -674,26 +873,49 @@ class AgentRunner:
                     arguments=arguments,
                 )
 
-                try:
-                    result = await self.mcp.call_tool(tool_name, arguments)
-                    result_str = json.dumps(result, default=str)
-                    error_str: str | None = None
-                except Exception as exc:
-                    result = None
-                    result_str = json.dumps({"error": str(exc)})
-                    error_str = str(exc)
-                    run_log.warning("tool_call_error", tool=tool_name, error=str(exc))
+                # Record the invocation BEFORE dispatching, then publish it. A
+                # tool call is the slowest thing in the run and the only part
+                # worth watching live; appending it afterwards means the trace
+                # only ever shows calls that already finished.
+                entry: dict[str, Any] = {
+                    "tool_call_id": tc["id"],
+                    "tool_name": tool_name,
+                    "mcp_server": self._server_for(tool_name),
+                    "arguments": arguments,
+                    "call_number": tool_call_count,
+                    "status": "running",
+                    "error": None,
+                }
+                run.tools_used.append(entry)
+                await emit()
 
-                # Record this tool invocation
-                run.tools_used.append(
-                    {
-                        "tool_call_id": tc["id"],
-                        "tool_name": tool_name,
-                        "arguments": arguments,
-                        "call_number": tool_call_count,
-                        "error": error_str,
-                    }
+                started = time.monotonic()
+                if shape_errors:
+                    # The call is malformed in a way no coercion can decide.
+                    # Dispatching it would spend a round trip to be told the
+                    # same thing in language the model has already misread.
+                    result = None
+                    error_str = " ".join(shape_errors)
+                    result_str = json.dumps({"error": error_str})
+                    run_log.warning("tool_call_rejected", tool=tool_name, error=error_str)
+                else:
+                    try:
+                        result = await self.mcp.call_tool(tool_name, arguments)
+                        result_str = json.dumps(result, default=str)
+                        error_str = None
+                    except Exception as exc:
+                        result = None
+                        result_str = json.dumps({"error": str(exc)})
+                        error_str = str(exc)
+                        run_log.warning("tool_call_error", tool=tool_name, error=str(exc))
+
+                entry.update(
+                    status="error" if error_str else "ok",
+                    error=error_str,
+                    duration_ms=int((time.monotonic() - started) * 1000),
+                    result_size=_result_size(result),
                 )
+                await emit()
 
                 # Extract post IDs from the result for citations
                 for pid in _extract_post_ids(result_str):
@@ -719,7 +941,13 @@ class AgentRunner:
                         "role": "tool",
                         "tool_call_id": tc["id"],
                         "content": _wrap_tool_result(
-                            tool_name, result_str, note=_describe_empty(result)
+                            tool_name,
+                            result_str,
+                            note=(
+                                _describe_error(error_str)
+                                if error_str
+                                else _describe_empty(result)
+                            ),
                         ),
                     }
                 )
@@ -727,6 +955,43 @@ class AgentRunner:
         # ----------------------------------------------------------------
         # 4. Finalise the run record
         # ----------------------------------------------------------------
+        # A run whose every tool call failed read nothing from the corpus, so
+        # whatever the model wrote is ungrounded by construction — there was no
+        # data for it to be grounded in. The observed case produced a fully
+        # formatted briefing with invented post IDs (#12345), invented topics
+        # and an invented average sentiment, and reported status "completed".
+        #
+        # The draft is discarded rather than banner-flagged. A caveat above a
+        # plausible table does not survive being screenshotted, pasted into a
+        # report, or skimmed — and there is no salvage value here, because the
+        # model had zero rows to work from. What replaces it is the one thing
+        # an operator can act on: which calls failed and why. The discarded
+        # text is logged, not silently dropped.
+        attempted = [e for e in run.tools_used if e.get("status") in ("ok", "error")]
+        all_calls_failed = bool(attempted) and not any(
+            e.get("status") == "ok" for e in attempted
+        )
+        if all_calls_failed:
+            run_log.error(
+                "all_tool_calls_failed",
+                tool_calls=len(attempted),
+                discarded_answer=(run.answer or "")[:500],
+            )
+            failures = "\n".join(
+                f"- `{e.get('tool_name')}` — {e.get('error') or 'unknown error'}"
+                for e in attempted
+            )
+            run.error = f"All {len(attempted)} tool call(s) failed; no data was retrieved."
+            run.answer = (
+                "**No data was retrieved — no answer can be given.**\n\n"
+                f"All {len(attempted)} tool call(s) in this run failed, so nothing "
+                "was read from the corpus. The draft the model wrote without data "
+                "has been discarded: with no rows returned, any figures, post IDs "
+                "or quotes in it would have been invented.\n\n"
+                f"Failed calls:\n{failures}\n\n"
+                "Nothing above is a statement about the corpus."
+            )
+
         # Citations asserted in prose but never returned by a tool are flagged on
         # the run AND in the answer itself — an operator reads the briefing, not
         # the run record, and an ungrounded post ID in an intelligence product is
@@ -745,7 +1010,7 @@ class AgentRunner:
 
         run.citations = sorted(seen_post_ids)
         run.usage = total_usage
-        run.status = "failed" if answer_is_tool_call else "completed"
+        run.status = "failed" if (answer_is_tool_call or all_calls_failed) else "completed"
         run.completed_at = time.time()
 
         run_log.info(
