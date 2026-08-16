@@ -19,7 +19,10 @@ import {
   Coins,
   Search,
   Trash2,
-  XCircle
+  XCircle,
+  Shield,
+  ShieldAlert,
+  ShieldX
 } from 'lucide-react';
 import { apiCall } from '../utils/api.js';
 import MarkdownView from '../components/MarkdownView.jsx';
@@ -141,6 +144,83 @@ const AGENT_CONFIGS = {
     ]
   }
 };
+
+// The header chip. It used to read "Prompt-Injection Hardened <tool_data>" for
+// every run, forever — including runs that never called a tool, and runs whose
+// answer was flagged as ungrounded. A permanent green shield says nothing about
+// what just happened; the run record already carries the verdict, so read it.
+//
+// `unverified_citations` / `_quotes` / `_stats` are the runner's grounding
+// guards (post IDs, comment text and comment statistics that no tool returned);
+// `tools_used[].status === 'ok'` is how many tool results were actually wrapped
+// in <tool_data> delimiters and handed to the model as untrusted data.
+function groundingStatus(run, loading) {
+  const base = 'Tool results are wrapped in <tool_data> delimiters and the system prompt forbids following instructions inside them.';
+
+  if (loading || run?.status === 'running') {
+    return {
+      icon: Shield,
+      iconClass: 'text-brand-500 animate-pulse',
+      label: 'Grounding checks running',
+      title: `${base} Guards run when the answer is written.`
+    };
+  }
+
+  if (!run) {
+    return {
+      icon: Shield,
+      iconClass: 'text-slate-400',
+      label: 'Injection-hardened — no run yet',
+      title: `${base} Ask a question to see this run's grounding verdict.`
+    };
+  }
+
+  const calls = run.tools_used || run.traces || [];
+  const grounded = calls.filter((t) => (t.status ? t.status === 'ok' : !t.error)).length;
+  const flagged = [
+    ...(run.unverified_citations || []),
+    ...(run.unverified_quotes || []),
+    ...(run.unverified_stats || [])
+  ].length;
+
+  if (run.status === 'failed') {
+    return {
+      icon: ShieldX,
+      iconClass: 'text-rose-500',
+      label: 'No grounded answer — run failed',
+      title: run.error || 'The run failed; nothing here is a statement about the corpus.'
+    };
+  }
+
+  // Zero successful calls outranks the guard counts: an answer written with no
+  // retrieval is ungrounded in whole, not in the places a guard happened to
+  // catch. The flagged count still goes in the tooltip.
+  if (grounded === 0) {
+    return {
+      icon: ShieldAlert,
+      iconClass: 'text-amber-500',
+      label: 'No tool data retrieved',
+      title: 'No tool call returned data, so nothing in this answer was read from the corpus.'
+        + (flagged > 0 ? ` ${flagged} claim(s) were flagged as ungrounded.` : '')
+    };
+  }
+
+  if (flagged > 0) {
+    return {
+      icon: ShieldAlert,
+      iconClass: 'text-amber-500',
+      label: `${flagged} ungrounded claim${flagged === 1 ? '' : 's'} flagged`,
+      title: 'Citations, quotes or statistics in this answer were not returned by any tool call in this run. See the warnings under the briefing.'
+    };
+  }
+
+  return {
+    icon: ShieldCheck,
+    iconClass: 'text-emerald-500',
+    label: `Grounded — ${grounded} tool result${grounded === 1 ? '' : 's'} in <tool_data>`,
+    title: `${base} No ungrounded citation, quote or statistic was detected in this answer.`
+  };
+}
 
 export default function Agents() {
   const [agentType, setAgentType] = useState('analyst');
@@ -299,6 +379,8 @@ export default function Agents() {
 
   const activeConfig = AGENT_CONFIGS[agentType] || AGENT_CONFIGS.analyst;
   const ActiveIcon = activeConfig.icon;
+  const grounding = groundingStatus(currentRun, loading);
+  const GroundingIcon = grounding.icon;
 
   return (
     <div className="space-y-6 animate-in fade-in slide-in-from-bottom-4 duration-500">
@@ -312,12 +394,15 @@ export default function Agents() {
             </span>
           </div>
           <p className="text-sm text-slate-500 dark:text-zinc-400">
-            Domain-specific multi-agent reasoning layer with prompt-injection hardening and grounded citation citations.
+            Domain-specific multi-agent reasoning layer with prompt-injection hardening and grounded citations.
           </p>
         </div>
-        <div className="flex items-center gap-2 text-xs text-slate-500 dark:text-zinc-400 bg-slate-100 dark:bg-zinc-900 px-3 py-1.5 rounded-lg border border-slate-200 dark:border-zinc-800">
-          <ShieldCheck className="w-4 h-4 text-emerald-500" />
-          <span>Prompt-Injection Hardened &lt;tool_data&gt;</span>
+        <div
+          className="flex items-center gap-2 text-xs text-slate-500 dark:text-zinc-400 bg-slate-100 dark:bg-zinc-900 px-3 py-1.5 rounded-lg border border-slate-200 dark:border-zinc-800"
+          title={grounding.title}
+        >
+          <GroundingIcon className={`w-4 h-4 ${grounding.iconClass}`} />
+          <span>{grounding.label}</span>
         </div>
       </div>
 
