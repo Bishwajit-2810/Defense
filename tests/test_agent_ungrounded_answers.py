@@ -994,6 +994,34 @@ def test_curly_quotes_are_read_the_same_as_straight_ones():
     assert len(_unverified_quotes(answer, RETRIEVED_COMMENTS)) == 1
 
 
+def test_json_and_code_are_not_read_as_quoted_comment_text():
+    """JSON is mostly quote characters, and none of them are quotations.
+
+    The Report Drafting run whose answer was four JSON tool calls was flagged
+    with four "unverified quotes", each a span that opened in the prose and
+    closed inside a code block: `": null } } ``` Next, let's perform a semantic
+    search…`. Noise here is not harmless — it is what teaches an operator to
+    scroll past the warning on the run where a quote really was invented.
+    """
+    answer = (
+        'Let\'s get the top posts for the "focus area" category, ranked by reactions:\n\n'
+        "```json\n"
+        '{"name": "top_posts", "parameters": {"campaign_id": "all", "metric": null}}\n'
+        "```\n\n"
+        "Next, let's perform a semantic search for posts related to the focus area."
+    )
+    assert _unverified_quotes(answer, RETRIEVED_COMMENTS) == []
+
+
+def test_an_invented_quote_beside_a_code_block_is_still_flagged():
+    """Stripping code must not become a way to smuggle a fabrication past."""
+    answer = (
+        "```json\n{\"name\": \"top_posts\"}\n```\n"
+        'One commenter wrote: "You\'re just a mindless drone, repeating what you\'ve been told."'
+    )
+    assert len(_unverified_quotes(answer, RETRIEVED_COMMENTS)) == 1
+
+
 def test_quoting_the_operators_own_question_is_not_fabrication():
     question = 'Find comments about "the new border policy and its economic effects".'
     answer = 'You asked about "the new border policy and its economic effects" — here is what ran.'

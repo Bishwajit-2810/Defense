@@ -24,13 +24,23 @@ Three separate defects, all visible in that one run:
 
 3. **The run was still recorded `completed`.** Nothing, anywhere, said it had
    failed.
+A later Report Drafting run, same model, showed the same defect surviving in a
+shape the recovery could not see: a NARRATED PLAN. Four well-formed calls, each
+introduced by a sentence —
+
+    First, let's get a list of top posts ... ```json {"name": "top_posts", ...}
+    Next, let's perform a semantic search ... ```json {"name": ...}
+
+657 characters of connective prose against a flat 400-character cap, so nothing
+was recovered, nothing was dispatched, and the operator's executive briefing was
+four JSON blocks recorded `completed`. The cap is now budgeted per call.
 """
 
 import json
 
 import pytest
 
-from defense.services.agents.registry import ANALYST_AGENT
+from defense.services.agents.registry import ANALYST_AGENT, REPORT_AGENT
 from defense.services.agents.runner import (
     _MAX_TEXT_TOOL_RECOVERIES,
     AgentRunner,
@@ -101,6 +111,23 @@ def test_a_real_briefing_that_quotes_json_is_left_alone():
     assert _recover_text_tool_calls(briefing) == []
 
 
+def test_a_briefing_that_quotes_several_calls_is_left_alone():
+    """The per-call budget must not open the door to re-executing an answer.
+
+    Three quoted calls buy 1200 characters of allowance, which this methodology
+    appendix stays under. Structure is what disqualifies it, not length.
+    """
+    briefing = (
+        "## Method\n\n"
+        "Figures below come from three calls:\n"
+        '{"name": "top_posts", "parameters": {"campaign_id": "all"}}, '
+        '{"name": "reaction_mix", "parameters": {"campaign_id": "all"}} and '
+        '{"name": "trend_query", "parameters": {"campaign_id": "all"}}.\n\n'
+        "Positive reactions lead 62% to 31% across the window."
+    )
+    assert _recover_text_tool_calls(briefing) == []
+
+
 def test_a_name_without_arguments_is_not_a_call():
     """`{"name": ...}` appears in ordinary quoted data far too often."""
     assert _recover_text_tool_calls('The entity was {"name": "post_reaction_breakdown"}.') == []
@@ -142,10 +169,11 @@ class ScriptedLLM:
 
 
 class RecordingMCP:
-    """Advertises the Analyst's real tools and records what gets dispatched."""
+    """Advertises an agent's real tools and records what gets dispatched."""
 
-    def __init__(self) -> None:
+    def __init__(self, tool_names: list[str] | None = None) -> None:
         self.calls: list[tuple[str, dict]] = []
+        self.tool_names = list(tool_names or ANALYST_AGENT.tools)
 
     async def get_all_manifests(self):
         return [
@@ -157,7 +185,7 @@ class RecordingMCP:
                     "parameters": {"type": "object", "properties": {}},
                 },
             }
-            for name in ANALYST_AGENT.tools
+            for name in self.tool_names
         ]
 
     def filter_tools(self, manifests, tool_names):
@@ -249,6 +277,99 @@ async def test_recovery_does_not_hijack_a_genuine_answer():
     assert mcp.calls == []
     assert run.status == "completed"
     assert run.answer == briefing
+
+
+# ---------------------------------------------------------------------------
+# The narrated plan — four calls, one lead-in sentence each
+# ---------------------------------------------------------------------------
+
+# The Report Drafting run, verbatim.
+_NARRATED_PLAN = """To draft the requested executive analytical briefing, we need to call several functions from the provided API.
+
+First, let's get a list of top posts for all campaigns in the "focus area" category, ranked by total reactions:
+
+```json
+{
+  "name": "top_posts",
+  "parameters": {"campaign_id": "all", "limit": 10, "metric": "total_reactions"}
+}
+```
+
+Next, let's perform a semantic search for posts related to the focus area:
+
+```json
+{
+  "name": "semantic_search",
+  "parameters": {"campaign_id": null, "limit": 10, "query": "focus area"}
+}
+```
+
+Now, let's get the sentiment breakdown per time period for all campaigns in the focus area:
+
+```json
+{
+  "name": "sentiment_over_time",
+  "parameters": {"campaign_id": "all", "granularity": "week"}
+}
+```
+
+Finally, let's get the aggregated reaction breakdown for all campaigns in the focus area:
+
+```json
+{
+  "name": "reaction_mix",
+  "parameters": {"campaign_id": "all"}
+}
+```
+
+These function calls will provide us with the necessary data to draft an executive analytical briefing summarizing sentiment, top themes, and notable posts."""
+
+
+def test_a_narrated_plan_recovers_every_call():
+    """657 characters of "First, ... Next, ... Finally, ..." between the blocks."""
+    assert [name for name, _ in _recover_text_tool_calls(_NARRATED_PLAN)] == [
+        "top_posts",
+        "semantic_search",
+        "sentiment_over_time",
+        "reaction_mix",
+    ]
+
+
+@pytest.mark.asyncio
+async def test_the_narrated_plan_is_dispatched_not_delivered():
+    """The observed run ended here, `completed`, with the JSON as the briefing."""
+    briefing = f"## Executive summary\n\nSentiment is net negative; see {_CITED_POST}."
+    llm = ScriptedLLM({"content": _NARRATED_PLAN}, {"content": briefing})
+    mcp = RecordingMCP(REPORT_AGENT.tools)
+
+    run = await AgentRunner(llm_client=llm, mcp_client=mcp).run(
+        agent_def=REPORT_AGENT,
+        query="Draft an executive analytical briefing.",
+        max_tool_calls=REPORT_AGENT.max_tool_calls,
+    )
+
+    assert [name for name, _ in mcp.calls] == [
+        "top_posts",
+        "semantic_search",
+        "sentiment_over_time",
+        "reaction_mix",
+    ]
+    assert run.answer == briefing
+    assert "```json" not in (run.answer or "")
+    assert run.status == "completed"
+
+
+@pytest.mark.asyncio
+async def test_a_narrated_plan_that_never_recovers_fails_the_run():
+    """The same helper backs the final check, so this shape is flagged too."""
+    llm = ScriptedLLM({"content": _NARRATED_PLAN})
+
+    run = await AgentRunner(llm_client=llm, mcp_client=RecordingMCP(REPORT_AGENT.tools)).run(
+        agent_def=REPORT_AGENT, query="Draft an executive analytical briefing."
+    )
+
+    assert run.status == "failed"
+    assert "top_posts" in (run.error or "")
 
 
 # ---------------------------------------------------------------------------

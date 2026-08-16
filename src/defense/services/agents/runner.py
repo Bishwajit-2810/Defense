@@ -200,9 +200,28 @@ def _describes_the_payload(text: str) -> bool:
 # Argument keys seen across the shapes models emit (OpenAI, llama, mistral).
 _TOOL_CALL_ARG_KEYS = ("parameters", "arguments", "args")
 
-# A recovered call must be nearly the whole message. A real briefing that quotes
-# a tool call in passing is far longer than this and must not be re-dispatched.
+# How much connective prose one recovered call may carry. Budgeted PER CALL,
+# because a model narrating a plan writes a lead-in sentence before each block:
+# "First, let's get the top posts:", then the JSON, then "Next, let's perform a
+# semantic search:". A live Report Drafting run wrote four calls that way with
+# 657 characters of narration between them; against a flat 400-character cap
+# nothing was recovered, so the loop read "no tool_calls" as "the agent is
+# done", dispatched none of the four, and handed the operator the raw JSON as a
+# `completed` briefing — and because the same helper backs the final check, the
+# run was not flagged either.
 _MAX_STRAY_PROSE_CHARS = 400
+
+# Structure that only an answer has. Widening the budget above must not start
+# re-executing genuine briefings, and length alone is a weak separator once the
+# allowance scales — so markdown structure vetoes recovery outright, at any
+# length. A model announcing its next call writes plain sentences; a briefing
+# carries headings, table rules or a citation block.
+_BRIEFING_STRUCTURE_RE = re.compile(
+    r"^\s{0,3}#{1,6}\s+\S"                # ## Heading
+    r"|^\s*\|[\s:|-]*-{3,}[\s:|-]*\|"     # |---|---| table rule
+    r"|^\s*(?:={3,}|-{3,})\s*$",          # setext underline
+    re.MULTILINE,
+)
 
 
 def _iter_json_objects(text: str):
@@ -263,9 +282,10 @@ def _as_tool_call(obj: Any) -> tuple[str, dict] | None:
 def _recover_text_tool_calls(text: str) -> list[tuple[str, dict]]:
     """Extract tool calls the model wrote into its answer text.
 
-    Returns ``[]`` unless the message is essentially nothing but the call —
+    Returns ``[]`` unless the message is essentially nothing but the call(s) —
     otherwise a genuine briefing that happens to quote JSON would be re-executed
-    instead of shown to the operator.
+    instead of shown to the operator. "Essentially nothing but" allows one short
+    lead-in sentence per call and no briefing structure at all.
     """
     if not text:
         return []
@@ -283,7 +303,9 @@ def _recover_text_tool_calls(text: str) -> list[tuple[str, dict]]:
     if not calls:
         return []
     prose = remainder.replace("```json", "").replace("```", "").strip()
-    if len(prose) > _MAX_STRAY_PROSE_CHARS:
+    if _BRIEFING_STRUCTURE_RE.search(prose):
+        return []
+    if len(prose) > _MAX_STRAY_PROSE_CHARS * len(calls):
         return []
     return calls
 
@@ -387,6 +409,27 @@ _ELLIPSIS_RE = re.compile(r"\.{3,}|…")
 
 _WHITESPACE_RE = re.compile(r"\s+")
 
+# Fenced blocks and inline code, removed before the answer is scanned for
+# quotes. JSON is mostly quote characters, so a span that opens in prose and
+# closes inside a code block is neither a quotation nor comment text. The
+# Report Drafting run whose answer was four JSON tool calls was flagged with
+# four "unverified quotes", the first of which read
+#
+#     ": null } } ``` Next, let's perform a semantic search for posts…"
+#
+# Nothing there is a claim about the corpus, and a warning full of noise is one
+# an operator learns to scroll past — including on the runs where it is real.
+_CODE_SPAN_RE = re.compile(r"```.*?```|``.*?``|`[^`\n]*`", re.DOTALL)
+
+
+def _strip_code(text: str) -> str:
+    """Drop fenced blocks and inline code, keeping the prose around them."""
+    stripped = _CODE_SPAN_RE.sub(" ", text or "")
+    # An unclosed fence — the model hit the token ceiling mid-block — leaves the
+    # remainder of the message as code with nothing to terminate it.
+    fence = stripped.find("```")
+    return stripped[:fence] if fence >= 0 else stripped
+
 
 def _normalise_quote(text: str) -> str:
     """Case, whitespace and quote-style folded, so only the words are compared."""
@@ -408,13 +451,14 @@ def _unverified_quotes(answer: str, tool_output: str) -> list[str]:
     A quote is grounded if its words appear in what some tool returned. Matching
     is substring-on-normalised-text rather than whole-token: quotes are prose,
     and a model that re-wraps or re-cases one has not invented it. A quote the
-    model shortened with an ellipsis is checked segment by segment.
+    model shortened with an ellipsis is checked segment by segment. Code and
+    JSON are removed first — see _strip_code.
     """
     if not answer:
         return []
     haystack = _normalise_quote(tool_output or "")
     ungrounded: list[str] = []
-    for raw in _QUOTED_SPAN_RE.findall(answer):
+    for raw in _QUOTED_SPAN_RE.findall(_strip_code(answer)):
         segments = [
             s for s in (_normalise_quote(p) for p in _ELLIPSIS_RE.split(raw)) if len(s) >= 15
         ]
