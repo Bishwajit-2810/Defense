@@ -52,6 +52,22 @@ def _canonical(stub_mode: bool = True) -> dict:
     }
 
 
+@pytest.fixture(autouse=True)
+def _allow_stub_embeddings(monkeypatch):
+    """These tests are ABOUT persisting stub vectors, so stubs must be allowed.
+
+    `_ALLOW_STUB_EMBEDDING` is read from EMBEDDING_ALLOW_STUB at import time, so
+    without this the whole file passes or fails depending on the developer's
+    `.env` — and once that flag was set to false for real (the §3.1 flip) every
+    test here started raising StubEmbeddingRefused from the refusal path rather
+    than exercising the provenance chain it means to check.
+
+    The refusal itself is covered in tests/test_retrieval_v2.py, where it is the
+    subject rather than an obstacle.
+    """
+    monkeypatch.setattr(pers, "_ALLOW_STUB_EMBEDDING", True)
+
+
 # ---------------------------------------------------------------------------
 # The producer tells the truth
 # ---------------------------------------------------------------------------

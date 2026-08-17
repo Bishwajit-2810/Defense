@@ -31,6 +31,14 @@ class ClusterResult:
     # convenience: members[cluster_id] -> list of input indices
     members: list[list[int]] = field(default_factory=list)
 
+    # The mean vector of each cluster. Computed here already to pick the
+    # representative; exposed because it is the only stable identity a cluster
+    # has. Cluster IDS are not: k-means renumbers them on every run, so matching
+    # today's "cluster 3" to last week's by id compares unrelated groups. A
+    # centroid can be compared across runs, which is what lets a persisted
+    # human/LLM label survive re-clustering (cluster_labels).
+    centroids: list[list[float]] = field(default_factory=list)
+
 
 def choose_k(n: int, max_k: int = MAX_CLUSTERS) -> int:
     """Pick a cluster count: ~sqrt(n/2), clamped to [2, max_k] and <= n."""
@@ -162,6 +170,7 @@ def cluster_embeddings(
         return ClusterResult(
             k=1, labels=[0] * n, sizes=[n],
             representative_indices=[rep], members=[list(range(n))],
+            centroids=[[float(v) for v in center]],
         )
 
     labels, _cent = _kmeans(x, k, seed=seed)
@@ -188,9 +197,11 @@ def _result_from_labels(x: np.ndarray, labels: list[int]) -> ClusterResult:
 
     sizes = [len(m) for m in members]
     reps: list[int] = []
+    centroids: list[list[float]] = []
     for ci in range(k):
         member_idx = np.array(members[ci])
         centroid = x[member_idx].mean(axis=0)
+        centroids.append([float(v) for v in centroid])
         d = np.sum((x[member_idx] - centroid) ** 2, axis=1)
         reps.append(int(member_idx[int(np.argmin(d))]))
 
@@ -200,6 +211,7 @@ def _result_from_labels(x: np.ndarray, labels: list[int]) -> ClusterResult:
         sizes=sizes,
         representative_indices=reps,
         members=members,
+        centroids=centroids,
     )
 
 

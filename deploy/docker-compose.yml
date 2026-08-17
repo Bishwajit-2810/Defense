@@ -28,10 +28,18 @@ services:
     volumes:
       - postgres_data:/var/lib/postgresql/data
       - ./init-db.sql:/docker-entrypoint-initdb.d/init.sql
-    # Host port publishing disabled for local verification (host already runs
-    # services on 5432/9000). Reach infra via the compose network instead.
-    # ports:
-    #   - "5432:5432"
+    # Published on 5433, not 5432: this host already runs its own Postgres on
+    # 5432. Publishing to the conflicting port either fails to bind or — worse,
+    # and this is what actually happened — silently leaves host tools pointed at
+    # the OTHER server, which has no `defense` role. Tools that run on the host
+    # rather than in the compose network need this: `eval/score_retrieval.py`,
+    # `deploy/backfill_embeddings.py`, and psql against init-db.sql.
+    #
+    # Same treatment as minio below, which is published on 9002 for the same
+    # reason. Services INSIDE the network keep using `postgres:5432` — see
+    # DATABASE_URL in .env.example.
+    ports:
+      - "5433:5432"
     healthcheck:
       test: ["CMD-SHELL", "pg_isready -U defense -d defense"]
       interval: 10s

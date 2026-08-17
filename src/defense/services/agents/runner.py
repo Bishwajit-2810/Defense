@@ -70,6 +70,10 @@ class AgentRun:
     status: str = "running"       # running / completed / failed
     answer: str | None = None
     citations: list[str] = field(default_factory=list)
+    # Comment IDs the tools returned, kept apart from `citations` because they
+    # are the same CUID shape as a post ID and the UI renders `citations` as
+    # post links. A comment cites the post it sits under, not itself.
+    comment_citations: list[str] = field(default_factory=list)
     tools_used: list[dict] = field(default_factory=list)
     llm_backend: str | None = None
     llm_model: str | None = None
@@ -337,6 +341,54 @@ def _extract_post_ids(text: str) -> list[str]:
     return _POST_ID_RE.findall(text)
 
 
+# Keys a tool result uses for the two kinds of ID. Read structurally rather than
+# by regex because in this corpus a comment id is a CUID — the same shape as a
+# post id — so the pattern that collects citations cannot tell them apart. Before
+# `search_comments` that was harmless: `get_thread` was the only tool returning
+# comment ids and its rows were always accompanied by their post. A tool whose
+# ENTIRE result is comment rows would have filled `run.citations` — the list the
+# chat UI renders as post links — with ids that are not posts.
+_POST_ID_KEYS = ("post_id", "post_ids", "representative_post_id", "member_post_ids")
+_COMMENT_ID_KEYS = ("comment_id", "comment_ids")
+
+
+def _walk_ids(node: Any, post_ids: list[str], comment_ids: list[str]) -> None:
+    """Collect id-valued fields from a parsed tool result, at any depth."""
+    if isinstance(node, dict):
+        for key, value in node.items():
+            bucket = (
+                post_ids
+                if key in _POST_ID_KEYS
+                else comment_ids
+                if key in _COMMENT_ID_KEYS
+                else None
+            )
+            if bucket is not None:
+                for v in value if isinstance(value, list) else [value]:
+                    if isinstance(v, str) and v.strip():
+                        bucket.append(v.strip())
+                continue
+            _walk_ids(value, post_ids, comment_ids)
+    elif isinstance(node, list):
+        for item in node:
+            _walk_ids(item, post_ids, comment_ids)
+
+
+def _ids_from_result(result: Any, result_str: str) -> tuple[list[str], list[str]]:
+    """``(post_ids, comment_ids)`` a tool result actually contains.
+
+    Falls back to the CUID regex over the serialised result when nothing
+    structural is found — a tool that returns a bare string or an unexpected
+    shape should still contribute citations, as it always did.
+    """
+    post_ids: list[str] = []
+    comment_ids: list[str] = []
+    _walk_ids(result, post_ids, comment_ids)
+    if not post_ids and not comment_ids:
+        return _extract_post_ids(result_str), []
+    return post_ids, comment_ids
+
+
 # ---------------------------------------------------------------------------
 # Citations the model invents
 # ---------------------------------------------------------------------------
@@ -375,6 +427,21 @@ _CITED_NUMERIC_ID_RE = re.compile(
     re.IGNORECASE,
 )
 
+# Comment IDs, which `search_comments` puts into play (RAG_STATE_AND_ROADMAP
+# §5.3). Every pattern above is anchored on the words "post id", so a comment
+# citation was invisible to the guard in BOTH directions: a fabricated
+# "Comment ID: 998877" passed unchallenged, and the change that most improves
+# grounding would have opened the largest hole in the fabrication checks.
+#
+# Numeric and alphanumeric in one pattern, unlike the post-ID pair above, because
+# there is no prose ambiguity to protect against here: "comment id" is never
+# written except to cite one. Four characters minimum matches _TOKEN_RE, so a
+# claimed id short enough to be tokenised differently cannot slip through.
+_CITED_COMMENT_ID_RE = re.compile(
+    r"comment[\s_]*id[\s:=#]*[`'\"\[(]?([A-Za-z0-9][A-Za-z0-9_.:-]{3,})",
+    re.IGNORECASE,
+)
+
 # Identifier-shaped tokens in tool output. Matching whole tokens rather than
 # substrings matters: "1234567890" — one of the ids the live run invented — is a
 # substring of the CUID "cm0abcdef12345678901234" that a tool did return, so a
@@ -383,12 +450,13 @@ _TOKEN_RE = re.compile(r"[A-Za-z0-9_-]{4,}")
 
 
 def _unverified_citations(answer: str, tool_output: str) -> list[str]:
-    """Post IDs asserted in the answer that no tool ever returned."""
+    """Post or comment IDs asserted in the answer that no tool ever returned."""
     if not answer:
         return []
     claimed = (
         set(_CITED_ID_RE.findall(answer))
         | set(_CITED_NUMERIC_ID_RE.findall(answer))
+        | set(_CITED_COMMENT_ID_RE.findall(answer))
         | set(_POST_ID_RE.findall(answer))
         | set(_HASH_ID_RE.findall(answer))
     )
@@ -687,9 +755,8 @@ def _discovery_tools(tools: list[dict]) -> list[str]:
 def _per_post_tools(tools: list[dict]) -> list[str]:
     """The complement of _discovery_tools: tools that read ONE post.
 
-    These are the only tools that return comment text. An agent that never
-    reaches one has read post-level aggregates and nothing else, whatever its
-    briefing says about "representative comments".
+    The second-hop prompt targets one of these, because the hop it exists to
+    force is "you have a post_id, go and read that post's comments".
     """
     discovery = set(_discovery_tools(tools))
     return sorted(
@@ -699,6 +766,35 @@ def _per_post_tools(tools: list[dict]) -> list[str]:
         )
         if name and name not in discovery
     )
+
+
+# Tools that return COMMENT TEXT while taking no post_id — i.e. that are
+# discovery tools by shape but comment tools by what they return.
+#
+# The distinction did not exist while every source of comment text needed a
+# post_id: "has this run read a comment?" and "has this run called a per-post
+# tool?" were the same question. `search_comments` separates them, and reading
+# the second as the first would have two consequences, both bad and both on the
+# guards this file exists for: a run that HAD retrieved comments would be shoved
+# back through the second-hop prompt (a live run, asked a second time to go and
+# read comments it had already read, refused outright and the briefing was
+# lost), and every percentage in it would be flagged as uncorroborated.
+_CORPUS_COMMENT_TOOLS = frozenset({"search_comments"})
+
+
+def _comment_tools(tools: list[dict]) -> list[str]:
+    """Every tool in this manifest that can return comment text.
+
+    Per-post tools plus the corpus-wide comment search. This is what answers
+    "has this run read a comment?"; ``_per_post_tools`` answers the different
+    question of which tool to send the model back to.
+    """
+    available = {
+        name
+        for name in ((t.get("function") or {}).get("name") for t in tools)
+        if name
+    }
+    return sorted(set(_per_post_tools(tools)) | (available & _CORPUS_COMMENT_TOOLS))
 
 
 def _second_hop_prompt(tool_name: str, post_id: str, quotes: list[str]) -> str:
@@ -974,6 +1070,13 @@ class AgentRunner:
             # given — inventing 'post_12345' once and passing the wildcard 'all'
             # the next time. Stating the order costs a line.
             "- A post_id argument must be a real ID from a tool result you have already received. If you have none yet, call top_posts or semantic_search FIRST to obtain them. Never invent a post ID, and never pass 'all' as a post_id — it names exactly one post.\n"
+            # Chunked retrieval (§3.5) returns the PASSAGE that matched rather
+            # than the whole post. That is better evidence and a worse citation:
+            # `chunk_idx` identifies a span inside a document, and a briefing
+            # that cited it would be pointing at something no reader can look up.
+            # The citation contract stays post_id — which is also what keeps the
+            # fabrication guards working unchanged.
+            "- When a search result carries `matched_chunk`, that is the passage of the post that matched — quote from it rather than from the start of the post. Still cite the `post_id`: `chunk_idx` is an internal offset, not a citation. Call `get_post` when you need the rest of the document.\n"
         )
         system_content = f"{system_directive}\n{agent_def.system_prompt}\n\n{TOOL_DATA_POLICY}"
 
@@ -1049,6 +1152,7 @@ class AgentRunner:
         tool_call_count = 0
         total_usage: dict = {}
         seen_post_ids: set[str] = set()
+        seen_comment_ids: set[str] = set()
         # Everything every tool returned, verbatim — the ground truth a citation
         # in the final answer has to appear in.
         tool_output: list[str] = []
@@ -1201,8 +1305,11 @@ class AgentRunner:
                 # `get_thread` was still untouched. The model, asked a second
                 # time to go and read toxic comments, refused outright and the
                 # briefing was lost.
+                read_a_comment = bool(succeeded_tools & set(_comment_tools(tools)))
+                # The push targets a per-post tool specifically: it works by
+                # handing the model a real post_id, which is the one argument it
+                # gets wrong on its own.
                 comment_tools = _per_post_tools(tools)
-                read_a_comment = bool(succeeded_tools & set(comment_tools))
                 if (
                     ungrounded_now
                     and comment_tools
@@ -1462,11 +1569,15 @@ class AgentRunner:
                 )
                 await emit()
 
-                # Extract post IDs from the result for citations
-                for pid in _extract_post_ids(result_str):
+                # Extract IDs from the result for citations. Post and comment IDs
+                # are both CUIDs in this corpus, so they are told apart by the
+                # FIELD they arrived in, not by their shape.
+                found_posts, found_comments = _ids_from_result(result, result_str)
+                for pid in found_posts:
                     if pid not in seen_post_ids:
                         retrieved_post_ids.append(pid)
                     seen_post_ids.add(pid)
+                seen_comment_ids.update(found_comments)
                 tool_output.append(result_str)
 
                 # Append tool result to the conversation — WRAPPED.
@@ -1559,9 +1670,9 @@ class AgentRunner:
             run.unverified_citations = unverified
             run_log.warning("unverified_citations", ids=unverified)
             run.answer = (run.answer or "") + (
-                "\n\n---\n**Unverified citations.** These post IDs appear above "
-                "but were not returned by any tool call in this run, so they are "
-                "not grounded in the corpus: "
+                "\n\n---\n**Unverified citations.** These post/comment IDs appear "
+                "above but were not returned by any tool call in this run, so they "
+                "are not grounded in the corpus: "
                 + ", ".join(f"`{c}`" for c in unverified)
                 + "."
             )
@@ -1601,7 +1712,7 @@ class AgentRunner:
         # Having retrieved comments is what normally makes a percentage
         # plausible; an answer caught inventing the quotes beside it has
         # forfeited that benefit of the doubt.
-        read_comments = bool(succeeded_tools & set(_per_post_tools(tools)))
+        read_comments = bool(succeeded_tools & set(_comment_tools(tools)))
         if not all_calls_failed and (not read_comments or run.unverified_quotes):
             invented_stats = _uncorroborated_comment_stats(
                 model_answer, "\n".join(tool_output)
@@ -1618,6 +1729,7 @@ class AgentRunner:
                 )
 
         run.citations = sorted(seen_post_ids)
+        run.comment_citations = sorted(seen_comment_ids)
         run.usage = total_usage
         run.status = (
             "failed"

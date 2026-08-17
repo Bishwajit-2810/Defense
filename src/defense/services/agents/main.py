@@ -182,9 +182,16 @@ class AgentQueryResponse(BaseModel):
     status_url: str
     answer: Optional[str] = None
     citations: list[str] = Field(default_factory=list)
+    comment_citations: list[str] = Field(
+        default_factory=list,
+        description=(
+            "Comment IDs returned by the tools. Separate from `citations` because "
+            "a comment ID is the same CUID shape as a post ID but is not a post."
+        ),
+    )
     unverified_citations: list[str] = Field(
         default_factory=list,
-        description="Post IDs asserted in the answer that no tool call returned.",
+        description="Post or comment IDs asserted in the answer that no tool call returned.",
     )
     unverified_quotes: list[str] = Field(
         default_factory=list,
@@ -222,6 +229,7 @@ def _run_to_response(run: AgentRun, base_url: str, want_citations: bool = True) 
         status_url=f"{base_url}/v1/agents/{run.run_id}",
         answer=run.answer,
         citations=run.citations if want_citations else [],
+        comment_citations=run.comment_citations if want_citations else [],
         unverified_citations=run.unverified_citations,
         unverified_quotes=run.unverified_quotes,
         unverified_stats=run.unverified_stats,

@@ -837,6 +837,9 @@ dev = [
     { name = "pytest-asyncio" },
     { name = "ruff" },
 ]
+embeddings = [
+    { name = "sentence-transformers" },
+]
 kafka = [
     { name = "aiokafka" },
 ]
@@ -890,6 +893,7 @@ requires-dist = [
     { name = "reportlab", specifier = ">=5.0.0" },
     { name = "ruff", marker = "extra == 'dev'", specifier = ">=0.6.0" },
     { name = "scikit-learn", marker = "extra == 'ml'", specifier = ">=1.6.0" },
+    { name = "sentence-transformers", marker = "extra == 'embeddings'", specifier = ">=3.0.0" },
     { name = "sentence-transformers", marker = "extra == 'ml'", specifier = ">=3.0.0" },
     { name = "sqlalchemy", extras = ["asyncio"], specifier = ">=2.0.0" },
     { name = "starlette", specifier = ">=0.40,<0.51" },
@@ -901,7 +905,7 @@ requires-dist = [
     { name = "uvicorn", extras = ["standard"], specifier = ">=0.32.0" },
     { name = "weasyprint", specifier = ">=69.0" },
 ]
-provides-extras = ["ml", "dev", "obs", "kafka"]
+provides-extras = ["embeddings", "ml", "dev", "obs", "kafka"]
 
 [[package]]
 name = "distro"

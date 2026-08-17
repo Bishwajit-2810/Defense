@@ -211,6 +211,30 @@ class Settings(BaseSettings):
     upstream_api_key: str = ""
     embedding_dim: int = 768
     embedding_model: str = "paraphrase-multilingual-mpnet-base-v2"
+    # Real embeddings WITHOUT the rest of the Stage-1 model suite.
+    #
+    # MODEL_STUB_MODE is one switch over seven models: sentiment, emotion,
+    # toxicity, CLIP/SigLIP, NER, KeyBERT and the sentence encoder. Retrieval
+    # needs exactly the last one, and the others land on a GPU that is normally
+    # already hosting the LLM — the stage2_classifier_device comment above puts
+    # the free VRAM on a 4 GB card at ~285 MB. Tying "make search meaningful" to
+    # "load the vision stack" made the first change cost the second.
+    #
+    # None = follow MODEL_STUB_MODE (so this is a no-op unless set). Setting it
+    # false also needs HF_OFFLINE=false, since HF offline policy follows
+    # MODEL_STUB_MODE too and would otherwise block the download.
+    embedding_stub_mode: bool | None = None
+    #: Device for the sentence encoder: "cpu", "cuda", "cuda:1", or "" to let
+    #: sentence-transformers choose (CUDA when present).
+    #:
+    #: Worth setting to "cpu" on this hardware. The GPU is a 4 GB card that
+    #: normally already hosts the LLM, so loading the encoder on CUDA fails with
+    #: `CUDA out of memory` depending on what ollama is doing — and the fallback
+    #: from a failed load is HASH vectors, i.e. retrieval silently degrades to
+    #: ranking noise, transiently. On CPU the same encoder costs 99 ms per query
+    #: and produces identical vectors. `_get_model` retries on CPU automatically;
+    #: this makes it the first choice rather than the recovery path.
+    embedding_device: str = ""
     llm_max_continuations: int = 2
     local_llm_api_key: str = "ollama"
     llm_backend: str = "local"
@@ -327,6 +351,45 @@ class Settings(BaseSettings):
     signup_tenant_id: str = "default"
     report_cluster_sample_cap: int = 1500
     embedding_allow_stub: bool = True
+
+    # -- Retrieval (RAG_STATE_AND_ROADMAP §3.2 - §3.7) ----------------------
+    # Hybrid retrieval: run the pgvector kNN and a lexical scan, then fuse with
+    # reciprocal rank fusion. On this corpus (code-mixed Bangla / English /
+    # Banglish) the lexical arm carries exact entity names, transliterations and
+    # hashtags — precisely what a multilingual sentence encoder blurs. It is
+    # also the ONLY arm that means anything while MODEL_STUB_MODE=true.
+    retrieval_hybrid: bool = True
+    #: The 60 in `score(d) = Σ 1/(k + rank_i(d))`. Standard RRF constant.
+    retrieval_rrf_k: int = 60
+    #: Over-fetch factor per arm before fusion/reranking: ask for k * this,
+    #: return k. 4 puts a limit=10 request at 40 candidates, matching §3.4's
+    #: "retrieve 30-50, rerank down to 8".
+    retrieval_candidate_multiplier: int = 4
+    #: Cross-encoder reranking of the fused candidates. Off by default: it needs
+    #: the `ml` extra and costs a second model load, and it is pointless while
+    #: the first-stage ranking is hash noise.
+    retrieval_rerank: bool = False
+    retrieval_rerank_model: str = "BAAI/bge-reranker-v2-m3"
+    #: How many posts get_clusters may pull vectors for. Was a hardcoded 100,
+    #: which turned "corpus themes" into "themes of the 100 newest posts" with
+    #: nothing saying so (§3.6).
+    retrieval_cluster_scan_cap: int = 2000
+    #: Chunk long captions and give each piece its own vector (§3.5). A short
+    #: post is one chunk holding the whole caption, so this is a no-op below the
+    #: threshold — the cost is paid only where a single vector was averaging
+    #: several arguments together.
+    retrieval_chunks: bool = True
+    #: Prefer chunk vectors over the post-level vector in semantic_search. Split
+    #: from the write switch so the two can be measured independently: chunks can
+    #: be written and NOT searched, which is what a before/after eval needs.
+    retrieval_chunk_search: bool = True
+    #: Embed comment text as well as captions (§3.2). The signal in this corpus
+    #: lives in the threads; without this a question about what people are angry
+    #: about can only ever match caption text.
+    comment_embeddings_enabled: bool = True
+    #: Per-post ceiling on comments embedded, after near-duplicate grouping.
+    #: 0 disables the cap.
+    comment_embedding_max_per_post: int = 1000
 
     model_config = SettingsConfigDict(
         env_file=".env",

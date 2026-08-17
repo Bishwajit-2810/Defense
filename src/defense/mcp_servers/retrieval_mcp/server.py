@@ -22,6 +22,7 @@ PORT                    8101  (default)
 
 from __future__ import annotations
 
+import asyncio
 import logging
 import os
 import re
@@ -97,7 +98,21 @@ _AsyncSessionLocal = async_sessionmaker(
 # Query embedding comes from the shared helper so its dimension always matches
 # the pgvector column and the Stage-1 document embeddings (libs/embeddings.py:
 # real SentenceTransformer when MODEL_STUB_MODE=false, deterministic stub otherwise).
-from defense.libs.embeddings import embed_text, to_pgvector_literal  # noqa: E402
+from defense.libs.embeddings import (  # noqa: E402
+    active_model_name,
+    embed_text_with_provenance,
+    to_pgvector_literal,
+)
+from defense.libs.retrieval import (  # noqa: E402
+    candidate_pool,
+    fuse,
+    lexical_terms,
+    rerank,
+)
+
+_HYBRID: bool = config.retrieval_hybrid
+_CHUNK_SEARCH: bool = config.retrieval_chunk_search
+_CLUSTER_SCAN_CAP: int = config.retrieval_cluster_scan_cap
 
 
 # ---------------------------------------------------------------------------
@@ -150,6 +165,357 @@ def _clean_campaign_id(cid: Any) -> str | None:
     return s
 
 
+#: Words that only ever appear in an unfilled schema placeholder, never in a real
+#: id. `_ID_RE` alone does not catch these: "post-uuid" and "cuid-of-the-post"
+#: are made of legal id characters and match it happily.
+_ID_PLACEHOLDER_WORDS = ("cuid", "uuid", "post_id", "postid", "example", "placeholder")
+
+
+def _clean_post_id(pid: Any, *, field: str = "post_id") -> str | None:
+    """Normalise an LLM-supplied post_id, or raise if it is a placeholder.
+
+    Same contract as :func:`_clean_campaign_id`, and for the same reason — but
+    this one is load-bearing in a way the campaign version is not, because
+    ``search_comments`` takes ``post_id`` as an OPTIONAL filter.
+
+    The previous behaviour dropped an unrecognised value and searched on:
+
+        search_comments(query=…, post_id="<CUID>")  ->  5 comments from 4
+        DIFFERENT posts, presented as the comments on one post
+
+    which is the failure `_clean_campaign_id` exists to prevent, one field over.
+    Worse, it inverted the incentive an agent learns from: a correctly scoped
+    call can legitimately return zero rows, while the placeholder call always
+    returns something. Rejecting it means the model is told to go and fetch a
+    real id — which the runner's system directive already instructs it to do.
+
+    ``None`` (argument omitted, or explicitly unspecified) means "no post filter"
+    and is the only value that widens the search.
+    """
+    if pid is None:
+        return None
+    s = str(pid).strip()
+    low = s.lower()
+    if low in _UNSPECIFIED:
+        return None
+    if low in _ALL_CAMPAIGNS:
+        raise ValueError(
+            f"{field} {s!r} names every post, but {field} identifies exactly one. "
+            f"Omit {field} to search across all posts."
+        )
+    if any(w in low for w in _ID_PLACEHOLDER_WORDS) or not _ID_RE.match(s):
+        raise ValueError(
+            f"{field} {s!r} is not a post id — it looks like an unfilled "
+            f"placeholder. Call top_posts or semantic_search first and pass a real "
+            f"post_id from the result, or omit {field} to search across all posts."
+        )
+    return s
+
+
+# The projection every retrieval arm returns, so a fused row is assembled from
+# whichever arm found it without a second round trip.
+_POST_PROJECTION = """
+    ar.post_id,
+    ar.campaign_id,
+    ar.result->>'overall_sentiment'  AS overall_sentiment,
+    ar.result->>'post_summary'       AS post_summary,
+    ar.result->>'post_text'          AS post_text,
+    COALESCE(ar.embedding_is_stub, FALSE) AS embedding_is_stub
+"""
+
+# The lexical arm's match expression. It must stay character-for-character in
+# step with `idx_analysis_fts_simple` in deploy/init-db.sql — Postgres matches an
+# expression index by the expression, so a stray space here silently turns an
+# index scan into a sequential scan over the whole table.
+_FTS_EXPR = (
+    "to_tsvector('simple', "
+    "coalesce(result->>'post_summary', '') || ' ' || "
+    "coalesce(result->>'post_text', ''))"
+)
+
+
+def _tenant_scope(
+    where_parts: list[str],
+    params: dict[str, Any],
+    tenant_id: str | None,
+) -> tuple[list[str], dict[str, Any]]:
+    """Add the tenant predicate to an arm's own WHERE clause.
+
+    Each arm applies this itself rather than trusting the caller's
+    ``where_parts`` to already contain it. Tenant isolation that depends on
+    every call site remembering a predicate is isolation that holds until
+    somebody adds a call site — and these arms are built to be reused (the
+    retrieval evaluation harness imports them directly).
+    """
+    if not tenant_id:
+        return list(where_parts), dict(params)
+    return [*where_parts, "ar.tenant_id = :tenant_id"], {**params, "tenant_id": tenant_id}
+
+
+async def _vector_arm(
+    session: AsyncSession,
+    qvec: str,
+    where_parts: list[str],
+    params: dict[str, Any],
+    pool: int,
+    tenant_id: str | None = None,
+) -> list[dict]:
+    """kNN over analysis_results.embedding, best cosine similarity first."""
+    scoped, scoped_params = _tenant_scope(where_parts, params, tenant_id)
+    sql = text(
+        f"""
+        SELECT {_POST_PROJECTION},
+               1 - (ar.embedding <=> CAST(:qvec AS vector)) AS vector_score
+        FROM analysis_results ar
+        WHERE {' AND '.join([*scoped, 'ar.embedding IS NOT NULL'])}
+        ORDER BY ar.embedding <=> CAST(:qvec AS vector)
+        LIMIT :pool
+        """
+    )
+    rows = (
+        await session.execute(sql, {**scoped_params, "qvec": qvec, "pool": pool})
+    ).mappings().all()
+    return [dict(r) for r in rows]
+
+
+async def _chunk_arm(
+    session: AsyncSession,
+    qvec: str,
+    where_parts: list[str],
+    params: dict[str, Any],
+    pool: int,
+    tenant_id: str | None = None,
+) -> list[dict]:
+    """kNN over post_chunks, collapsed to one best chunk per post.
+
+    Replaces the post-level vector arm when chunks are available. A post is
+    ranked by its BEST-matching chunk rather than by the average of everything it
+    says, which is the entire argument for chunking: a 5,463-character post that
+    argues three things is reachable by a query about any one of them.
+
+    The collapse happens after a bounded kNN rather than over the whole table, so
+    the HNSW index still does the work — ``DISTINCT ON`` across all chunks would
+    force a full scan and sort. Over-fetching 3x the pool covers the case where a
+    single verbose post owns several of the top chunks.
+
+    Degrades to ``[]`` (caller falls back to the post-level arm) when the table
+    is absent, so an un-migrated deployment loses chunk precision rather than
+    search.
+    """
+    scoped_pc = ["1=1"]
+    pc_params = dict(params)
+    if tenant_id:
+        scoped_pc.append("pc.tenant_id = :tenant_id")
+        pc_params["tenant_id"] = tenant_id
+    if "campaign_id" in params:
+        scoped_pc.append("pc.campaign_id = :campaign_id")
+
+    # `where_parts` is written against the `ar` alias, so it needs
+    # analysis_results in scope.
+    outer, outer_params = _tenant_scope(where_parts, pc_params, tenant_id)
+
+    # Predicates beyond tenant/campaign — sentiment and the date window — live on
+    # analysis_results, and applying them only in the OUTER query silently loses
+    # rows: the inner kNN takes the `chunk_pool` nearest chunks corpus-wide and
+    # the filter then deletes most of them. Measured on this corpus with
+    # sentiment='neutral' (4 posts of 50): the chunk arm returned 0 where the
+    # post-level arm returned 4, because none of the nearest chunks belonged to a
+    # neutral post. Total loss is masked by the caller's fallback to
+    # `_vector_arm`; PARTIAL loss is not masked at all, and begins as soon as the
+    # corpus exceeds `chunk_pool` chunks (120 at the default limit, against 86
+    # today — roughly 17 posts of headroom).
+    #
+    # So the filter is pushed into the inner CTE, but ONLY when one exists. In the
+    # common unfiltered case (agents are told to omit the date window) the inner
+    # query keeps its original shape, with no join, so the HNSW plan is unchanged.
+    # When a filter IS present the join may cost the index — that is the standard
+    # filtered-ANN tradeoff, and a narrowed candidate set is exactly when a scan
+    # is affordable. Correctness first either way.
+    inner_filters = [p for p in where_parts if p != "1=1"]
+    inner_join = ""
+    if inner_filters:
+        inner_join = "JOIN analysis_results ar ON ar.post_id = pc.post_id"
+        scoped_pc = [*scoped_pc, *inner_filters]
+
+    sql = text(
+        f"""
+        WITH top_chunks AS (
+            SELECT pc.post_id,
+                   pc.chunk_idx,
+                   pc.text,
+                   COALESCE(pc.embedding_is_stub, FALSE) AS embedding_is_stub,
+                   pc.embedding <=> CAST(:qvec AS vector) AS dist
+            FROM post_chunks pc
+            {inner_join}
+            WHERE {' AND '.join(scoped_pc)}
+              AND pc.embedding IS NOT NULL
+            ORDER BY pc.embedding <=> CAST(:qvec AS vector)
+            LIMIT :chunk_pool
+        ),
+        best AS (
+            SELECT DISTINCT ON (post_id)
+                   post_id, chunk_idx, text, embedding_is_stub, dist
+            FROM top_chunks
+            ORDER BY post_id, dist
+        )
+        SELECT b.post_id,
+               b.chunk_idx,
+               b.text                            AS matched_chunk,
+               b.embedding_is_stub,
+               ar.campaign_id,
+               ar.result->>'overall_sentiment'   AS overall_sentiment,
+               ar.result->>'post_summary'        AS post_summary,
+               ar.result->>'post_text'           AS post_text,
+               1 - b.dist                        AS vector_score
+        FROM best b
+        JOIN analysis_results ar ON ar.post_id = b.post_id
+        WHERE {' AND '.join(outer)}
+        ORDER BY b.dist
+        LIMIT :pool
+        """
+    )
+    try:
+        rows = (
+            await session.execute(
+                sql,
+                {**outer_params, "qvec": qvec, "pool": pool, "chunk_pool": pool * 3},
+            )
+        ).mappings().all()
+    except Exception as exc:
+        log.warning("chunk_arm_unavailable", error=str(exc), detail="falling back to post vectors")
+        return []
+    return [dict(r) for r in rows]
+
+
+async def _lexical_arm(
+    session: AsyncSession,
+    query: str,
+    where_parts: list[str],
+    params: dict[str, Any],
+    pool: int,
+    tenant_id: str | None = None,
+) -> list[dict]:
+    """The lexical half of hybrid retrieval on its own: ``fts`` fused with ``trgm``.
+
+    Not used by :func:`semantic_search`, which fuses ``fts`` and ``trgm`` as two
+    of its three arms directly so that a row found by both outranks a row found
+    by one. This composes the same two arms with the same RRF and no dense arm,
+    which is what the evaluation harness's ``lexical`` configuration measures —
+    "what would this query retrieve with the vectors switched off". Keep it
+    fusing rather than merging: an earlier version scored the two signals into
+    one arm with ``GREATEST(ts_rank, similarity)``, a max across two unrelated
+    scales, and that cost 0.10 of MRR@10 (see :func:`_trgm_arm`).
+
+    Each sub-arm returns ``[]`` rather than raising when its extension or index
+    is missing, so losing lexical matching costs recall, not the query.
+    """
+    fts, trgm = await asyncio.gather(
+        _fts_arm(session, query, where_parts, params, pool, tenant_id),
+        _trgm_arm(session, query, where_parts, params, pool, tenant_id),
+    )
+    by_id = {r["post_id"]: r for r in [*trgm, *fts]}
+    ranked = fuse(
+        {"fts": [r["post_id"] for r in fts], "trgm": [r["post_id"] for r in trgm]}
+    )
+    return [by_id[pid] for pid, _s, _a in ranked if pid in by_id][:pool]
+
+
+async def _fts_arm(
+    session: AsyncSession,
+    query: str,
+    where_parts: list[str],
+    params: dict[str, Any],
+    pool: int,
+    tenant_id: str | None = None,
+) -> list[dict]:
+    """Full-text search over caption + summary, ranked by ts_rank.
+
+    OR, not AND. ``plainto_tsquery`` conjoins every term, so an eight-token
+    question demanded that all eight appear in one caption — which never
+    happened: across the 32-query evaluation set that predicate matched ZERO
+    rows. The FTS half of hybrid retrieval was dead, the GIN index built for it
+    was never used, and the numbers attributed to "full-text + trigram" were
+    trigram alone. Fixing it to OR took lexical recall@10 from 0.375 to 0.750.
+
+    ``to_tsquery('simple', 'a | b | c')`` matches a post containing ANY term and
+    lets ts_rank discriminate — a post matching four terms outranks one matching
+    one. Safe to interpolate: ``lexical_terms`` emits word characters only, so no
+    tsquery operator can reach the parser. ``websearch_to_tsquery`` is not an
+    alternative; it also conjoins, and scored zero on the same set.
+    """
+    terms = lexical_terms(query)
+    if not terms:
+        return []
+    scoped, scoped_params = _tenant_scope(where_parts, params, tenant_id)
+    sql = text(
+        f"""
+        SELECT {_POST_PROJECTION},
+               ts_rank({_FTS_EXPR}, to_tsquery('simple', :or_query)) AS lexical_score
+        FROM analysis_results ar
+        WHERE {' AND '.join(scoped)}
+          AND {_FTS_EXPR} @@ to_tsquery('simple', :or_query)
+        ORDER BY lexical_score DESC
+        LIMIT :pool
+        """
+    )
+    try:
+        rows = (
+            await session.execute(
+                sql, {**scoped_params, "or_query": " | ".join(terms), "pool": pool}
+            )
+        ).mappings().all()
+    except Exception as exc:
+        log.warning("fts_arm_unavailable", error=str(exc))
+        return []
+    return [dict(r) for r in rows]
+
+
+async def _trgm_arm(
+    session: AsyncSession,
+    query: str,
+    where_parts: list[str],
+    params: dict[str, Any],
+    pool: int,
+    tenant_id: str | None = None,
+) -> list[dict]:
+    """Trigram similarity over the caption — the fuzzy half of lexical matching.
+
+    Separate from FTS rather than folded into it. They used to share one arm via
+    ``GREATEST(ts_rank, similarity)``, which is a max across two scales that have
+    nothing to do with each other — the exact comparison RRF exists to avoid, and
+    it cost real ranking quality: splitting them raised MRR@10 from 0.551 to
+    0.648 on the evaluation set with no other change.
+
+    What it catches that FTS cannot: a transliterated Bangla name spelled three
+    different ways, where no token matches exactly but the trigrams overlap.
+    """
+    terms = lexical_terms(query)
+    if not terms:
+        return []
+    scoped, scoped_params = _tenant_scope(where_parts, params, tenant_id)
+    sql = text(
+        f"""
+        SELECT {_POST_PROJECTION},
+               similarity(coalesce(ar.result->>'post_text', ''), :probe) AS lexical_score
+        FROM analysis_results ar
+        WHERE {' AND '.join(scoped)}
+          AND similarity(coalesce(ar.result->>'post_text', ''), :probe) > 0.1
+        ORDER BY lexical_score DESC
+        LIMIT :pool
+        """
+    )
+    try:
+        rows = (
+            await session.execute(
+                sql, {**scoped_params, "probe": " ".join(terms), "pool": pool}
+            )
+        ).mappings().all()
+    except Exception as exc:
+        log.warning("trgm_arm_unavailable", error=str(exc))
+        return []
+    return [dict(r) for r in rows]
+
+
 @mcp.tool
 async def semantic_search(
     query: Annotated[str, Field(description="Natural-language search query.")],
@@ -159,62 +525,194 @@ async def semantic_search(
         str | None, Field(description="Optional overall_sentiment filter (positive/negative/neutral/mixed).")
     ] = None,
     tenant_id: Annotated[str | None, Field(description="Optional tenant ID filter.")] = None,
+    from_date: Annotated[
+        str | None,
+        Field(description="Optional inclusive start date (YYYY-MM-DD). Omit to search the whole corpus."),
+    ] = None,
+    to_date: Annotated[
+        str | None,
+        Field(description="Optional inclusive end date (YYYY-MM-DD). Omit to search the whole corpus."),
+    ] = None,
 ) -> list[dict]:
-    """Vector (pgvector cosine) search over analyzed posts; returns post_id, score,
-    campaign_id, overall_sentiment, and post_summary. Falls back to recency in stub mode."""
+    """Hybrid search over analysed posts: pgvector cosine kNN fused with a lexical
+    (full-text + trigram) scan by reciprocal rank fusion.
+
+    Each row carries `embedding_is_stub` — TRUE means that post's vector is a
+    deterministic hash, NOT a semantic embedding, so its position in the ranking
+    is arbitrary and only the lexical arm's contribution is meaningful. Report
+    that rather than describing such a row as "semantically similar".
+
+    `matched_by` names the arms that found the row ("chunk" or "vector" for
+    meaning, "fts" for exact words, "trgm" for fuzzy spelling); a row found by
+    several arms is a stronger match than one found by a single arm.
+
+    `score` is a rank-fusion score, NOT a similarity or a confidence. It is
+    computed from each arm's RANK, so a top hit scores about 0.016 no matter how
+    good it is — use it to order results and never report it as a relevance
+    figure. `vector_similarity`, when present, IS a real cosine similarity in
+    [-1, 1]; it is absent when only the lexical arms matched the row.
+
+    When present, `matched_chunk` is the passage of the post that actually
+    matched and `chunk_idx` is its position — quote from that passage rather than
+    the start of the post, but ALWAYS cite the `post_id`, and call `get_post` when
+    you need the full document. Optional from_date/to_date scope by analysis
+    timestamp — omit them to search the whole corpus, which is usually what you
+    want."""
     limit = min(int(limit), 50)
     clean_cid = _clean_campaign_id(campaign_id)
-    log.info("tool_call", tool="semantic_search", campaign_id=clean_cid, tenant_id=tenant_id, stub=_STUB_MODE)
+    log.info(
+        "tool_call", tool="semantic_search", campaign_id=clean_cid,
+        tenant_id=tenant_id, stub=_STUB_MODE, hybrid=_HYBRID,
+        from_date=from_date, to_date=to_date,
+    )
 
     if _STUB_MODE:
         return await _stub_semantic_search(clean_cid, limit, sentiment_filter, tenant_id=tenant_id)
 
-    # --- Real path: embed query and run a pgvector cosine-similarity search ---
-    qvec = to_pgvector_literal(embed_text(query))
-
-    params: dict[str, Any] = {"qvec": qvec, "limit": limit}
-    where_parts = ["ar.embedding IS NOT NULL"]
+    # Filters shared by both arms. Tenancy is deliberately NOT here — each arm
+    # applies it itself (see _tenant_scope), so isolation does not depend on
+    # every call site remembering to build the predicate.
+    where_parts: list[str] = ["1=1"]
+    params: dict[str, Any] = {}
     if clean_cid:
         where_parts.append("ar.campaign_id = :campaign_id")
         params["campaign_id"] = clean_cid
-    if tenant_id:
-        where_parts.append("ar.tenant_id = :tenant_id")
-        params["tenant_id"] = tenant_id
     if sentiment_filter:
         where_parts.append("ar.result->>'overall_sentiment' = :sentiment")
         params["sentiment"] = sentiment_filter
+    # The same window helper the stance tools use. semantic_search had no date
+    # argument at all, which on a corpus roughly three months behind the current
+    # date left recency scoping impossible to ask for (§3.6).
+    _date_filter(where_parts, params, from_date, to_date)
 
-    # ``<=>`` is pgvector's cosine-distance operator; score = 1 - distance.
-    sql = text(
-        f"""
-        SELECT
-            ar.post_id,
-            ar.campaign_id,
-            ar.result->>'overall_sentiment'  AS overall_sentiment,
-            ar.result->>'post_summary'       AS post_summary,
-            1 - (ar.embedding <=> CAST(:qvec AS vector)) AS score
-        FROM analysis_results ar
-        WHERE {' AND '.join(where_parts)}
-        ORDER BY ar.embedding <=> CAST(:qvec AS vector)
-        LIMIT :limit
-        """
-    )
+    # Over-fetch per arm so fusion and reranking have something to reorder: if
+    # each arm returns exactly `limit` rows, nothing ranked limit+1 by either arm
+    # can ever be promoted, and fusion becomes a no-op reshuffle.
+    pool = candidate_pool(limit)
+    query_vec, query_is_stub = embed_text_with_provenance(query)
+    qvec = to_pgvector_literal(query_vec)
 
     async with _AsyncSessionLocal() as session:
-        rows = (await session.execute(sql, params)).mappings().all()
+        # Chunk vectors first when available: a post is then ranked by its
+        # best-matching passage rather than by the average of everything it says.
+        # Falls back to the post-level arm when chunking is off or the table has
+        # not been migrated in — precision degrades, search does not.
+        vector_arm_name = "vector"
+        vector_rows: list[dict] = []
+        if _CHUNK_SEARCH:
+            vector_rows = await _chunk_arm(
+                session, qvec, where_parts, params, pool, tenant_id=tenant_id
+            )
+            if vector_rows:
+                vector_arm_name = "chunk"
+        if not vector_rows:
+            vector_rows = await _vector_arm(
+                session, qvec, where_parts, params, pool, tenant_id=tenant_id
+            )
+        # Full-text and trigram are fused as SEPARATE arms, not merged into one
+        # lexical score. They measure different things on incomparable scales —
+        # combining them with GREATEST() cost 0.10 of MRR@10 against doing this.
+        fts_rows, trgm_rows = (
+            await asyncio.gather(
+                _fts_arm(session, query, where_parts, params, pool, tenant_id=tenant_id),
+                _trgm_arm(session, query, where_parts, params, pool, tenant_id=tenant_id),
+            )
+            if _HYBRID
+            else ([], [])
+        )
 
-    results = [
-        {
-            "post_id": row["post_id"],
-            "score": round(float(row["score"]), 6) if row["score"] is not None else None,
-            "campaign_id": row["campaign_id"],
-            "overall_sentiment": row["overall_sentiment"],
-            "post_summary": row["post_summary"],
-        }
-        for row in rows
-    ]
+    lexical_rows = [*trgm_rows, *fts_rows]
+    by_id: dict[str, dict] = {}
+    for row in [*lexical_rows, *vector_rows]:
+        by_id.setdefault(row["post_id"], row).update(
+            {k: v for k, v in row.items() if v is not None}
+        )
 
-    log.info("semantic_search_completed", query=query, hits=len(results), stub=False)
+    arms: dict[str, list[str]] = {vector_arm_name: [r["post_id"] for r in vector_rows]}
+    if fts_rows:
+        arms["fts"] = [r["post_id"] for r in fts_rows]
+    if trgm_rows:
+        arms["trgm"] = [r["post_id"] for r in trgm_rows]
+
+    # A hash-stub query vector ranks nothing meaningfully, so its arm must not
+    # outvote the arms that do. Down-weighting rather than dropping it keeps the
+    # tool's behaviour continuous across the stub-mode flip and still lets kNN
+    # supply candidates when the lexical arms find none.
+    weights = {vector_arm_name: 0.2 if query_is_stub else 1.0}
+    fused = fuse(arms, weights=weights)
+
+    candidates: list[dict] = []
+    for post_id, score, matched_by in fused[: max(pool, limit)]:
+        row = by_id.get(post_id)
+        if row is None:  # pragma: no cover — every fused id came from an arm
+            continue
+        candidates.append(
+            {
+                "post_id": post_id,
+                "score": round(float(score), 6),
+                "campaign_id": row.get("campaign_id"),
+                "overall_sentiment": row.get("overall_sentiment"),
+                "post_summary": row.get("post_summary"),
+                # §5.2: the honesty gap real embeddings do NOT close. /v1/search
+                # has always returned this; the tool the agents actually use
+                # returned nothing of the kind, so an agent asserting "the most
+                # semantically similar posts are…" was asserting something it
+                # had no way to check — and in the default configuration that
+                # assertion is false.
+                "embedding_is_stub": bool(row.get("embedding_is_stub")) or query_is_stub,
+                "matched_by": matched_by,
+                # Kept for the reranker, dropped before the row is returned:
+                # captions run to several KB and the agent already has
+                # post_summary plus get_post for the full document.
+                #
+                # The matched CHUNK is preferred as the rerank input when there
+                # is one: the cross-encoder is being asked "is this relevant to
+                # the query", and handing it 5 KB of caption to judge a match
+                # that happened in one passage is the same averaging problem
+                # chunking exists to solve, moved one stage later.
+                "_text": (
+                    row.get("matched_chunk")
+                    or row.get("post_text")
+                    or row.get("post_summary")
+                    or ""
+                ),
+            }
+        )
+        # The actual cosine similarity, when a dense arm found this row. `score`
+        # above is an RRF score — it is built from RANKS, so its absolute value
+        # is an artefact of position (rank 1 in one arm is always 1/61 ≈ 0.0164)
+        # and says nothing about how similar anything is. Handing an LLM only
+        # that invites it to read a perfectly good top hit as a 1.6% match.
+        # This is the number that is on a meaningful scale; it is absent when
+        # only the lexical arms matched, which is itself worth knowing.
+        if row.get("vector_score") is not None:
+            candidates[-1]["vector_similarity"] = round(float(row["vector_score"]), 4)
+        if row.get("matched_chunk") is not None:
+            # Citation granularity (§3.5). The post_id is still the citation —
+            # see the agent prompts — and this says WHERE in the post the match
+            # was, so a briefing can quote the right passage instead of the
+            # first paragraph.
+            candidates[-1]["chunk_idx"] = row.get("chunk_idx")
+            candidates[-1]["matched_chunk"] = (row.get("matched_chunk") or "")[:400]
+
+    ranked, was_reranked = rerank(query, candidates, text_key="_text", limit=limit)
+    results = [{k: v for k, v in row.items() if k != "_text"} for row in ranked[:limit]]
+
+    stub_rows = sum(1 for r in results if r["embedding_is_stub"])
+    if query_is_stub or stub_rows:
+        log.warning(
+            "semantic_search_over_stub_vectors",
+            query_is_stub=query_is_stub,
+            stub_rows=stub_rows,
+            total_rows=len(results),
+            detail="vector ranking is not semantically meaningful",
+        )
+    log.info(
+        "semantic_search_completed",
+        query=query, hits=len(results), stub=False,
+        vector_hits=len(vector_rows), lexical_hits=len(lexical_rows),
+        reranked=was_reranked,
+    )
     return results
 
 
@@ -256,6 +754,10 @@ async def _stub_semantic_search(
     async with _AsyncSessionLocal() as session:
         rows = (await session.execute(sql, params)).mappings().all()
 
+    # Same shape as the real path, including the provenance fields: a caller
+    # that only ever sees stub output must not learn a row shape that the live
+    # server does not produce. `embedding_is_stub` is True because no vector was
+    # consulted at all — these are the newest rows, not the nearest ones.
     return [
         {
             "post_id": row["post_id"],
@@ -263,9 +765,311 @@ async def _stub_semantic_search(
             "campaign_id": row["campaign_id"],
             "overall_sentiment": row["overall_sentiment"],
             "post_summary": row["post_summary"],
+            "embedding_is_stub": True,
+            "matched_by": ["recency"],
         }
         for row in rows
     ]
+
+
+# ---------------------------------------------------------------------------
+# Tool: search_comments
+#
+# The structural gap this closes: one vector per post, built from the CAPTION,
+# while the signal in this corpus lives in the comment threads — that is the
+# entire reason the per-comment ensemble exists. "Where are people angry about
+# fuel prices?" could only ever match caption text; the anger sat in rows that
+# carried no vector.
+#
+# Hybrid for the same reason semantic_search is, more so: comments are shorter
+# than captions, so a single misjudged token costs a bi-encoder more, and
+# comment text is where the transliteration variance is worst.
+# ---------------------------------------------------------------------------
+
+
+_COMMENT_PROJECTION = """
+    c.comment_id,
+    c.post_id,
+    c.text,
+    c.author,
+    c.likes,
+    c.sentiment
+"""
+
+
+async def _comment_vector_arm(
+    session: AsyncSession,
+    qvec: str,
+    where_parts: list[str],
+    params: dict[str, Any],
+    pool: int,
+) -> list[dict]:
+    """kNN over comment_embeddings, joined back to the comment text."""
+    sql = text(
+        f"""
+        SELECT {_COMMENT_PROJECTION},
+               COALESCE(ce.embedding_is_stub, FALSE) AS embedding_is_stub,
+               1 - (ce.embedding <=> CAST(:qvec AS vector)) AS vector_score
+        FROM comment_embeddings ce
+        JOIN comments c
+          ON c.post_id = ce.post_id AND c.comment_id = ce.comment_id
+        WHERE {' AND '.join([*where_parts, 'ce.embedding IS NOT NULL'])}
+        ORDER BY ce.embedding <=> CAST(:qvec AS vector)
+        LIMIT :pool
+        """
+    )
+    try:
+        rows = (await session.execute(sql, {**params, "qvec": qvec, "pool": pool})).mappings().all()
+    except Exception as exc:
+        # The table exists only after the schema migration in deploy/init-db.sql
+        # has been applied. An un-migrated deployment should lose the vector arm
+        # and keep the lexical one, not lose comment search entirely.
+        log.warning("comment_vector_arm_unavailable", error=str(exc))
+        return []
+    return [dict(r) for r in rows]
+
+
+async def _comment_term_arm(
+    session: AsyncSession,
+    query: str,
+    where_parts: list[str],
+    params: dict[str, Any],
+    pool: int,
+) -> list[dict]:
+    """Comments that literally CONTAIN one of the query's terms.
+
+    The exact-match half of comment lexical search, and the reason a
+    transliterated entity name the encoder has blurred is still findable.
+
+    Ranked by how many distinct query terms the comment contains, tie-broken by
+    likes. Term count rather than a similarity score: this arm's claim is
+    "these words are present", so the comment containing three of them is the
+    better answer, and mixing a trigram score in here is what the split below
+    exists to undo.
+    """
+    terms = lexical_terms(query)
+    if not terms:
+        return []
+    sql = text(
+        f"""
+        SELECT {_COMMENT_PROJECTION},
+               FALSE AS embedding_is_stub,
+               (SELECT count(*)
+                  FROM unnest(CAST(:likes AS text[])) AS t
+                 WHERE coalesce(c.text, '') ILIKE t) AS lexical_score
+        FROM comments c
+        WHERE {' AND '.join(where_parts)}
+          AND coalesce(c.text, '') ILIKE ANY(CAST(:likes AS text[]))
+        ORDER BY lexical_score DESC, c.likes DESC NULLS LAST
+        LIMIT :pool
+        """
+    )
+    try:
+        rows = (
+            await session.execute(
+                sql, {**params, "likes": [f"%{t}%" for t in terms], "pool": pool}
+            )
+        ).mappings().all()
+    except Exception as exc:
+        log.warning("comment_term_arm_unavailable", error=str(exc))
+        return []
+    return [dict(r) for r in rows]
+
+
+async def _comment_trgm_arm(
+    session: AsyncSession,
+    query: str,
+    where_parts: list[str],
+    params: dict[str, Any],
+    pool: int,
+) -> list[dict]:
+    """Comments whose trigrams overlap the whole query strongly.
+
+    The fuzzy half, for the spelling the term arm's ILIKE misses.
+
+    Kept a SEPARATE fusion arm from :func:`_comment_term_arm` rather than merged
+    into one score with ``GREATEST(similarity, <term bonus>)``. That merge is a
+    max across two scales that have nothing to do with each other — precisely
+    the comparison RRF exists to remove, and on the post side splitting the
+    equivalent pair raised MRR@10 from 0.551 to 0.648 with no other change
+    (see :func:`_trgm_arm`). There is no comment-level gold set to put a number
+    on it here, so this is applied for consistency of mechanism, not on a
+    measurement.
+
+    The 0.3 floor is high on purpose. Trigram similarity is length-normalised,
+    so on text this short a bare ``> 0.05`` is close to meaningless: a
+    nine-character "Very good" cleared it for the query "angry criticism of the
+    government" and, being rank 1 in its own arm, tied with the best genuine
+    semantic hit under RRF.
+    """
+    terms = lexical_terms(query)
+    if not terms:
+        return []
+    sql = text(
+        f"""
+        SELECT {_COMMENT_PROJECTION},
+               FALSE AS embedding_is_stub,
+               similarity(coalesce(c.text, ''), :probe) AS lexical_score
+        FROM comments c
+        WHERE {' AND '.join(where_parts)}
+          AND similarity(coalesce(c.text, ''), :probe) > 0.3
+        ORDER BY lexical_score DESC, c.likes DESC NULLS LAST
+        LIMIT :pool
+        """
+    )
+    try:
+        rows = (
+            await session.execute(
+                sql, {**params, "probe": " ".join(terms), "pool": pool}
+            )
+        ).mappings().all()
+    except Exception as exc:
+        log.warning("comment_trgm_arm_unavailable", error=str(exc))
+        return []
+    return [dict(r) for r in rows]
+
+
+@mcp.tool
+async def search_comments(
+    query: Annotated[str, Field(description="Natural-language description of the comments to find.")],
+    campaign_id: Annotated[str | None, Field(description="Optional campaign to scope the search.")] = None,
+    post_id: Annotated[str | None, Field(description="Optional single post to search within.")] = None,
+    sentiment: Annotated[
+        str | None, Field(description="Optional comment sentiment filter (positive/negative/neutral).")
+    ] = None,
+    limit: Annotated[int, Field(description="Max comments to return (max 50).", ge=1, le=50)] = 15,
+    tenant_id: Annotated[str | None, Field(description="Optional tenant ID filter.")] = None,
+) -> list[dict]:
+    """Search COMMENT TEXT by meaning across the corpus — hybrid vector + lexical,
+    fused by reciprocal rank fusion.
+
+    Use this to find what people are actually saying (harassment patterns, a
+    recurring complaint, reactions to a named entity) WITHOUT first having to
+    guess which posts to open. Returns comment_id, post_id, the verbatim comment
+    text, author, likes and stored sentiment.
+
+    Quote only the `text` returned here, verbatim, and cite the `post_id`
+    alongside the `comment_id`. `embedding_is_stub` TRUE means that comment's
+    vector is a deterministic hash rather than a semantic embedding, so only the
+    lexical arms' contribution to its ranking is meaningful.
+
+    `matched_by` names the arms that found the comment: "vector" (meaning),
+    "term" (contains your query's words) and "trgm" (fuzzy spelling match). A
+    comment found by more than one is a stronger match than one found by a single
+    arm. `score` is a rank-fusion score, NOT a similarity or a confidence — its
+    absolute value carries no meaning, so rank the results by it but never report
+    it as a relevance percentage."""
+    limit = min(int(limit), 50)
+    clean_cid = _clean_campaign_id(campaign_id)
+    log.info(
+        "tool_call", tool="search_comments", campaign_id=clean_cid,
+        post_id=post_id, sentiment=sentiment, tenant_id=tenant_id,
+    )
+
+    # The vector arm filters on comment_embeddings (which carries campaign and
+    # tenant); the lexical arm filters on comments (which carries neither), so
+    # each gets its own scoping clause rather than sharing one that cannot apply.
+    vec_where: list[str] = ["1=1"]
+    lex_where: list[str] = ["1=1"]
+    params: dict[str, Any] = {}
+    if clean_cid:
+        vec_where.append("ce.campaign_id = :campaign_id")
+        lex_where.append(
+            "EXISTS (SELECT 1 FROM posts p WHERE p.id = c.post_id "
+            "AND p.campaign_id = :campaign_id)"
+        )
+        params["campaign_id"] = clean_cid
+    if tenant_id:
+        vec_where.append("ce.tenant_id = :tenant_id")
+        lex_where.append(
+            "EXISTS (SELECT 1 FROM posts p WHERE p.id = c.post_id "
+            "AND p.tenant_id = :tenant_id)"
+        )
+        params["tenant_id"] = tenant_id
+    # Raises on a placeholder rather than dropping the filter. Silently widening
+    # a single-post question to the whole corpus is the one failure this tool must
+    # not have: the caller asked for the comments on ONE post.
+    clean_pid = _clean_post_id(post_id)
+    if clean_pid:
+        vec_where.append("ce.post_id = :post_id")
+        lex_where.append("c.post_id = :post_id")
+        params["post_id"] = clean_pid
+    if sentiment and sentiment.lower() != "all":
+        vec_where.append("c.sentiment = :sentiment")
+        lex_where.append("c.sentiment = :sentiment")
+        params["sentiment"] = sentiment.lower()
+
+    pool = candidate_pool(limit)
+    query_vec, query_is_stub = embed_text_with_provenance(query)
+    qvec = to_pgvector_literal(query_vec)
+
+    async with _AsyncSessionLocal() as session:
+        vector_rows = await _comment_vector_arm(session, qvec, vec_where, params, pool)
+        # Exact-term and trigram are SEPARATE arms, for the reason given on
+        # _comment_trgm_arm: merging them into one score is the comparison RRF
+        # exists to remove.
+        term_rows, trgm_rows = (
+            await asyncio.gather(
+                _comment_term_arm(session, query, lex_where, params, pool),
+                _comment_trgm_arm(session, query, lex_where, params, pool),
+            )
+            if _HYBRID
+            else ([], [])
+        )
+
+    lexical_rows = [*term_rows, *trgm_rows]
+
+    def _key(row: dict) -> str:
+        return f"{row['post_id']}#{row['comment_id']}"
+
+    by_id: dict[str, dict] = {}
+    for row in [*lexical_rows, *vector_rows]:
+        by_id.setdefault(_key(row), dict(row)).update(
+            {k: v for k, v in row.items() if v is not None}
+        )
+
+    arms: dict[str, list[str]] = {"vector": [_key(r) for r in vector_rows]}
+    if term_rows:
+        arms["term"] = [_key(r) for r in term_rows]
+    if trgm_rows:
+        arms["trgm"] = [_key(r) for r in trgm_rows]
+    weights = {
+        "vector": 0.2 if query_is_stub else 1.0,
+        "term": 1.0,
+        "trgm": 1.0,
+    }
+
+    candidates: list[dict] = []
+    for key, score, matched_by in fuse(arms, weights=weights)[: max(pool, limit)]:
+        row = by_id.get(key)
+        if row is None:  # pragma: no cover
+            continue
+        candidates.append(
+            {
+                "comment_id": row["comment_id"],
+                "post_id": row["post_id"],
+                "text": row.get("text"),
+                "author": row.get("author"),
+                "likes": row.get("likes"),
+                "sentiment": row.get("sentiment"),
+                "score": round(float(score), 6),
+                "embedding_is_stub": bool(row.get("embedding_is_stub")) or query_is_stub,
+                "matched_by": matched_by,
+            }
+        )
+
+    results, was_reranked = rerank(query, candidates, text_key="text", limit=limit)
+    results = results[:limit]
+
+    if not results:
+        log.info("search_comments_empty", query=query, hybrid=_HYBRID)
+    log.info(
+        "search_comments_completed",
+        query=query, hits=len(results),
+        vector_hits=len(vector_rows), lexical_hits=len(lexical_rows),
+        reranked=was_reranked,
+    )
+    return results
 
 
 # ---------------------------------------------------------------------------
@@ -515,7 +1319,18 @@ async def get_clusters(
     tenant_id: Annotated[str | None, Field(description="Optional tenant ID filter.")] = None,
 ) -> list[dict]:
     """Cluster analyzed posts by embedding similarity (pgvector + k-means/HDBSCAN).
-    Returns cluster metadata, sizes, dominant sentiments, representative post summaries, and member post IDs."""
+    Returns cluster sizes, dominant sentiments, a representative post summary per
+    cluster, and member post IDs.
+
+    Clusters have NO name — `representative_summary` is the summary of one real
+    post, not a label for the group. Describe a cluster by that summary; do not
+    invent a theme name and present it as data.
+
+    `posts_clustered` / `posts_available` / `scan_truncated` state which slice of
+    the corpus was actually clustered. When `scan_truncated` is true these are
+    the themes of the most recent `posts_clustered` posts, not corpus-wide
+    themes, and must be reported as such. `is_stub` true means the vectors are
+    deterministic hashes, so the groupings are arbitrary."""
     clean_cid = _clean_campaign_id(campaign_id)
     log.info("tool_call", tool="get_clusters", campaign_id=clean_cid, max_clusters=max_clusters, stub=_STUB_MODE)
 
@@ -525,7 +1340,12 @@ async def get_clusters(
     from defense.libs.clustering import cluster_embeddings, parse_pgvector
 
     where_parts = ["ar.embedding IS NOT NULL"]
-    params: dict[str, Any] = {"limit": 100}
+    # Was a hardcoded 100 with `ORDER BY created_at DESC`, which made "corpus
+    # themes" mean "themes of the 100 newest posts, in at most 8 buckets" while
+    # reading as corpus-wide. The cap is now configurable AND disclosed on every
+    # cluster row below — raising it alone would just move the number at which
+    # the tool quietly lies (§3.6).
+    params: dict[str, Any] = {"limit": _CLUSTER_SCAN_CAP}
     if clean_cid:
         where_parts.append("ar.campaign_id = :campaign_id")
         params["campaign_id"] = clean_cid
@@ -548,14 +1368,39 @@ async def get_clusters(
         """
     )
 
+    # How many posts COULD have been clustered, so the rows can say what the cap
+    # dropped instead of presenting a sample as the corpus.
+    count_sql = text(
+        f"""
+        SELECT count(*) AS n
+        FROM analysis_results ar
+        WHERE {' AND '.join(where_parts)}
+        """
+    )
+    count_params = {k: v for k, v in params.items() if k != "limit"}
+
     async with _AsyncSessionLocal() as session:
         rows = (await session.execute(sql, params)).mappings().all()
+        available = int((await session.execute(count_sql, count_params)).scalar() or 0)
 
     # No embeddings is a finding ("nothing has been vectorised yet"), not a
     # reason to hand the agent synthetic clusters it cannot tell apart.
     if not rows:
         log.info("get_clusters_no_embeddings", campaign_id=clean_cid)
         return []
+
+    truncated = available > len(rows)
+    scope = {
+        "posts_clustered": len(rows),
+        "posts_available": available,
+        "scan_truncated": truncated,
+    }
+    if truncated:
+        scope["scope_note"] = (
+            f"These clusters describe the {len(rows)} most recent analysed posts, "
+            f"not all {available} in scope. Do NOT describe them as corpus-wide "
+            "themes; say which slice they cover."
+        )
 
     vectors: list[list[float]] = []
     meta: list[dict] = []
@@ -582,10 +1427,17 @@ async def get_clusters(
                 "representative_summary": meta[0]["summary"] if meta else "No post summary available",
                 "member_post_ids": [m["post_id"] for m in meta],
                 "is_stub": bool(stub_count),
+                **scope,
             }
         ]
 
     cr = cluster_embeddings(vectors, max_k=max_clusters, algo=algo)
+
+    # Stable names, when somebody has written any. Matched by centroid rather
+    # than by cluster_id, which k-means reassigns on every run.
+    centroids = [list(c) for c in (getattr(cr, "centroids", None) or [])]
+    async with _AsyncSessionLocal() as session:
+        labels = await _match_persisted_labels(session, centroids, clean_cid, tenant_id)
 
     results: list[dict] = []
     for ci in range(cr.k):
@@ -603,16 +1455,88 @@ async def get_clusters(
         rep_meta = meta[rep_idx]
         results.append({
             "cluster_id": ci,
+            # Present ONLY when a label has been persisted for a centroid this
+            # close to this cluster's. Absent means nobody has named this group
+            # — which the narrative prompt is told to treat as "describe it by
+            # representative_summary", not as licence to invent a name.
+            **({"label": labels[ci]} if ci in labels else {}),
             "size": len(member_indices),
             "dominant_sentiment": dominant_sent,
             "representative_post_id": rep_meta["post_id"],
             "representative_summary": rep_meta["summary"] or "Summary unavailable",
             "member_post_ids": [meta[mi]["post_id"] for mi in member_indices[:25]],
             "is_stub": bool(stub_count),
+            **scope,
         })
 
-    log.info("get_clusters_completed", clusters=len(results), total_posts=len(meta))
+    log.info(
+        "get_clusters_completed", clusters=len(results), total_posts=len(meta),
+        posts_available=available, truncated=truncated,
+    )
     return results
+
+
+async def _match_persisted_labels(
+    session: AsyncSession,
+    centroids: list[list[float]],
+    campaign_id: str | None,
+    tenant_id: str | None,
+    max_distance: float = 0.35,
+) -> dict[int, str]:
+    """Map cluster index → a previously stored human-readable label.
+
+    Matching is by centroid cosine distance, NOT by cluster_id: k-means assigns
+    ids arbitrarily on each run, so "cluster 3" in today's report and "cluster 3"
+    in last week's are unrelated. That is precisely why themes could not be
+    tracked over time, and why the narrative agent had nothing stable to name.
+
+    ``max_distance`` is a floor on similarity, not a nicety: without it every
+    cluster matches *something*, and a genuinely new narrative silently inherits
+    the label of the nearest old one — which is worse than having no label,
+    because it reads as continuity that was never observed.
+
+    Centroids from a DIFFERENT embedding model are excluded outright, for the
+    same reason `coverage_stats` warns about a mixed index: a cosine distance
+    between two vector spaces is computed, comparable-looking and meaningless, so
+    a distance floor cannot filter it. Rows predating the column (NULL) are
+    allowed through — the alternative is discarding every label written before
+    provenance was recorded.
+
+    Returns ``{}` on any failure. A missing label costs a nicer column; a raised
+    exception would cost the clustering.
+    """
+    if not centroids:
+        return {}
+    where = ["1=1", "(cl.embedding_model IS NULL OR cl.embedding_model = :model)"]
+    params: dict[str, Any] = {"model": active_model_name()}
+    if campaign_id:
+        where.append("cl.campaign_id = :campaign_id")
+        params["campaign_id"] = campaign_id
+    if tenant_id:
+        where.append("cl.tenant_id = :tenant_id")
+        params["tenant_id"] = tenant_id
+
+    out: dict[int, str] = {}
+    sql = text(
+        f"""
+        SELECT cl.label, cl.centroid <=> CAST(:vec AS vector) AS dist
+        FROM cluster_labels cl
+        WHERE {' AND '.join(where)}
+        ORDER BY cl.centroid <=> CAST(:vec AS vector)
+        LIMIT 1
+        """
+    )
+    try:
+        for i, centroid in enumerate(centroids):
+            row = (
+                await session.execute(sql, {**params, "vec": to_pgvector_literal(centroid)})
+            ).mappings().first()
+            if row and row["dist"] is not None and float(row["dist"]) <= max_distance:
+                out[i] = row["label"]
+    except Exception as exc:
+        log.warning("cluster_label_lookup_unavailable", error=str(exc))
+        return {}
+    return out
 
 
 async def _stub_get_clusters(
@@ -637,6 +1561,13 @@ async def _stub_get_clusters(
             "representative_summary": stub_themes[i][0],
             "member_post_ids": [f"stub-post-{i * 10 + j:04d}" for j in range(5)],
             "is_stub": True,
+            "posts_clustered": 0,
+            "posts_available": 0,
+            "scan_truncated": False,
+            "scope_note": (
+                "SYNTHETIC — RETRIEVAL_MCP_STUB is on. These themes are canned "
+                "strings, not clusters of anything in the corpus."
+            ),
         }
         for i in range(k)
     ]
@@ -876,10 +1807,18 @@ async def coverage_stats(
     campaign_id: Annotated[str | None, Field(description="Campaign to scope to; 'all' for every campaign.")] = None,
     tenant_id: Annotated[str | None, Field(description="Optional tenant ID filter.")] = None,
 ) -> dict:
-    """Audit analysis coverage: how many collected posts have been analysed, how many
-    of their reported comments were actually stored and labelled, how many posts carry
-    a coverage anomaly, and how many embeddings are deterministic stubs rather than
-    semantic vectors (stub vectors make semantic_search results non-meaningful)."""
+    """Audit analysis coverage AND vector provenance: how many collected posts have
+    been analysed, how many of their reported comments were stored and labelled, how
+    many posts carry a coverage anomaly, how many embeddings are deterministic stubs
+    rather than semantic vectors, which embedding model(s) wrote them, and how much of
+    the comment corpus is embedded at all.
+
+    Stub vectors make semantic_search rankings arbitrary; more than one entry in
+    `embedding_models` means the index mixes two incomparable vector spaces; a
+    `comment_vector_coverage` of 0 means search_comments can reach nothing; and
+    `posts_over_comment_cap` / `comments_dropped_by_cap` say how much of the
+    comment corpus is unreachable because a thread ran past the per-post
+    embedding cap rather than because the encoder failed."""
     clean_cid = _clean_campaign_id(campaign_id)
     log.info("tool_call", tool="coverage_stats", campaign_id=clean_cid)
 
@@ -932,8 +1871,100 @@ async def coverage_stats(
         """
     )
 
+    # Vector provenance, separately: which model produced the post vectors, and
+    # how much of the comment corpus is retrievable by meaning at all. Comment
+    # vectors are the newer half of the index (§3.2) and a deployment that has
+    # not run the migration has none — a fact an audit must state rather than
+    # leave to be inferred from an empty search_comments result.
+    vec_sql = text(
+        f"""
+        WITH latest AS (
+            SELECT DISTINCT ON (ar.post_id)
+                ar.post_id, ar.embedding_model, ar.embedding_dim
+            FROM analysis_results ar
+            WHERE {' AND '.join(ar_where)}
+            ORDER BY ar.post_id, ar.created_at DESC
+        )
+        SELECT
+            COALESCE(embedding_model, 'unknown') AS model,
+            COALESCE(embedding_dim, 0)           AS dim,
+            count(*)                             AS n
+        FROM latest
+        GROUP BY 1, 2
+        ORDER BY n DESC
+        """
+    )
+    comment_vec_sql = text(
+        """
+        SELECT
+            count(*)                                                   AS vectors,
+            count(*) FILTER (WHERE COALESCE(embedding_is_stub, FALSE)) AS stub_vectors,
+            count(*) FILTER (WHERE represented_by IS NOT NULL)         AS propagated
+        FROM comment_embeddings ce
+        -- CAST(...) rather than `:param::varchar`: SQLAlchemy's bind-parameter
+        -- parser reads the second colon of a postfix cast as the start of
+        -- another parameter, and the statement reaches Postgres malformed.
+        WHERE (CAST(:campaign_id AS varchar) IS NULL OR ce.campaign_id = :campaign_id)
+          AND (CAST(:tenant_id AS varchar) IS NULL OR ce.tenant_id = :tenant_id)
+        """
+    )
+
+    # Posts whose thread is longer than the per-post embedding cap. Those
+    # comments are stored and labelled but have NO vector, so search_comments
+    # cannot reach them — the same class of silent truncation as the cluster scan
+    # cap (§3.6), and one that otherwise shows up only as an unexplained dip in
+    # `comment_vector_coverage`. Derived from the cap and the comments table
+    # rather than recorded at write time, so it is correct for a corpus ingested
+    # before the cap was set, or after it was changed.
+    cap = config.comment_embedding_max_per_post
+    cap_sql = text(
+        """
+        SELECT count(*) AS posts, COALESCE(SUM(n - :cap), 0) AS dropped
+        FROM (
+            SELECT c.post_id, count(*) AS n
+            FROM comments c
+            JOIN posts p ON p.id = c.post_id
+            WHERE (CAST(:campaign_id AS varchar) IS NULL OR p.campaign_id = :campaign_id)
+              AND (CAST(:tenant_id AS varchar) IS NULL OR p.tenant_id = :tenant_id)
+            GROUP BY c.post_id
+            HAVING count(*) > :cap
+        ) over_cap
+        """
+    )
+
     async with _AsyncSessionLocal() as session:
         row = (await session.execute(sql, params)).mappings().first()
+        try:
+            model_rows = (await session.execute(vec_sql, params)).mappings().all()
+        except Exception as exc:
+            log.warning("embedding_model_stats_unavailable", error=str(exc))
+            model_rows = []
+        capped = None
+        if cap:
+            try:
+                capped = (
+                    await session.execute(
+                        cap_sql,
+                        {
+                            "cap": cap,
+                            "campaign_id": clean_cid,
+                            "tenant_id": tenant_id,
+                        },
+                    )
+                ).mappings().first()
+            except Exception as exc:
+                log.warning("comment_cap_stats_unavailable", error=str(exc))
+        try:
+            cvec = (
+                await session.execute(
+                    comment_vec_sql,
+                    {"campaign_id": clean_cid, "tenant_id": tenant_id},
+                )
+            ).mappings().first()
+        except Exception as exc:
+            # comment_embeddings only exists after the schema migration.
+            log.warning("comment_vector_stats_unavailable", error=str(exc))
+            cvec = None
 
     def _int(v: Any) -> int:
         return int(v or 0)
@@ -963,7 +1994,64 @@ async def coverage_stats(
             "platform reported (coverage anomaly)."
         )
 
+    # `.get` rather than `[...]`: this is a second query against the same
+    # session, and a caller that substitutes a session double (or a deployment
+    # whose columns predate the migration) must lose the provenance breakdown,
+    # not the coverage audit it is attached to.
+    embedding_models = [
+        {"model": r.get("model"), "dim": _int(r.get("dim")), "posts": _int(r.get("n"))}
+        for r in model_rows
+        if r.get("model") is not None
+    ]
+    # Two models in one column means two vector spaces in one HNSW index:
+    # distances across them are computed, comparable, and meaningless.
+    if len(embedding_models) > 1:
+        notes.append(
+            "Post vectors were written by more than one embedding model ("
+            + ", ".join(f"{m['model']} × {m['posts']}" for m in embedding_models)
+            + "). Distances between rows from different models are not comparable; "
+            "re-embed the corpus before trusting semantic_search rankings."
+        )
+
+    comment_vectors = _int(cvec.get("vectors")) if cvec else 0
+    comment_stub_vectors = _int(cvec.get("stub_vectors")) if cvec else 0
+    comment_propagated = _int(cvec.get("propagated")) if cvec else 0
+
+    capped_posts = _int(capped.get("posts")) if capped else 0
+    capped_dropped = _int(capped.get("dropped")) if capped else 0
+    if capped_posts:
+        notes.append(
+            f"{capped_posts} post(s) have threads longer than the per-post embedding "
+            f"cap of {cap}, so roughly {capped_dropped} comment(s) are stored and "
+            "labelled but carry NO vector and cannot be reached by search_comments. "
+            "This lowers comment_vector_coverage for a reason unrelated to the "
+            "encoder — raise COMMENT_EMBEDDING_MAX_PER_POST and re-run the backfill "
+            "to embed them."
+        )
+
+    if analyzed_comments and not comment_vectors:
+        notes.append(
+            f"{analyzed_comments} comment(s) are labelled but NONE are embedded, so "
+            "search_comments cannot reach them. Comment vectors are written at "
+            "analysis time — re-run the pipeline, or apply deploy/init-db.sql if "
+            "the comment_embeddings table is missing."
+        )
+
     return {
+        "embedding_models": embedding_models,
+        "comment_vectors": comment_vectors,
+        "comment_stub_vectors": comment_stub_vectors,
+        # Vectors shared with a near-duplicate rather than computed. Not a
+        # defect — it is the cost lever — but it means N vectors do not imply N
+        # distinct encoder calls.
+        "comment_vectors_propagated": comment_propagated,
+        "comment_vector_coverage": (
+            round(comment_vectors / analyzed_comments, 4) if analyzed_comments else 0.0
+        ),
+        # Disclosed rather than left to be inferred from the coverage figure.
+        "comment_embedding_cap": cap,
+        "posts_over_comment_cap": capped_posts,
+        "comments_dropped_by_cap": capped_dropped,
         "campaign_id": clean_cid or "all",
         "total_posts": total_posts,
         "analyzed_posts": analyzed_posts,

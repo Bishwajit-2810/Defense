@@ -94,6 +94,7 @@ def test_agent_system_prompts_contain_guidelines(agent):
 KNOWN_VALID_TOOLS = {
     # retrieval-mcp
     "semantic_search",
+    "search_comments",
     "get_post",
     "get_thread",
     "representative_comments",

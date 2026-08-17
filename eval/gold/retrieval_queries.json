@@ -1,0 +1,367 @@
+{
+  "version": 1,
+  "seed": 20260817,
+  "size": 32,
+  "source": "topics+entities from analysis_results",
+  "human_verified_count": 0,
+  "notes": [
+    "KNOWN-ITEM retrieval set: one relevant post per query, derived from that post's own analysis. NOT human relevance judgement.",
+    "recall@k is a LOWER bound: other posts on the same topic are unmarked and count as misses. Use it to compare retrievers on this set, not as an absolute quality figure.",
+    "A human can upgrade a row by adding ids to relevant_post_ids and setting human_verified true; score_retrieval.py reports that subset separately.",
+    "Queries whose tokens overlapped the target's indexed text by more than 60% were dropped (11); posts with too little analysis to describe were skipped (7)."
+  ],
+  "queries": [
+    {
+      "query": "Find posts about জামাল হোসেন and সোলাইমান হোসেন and politics",
+      "relevant_post_ids": [
+        "cmolrrc7y0ixkkrd0j9xpgij6"
+      ],
+      "human_verified": false,
+      "derivation": "topics+entities of the target post",
+      "lexical_overlap": 0.6,
+      "subject": "জামাল হোসেন and সোলাইমান হোসেন and politics",
+      "post_summary": "পুলিশের কনস্টেবল জামাল হোসেন ও কনস্টেবল সোলাইমান হোসেনকে অধিকার বিরুদ্ধে প্রত্যাহার করা হয়, তারা আসামির নিরাপত্তা নিশ্চিত ও দেখভালের জন্য নিয়োজিত। এছাড়াও, রাষ্ট্রের বৈষম্যমূলক ও ফ্যাসিবাদী বন্দোবস্"
+    },
+    {
+      "query": "Public reaction to মাদ্রাসার শিক্ষক and বাচ্চাটা and crime",
+      "relevant_post_ids": [
+        "cmosiagoc00x9u9tszga2phla"
+      ],
+      "human_verified": false,
+      "derivation": "topics+entities of the target post",
+      "lexical_overlap": 0.4,
+      "subject": "মাদ্রাসার শিক্ষক and বাচ্চাটা and crime",
+      "post_summary": "১১বছর বয়সী একটি বাচ্চাকে মাদ্রাসার শিক্ষক ধর্ষণ করে, যার ওজন ৩০ কেজি হয়নি এবং পেটের বাচ্চাটার ওজন ৯৫৮ গ্রাম। তদন্ত করা হয়েছিল এবং স্বরাষ্ট্রমন্ত্রী এবং সংবিধান চাবাই করেন।"
+    },
+    {
+      "query": "Which posts discuss grief and crime?",
+      "relevant_post_ids": [
+        "cmotpdb7k02dyg1jobio4saxc"
+      ],
+      "human_verified": false,
+      "derivation": "topics+entities of the target post",
+      "lexical_overlap": 0.0,
+      "subject": "grief and crime",
+      "post_summary": "এই পোস্টটি বাংলা ভাষায় লিখিত এবং দিনের পassing সময়ে অনেক বাড়ি ও রক্তের দণ্ড হচ্ছে, এটি মানসিকভাবে দুঃখজনক।"
+    },
+    {
+      "query": "Sentiment around তারেক রহমান and politics and bangladesh",
+      "relevant_post_ids": [
+        "cmoq9a2b40mjpl0k5xk4qi4g3"
+      ],
+      "human_verified": false,
+      "derivation": "topics+entities of the target post",
+      "lexical_overlap": 0.2,
+      "subject": "তারেক রহমান and politics and bangladesh",
+      "post_summary": "তারেক রহমানের সামনে দুইটা রাস্তা আছে, কিন্তু তিনি যে রাস্তাটা বেছে নিবে তা অবধি বোঝা যায়নি। সংসদের সমাপনী বক্তব্যে ফ্যাসিজমের দিকে যাওয়ার চেষ্টায় তিনি হার্ড ব্রেক করেছেন।"
+    },
+    {
+      "query": "What are people saying about রূপপুর and হাসিনা and energy?",
+      "relevant_post_ids": [
+        "cmolxriad14dakrd0f3eqe30q"
+      ],
+      "human_verified": false,
+      "derivation": "topics+entities of the target post",
+      "lexical_overlap": 0.5,
+      "subject": "রূপপুর and হাসিনা and energy",
+      "post_summary": "রূপপুর নিউক্লিয়ার প্লান্টের সম্পাদনার কথা আলোচনা করা হয়েছে। এই প্লান্টটি বাংলাদেশের জনবসতিতে অবস্থিত, যা সুবিধাজনক হওয়ার আশা করা হচ্ছে।\n\nকিন্তু এই প্লানটির অভিজ্ঞতা ও নেগোসিয়েশনের দুর্বলতা কথা উঠি"
+    },
+    {
+      "query": "Public reaction to আওয়ামী লীগ and ইউনুস and politics",
+      "relevant_post_ids": [
+        "cmp2i0uxq0irfybuoiubemlgj"
+      ],
+      "human_verified": false,
+      "derivation": "topics+entities of the target post",
+      "lexical_overlap": 0.2,
+      "subject": "আওয়ামী লীগ and ইউনুস and politics",
+      "post_summary": "এই পোস্টে আওমিলীগ বাজেটে টাকা দিয়েছিল, তবে হামের টিকা কিনেছিল কি না সেই পয়েন্টে অস্পষ্টতা রয়েছে।"
+    },
+    {
+      "query": "Which posts discuss পিরোজপুর and মাননীয় প্রধানমন্ত্রী and politics?",
+      "relevant_post_ids": [
+        "cmotjhxnj1bsnnkx47bsim8ne"
+      ],
+      "human_verified": false,
+      "derivation": "topics+entities of the target post",
+      "lexical_overlap": 0.4,
+      "subject": "পিরোজপুর and মাননীয় প্রধানমন্ত্রী and politics",
+      "post_summary": "আলহামদুলিল্লাহ, আজকে মাননীয় প্রধানমন্ত্রীর সাথে বসে আলোচনা করা হয়েছিল পিরোজপুর-১, -২ ও -৩ আসনের উন্নয়ন ও দূর্নীতির কারণে স্থগিত হওয়া রাস্তাগুলোর পুনরুদ্ধার বিষয়ে। মাননীয় প্রধানমন্ত্রী ৩০ মিনিটের"
+    },
+    {
+      "query": "Sentiment around Thalapathy Vijay and মুখ্যमंत्री and politics",
+      "relevant_post_ids": [
+        "cmp2x7ue00spw8cx6m2xh8p0o"
+      ],
+      "human_verified": false,
+      "derivation": "topics+entities of the target post",
+      "lexical_overlap": 0.4,
+      "subject": "Thalapathy Vijay and মুখ্যमंत्री and politics",
+      "post_summary": "এই পোস্টে থালাপথি ভিয়াজি, তামিলনাড়ুর মুখ্যমন্ত্রী, বলেছেন যে কোনও ধর্মীয় অপরাধীকেও কোনোভাবেই ছাড় দেওয়া হবে না।"
+    },
+    {
+      "query": "What are people saying about হিরোshima and বাংলাদেশ and history?",
+      "relevant_post_ids": [
+        "cmoty7cv202s010d12jmicqsb"
+      ],
+      "human_verified": false,
+      "derivation": "topics+entities of the target post",
+      "lexical_overlap": 0.0,
+      "subject": "হিরোshima and বাংলাদেশ and history",
+      "post_summary": "হিরোশিমার বিধ্বস্ত এ-বম্ব ডোমের সামনে বাংলাদেশের বিরোধীদলীয় নেতার সাথে ফটো লিখা আছে। এই ধ্বংসাবশেষ মানব সভ্যতার কালো অধ্যায়ের সাক্ষী হিসেবে উল্লেখ করা হয়েছে এবং ক্ষমতার ব্যবহারের অপরিচিত ফলের দুঃসা"
+    },
+    {
+      "query": "Public reaction to মো. আসাদুজ্জামান and মুহাম্মাদ আলী আছগার and politics",
+      "relevant_post_ids": [
+        "cmoldbmz1026tfu22bt5h3stz"
+      ],
+      "human_verified": false,
+      "derivation": "topics+entities of the target post",
+      "lexical_overlap": 0.5,
+      "subject": "মো. আসাদুজ্জামান and মুহাম্মাদ আলী আছগার and politics",
+      "post_summary": "আইন বিচার ও সংসদ বিষয়ক মন্ত্রী আসাদুজ্জামান বলেন, ফ্যাসিস্ট হাসিনা আমলের ২৩,৮৬৫টি মিথ্যা রাজনৈতিক মামলাতে প্রত্যাহারের কার্যক্রম চলমান রয়েছে। এছাড়াও, বিএনপির কেন্দ্রীয় কার্যালয় থেকে পাওয়া তথ্য অ"
+    },
+    {
+      "query": "Sentiment around রংপুর and ফরিদপুর and politics",
+      "relevant_post_ids": [
+        "cmp2k5xts01oej5xfc4u23ep7"
+      ],
+      "human_verified": false,
+      "derivation": "topics+entities of the target post",
+      "lexical_overlap": 0.5,
+      "subject": "রংপুর and ফরিদপুর and politics",
+      "post_summary": "রংপুর, ফরিদপুর এবং খুলনা বিভাগ থেকে নির্বাচিত উপজেলা চেয়ারম্যান ও পৌরসভা মেয়র পদপ্রার্থীদের শুভকামনা। ইনশাল্লাহ তাদের জয় দেখা হবে।"
+    },
+    {
+      "query": "What are people saying about বিকাশ নুরু and আফ্রিদি and crime?",
+      "relevant_post_ids": [
+        "cmos9vz3o06eo5pwam7mxgqmh"
+      ],
+      "human_verified": false,
+      "derivation": "topics+entities of the target post",
+      "lexical_overlap": 0.6,
+      "subject": "বিকাশ নুরু and আফ্রিদি and crime",
+      "post_summary": "বিকাশ নুরু, আফ্রিদি এবং তার বাবা কোটি টাকায় জামিন দিয়ে একটি পণ্যমুক্তিকরণ করছেন, যেখানে নুরু অন্তত ৭ কোটি টাকা নিয়েছে। পরিণাম দ্রুতই দেখা যাবে।"
+    },
+    {
+      "query": "Find posts about ৫ ই মে and সাবির মুস্তাফা and grief",
+      "relevant_post_ids": [
+        "cmosi7qb800nqu9tsrei4pdwb"
+      ],
+      "human_verified": false,
+      "derivation": "topics+entities of the target post",
+      "lexical_overlap": 0.5,
+      "subject": "৫ ই মে and সাবির মুস্তাফা and grief",
+      "post_summary": "সবীর মুস্তাফা, পূর্বের বিবিসি বাংলা প্রধান, অনুমান করেন যে ৫ ই মে রাতে শাপলা চত্তরে কোনও মৃত্যুর প্রমান পাওয়া গেল না। তার প্রতিনিধি সেই অঞ্চলে সারারাত থাকেন।"
+    },
+    {
+      "query": "Public reaction to মোশাররফ হোসেন and চট্টগ্রাম and politics",
+      "relevant_post_ids": [
+        "cmp3vx6l5015eqkfw8gvtehu4"
+      ],
+      "human_verified": false,
+      "derivation": "topics+entities of the target post",
+      "lexical_overlap": 0.4,
+      "subject": "মোশাররফ হোসেন and চট্টগ্রাম and politics",
+      "post_summary": "মোশাররফ হোসেন, মীরসরাইয়ের সাবেক এমপি ইঞ্জিনিয়ার ও আওয়ামী লীগের রাজনৈতিক নেতা, আজ মারা গিয়েছেন। তিনি ১৯৭০ সাল থেকে অনুষ্ঠিত বহু জাতীয় সংসদ নির্বাচনে সদস্য হিসেবে পদক্ষেপ করেছিলেন। তার মৃত্যুর কারণ"
+    },
+    {
+      "query": "Which posts discuss ঢাকা বিশ্ববিদ্যালয়ের (ঢাবি) শামসুন্নাহার হল সংসদ and শেখ তাসনিম আফরোজ ইমি and politics?",
+      "relevant_post_ids": [
+        "cmolxrj3j14eakrd0iw94w7ua"
+      ],
+      "human_verified": false,
+      "derivation": "topics+entities of the target post",
+      "lexical_overlap": 0.545,
+      "subject": "ঢাকা বিশ্ববিদ্যালয়ের (ঢাবি) শামসুন্নাহার হল সংসদ and শেখ তাসনিম আফরোজ ইমি and politics",
+      "post_summary": "ঢাকা বিশ্ববিদ্যালয়ের (ঢাবি) শামসুন্নাহার হল সংসদের সাবেক সহসভাপতি শেখ তাসনিম আফরোজ ইমিকে জামিন দিয়েছেন, এটি সন্ত্রাসবিরোধী আইনের মামলায়।"
+    },
+    {
+      "query": "Sentiment around তারেক রহমান and নিলিমা and politics",
+      "relevant_post_ids": [
+        "cmoldbhw0026ffu22lt3nzj33"
+      ],
+      "human_verified": false,
+      "derivation": "topics+entities of the target post",
+      "lexical_overlap": 0.6,
+      "subject": "তারেক রহমান and নিলিমা and politics",
+      "post_summary": "যশোরে গাড়িতে ছিলেন মাননী প্রধানমন্ত্রী, যিনি একটি শিশুর জন্য উপহার পাঠানোর নির্দেশ দিলেন। গাড়িতে ছিলেন মাননী প্রধানমন্ত্রী এবং তিনি যখন শিশুর দিকে চাহলেন, তখন সেই শিশুর মা নিলিমা ফুল হাতে ডেকে নিয়ে"
+    },
+    {
+      "query": "Public reaction to crime and grief",
+      "relevant_post_ids": [
+        "cmosjpp9305n0u9tskgmd1c4k"
+      ],
+      "human_verified": false,
+      "derivation": "topics+entities of the target post",
+      "lexical_overlap": 0.0,
+      "subject": "crime and grief",
+      "post_summary": "এই পোস্টটিতে, লেখক বর্ণনা করেছেন যে কিছু মানুষগুলি অপরাধ করে থাকতে থাকতে পরম ভালোবাসার বিষয়ে জানতেন না, এবং তাদের হাতেই মৃত্যু আসছে। পোস্টটি অনুমান করে যে এই ব্যক্তিগণের পরিবার কখনও বিচারের সুযোগ পাব"
+    },
+    {
+      "query": "Which posts discuss হাসিনা and যুক্তরাষ্ট্রের দূতাবাস and politics?",
+      "relevant_post_ids": [
+        "cmoxb5qi102luv0toasaz5ofh"
+      ],
+      "human_verified": false,
+      "derivation": "topics+entities of the target post",
+      "lexical_overlap": 0.4,
+      "subject": "হাসিনা and যুক্তরাষ্ট্রের দূতাবাস and politics",
+      "post_summary": "এই পোস্টটি একজন ইউটিউবারের বিরুদ্ধে কriticism ও অভিযোগ জানাচ্ছে, যিনি আপন"
+    },
+    {
+      "query": "What are people saying about ভারত and politics and religion?",
+      "relevant_post_ids": [
+        "cmouf3g7p0dnae4hkfuk6spet"
+      ],
+      "human_verified": false,
+      "derivation": "topics+entities of the target post",
+      "lexical_overlap": 0.25,
+      "subject": "ভারত and politics and religion",
+      "post_summary": "ভারতটি মুসলিমদের জন্য ন'রকে পরিণত হয়েছে, এই কথা উল্লেখ করে একটি সার্ভিশীয় পোস্ট।"
+    },
+    {
+      "query": "Find posts about সাকিব আল হাসান and আওয়ামিলীগের and politics",
+      "relevant_post_ids": [
+        "cmor32gyn03o6o18fih8mswoq"
+      ],
+      "human_verified": false,
+      "derivation": "topics+entities of the target post",
+      "lexical_overlap": 0.4,
+      "subject": "সাকিব আল হাসান and আওয়ামিলীগের and politics",
+      "post_summary": "সাকিব আল হাসান আওয়ামিলীগের এবং বাংলাদেশের প্রধান মন্ত্রী। এই পোস্টটি তার উল্লেখযোগ্য ভূমিকা বর্ণনা করছে।"
+    },
+    {
+      "query": "Public reaction to এনসিপি and উপজেলা চেয়ারম্যান and politics",
+      "relevant_post_ids": [
+        "cmotusl0o0cmcg1joz3bo8naw"
+      ],
+      "human_verified": false,
+      "derivation": "topics+entities of the target post",
+      "lexical_overlap": 0.6,
+      "subject": "এনসিপি and উপজেলা চেয়ারম্যান and politics",
+      "post_summary": "আগামী ১০ তারিখের মধ্যে, এনসিপি সমর্থিত ১০০ জন উপজেলা চেয়ারম্যান ও পৌরসভা মেয়র প্রার্থীদের নাম ঘোষণার প্রস্তুতির জন্য, স্থানীয় নির্বাচন পরিচালনা কমিটি এবং বিভাগীয় সাংগঠনিক সম্পাদকদের মধ্যে গুরুত্বপ"
+    },
+    {
+      "query": "Find posts about politics and religion",
+      "relevant_post_ids": [
+        "cmolm38an04ookrd05e6eibde"
+      ],
+      "human_verified": false,
+      "derivation": "topics+entities of the target post",
+      "lexical_overlap": 0.0,
+      "subject": "politics and religion",
+      "post_summary": "লক্ষ্মীপুর-৪ আসনের এমপি আশরাফ উদ্দিন নিজান সংসদে দাঁড়ি করেছেন, যেখানে তিনি রাষ্ট্রপতি চুপ্পুকে সম্মান করতে বাধা দিয়েছেন এবং জনগণের মনের কথা সরাসরি বলেছেন।"
+    },
+    {
+      "query": "Public reaction to politics and online",
+      "relevant_post_ids": [
+        "cmoxb5qw402muv0tou5h4igzm"
+      ],
+      "human_verified": false,
+      "derivation": "topics+entities of the target post",
+      "lexical_overlap": 0.0,
+      "subject": "politics and online",
+      "post_summary": "ইতিমধ্যে উত্তম প্রস্তাব দেওয়া হয়েছে। একই সাথে ভুঁইফোঁজি অনলাইন পোর্টাল ও পেজ নামের সাংঘাতিকদের বিরুদ্ধে ব্যবস্থা নেওয়ার বিধানও করতে হবে।"
+    },
+    {
+      "query": "Which posts discuss agreement and validation?",
+      "relevant_post_ids": [
+        "cmoxb5qp002mcv0toa1ivwdcv"
+      ],
+      "human_verified": false,
+      "derivation": "topics+entities of the target post",
+      "lexical_overlap": 0.0,
+      "subject": "agreement and validation",
+      "post_summary": "এই পোস্টে \"সঠিক!\" লিখা আছে, তবে ছবির উত্তর থাকলেও সেটি অনুমান করা যায় না।"
+    },
+    {
+      "query": "Public reaction to মান্নান আজাদ and প্যারিস and politics",
+      "relevant_post_ids": [
+        "cmpcjqky3004wegjpy3cwulpq"
+      ],
+      "human_verified": false,
+      "derivation": "topics+entities of the target post",
+      "lexical_overlap": 0.4,
+      "subject": "মান্নান আজাদ and প্যারিস and politics",
+      "post_summary": "আনীমান আজাদ ভাইরা প্যারিসের বাস্তিল দুর্গে একটি মানববন্ধনের পর হাজার হাজার ব্যক্তিদের সাথে মান্নান আলাদা হয়ে থাকেন।"
+    },
+    {
+      "query": "Which posts discuss প্রধানমন্ত্রী and তারেক রহমান and politics?",
+      "relevant_post_ids": [
+        "cmomi755o1xvckrd045gdcg45"
+      ],
+      "human_verified": false,
+      "derivation": "topics+entities of the target post",
+      "lexical_overlap": 0.6,
+      "subject": "প্রধানমন্ত্রী and তারেক রহমান and politics",
+      "post_summary": "প্রধানমন্ত্রী ও সংসদ নেতা তারেক রহমান বলেছেন, এই সরকার জনগণের ভোটে নির্বাচিত এবং জনগণের কাছে জবাবদিহিমূলক।"
+    },
+    {
+      "query": "Sentiment around ভারতে and ইমামকে and crime",
+      "relevant_post_ids": [
+        "cmopx1rsa027u2jw46z8j1d21"
+      ],
+      "human_verified": false,
+      "derivation": "topics+entities of the target post",
+      "lexical_overlap": 0.5,
+      "subject": "ভারতে and ইমামকে and crime",
+      "post_summary": "ভারতে একটি কমেন্টে ইমামকে চলন্ত ট্রেন থেকে ফেলে দেওয়ার ঘটনার বিস্তারিত উল্লেখ করা হয়েছে। এই পোস্টে অধিক তথ্য নেই।"
+    },
+    {
+      "query": "What are people saying about পুলিশকে and politics and protest?",
+      "relevant_post_ids": [
+        "cmp1cj7rb05tjd1w1uh5g3k8j"
+      ],
+      "human_verified": false,
+      "derivation": "topics+entities of the target post",
+      "lexical_overlap": 0.25,
+      "subject": "পুলিশকে and politics and protest",
+      "post_summary": "পোস্টের মূল বিষয় হল \"হাসনাত আব্দুল্লাহ\" যিনি বলেছেন পুলিশকে 'না' বলতে শেখাতে হবে।"
+    },
+    {
+      "query": "Find posts about tarek rahman and prime minister and politics",
+      "relevant_post_ids": [
+        "cmomf98aq1tuxkrd0u2qfvtjc"
+      ],
+      "human_verified": false,
+      "derivation": "topics+entities of the target post",
+      "lexical_overlap": 0.167,
+      "subject": "tarek rahman and prime minister and politics",
+      "post_summary": "প্রধানমন্ত্রী তারেক রহমান সংসদে দাঁজি পরিচালনায় কয়েকটি গভীর মতামত জানালে, তিনি বলেছেন যে সহজেই পপুলার কথা বলে হাততালি দিতে পারা খুব সহজ, কিন্তু সঠিক সিদ্ধান্ত নেওয়াই আসল চ্যালেঞ্জ। তিনি বিশ্বাস করে"
+    },
+    {
+      "query": "What are people saying about নাহিদ ইসলাম and বিএনপি and politics?",
+      "relevant_post_ids": [
+        "cmolm36hj04mgkrd0hibu386o"
+      ],
+      "human_verified": false,
+      "derivation": "topics+entities of the target post",
+      "lexical_overlap": 0.6,
+      "subject": "নাহিদ ইসলাম and বিএনপি and politics",
+      "post_summary": "নাহিদ ইসলাম একটি স্পিচ দিয়েছে, যা তার অভিজ্ঞতা ও ধারণাগুলির প্রতিবেদন হিসেবে মনে করা যায়। তিনি ৭১ আন্দোলন, ২৪ বিপ্লব এবং বিএনপি ক্ষমতার সম্পর্কে যথার্থভাবে চিত্রিত করেছেন, যা তার মন্ত্রিত্বের জ্ঞান "
+    },
+    {
+      "query": "Find posts about politics and bangladesh",
+      "relevant_post_ids": [
+        "cmot41amv10ornkx49k1wlq2o"
+      ],
+      "human_verified": false,
+      "derivation": "topics+entities of the target post",
+      "lexical_overlap": 0.0,
+      "subject": "politics and bangladesh",
+      "post_summary": "এই পোস্টটি কৃষকদের দিশেহারা থাকলে আওমাই লীগ তাদের সাহায্য করবে এই অর্থে লিখেছে। উপস্থিত চিত्र বা অন্যান্য মাধ্যমে কোনও তথ্য নেই।"
+    },
+    {
+      "query": "Sentiment around politics and criticism",
+      "relevant_post_ids": [
+        "cmpcqyv3c016nyuicavo60q3m"
+      ],
+      "human_verified": false,
+      "derivation": "topics+entities of the target post",
+      "lexical_overlap": 0.0,
+      "subject": "politics and criticism",
+      "post_summary": "এই পোস্টে আওঁামী লীগের জন্য তারেক রহমান ও ইউনুস দুইটি গান বানিয়েছেন এবং সেইডা রিলগুলোও তৈরি করেছেন। পোস্ট অথচ জুলাই পক্ষের দিক থেকে আশঙ্কা জানায় এবং ভাইজান বলেন যে তারা নিজেরা শক্তি গড়ে তোলার পথ খু"
+    }
+  ]
+}

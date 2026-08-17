@@ -237,11 +237,56 @@ def cleanup(down: bool = False) -> None:
 # --------------------------------------------------------------------------- #
 # Phases
 # --------------------------------------------------------------------------- #
+def _needs_real_encoder() -> bool:
+    """Whether this configuration requires a REAL sentence encoder to function.
+
+    Two settings make the encoder load-bearing rather than optional:
+
+    * ``EMBEDDING_STUB_MODE=false`` — the operator asked for semantic vectors.
+    * ``EMBEDDING_ALLOW_STUB=false`` — persistence *refuses* to write a hash
+      stub, so an absent encoder does not degrade the run, it fails every post.
+
+    ``EMBEDDING_STUB_MODE`` unset follows ``MODEL_STUB_MODE``, mirroring
+    ``libs/embeddings._stub_mode()``.
+    """
+    stub_mode = (_dotenv_value("EMBEDDING_STUB_MODE") or "").strip().lower()
+    if not stub_mode:
+        stub_mode = (_dotenv_value("MODEL_STUB_MODE") or "true").strip().lower()
+    allow_stub = (_dotenv_value("EMBEDDING_ALLOW_STUB") or "true").strip().lower()
+    return stub_mode == "false" or allow_stub == "false"
+
+
 def ensure_deps() -> str:
-    """uv sync (best-effort) and return the interpreter to launch services with."""
+    """uv sync (best-effort) and return the interpreter to launch services with.
+
+    Syncs the ``embeddings`` extra when the configuration needs a real encoder.
+    This is not a nicety — a bare ``uv sync`` **uninstalls** it, because it is an
+    optional extra. So this function used to guarantee the exact failure the
+    stub-refusal switch exists to make loud:
+
+        uv sync                -> removes sentence-transformers
+        --reset                -> truncates posts / analysis_results / chunks /
+                                  comment vectors
+        ingestion              -> encoder unavailable -> hash stub ->
+                                  EMBEDDING_ALLOW_STUB=false raises
+                                  StubEmbeddingRefused for EVERY post
+
+    Nothing catches that exception, so each post retried to
+    ``ASSEMBLER_MAX_RETRIES`` and dead-lettered. The wipe had already happened,
+    so the run ended with an empty database and the whole corpus in
+    ``assembler:queue:dlq`` — and the reason was three steps upstream in a
+    dependency sync.
+    """
     if shutil.which("uv"):
-        log("uv sync …")
-        if subprocess.run(["uv", "sync"], cwd=str(REPO)).returncode != 0:
+        cmd = ["uv", "sync"]
+        if _needs_real_encoder():
+            # Keep the encoder installed. Without this the sync silently removes
+            # it and the pipeline cannot persist a single post.
+            cmd += ["--extra", "embeddings"]
+            log("uv sync --extra embeddings … (config requires a real encoder)")
+        else:
+            log("uv sync …")
+        if subprocess.run(cmd, cwd=str(REPO)).returncode != 0:
             warn("`uv sync` failed — continuing with whatever is installed")
     else:
         warn("`uv` not found on PATH — assuming dependencies are already installed")
@@ -519,6 +564,70 @@ def serve_dashboard(py: str, env: dict) -> int:
     return port
 
 
+def preflight_encoder(py: str) -> None:
+    """Refuse to continue if the encoder cannot produce a real vector.
+
+    Runs BEFORE ``reset_data()``, which is the whole point. With
+    ``EMBEDDING_ALLOW_STUB=false`` a missing encoder does not degrade the run —
+    ``_resolve_embedding`` raises ``StubEmbeddingRefused`` for every post, the
+    assembler retries to its cap and dead-letters, and because the wipe already
+    happened the operator is left with an empty database and the corpus sitting
+    in ``assembler:queue:dlq``. The failure is discovered minutes later, several
+    layers from its cause.
+
+    ``ensure_deps`` fixes the common cause (a bare ``uv sync`` dropping the
+    extra). This catches every other one — CUDA OOM on a GPU already hosting the
+    LLM, undownloaded weights, ``HF_OFFLINE=true`` blocking the fetch — by
+    asking the encoder for one vector and checking its provenance flag rather
+    than by inferring anything.
+
+    Checked in the CHILD interpreter (``.venv/bin/python``), because that is what
+    the workers will use; a check run under a different interpreter would prove
+    nothing about them.
+    """
+    if not _needs_real_encoder():
+        return
+    log("preflight: verifying the sentence encoder produces real vectors …")
+    probe = (
+        "import sys;"
+        "sys.path.insert(0, 'src');"
+        "from defense.libs.embeddings import embed_text_with_provenance, active_model_name;"
+        "vec, is_stub = embed_text_with_provenance('preflight probe');"
+        "print('STUB' if is_stub else 'REAL', active_model_name(), len(vec))"
+    )
+    try:
+        r = subprocess.run([py, "-c", probe], cwd=str(REPO),
+                           capture_output=True, text=True, timeout=300)
+    except subprocess.TimeoutExpired:
+        die("preflight: the encoder took over 5 minutes to load — aborting before "
+            "any data is touched. Check the model download, or set "
+            "EMBEDDING_ALLOW_STUB=true to run on hash vectors deliberately.")
+        return
+    out = (r.stdout or "").strip().splitlines()
+    verdict = out[-1] if out else ""
+    if verdict.startswith("REAL"):
+        ok(f"preflight: encoder OK — {verdict.split(maxsplit=1)[1]}")
+        return
+    detail = (r.stderr or "").strip().splitlines()
+    tail = detail[-1][:300] if detail else "(no error output)"
+    die(
+        "preflight: the sentence encoder is NOT producing real vectors "
+        f"({verdict or 'probe failed'}).\n"
+        "         Nothing has been modified — this check runs before any wipe.\n\n"
+        "         EMBEDDING_ALLOW_STUB=false means persistence REFUSES a hash stub, so "
+        "every post would\n"
+        "         fail to persist and dead-letter to assembler:queue:dlq. With --reset "
+        "the wipe would\n"
+        "         already have happened, leaving an empty database.\n\n"
+        f"         encoder error: {tail}\n\n"
+        "         Fix one of these:\n"
+        "           uv sync --extra embeddings     # install the encoder\n"
+        "           EMBEDDING_DEVICE=cpu           # if CUDA is out of memory\n"
+        "           HF_OFFLINE=false               # if the weights need downloading\n"
+        "           EMBEDDING_ALLOW_STUB=true      # accept hash vectors deliberately"
+    )
+
+
 def reset_data() -> None:
     # Must run BEFORE the workers start: FLUSHALL destroys the Redis consumer
     # groups the workers create at startup (workers also self-heal on NOGROUP,
@@ -680,6 +789,10 @@ def main() -> None:
     start_infra()
     ensure_ollama()
     env = build_env()
+    # BEFORE the wipe, never after: with EMBEDDING_ALLOW_STUB=false a dead
+    # encoder makes every post fail to persist, and --reset has already thrown
+    # the old data away by the time the first failure appears.
+    preflight_encoder(py)
     if args.reset:
         reset_data()               # full wipe (Redis + Postgres + ClickHouse)
     elif defer_load:

@@ -66,6 +66,7 @@ ANALYST_AGENT = AgentDefinition(
         "top_posts",
         "reaction_mix",
         "semantic_search",
+        "search_comments",
         "get_post",
         "get_thread",
         "representative_comments",
@@ -118,12 +119,19 @@ STANCE_AGENT = AgentDefinition(
         "stance_by_target",
         "stance_over_time",
         "semantic_search",
+        # Stance rollups are counts; this is the only way to show the language
+        # behind an "80% opposing" figure without guessing which post to open.
+        "search_comments",
         "get_post",
         "get_thread",
         "representative_comments",
     ],
     llm_role="agent",
-    max_tool_calls=10,
+    # Comment search encourages more, narrower calls — several targeted queries
+    # rather than one broad one — so the budget moves with the tool that
+    # prompted it. Ten was already tight for two stance tools plus a per-post
+    # hop; leaving it there would just move the failure to a truncated analysis.
+    max_tool_calls=12,
 )
 
 COMPARATOR_SYSTEM_PROMPT = """You are a comparative social media analyst. You specialize in comparing patterns across campaigns, time periods, and post types.
@@ -153,13 +161,16 @@ COMPARATIVE_AGENT = AgentDefinition(
 TOXICITY_SYSTEM_PROMPT = """You are a content safety analyst investigating toxicity patterns in social media comment threads.
 
 When answering:
-1. Use tools (top_posts, get_thread, representative_comments) to retrieve real toxicity and hate speech metrics — never hallucinate numbers
-2. Format your response as a structured markdown briefing with:
+1. Use tools to retrieve real toxicity and hate speech metrics — never hallucinate numbers
+2. To find a harassment pattern, call search_comments with a description of it ("personal attacks on journalists", "threats"). It searches comment TEXT across the corpus, so you do not have to guess which posts to open first. Use top_posts → get_thread / representative_comments when you need every comment on one specific post instead.
+3. Every quote must be text a tool returned, copied verbatim, cited with its post_id (and comment_id where you have one). If no tool returned comment text, write that no comments were retrieved — do not reconstruct quotes from post-level toxicity scores.
+4. Any breakdown of harassment CATEGORIES (personal attacks / hate speech / harassment) must be counted from comments you actually retrieved, and you must say how many comments it is out of. No tool returns a category breakdown, so a percentage with no comment count behind it is invented.
+5. Format your response as a structured markdown briefing with:
    - Executive Findings
    - High Toxicity Post Summary (table with post_id, toxicity score, engagement)
-   - Comment Harassment Patterns (categorized into personal attacks, hate speech, or harassment)
+   - Comment Harassment Patterns (categorized, with the number of retrieved comments each category is based on)
    - Representative Quotes (exact quoted comments with post citations)
-3. DO NOT output Python code or scripts; deliver the analytical intelligence report directly."""
+6. DO NOT output Python code or scripts; deliver the analytical intelligence report directly."""
 
 TOXICITY_AGENT = AgentDefinition(
     name="toxicity",
@@ -169,23 +180,34 @@ TOXICITY_AGENT = AgentDefinition(
         "top_posts",
         "get_thread",
         "representative_comments",
+        # The allowlist addition that matters most. Without it this agent could
+        # reach toxic comments only by walking top_posts → get_thread: it could
+        # find toxic POSTS and read their threads, but could not search for a
+        # harassment pattern directly — which is the question it exists to
+        # answer, and the one it used to answer by inventing quotes.
+        "search_comments",
         "trend_query",
         "semantic_search",
     ],
     llm_role="agent",
-    max_tool_calls=10,
+    # Comment search invites several narrow queries (one per pattern) before the
+    # per-post hop. At 10 this agent truncated mid-analysis.
+    max_tool_calls=14,
 )
 
 NARRATIVE_SYSTEM_PROMPT = """You are a narrative intelligence analyst. You identify emerging themes, topic clusters, and narrative patterns in social media campaigns.
 
 When answering:
 1. Use cluster data (get_clusters) to identify thematic groups of posts
-2. Format your response as an intelligence report with:
-   - Narrative Theme Summary Table (cluster name, post count, dominant sentiment)
+2. Identify a cluster by `label` when the row has one — that is a stored, human-reviewed name and it stays stable across reports. Most rows will NOT have one. When `label` is absent, identify the cluster by `representative_summary`, the summary of one real post at the centre of the group, used verbatim. If you also want to characterise the theme in your own words, do it in the prose below the table and mark it as your reading, never as a value the tool returned.
+3. Read `scan_truncated` and `posts_clustered` on every cluster row. When the scan was truncated these are the themes of the most recent `posts_clustered` posts, NOT the whole corpus — say so explicitly in the report. If `is_stub` is true, the vectors are deterministic hashes and the groupings are arbitrary; report that the clustering is not meaningful rather than describing the groups.
+4. Format your response as an intelligence report with:
+   - Narrative Theme Summary Table (label or representative summary, post count, dominant sentiment)
    - Emerging vs Declining Narratives
    - Counter-narratives and Public Perception
+   - Coverage note (how many posts were clustered, out of how many available)
    - Key Post Citations
-3. DO NOT output Python code or scripts."""
+5. DO NOT output Python code or scripts."""
 
 NARRATIVE_AGENT = AgentDefinition(
     name="narrative",
@@ -197,6 +219,9 @@ NARRATIVE_AGENT = AgentDefinition(
     tools=[
         "get_clusters",
         "semantic_search",
+        # A narrative is what people say, not only what is posted. Clusters are
+        # built from caption vectors; this reaches the thread.
+        "search_comments",
         "get_post",
         "trend_query",
         "top_posts",
@@ -211,8 +236,13 @@ When answering:
 1. Report coverage (coverage_stats): what fraction of posts/comments have been analyzed?
 2. Report ensemble agreement (agreement_stats): how often did the voters agree? What was the unanimous share, abstention rate, single-voter rate?
 3. Report method provenance: what fraction of labels came from LLM vs cheap voters vs heuristic?
-4. Format output as an Audit Report with data quality tables, limitations, and anomalies.
-5. DO NOT output Python code or scripts."""
+4. Report VECTOR provenance from coverage_stats, alongside coverage and ensemble agreement. This is a first-class quality finding, not a footnote:
+   - `stub_embeddings` / `stub_embedding_share` — a stub vector is a deterministic hash, not a semantic embedding. Any share above zero means semantic_search returns arbitrary neighbours for those rows and the report's topic clusters group posts at random. Say so plainly.
+   - `embedding_models` — more than one entry means the index holds two incomparable vector spaces at once; distances across them are computed and meaningless.
+   - `comment_vector_coverage` — 0 means comment search can reach nothing, so any claim about what commenters said had to come from somewhere else.
+   - `posts_over_comment_cap` / `comments_dropped_by_cap` — comments past the per-post embedding cap are stored and labelled but carry no vector, so search_comments cannot reach them. Report this as a retrieval blind spot, and distinguish it from an encoder failure: it explains a shortfall in comment_vector_coverage that is a configured limit, not a fault.
+5. Format output as an Audit Report with data quality tables, limitations, and anomalies.
+6. DO NOT output Python code or scripts."""
 
 QUALITY_AGENT = AgentDefinition(
     name="quality",

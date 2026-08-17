@@ -17,6 +17,7 @@ from defense.services.api.models import SearchResponse, SearchResult
 # Repo root on path for `libs.*` (no-op when PYTHONPATH already provides it).
 
 from defense.libs.embeddings import embed_text_with_provenance, to_pgvector_literal  # noqa: E402
+from defense.libs.retrieval import candidate_pool, fuse  # noqa: E402
 
 log = structlog.get_logger(__name__)
 
@@ -36,6 +37,10 @@ router = APIRouter(prefix="/v1/search", tags=["search"])
 async def search(
     q: str = Query(..., min_length=1, description="Search query string"),
     semantic: bool = Query(False, description="Use semantic (vector) search"),
+    mode: str | None = Query(
+        None,
+        description="keyword | semantic | hybrid. Overrides `semantic` when given.",
+    ),
     campaign_id: str | None = Query(None, description="Filter by campaign ID"),
     limit: int = Query(20, ge=1, le=200, description="Maximum results to return"),
     db: AsyncSession = Depends(get_db),
@@ -43,17 +48,34 @@ async def search(
 ) -> SearchResponse:
     """Search analysis results.
 
-    - **Keyword search** (default): performs a case-insensitive JSONB text
-      scan across ``analysis_results.result``.  Matches on post summary,
-      topics, keywords, and comment themes.
-    - **Semantic search** (``?semantic=true``): embeds the query and runs a
-      pgvector cosine search over ``analysis_results.embedding``. Semantic
-      *quality* requires real embeddings (``MODEL_STUB_MODE=false`` +
-      ``uv sync --extra ml``); in stub mode vectors are deterministic hashes,
-      so results are stable but not meaning-based.
+    - **Keyword search** (default): a case-insensitive JSONB text scan across
+      ``analysis_results.result``. Matches post summary, caption, topics,
+      keywords and comment themes.
+    - **Semantic search** (``?semantic=true`` / ``?mode=semantic``): embeds the
+      query and runs a pgvector cosine search over ``analysis_results.embedding``.
+      Semantic *quality* requires real embeddings (``MODEL_STUB_MODE=false`` +
+      ``uv sync --extra ml``); in stub mode vectors are deterministic hashes, so
+      results are stable but not meaning-based.
+    - **Hybrid** (``?mode=hybrid``): runs both and fuses them with reciprocal
+      rank fusion. On a code-mixed Bangla/English corpus neither arm dominates —
+      the encoder blurs the exact entity names and transliterations that the
+      keyword scan nails — so this is the mode to prefer when you have no reason
+      to force one.
+
+    ``mode`` is not the default because ``semantic`` is the existing contract and
+    silently changing what a caller's query returns is worse than making them ask.
     """
     tenant_id = current_user.get("tenant_id", "default")
-    if semantic:
+
+    requested = (mode or ("semantic" if semantic else "keyword")).strip().lower()
+    if requested == "hybrid":
+        results = await _hybrid_search(
+            db, q=q, campaign_id=campaign_id, limit=limit, tenant_id=tenant_id
+        )
+        log.info("hybrid_search_completed", q=q, total=len(results))
+        return SearchResponse(query=q, semantic=True, total=len(results), results=results)
+
+    if requested == "semantic":
         results = await _semantic_search(db, q=q, campaign_id=campaign_id, limit=limit, tenant_id=tenant_id)
         log.info("semantic_search_completed", q=q, total=len(results))
         return SearchResponse(query=q, semantic=True, total=len(results), results=results)
@@ -134,6 +156,60 @@ async def _semantic_search(
         )
         for row in rows
     ]
+
+
+async def _hybrid_search(
+    db: AsyncSession,
+    q: str,
+    campaign_id: str | None,
+    limit: int,
+    tenant_id: str = "default",
+) -> list[SearchResult]:
+    """Fuse the vector and keyword arms with reciprocal rank fusion.
+
+    Both arms over-fetch, then RRF combines their RANKS — never their scores,
+    which live on incomparable scales (cosine similarity vs. a substring-density
+    heuristic) and cannot be normalised into each other.
+
+    When the vector arm is running on hash stubs its rank order carries no
+    information, so it is down-weighted rather than dropped: it still supplies
+    candidates the keyword scan missed, but it can no longer outvote the arm that
+    is actually measuring something.
+    """
+    pool = candidate_pool(limit)
+    vector_hits = await _semantic_search(
+        db, q=q, campaign_id=campaign_id, limit=pool, tenant_id=tenant_id
+    )
+    keyword_hits = await _keyword_search(
+        db, q=q, campaign_id=campaign_id, limit=pool, tenant_id=tenant_id
+    )
+
+    by_id: dict[str, SearchResult] = {}
+    for hit in [*keyword_hits, *vector_hits]:
+        by_id.setdefault(hit.post_id, hit)
+
+    vectors_are_stubs = any(h.embedding_is_stub for h in vector_hits)
+    fused = fuse(
+        {
+            "vector": [h.post_id for h in vector_hits],
+            "keyword": [h.post_id for h in keyword_hits],
+        },
+        weights={"vector": 0.2 if vectors_are_stubs else 1.0, "keyword": 1.0},
+    )
+
+    out: list[SearchResult] = []
+    for post_id, score, _matched_by in fused[:limit]:
+        hit = by_id.get(post_id)
+        if hit is None:  # pragma: no cover — every fused id came from an arm
+            continue
+        out.append(hit.model_copy(update={"score": round(float(score), 6)}))
+
+    log.info(
+        "hybrid_search_fused",
+        q=q, vector_hits=len(vector_hits), keyword_hits=len(keyword_hits),
+        fused=len(out), vector_arm_is_stub=vectors_are_stubs,
+    )
+    return out
 
 
 async def _keyword_search(
