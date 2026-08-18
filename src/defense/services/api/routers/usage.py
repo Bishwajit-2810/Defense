@@ -34,6 +34,9 @@ router = APIRouter(prefix="/v1/usage", tags=["usage"])
 # without a code change when the vendor's pricing moves.
 _COST_PER_1K_TOKENS_LOCAL: float = 0.0
 
+# Frontier commercial cloud LLM API benchmark rate (e.g. GPT-4o / Claude 3.5 @ $5.00 per 1M tokens = $0.005 per 1k)
+_STANDARD_MARKET_PRICE_PER_1K: float = 0.005
+
 _GROQ_PRICE_PER_1K: dict[str, float] = {
     "llama-3.1-8b-instant": 0.00008,
     "llama-3.3-70b-versatile": 0.00075,
@@ -140,6 +143,12 @@ class UsageResponse(BaseModel):
     inflated by a chatbot session or an agent run, which are per-question costs
     with no relation to corpus size. ``total_tokens`` is everything.
     """
+
+    market_price_equivalent_usd: float = 0.0
+    """Estimated equivalent cost at standard commercial cloud API market rates ($0.50/1M tokens)."""
+
+    cost_savings_usd: float = 0.0
+    """Estimated cost saved by self-hosted zero-cost tokens vs cloud market rates."""
 
     scope_note: str = ""
     """What the numbers above actually cover — see the ``campaign_id`` caveat."""
@@ -378,6 +387,13 @@ async def get_usage(
             "is ineffective."
         )
 
+    market_price_equivalent_usd: float = round(
+        (total_tokens / 1_000) * _STANDARD_MARKET_PRICE_PER_1K, 6
+    )
+    cost_savings_usd: float = round(
+        max(0.0, market_price_equivalent_usd - estimated_cost_usd), 6
+    )
+
     log.info(
         "usage_queried",
         campaign_id=campaign_id,
@@ -399,5 +415,7 @@ async def get_usage(
         cost_by_backend_model=cost_by_backend_model,
         lane_split=lane_split,
         pipeline_tokens=pipeline_tokens,
+        market_price_equivalent_usd=market_price_equivalent_usd,
+        cost_savings_usd=cost_savings_usd,
         scope_note=scope_note,
     )

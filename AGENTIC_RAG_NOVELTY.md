@@ -31,7 +31,7 @@ graph TB
     subgraph "Data & Intelligence"
         PG["PostgreSQL + pgvector"]
         Embed["SentenceTransformer 768-dim"]
-        Ensemble["Ensemble Voter (heuristic + xlmr + distilbert + LLM)"]
+        Ensemble["Ensemble Voter (heuristic + 7 HF heads + LLM)"]
         Stance["Stance Scoring (watchlist + clause-level cues)"]
         Cluster["k-means / HDBSCAN Clustering"]
     end
@@ -122,9 +122,18 @@ The RAG system doesn't retrieve raw text. It retrieves analysis results that
 were produced by a **multi-voter ensemble** ([ensemble.py](file:///home/bk/code/defense/src/defense/libs/ensemble.py)):
 
 - **Heuristic** (emoji + lexicon rules — free)
-- **XLM-R** (multilingual transformer — cheap)
-- **DistilBERT** (second multilingual head — cheap)
+- **Seven ML sentiment heads** (cheap, batched, CPU): `xlmr`, `distilbert`,
+  `twitter_xlmr`, `banglabert`, `bengali_sentiment_bert`, `mbert`, `modernbert`
+  — two BanglaBERT fine-tunes among them, so Bangla is judged by more than
+  multilingual models that merely include it
 - **LLM** (context-aware stance — expensive, only for escalated comments)
+
+Note what "seven" does and does not buy: five of the heads are multilingual
+models trained on overlapping data, so their votes are correlated and unanimity
+among them is weaker evidence than seven independent readings would be. The
+roster is also configurable (`STAGE2_CLASSIFIER_1..7`) and a head whose weights
+are absent abstains rather than voting neutral — `stage2_cheap_voters` logs
+`declared` vs `voted` so a degraded run is visible rather than silent.
 
 The ensemble's `should_escalate()` function is the **cost lever**: it decides
 which comments get the expensive LLM call based on cheap-voter disagreement,

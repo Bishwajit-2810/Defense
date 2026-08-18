@@ -26,6 +26,7 @@ from .rules import (
     read_overall_confidence,
     read_photo_count,
     read_text_length,
+    select_comments_for_stage2,
     should_use_llm,
 )
 from defense.libs import streams
@@ -163,6 +164,14 @@ async def _process_message(
     task_flags["post_level_routed"] = bool(use_llm)
     payload["task_flags"] = task_flags
 
+    # Which comments Stage 2 analyses — top-N by reaction count, chosen ONCE
+    # here so every Stage-2 voter reads the same set (rules.py). Marks the
+    # comments in `stage1_result` in place; the ones outside the cut stay in the
+    # payload with their Stage-1 label, so nothing is dropped from persistence.
+    selection = select_comments_for_stage2(stage1_result, options)
+    if selection:
+        logger.info("router_comment_selection", post_id=post_id, **selection)
+
     await redis.xadd(STAGE2_QUEUE, {"data": json.dumps(payload)})
     if use_llm:
         await redis.incr(STAT_LLM)
@@ -187,6 +196,8 @@ async def _process_message(
             # cannot read "no post-level tasks" as "Stage 2 was skipped".
             "post_level_tasks": bool(use_llm),
             "comment_analysis": True,
+            # …and how much of the thread that comment analysis covers.
+            "comment_selection": selection,
         },
         log=logger,
     )

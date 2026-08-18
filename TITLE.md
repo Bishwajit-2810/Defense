@@ -17,11 +17,22 @@ pipeline** behind a pluggable (local Ollama/vLLM ⇄ Groq) backend.
 >
 > **"Cost-Efficient"** — defensible only if it is *measured*, and the measurement
 > has moved. The routing rate is **16% of posts** on the shipped configuration
-> (not single digits), and since every non-emoji comment now reaches the LLM the
-> cost is **comment-dominated**: 85% of LLM calls are comment-level. The gate
-> governs 55% of total spend. The claim that survives is *"cheap NLP filters
+> (not single digits), and because comment labelling runs for every post the cost
+> is **comment-dominated**: 85–96% of LLM calls are comment-level, and the gate
+> governs only 30–55% of spend. The claim that survives is *"cheap NLP filters
 > which comments and which posts deserve an LLM"* — real, but narrower than the
 > phrase "cost-efficient" implies on a title page.
+>
+> **Update (17 August 2026): the comment half *can* be bounded, but the shipped
+> configuration deliberately is not.** `ROUTER_COMMENT_TOP_N` selects the N
+> most-reacted comments with text and every Stage-2 voter reads that one set, so
+> setting it to 100 fixes Stage-2 comment cost at `ceil(100/batch)` = **4 LLM
+> calls per post regardless of thread size**. It ships at **0 — the whole thread**,
+> because a capped run leaves the tail with no model verdict at all and the
+> post-level breakdown fills with `uncertain`. So the defensible sentence is
+> *"coverage was chosen over cost, and the cap is a one-line switch"* — not
+> "cost-efficient". Neither half has an accuracy number beside it while the gold
+> set is unadjudicated, and a title claiming efficiency implies both.
 >
 > The honest distinctive claims are: **code-mixed Bangla/Banglish**, the
 > **post+thread** unit with per-comment coverage, the **confidence-gated

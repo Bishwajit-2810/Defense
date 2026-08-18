@@ -7,6 +7,7 @@ from __future__ import annotations
 import json
 import logging
 import os
+import re
 from defense.libs.common.config import get_settings
 
 config = get_settings()
@@ -15,6 +16,7 @@ import sys
 import structlog
 
 _CONFIGURED = False
+_ANSI_RE = re.compile(r"\x1b\[[0-9;]*[a-zA-Z]")
 
 LOG_LIST_KEY = "logs:recent"
 LOG_CHANNEL = "logs:live"
@@ -58,6 +60,7 @@ class RedisLogHandler(logging.Handler):
                 return
 
             msg = self.format(record)
+            clean_msg = _ANSI_RE.sub("", msg) if isinstance(msg, str) else str(msg)
             
             # Extract fields if using structlog
             # structlog puts event_dict in record.msg if formatted a certain way,
@@ -66,7 +69,7 @@ class RedisLogHandler(logging.Handler):
                 "ts": record.created,
                 "level": record.levelname,
                 "service": getattr(record, "service", "-"),
-                "message": msg[:_MAX_MSG],
+                "message": clean_msg[:_MAX_MSG],
                 "fields": {},
                 "module": f"{record.module}:{record.lineno}",
             }

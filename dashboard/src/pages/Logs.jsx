@@ -2,6 +2,8 @@ import React, { useState, useEffect, useRef } from 'react';
 import { Terminal, Play, Square, Trash2, Filter, AlertCircle, Info, Bug } from 'lucide-react';
 import { API_BASE, getSseQueryAsync } from '../utils/api';
 
+const stripAnsi = (str) => (typeof str === 'string' ? str.replace(/\x1b\[[0-9;]*[a-zA-Z]/g, '') : str);
+
 export default function Logs() {
   const [logs, setLogs] = useState([]);
   const [isFollowing, setIsFollowing] = useState(true);
@@ -20,6 +22,9 @@ export default function Logs() {
     es.addEventListener('log', (e) => {
       try {
         const parsed = JSON.parse(e.data);
+        if (parsed && parsed.message) {
+          parsed.message = stripAnsi(parsed.message);
+        }
         setLogs(prev => [...prev.slice(-999), parsed]);
       } catch (err) {
         // ignore malformed

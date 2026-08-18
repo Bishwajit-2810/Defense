@@ -2,6 +2,8 @@ import React, { useState, useEffect, useRef } from 'react';
 import { Database, Brain, Cpu, MessageSquare, Save, Activity, ChevronRight, Terminal, CheckCircle2 } from 'lucide-react';
 import { API_BASE, apiCall, getSseQueryAsync } from '../utils/api.js';
 
+const stripAnsi = (str) => (typeof str === 'string' ? str.replace(/\x1b\[[0-9;]*[a-zA-Z]/g, '') : str);
+
 export default function Pipeline() {
   const [logs, setLogs] = useState([]);
   const [isFollowing, setIsFollowing] = useState(true);
@@ -21,6 +23,9 @@ export default function Pipeline() {
     es.addEventListener('log', (e) => {
       try {
         const parsed = JSON.parse(e.data);
+        if (parsed && parsed.message) {
+          parsed.message = stripAnsi(parsed.message);
+        }
         setLogs(prev => [...prev.slice(-99), parsed]);
       } catch (err) {}
     });

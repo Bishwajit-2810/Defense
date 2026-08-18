@@ -47,6 +47,19 @@ What ends up running:
   | `qwen2.5:7b` | Stage-2 — summary, insight, comment stance; also the Chat tab |
   | `qwen3-vl:4b` | VLM — image-grounded summaries (unexercised: no image bytes are reachable) |
 
+- **(Optional) the seven small sentiment heads** — the cheap half of the Stage-2
+  comment ensemble, ~3 GB of HF checkpoints on CPU. Everything runs without them
+  (the ensemble degrades to the LLM alone and says so), so this is a second-run
+  step, not a prerequisite:
+
+  ```bash
+  uv run python deploy/prefetch_classifiers.py     # downloads, then proves each head votes
+  ```
+
+  Until you do, the Stage-2 log says `stage2_cheap_voters voted=0 declared=7` and
+  the per-comment table in the dashboard shows `—` in those seven columns. That is
+  the honest rendering of a head that never ran — not a bug.
+
 Repo assumed at `/home/bk/code/defense`.
 
 ---

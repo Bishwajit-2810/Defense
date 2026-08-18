@@ -45,7 +45,14 @@ from defense.libs.llm.client import LLMClient
 from defense.libs.common.config import get_settings
 
 ROOT = Path(__file__).resolve().parent.parent
-for _p in (ROOT, ROOT / "libs", ROOT / "services" / "workers" / "stage1_nlp"):
+# NB: the tree moved under src/defense/ — these paths track that layout.
+for _p in (
+    ROOT,
+    ROOT / "src",
+    ROOT / "src" / "defense",
+    ROOT / "src" / "defense" / "libs",
+    ROOT / "src" / "defense" / "services" / "workers" / "stage1_nlp",
+):
     if str(_p) not in sys.path:
         sys.path.insert(0, str(_p))
 
@@ -95,11 +102,15 @@ async def _measure(corpus: Path, max_comments: int) -> dict:
 
         (
             text_result, image_result, comment_analysis,
+            post_summary, post_summary_lang, post_summary_grounding,
             overall_sentiment, sentiment_score,
         ) = await stage1._process_message(post, registry)
         result = stage1._build_result(
             post=post, text_result=text_result, image_result=image_result,
-            comment_analysis=comment_analysis, overall_sentiment=overall_sentiment,
+            comment_analysis=comment_analysis, post_summary=post_summary,
+            post_summary_lang=post_summary_lang,
+            post_summary_grounding=post_summary_grounding,
+            overall_sentiment=overall_sentiment,
             sentiment_score=sentiment_score, stage1_ms=0.0,
         )
 
@@ -143,7 +154,9 @@ async def _measure(corpus: Path, max_comments: int) -> dict:
 
 async def main() -> None:
     parser = argparse.ArgumentParser(description=__doc__)
-    parser.add_argument("--corpus", type=Path, default=ROOT / "posts_text_only.json")
+    # Full 50-post source: the sweep's cost axis is dominated by the comment
+    # lane, and the caption-filtered subset hides 1,307 of the 10,272 comments.
+    parser.add_argument("--corpus", type=Path, default=ROOT / "posts_with_details.json")
     parser.add_argument(
         "--sweep", choices=["threshold", "comment-cap"], default="threshold",
         help="threshold = ROUTER_CONFIDENCE_THRESHOLD; comment-cap = STAGE1_LLM_COMMENT_MAX",
@@ -164,7 +177,12 @@ async def main() -> None:
         env_key = "STAGE1_LLM_COMMENT_MAX"
 
     print(f"Sweeping {env_key} over {values}")
-    print(f"Corpus: {args.corpus.name}\n")
+    _corpus_posts = json.loads(args.corpus.read_text())
+    _captionless = sum(1 for p in _corpus_posts if not (p.get("caption") or "").strip())
+    print(f"Corpus: {args.corpus.name} — {len(_corpus_posts)} posts, "
+          f"{sum(len(p.get('comments') or []) for p in _corpus_posts):,} comments"
+          + (f" ({_captionless} null-caption)" if _captionless else ""))
+    print()
 
     rows: list[dict] = []
     for value in values:

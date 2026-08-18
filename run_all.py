@@ -363,28 +363,30 @@ def build_env() -> dict:
         "STAGE1_LLM": "true",
         # Stage 1 uses the LLM for the post (summary + post-type) but NOT for
         # the comments: Stage 2 labels every post's comments with qwen2.5:7b
-        # plus both classifiers, so doing it here as well spends the slowest
+        # plus the seven classifiers, so doing it here as well spends the slowest
         # calls in the pipeline re-deriving a label that then gets outvoted.
         # Measured on a live run: one 25-comment gemma3:4b batch took 120 s and
         # returned invalid JSON (16 of 25 labels salvaged).
+        #
+        # STAGE1_LLM_COMMENT_MAX is deliberately NOT set here. It used to be 60,
+        # which was inert while the line above is "false" — and a silent 60-comment
+        # coverage cap the moment anyone flipped it to "true", overriding whatever
+        # .env said. Coverage knobs belong to the operator; see the note in
+        # build_env's tail.
         "STAGE1_LLM_COMMENTS": "false",
-        "STAGE1_LLM_COMMENT_MAX": "60",
         "LLM_A_LOCAL_MODEL": "qwen2.5:7b",
         "LLM_B_LOCAL_MODEL": "qwen2.5:7b",
         "VLM_LOCAL_MODEL": "qwen3-vl:4b",
-        # Per-post context-aware comment labelling. Every comment is ALWAYS
-        # analysed by the instant Stage-1 heuristic (full coverage); this only
-        # bounds the slow premium LLM pass to the top-N most-liked comments so a
-        # post with thousands of comments can't stall Stage-2. Set 0 to LLM-label
-        # EVERY comment (only practical on Groq / a GPU — slow on local CPU).
-        "COMMENT_STANCE_MAX_PER_POST": "40",
         "COMMENT_STANCE_BATCH": "40",
         "MODEL_STUB_MODE": "true",
-        # The two Stage-2 comment classifiers (XLM-R + DistilBERT) that vote
-        # alongside the LLM. They load from the local HF cache only — stub mode
-        # means "download nothing", not "refuse models you already have" — so a
-        # machine without the checkpoints degrades to LLM-only rather than
-        # stalling on a 1 GB fetch.
+        # The seven Stage-2 comment classifiers that vote alongside the LLM
+        # (see STAGE2_CLASSIFIER_1..7). They load from the local HF cache only —
+        # stub mode means "download nothing", not "refuse models you already
+        # have" — so a machine without the checkpoints degrades to LLM-only
+        # rather than stalling on a 3 GB fetch. Fetch them once with
+        # `uv run python deploy/prefetch_classifiers.py`; until then the
+        # `stage2_cheap_voters` log line reports voted<declared and names the
+        # heads that stayed silent.
         "STAGE2_CLASSIFIERS_ENABLED": "true",
         # ...strictly from the local HF cache. Set in the process environment
         # (not from Python) because transformers reads these at import time, so
@@ -411,6 +413,21 @@ def build_env() -> dict:
         # in host mode — so the host URL must be in the API's env too.
         "AGENTS_SERVICE_URL": "http://127.0.0.1:8010",
     })
+
+    # NO COVERAGE CAPS ARE SET HERE, deliberately. `env.update` above beats .env
+    # (pydantic-settings ranks the process environment above the file), so any
+    # coverage default hardcoded in this launcher silently overrides a deliberate
+    # setting — which is how `COMMENT_STANCE_MAX_PER_POST=0` in .env still ran with
+    # a cap of 40, and the post detail read "✓ all 2857 analyzed" next to
+    # "⚠ 2606 capped out".
+    #
+    # The full payload is analysed: ROUTER_COMMENT_TOP_N, STAGE1_LLM_COMMENT_MAX and
+    # COMMENT_STANCE_MAX_PER_POST all default to 0 in `Settings`. On local CPU that
+    # is slow on a long thread — seven heads are ~0.92 s/comment, so a
+    # 2,857-comment post is ~44 min of classifier time plus ~115 LLM stance
+    # batches. Cap it for a quick demo by exporting `ROUTER_COMMENT_TOP_N=100`, or
+    # run `--fast` (Groq) — but do it in the environment, not here, so the run's
+    # own setting is the one that shows up in the output.
     return env
 
 
@@ -451,8 +468,9 @@ def apply_fast_preset(env: dict) -> None:
 
     Groq is dramatically faster than CPU Ollama, so this is the recommended way
     to get quick, high-quality summaries + comment stance. Requires GROQ_API_KEY
-    (exported, or in .env). Combine with COMMENT_STANCE_MAX_PER_POST=0 to LLM-label
-    every comment (now tractable on Groq).
+    (exported, or in .env). Combine with ROUTER_COMMENT_TOP_N=0 to analyse every
+    comment on every post rather than the top 100 by reaction count — tractable on
+    Groq, and the setting a scoring run wants so the ensemble also labels the tail.
     """
     key = env.get("GROQ_API_KEY") or os.environ.get("GROQ_API_KEY") or _dotenv_value("GROQ_API_KEY")
     if not key:

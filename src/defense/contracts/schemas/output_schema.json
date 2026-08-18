@@ -617,6 +617,24 @@
                 "type": "string"
               },
               "description": "Which labellers actually ran on this post."
+            },
+            "analysed": {
+              "type": "integer",
+              "description": "Comments the Stage-2 voters actually read — the router's selection. Distinct from `comments`, which is the whole thread."
+            },
+            "not_analysed": {
+              "type": "integer",
+              "description": "Comments outside the router's selection. Not a failure: their label is Stage 1's, and `escalation_reason` says `below_top_n`."
+            },
+            "llm_share_analysed": {
+              "type": "number",
+              "minimum": 0,
+              "maximum": 1,
+              "description": "LLM coverage of the SELECTION, where `llm_share` is coverage of the whole thread. 100 of 2,857 is 3.4% of the post and 100% of what was selected; both are needed or one gets read as the other."
+            },
+            "selection": {
+              "type": "object",
+              "description": "Copy of comment_analysis.stage2_selection, so a consumer holding only the ensemble rollup can still say how much of the thread it describes."
             }
           }
         },
@@ -708,7 +726,7 @@
               },
               "parallel_labels": {
                 "type": "object",
-                "description": "Every independent opinion about this comment, keyed by source (heuristic / xlmr / distilbert / llm). A source that did not run is ABSENT — never present with a fabricated neutral."
+                "description": "Every independent opinion about this comment, keyed by source: the seven STAGE2_CLASSIFIER_* heads (xlmr / distilbert / twitter_xlmr / banglabert / bengali_sentiment_bert / mbert / modernbert) and `llm`. A source that did not run is ABSENT — never present with a fabricated neutral. There is no `heuristic` key: only a model may label a comment, so Stage 1's emoji + keyword verdict is not a voter (removed 17 Aug 2026). Its label remains visible in `method` and in `provenance`."
               },
               "label_agreement": {
                 "type": [
@@ -857,7 +875,60 @@
                   "type": "string"
                 },
                 "description": "Which labellers voted, by name."
+              },
+              "stage2_selected": {
+                "type": [
+                  "boolean",
+                  "null"
+                ],
+                "description": "False when the comment fell outside the router's top-N by reaction count: NO Stage-2 model read it, and the label shown is Stage 1's own. Absent on textless comments (never ranked) and on results written before the selection existed."
+              },
+              "stage2_skip_reason": {
+                "type": [
+                  "string",
+                  "null"
+                ],
+                "description": "Why the router left this comment out of the analysis set. 'below_top_n' is the only value."
               }
+            }
+          }
+        },
+        "stage2_selection": {
+          "type": "object",
+          "description": "Which comments Stage 2 analysed, chosen by the ROUTER. `limit` is ROUTER_COMMENT_TOP_N: **0 (the default) means no cap — every comment with text was analysed**, so `selected` equals `eligible`. A positive `limit` keeps only that many, ranked by reaction count; the rest are kept and persisted but no model reads them, so they carry `stage2_selected: false` and report `uncertain`. `total` / `eligible` / `selected` are three different numbers — reading any one as another is how 'every comment was analysed' gets claimed for a capped run.",
+          "properties": {
+            "strategy": {
+              "type": "string",
+              "description": "Selection rule. 'top_reactions' is the only one implemented."
+            },
+            "limit": {
+              "type": "integer",
+              "minimum": 0,
+              "description": "ROUTER_COMMENT_TOP_N in force for this post. 0 = no cap (every comment with text)."
+            },
+            "total": {
+              "type": "integer",
+              "description": "Every comment stored on the post."
+            },
+            "eligible": {
+              "type": "integer",
+              "description": "…of which had text to read. Emoji-only reactions and bare links are never ranked: no model would read them, so they must not consume a slot."
+            },
+            "selected": {
+              "type": "integer",
+              "description": "Comments every Stage-2 voter read."
+            },
+            "skipped": {
+              "type": "integer",
+              "description": "Eligible comments below the cut. They keep `stage2_selected: false` and, because no model read them, report `uncertain` at zero voters. Always 0 when limit is 0."
+            },
+            "cutoff_likes": {
+              "type": "integer",
+              "description": "Reaction count of the lowest-ranked comment that made the cut."
+            },
+            "top_likes": {
+              "type": "integer",
+              "description": "Reaction count of the most-reacted comment."
             }
           }
         }

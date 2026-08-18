@@ -3,7 +3,33 @@
 > **Superseded in part.** A fourth pass (12–13 August 2026) found eleven more, two of them
 > regressions of items fixed here: the routing gate (below) and issue 4 (report cluster
 > summaries computed, paid for and discarded). It also found that the contract guards this
-> pass left behind had _all_ stopped running. See **[AUDIT_PASS7.md](AUDIT_PASS7.md)**.
+> pass left behind had _all_ stopped running. See **[AUDIT_PASS7.md](AUDIT_PASS7.md)**,
+> then [AUDIT_PASS8.md](AUDIT_PASS8.md) and [AUDIT_PASS9.md](AUDIT_PASS9.md)
+> (14 August — multi-tenant data isolation across Postgres, ClickHouse, the routers,
+> the worker envelopes and the retrieval MCP).
+>
+> **Two later changes touch items in this file (17 August 2026), neither of them a
+> regression:**
+>
+> - **The Stage-2 comment set is chosen by the router**, not by the stance pass:
+>   `ROUTER_COMMENT_TOP_N` (default **0 = every comment with text**) is applied once
+>   and *every* voter reads that set. The cap this file discusses
+>   (`COMMENT_STANCE_MAX_PER_POST`) also stays at 0 — a positive value gives the LLM
+>   fewer comments than the seven cheap heads got, which is the hole the
+>   router-side selection exists to close. If a positive cap is set for speed, the
+>   comments below the cut are kept, persisted, and reported as
+>   `ensemble.not_analysed` with `uncertain` labels.
+> - **Stage 1's label is no longer a voter, and `_seed_heuristic_vote` is gone.**
+>   It was dead code for a while (defined, unit-tested, never called); it was
+>   briefly wired up for the comments the router left out; it is now deleted and
+>   `heuristic` is out of `ensemble.CHEAP_SOURCES`. **Only a model may label a
+>   comment.** The rule is that a voter which answers on every comment — and whose
+>   answers are 71.3% deterministic stub or emoji rule (§6.2) — can never abstain,
+>   which makes `abstained` / `unread` / `single_voter` unfalsifiable. **Consequence
+>   to watch:** every comment outside the router's top-N now reports `uncertain` at
+>   zero voters, so on a thread much larger than `ROUTER_COMMENT_TOP_N` the
+>   post-level `sentiment_breakdown` is mostly `uncertain`. That is accurate, and it
+>   is a reporting change worth knowing before showing a chart.
 
 **Found:** 5 August 2026, fresh-eyes audit of the whole tree (the third such pass).
 **Status: ALL TEN ARE FIXED** and regression-tested, 5 August 2026.
@@ -1043,7 +1069,7 @@ then call the new anomaly check with the same inputs and assert it flags it.
 
 ### 17a — Schema validator crashes on mixed-type path sorting
 
-[validator.py:48](src/defense/libs/schemas/validator.py#L48) `_collect_errors` sorts
+[validator.py:48](src/defense/contracts/schemas/validator.py#L48) `_collect_errors` sorts
 validation errors by `key=lambda e: list(e.absolute_path)`. JSON Schema paths
 contain both strings (object keys) and integers (array indices). Python 3 raises
 `TypeError: '<' not supported between instances of 'int' and 'str'` when

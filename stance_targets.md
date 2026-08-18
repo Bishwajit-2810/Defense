@@ -264,6 +264,13 @@ Reuse the existing lane rather than adding one:
   calls, so this feature is **free** against the cost model in
   [PROJECT_ASSESSMENT.md](PROJECT_ASSESSMENT.md) §6.8. Worth saying out loud: it
   adds a capability without adding a lane.
+- **…which also means it inherits that call's reach.** The Stage-2 comment pass
+  covers whatever the router selected — by default every comment with text
+  (`ROUTER_COMMENT_TOP_N=0`), so the LLM-scored target stances cover the whole
+  thread. Set a positive cap for speed and they cover only that slice, while the
+  Stage-1 deterministic verdict still covers every comment; the rollup then mixes
+  the two, and `method: "llm"` per entry is the field to check before describing a
+  per-target number as LLM-judged.
 - **The deterministic scorer fills in** for bypassed posts and stub-mode runs.
 
 ---
@@ -276,7 +283,8 @@ thing**, not a scorecard.
 Two metrics, and they must be reported separately because they fail differently:
 
 1. **Mention detection** — precision and recall of the matcher, on comments
-   sampled from `posts_text_only.json`. This is where the alias work is proved
+   sampled from `posts_with_details.json` (all 50 posts — comment text does not
+   depend on the parent post carrying a caption). This is where the alias work is proved
    or disproved, and it is the number that matters most. **Recall is the one to
    watch**: a missed alias is invisible, an over-match is obvious.
 2. **Stance agreement** — of the correctly-matched mentions, how often the stance

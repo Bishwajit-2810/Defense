@@ -24,6 +24,18 @@ in [data_contract.md](data_contract.md), and the API in [api_design.md](api_desi
 >   sentiment — and the `provenance` block is what tells you how many labels were
 >   real inferences. With a watchlist configured there is also `target_stances`,
 >   a **separate** measurement from `sentiment_breakdown`.
+> - **Per-comment labels are an ensemble, and only part of the thread gets one.**
+>   Each analysed comment carries `parallel_labels` (up to eight voters: seven
+>   small sentiment heads and the LLM stance pass — Stage 1's keyword label does
+>   not vote) plus
+>   `label_voters` / `label_sources` / `label_agreement`. The router selects which
+>   comments those voters read: by default **every comment with text**
+>   (`ROUTER_COMMENT_TOP_N=0`), recorded in `comment_analysis.stage2_selection`
+>   with `ensemble.analysed` / `not_analysed` beside it. Set a positive cap and the
+>   comments outside it carry `stage2_selected: false` and **no model verdict** —
+>   they read `uncertain`, never `neutral`. Emoji-only comments read `uncertain`
+>   too: there is no text in them for a model. The flat single-label comments in
+>   the examples below are the pre-ensemble shape.
 > - **`processing` carries `role_models` and `degraded_components`.** The second
 >   matters most: it lists real-mode components that fell back to a heuristic, so
 >   a run reporting `nlp_engine: "models"` can still be shown to have produced

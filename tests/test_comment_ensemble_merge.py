@@ -50,7 +50,23 @@ def _ca(comments):
     return {"analyzed": len(comments), "comments": comments}
 
 
-def _merge(ca, watchlist=None, reasons=None, dedup=None, voters=("heuristic",)):
+def _vote(comment, source="xlmr", label=None, score=None):
+    """Give the comment one real MODEL vote.
+
+    These tests used to call `w._seed_heuristic_vote()`, which copied Stage 1's
+    own label into `parallel_labels["heuristic"]`. Stage 1's keyword label no
+    longer votes at all (17 Aug 2026), so the merge is now exercised the way it
+    actually runs: with a cheap head's verdict.
+    """
+    label = label or comment["sentiment"]
+    comment.setdefault("parallel_labels", {})[source] = {
+        "sentiment": label,
+        "score": comment.get("sentiment_score", 0.0) if score is None else score,
+    }
+    return comment
+
+
+def _merge(ca, watchlist=None, reasons=None, dedup=None, voters=("xlmr",)):
     return w._merge_ensemble(
         ca, watchlist,
         escalation_reasons=reasons or {},
@@ -72,7 +88,7 @@ def test_the_breakdown_totals_the_comments_it_describes():
     ]
     ca = _ca(comments)
     for c in comments:
-        w._seed_heuristic_vote(c)
+        _vote(c)
     _merge(ca)
 
     assert sum(ca["sentiment_breakdown"].values()) == len(comments)
@@ -82,7 +98,7 @@ def test_every_comment_carries_the_label_the_counts_were_built_from():
     comments = [_comment("c1", "great", "positive"), _comment("c2", "awful", "negative")]
     ca = _ca(comments)
     for c in comments:
-        w._seed_heuristic_vote(c)
+        _vote(c)
     _merge(ca)
 
     counted = {"positive": 0, "negative": 0, "neutral": 0, "uncertain": 0}
@@ -94,12 +110,12 @@ def test_every_comment_carries_the_label_the_counts_were_built_from():
 def test_the_llm_vote_actually_changes_the_comments_label():
     """It used to land in parallel_labels and stop there."""
     c = _comment("c1", "this is fine", "neutral")
-    w._seed_heuristic_vote(c)
+    _vote(c, "distilbert")                      # neutral
     c["parallel_labels"]["xlmr"] = {"sentiment": "negative", "score": -0.7}
     c["parallel_labels"]["llm"] = {"sentiment": "negative", "sentiment_score": -0.6}
 
     ca = _ca([c])
-    _merge(ca, voters=("heuristic", "xlmr", "llm"))
+    _merge(ca, voters=("distilbert", "xlmr", "llm"))
 
     assert c["sentiment"] == "negative"      # 2 of 3 voters
     assert c["label_agreement"] == pytest.approx(2 / 3, abs=1e-3)
@@ -108,7 +124,7 @@ def test_the_llm_vote_actually_changes_the_comments_label():
 
 def test_a_split_is_reported_as_uncertain_in_its_own_bucket():
     c = _comment("c1", "hmm", "positive")
-    w._seed_heuristic_vote(c)
+    _vote(c, "distilbert")                      # positive
     c["parallel_labels"]["xlmr"] = {"sentiment": "negative", "score": -0.9}
 
     ca = _ca([c])
@@ -130,7 +146,7 @@ def test_emoji_reactions_stay_reactions():
     ]
     ca = _ca(comments)
     for c in comments:
-        w._seed_heuristic_vote(c)
+        _vote(c)
     _merge(ca)
 
     assert ca["reaction_only"] == 2
@@ -140,12 +156,12 @@ def test_emoji_reactions_stay_reactions():
 def test_method_breakdown_reports_what_actually_labelled_each_comment():
     """`provenance` reported 0% LLM for runs where every comment saw one."""
     c = _comment("c1", "text", "neutral")
-    w._seed_heuristic_vote(c)
+    _vote(c)
     c["parallel_labels"]["llm"] = {"sentiment": "negative", "sentiment_score": -0.6}
     c["parallel_labels"]["xlmr"] = {"sentiment": "negative", "score": -0.8}
 
     ca = _ca([c])
-    _merge(ca, voters=("heuristic", "xlmr", "llm"))
+    _merge(ca, voters=("xlmr", "llm"))
 
     assert ca["method_breakdown"] == {"ensemble": 1}
     assert ca["provenance"]["total"] == 1
@@ -153,13 +169,13 @@ def test_method_breakdown_reports_what_actually_labelled_each_comment():
 
 def test_a_propagated_label_says_it_was_propagated():
     dup = _comment("c2", "same thing", "neutral")
-    w._seed_heuristic_vote(dup)
+    _vote(dup)
     dup["parallel_labels"]["llm"] = {"sentiment": "positive", "sentiment_score": 0.6}
     dup["label_source"] = "propagated"
     dup["propagated_from"] = "c1"
 
     ca = _ca([dup])
-    _merge(ca, voters=("heuristic", "llm"))
+    _merge(ca, voters=("xlmr", "llm"))
 
     assert dup["label_source"] == "propagated"
     assert dup["method"] == "propagated"
@@ -170,7 +186,7 @@ def test_the_ensemble_block_reports_what_the_agreement_bought():
     comments = [_comment(f"c{i}", f"text {i}", "positive") for i in range(4)]
     ca = _ca(comments)
     for c in comments:
-        w._seed_heuristic_vote(c)
+        _vote(c)
     summary = _merge(
         ca,
         reasons={"cheap_consensus": 3, "cheap_disagreement": 1},
@@ -186,34 +202,54 @@ def test_the_ensemble_block_reports_what_the_agreement_bought():
 
 def test_the_llms_emotion_upgrades_the_heuristic_one():
     c = _comment("c1", "text", "negative")
-    w._seed_heuristic_vote(c)
+    _vote(c)
     c["parallel_labels"]["llm"] = {"sentiment": "negative", "emotion": "anger"}
 
-    _merge(_ca([c]), voters=("heuristic", "llm"))
+    _merge(_ca([c]), voters=("xlmr", "llm"))
 
     assert c["emotion"] == "anger"
     assert c["emotion_method"] == "llm"
 
 
-def test_the_hash_stub_does_not_get_a_vote():
-    """`stub` is the deterministic hash fallback — "reproducible, and it is not
-    sentiment" in the schema's own words. On a real Bangla thread with no
-    sentiment model loaded it is the MAJORITY of Stage-1 labels (11 of 12
-    measured), so letting it vote would let hash noise decide the ensemble."""
-    stubbed = _comment("c1", "কিছু একটা", "positive", method="stub")
-    w._seed_heuristic_vote(stubbed)
-    assert "heuristic" not in (stubbed.get("parallel_labels") or {})
+@pytest.mark.parametrize("method", ["fast", "emoji", "model", "llm", "stub", "failed"])
+def test_stage_1s_own_label_never_votes(method):
+    """ONLY A MODEL MAY LABEL A COMMENT (17 Aug 2026).
 
-    failed = _comment("c2", "x", "neutral", method="failed")
-    w._seed_heuristic_vote(failed)
-    assert "heuristic" not in (failed.get("parallel_labels") or {})
+    Stage 1's label used to be copied into `parallel_labels["heuristic"]` and
+    counted as a voter — for every method except the hash `stub` and `failed`.
+    That seeding is gone and `heuristic` is out of `ensemble.CHEAP_SOURCES`: it is
+    an emoji + keyword rule, and in the shipped configuration most of its verdicts
+    ARE the stub (11 of 12 comments on a real Bangla thread), so a free voter that
+    answers every comment made abstention impossible to report.
+
+    The merge must therefore find no voter here, whatever Stage 1 wrote.
+    """
+    c = _comment("c1", "দারুণ", "positive", method=method)
+    ca = _ca([c])
+    summary = _merge(ca, voters=())
+
+    assert "heuristic" not in (c.get("parallel_labels") or {})
+    assert c["label_voters"] == 0
+    assert c["sentiment"] == "uncertain"
+    assert summary["unread"] == 1
+    # `method` is untouched, so `provenance` still discloses which cheap path ran.
+    assert ca["method_breakdown"] == {method: 1}
+
+
+def test_the_heuristic_seeder_is_gone_for_good():
+    """A regression guard on the removal itself. Re-adding a seeded Stage-1 vote
+    is the one change that would silently undo every abstention number above."""
+    from defense.libs import ensemble
+
+    assert not hasattr(w, "_seed_heuristic_vote")
+    assert "heuristic" not in ensemble.CHEAP_SOURCES
 
 
 def test_a_comment_nobody_read_is_uncertain_not_its_stub_label():
     """Declining the vote is only half the fix.
 
-    `_seed_heuristic_vote` correctly refuses to let the hash stub vote — but the
-    stub label was still sitting in `comment["sentiment"]`, and the merge only
+    The hash stub was refused a *vote* — but its label was still sitting in
+    `comment["sentiment"]`, and the merge only
     overwrote it when at least one voter spoke. So with no sentiment model, no
     cached classifiers and no LLM verdict (the documented MODEL_STUB_MODE run),
     every comment kept its hash label, `sentiment_breakdown` counted it as a
@@ -225,10 +261,8 @@ def test_a_comment_nobody_read_is_uncertain_not_its_stub_label():
         _comment("c2", "Chatte thak", "negative", method="stub"),
         _comment("c3", "ভাই চালিয়ে যান", "positive", method="stub"),
     ]
-    for c in comments:
-        w._seed_heuristic_vote(c)
     ca = _ca(comments)
-    summary = _merge(ca)
+    summary = _merge(ca, voters=())
 
     # Nobody voted, so nothing is claimed about any of them.
     assert [c["sentiment"] for c in comments] == ["uncertain"] * 3
@@ -272,25 +306,17 @@ def test_one_voter_is_not_unanimity():
     assert [c["label_voters"] for c in comments] == [1, 1]
 
 
-@pytest.mark.parametrize("method", ["fast", "emoji", "model", "llm"])
-def test_a_real_stage1_reading_does_vote(method):
-    c = _comment("c1", "দারুণ", "positive", method=method)
-    w._seed_heuristic_vote(c)
-    assert c["parallel_labels"]["heuristic"]["sentiment"] == "positive"
-    assert c["parallel_labels"]["heuristic"]["via"] == method
-
-
 def test_llm_coverage_is_counted_from_the_labels_not_the_intent():
     """A batch can fail. A post whose stance pass half-failed must not report
     full LLM coverage just because every comment was selected for one."""
     labelled = _comment("c1", "one", "positive")
     unlabelled = _comment("c2", "two", "positive")
     for c in (labelled, unlabelled):
-        w._seed_heuristic_vote(c)
+        _vote(c)
     labelled["parallel_labels"]["llm"] = {"sentiment": "positive", "sentiment_score": 0.6}
 
     ca = _ca([labelled, unlabelled])
-    summary = _merge(ca, reasons={"llm_all": 2}, voters=("heuristic", "llm"))
+    summary = _merge(ca, reasons={"llm_all": 2}, voters=("xlmr", "llm"))
 
     assert summary["escalated"] == 2          # both were sent
     assert summary["llm_labelled"] == 1       # one came back
@@ -299,7 +325,7 @@ def test_llm_coverage_is_counted_from_the_labels_not_the_intent():
 
 def test_comments_dropped_by_the_cap_are_reported_not_hidden():
     ca = _ca([_comment("c1", "x", "positive")])
-    w._seed_heuristic_vote(ca["comments"][0])
+    _vote(ca["comments"][0])
     summary = _merge(ca, reasons={"llm_all": 1, "capped_by_max_per_post": 40})
     assert summary["capped_out"] == 40
 

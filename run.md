@@ -559,17 +559,63 @@ and cost than the router threshold does ([PROJECT_ASSESSMENT.md](PROJECT_ASSESSM
 
 | Variable | Purpose | Required? | Example / default |
 | --- | --- | --- | --- |
-| `STAGE1_LLM_COMMENT_MAX` | Cap on comments per post given a Stage-1 LLM label. **0 = no cap** (every non-emoji comment). | default `0` | `60` for a fast demo |
-| `COMMENT_STANCE_MAX_PER_POST` | Same cap for the Stage-2 context-aware stance pass (routed posts only). | default `0` | `40` for a fast demo |
+| `ROUTER_COMMENT_TOP_N` | **How much of the thread Stage 2 analyses.** `0` (default) = **every comment with text**; every voter reads that same set — the seven cheap heads, the dedup cache and the LLM. A positive N keeps only the N most-reacted comments and bounds per-post cost at `ceil(N / COMMENT_STANCE_BATCH)` LLM calls plus ~0.92 s × N of classifier CPU, however large the thread. Uncapped, a 2,857-comment post is ~44 min of CPU and ~115 stance batches — set a cap for a quick demo, and quote it when you do. | default `0` | `100` for a fast local demo |
+| `STAGE1_LLM_COMMENT_MAX` | Cap on comments per post given a Stage-1 LLM label. **0 = no cap** (every non-emoji comment). Stage 1 is *not* bounded by `ROUTER_COMMENT_TOP_N` — it runs before the router. | default `0` | `60` for a fast demo |
+| `COMMENT_STANCE_MAX_PER_POST` | A second, tighter cap on the LLM stance pass **inside** the router's set. Leave at `0`: a positive value gives the LLM fewer comments than the seven cheap heads got, which is the hole in the per-comment comparison that `ROUTER_COMMENT_TOP_N` exists to avoid. | default `0` | `0` |
 | `STAGE1_LLM_BATCH` | Comments per LLM call. Bigger = fewer calls, longer prompts, coarser retries. | default `25` | `25` |
 | `STAGE1_LLM_CONCURRENCY` | Batches in flight per post. The loop used to be sequential, which is why the caps existed. | default `3` | `3` |
 | `COMMENT_STANCE_BATCH` / `COMMENT_STANCE_CONCURRENCY` | The same two knobs for Stage 2. | default `25` / `3` | — |
 | `COMMENT_LAUGH_SENTIMENT` | How 🤣😂😆 score: `negative` (mockery — right for this corpus), `positive`, or `neutral`. Drives **both** the sentiment and emotion tables, which used to disagree. | default `negative` | `negative` |
 | `STAGE1_OCR_SENTIMENT` | Sentiment-analyse OCR text on null-caption image posts. Off while no image bytes are reachable (§5.2). | default `false` | `false` |
 
-> **If you set the caps above 0, say so when quoting coverage.** At the defaults
-> ~100% of non-emoji comments carry an LLM label; at `60`/`40` it is ~29%, and
-> `comment_analysis.provenance.inferred_share` will show it.
+> **At the defaults, everything with text is analysed by everything.** Stage 1
+> labels every non-emoji comment, and the Stage-2 ensemble (7 heads + LLM) reads
+> every comment with text. The two remaining gaps are inherent, not caps:
+> emoji-only comments and bare links have nothing for a model to read, so they end
+> up `uncertain` at zero voters (Stage 1's keyword label does not vote), and they
+> are counted in `reaction_only`.
+>
+> **If you set a positive `ROUTER_COMMENT_TOP_N`, quote it.** The result then says
+> what was skipped — `comment_analysis.ensemble.analysed` / `not_analysed`,
+> `llm_share` against the whole thread beside `llm_share_analysed` against the
+> selection, and `stage2_selected: false` on every comment no model read — and the
+> post-level `sentiment_breakdown` fills with `uncertain` in proportion.
+
+### The seven Stage-2 comment classifiers
+
+The cheap half of the ensemble. Each slot is a checkpoint; the **voter name** it
+answers as is fixed in code (`Settings.stage2_classifier_names`) because the names
+are keys in `parallel_labels` and renaming one would orphan stored rows and the
+dashboard column that reads them. Set a slot to `""` to drop that voter.
+
+| Variable | Voter | Default checkpoint |
+| --- | --- | --- |
+| `STAGE2_CLASSIFIER_1` | `xlmr` | `tabularisai/multilingual-sentiment-analysis` (DistilBERT-multilingual, 5-class) |
+| `STAGE2_CLASSIFIER_2` | `distilbert` | `lxyuan/distilbert-base-multilingual-cased-sentiments-student` |
+| `STAGE2_CLASSIFIER_3` | `twitter_xlmr` | `cardiffnlp/twitter-xlm-roberta-base-sentiment-multilingual` |
+| `STAGE2_CLASSIFIER_4` | `banglabert` | `ADn-001/banglabert-sentnob-sentiment` |
+| `STAGE2_CLASSIFIER_5` | `bengali_sentiment_bert` | `ahs95/banglabert-sentiment-analysis` |
+| `STAGE2_CLASSIFIER_6` | `mbert` | `nlptown/bert-base-multilingual-uncased-sentiment` (1–5 stars) |
+| `STAGE2_CLASSIFIER_7` | `modernbert` | `clapAI/modernBERT-base-multilingual-sentiment` |
+| `STAGE2_CLASSIFIERS_ENABLED` | — | `true`. Off leaves the **LLM as the only labeller** — Stage 1's keyword label does not vote — so every comment the LLM misses reports `uncertain` at zero voters. |
+| `STAGE2_CLASSIFIER_DEVICE` | — | `auto` (GPU then CPU), `cpu`, or `cuda`. **`cpu` is right when the GPU is serving the LLM** — a 4 GB card running qwen2.5:7b has ~285 MB left, which fits one head, not seven. |
+
+**Fetch them once, and check they vote:**
+
+```bash
+uv run python deploy/prefetch_classifiers.py           # download + verify
+uv run python deploy/prefetch_classifiers.py --check   # verify only
+```
+
+`MODEL_STUB_MODE=true` means *download nothing*, so until you run this, Stage 2
+skips every uncached head and logs
+`stage2_cheap_voters voted=0 declared=7 silent=[…]` at WARNING. That log line is
+the one to read before quoting an agreement number: a post labelled by 2 of 7
+voters is a degraded run, and `unanimous_share` computed over the survivors cannot
+tell you that by itself. The script also runs each head on a Bangla/English/
+Banglish probe, because a checkpoint can download perfectly and still never cast a
+vote — a base encoder emits `LABEL_0`/`LABEL_1`, which maps to nothing, and four of
+the roster's original five entries were exactly that or absent from the Hub.
 
 ### Auth & tenancy
 

@@ -34,8 +34,9 @@ prior** we cross-check against.
 > reachable in any runnable configuration** — the image term has never
 > contributed a non-zero value ([PROJECT_ASSESSMENT.md](PROJECT_ASSESSMENT.md)
 > §5.2). OCR is consequently off by default (`STAGE1_OCR_SENTIMENT=false`), the
-> working corpus is `posts_text_only.json` (43 captioned posts), and post
-> sentiment is a **text** measurement. The vision rows below are kept because
+> working corpus is `posts_with_details.json` (all 50 posts — post-level
+> sentiment on the 7 null-caption posts rests on reactions and comments alone),
+> and post sentiment is a **text** measurement. The vision rows below are kept because
 > the code path is retained and the models are the right ones — they are
 > labelled ⚠ so nothing here reads as a measured capability.
 
@@ -144,6 +145,64 @@ needs it, **once per post**, rather than on every classification call (which,
 since comment stance runs per batch, would multiply straight through the
 comment lane). `summary` defaults to the same model as `stage2`, so nothing
 changes until you point it elsewhere.
+
+### The Stage-2 comment ensemble — seven small heads beside the LLM
+
+Comment sentiment is not decided by one model. Every comment in the router's
+analysis set collects up to **eight** verdicts in `parallel_labels`, and
+`libs/ensemble.combine()` reduces them to one label plus an agreement figure. The
+LLM is one voter of eight — the only one that sees the post, and therefore the only
+one judging *stance toward it* rather than the comment's own tone.
+
+| Slot (env) | Voter name | Checkpoint | Note |
+| --- | --- | --- | --- |
+| `STAGE2_CLASSIFIER_1` | `xlmr` | `tabularisai/multilingual-sentiment-analysis` | DistilBERT-multilingual, 5-class |
+| `STAGE2_CLASSIFIER_2` | `distilbert` | `lxyuan/distilbert-base-multilingual-cased-sentiments-student` | 3-class student |
+| `STAGE2_CLASSIFIER_3` | `twitter_xlmr` | `cardiffnlp/twitter-xlm-roberta-base-sentiment-multilingual` | XLM-R trained on social media |
+| `STAGE2_CLASSIFIER_4` | `banglabert` | `ADn-001/banglabert-sentnob-sentiment` | BanglaBERT/Electra on SentNoB — Bangla social text |
+| `STAGE2_CLASSIFIER_5` | `bengali_sentiment_bert` | `ahs95/banglabert-sentiment-analysis` | BanglaBERT/Electra, 5-class |
+| `STAGE2_CLASSIFIER_6` | `mbert` | `nlptown/bert-base-multilingual-uncased-sentiment` | multilingual BERT, 1–5 stars |
+| `STAGE2_CLASSIFIER_7` | `modernbert` | `clapAI/modernBERT-base-multilingual-sentiment` | ModernBERT-base multilingual |
+| — | `llm` | the `stage2` role above | context-aware stance, per batch |
+
+**Stage 1's emoji + lexicon rule is deliberately absent from that table.** It used
+to vote as `heuristic`; it was removed on 17 Aug 2026 and **only a model may label
+a comment** now. Two reasons: it is a keyword rule, and in the shipped
+configuration most of its verdicts are the deterministic hash `stub` — reproducible
+and not sentiment (measured: 11 of 12 comments on a real Bangla thread) — and a
+free voter that answers on *every* comment can never abstain, which made
+`abstained` / `unread` / `single_voter` unable to report a run where no model
+loaded. The consequence is intended and visible: a comment no model read is
+`uncertain` with `label_voters: 0`, and its cheap Stage-1 path is still disclosed
+in `method` / `provenance`.
+
+Four things about this roster are worth knowing before changing it — each is a
+trap this project already walked into:
+
+- **Seven heads are not seven independent readings.** Five of them are
+  multilingual encoders trained on overlapping data, so their agreement is
+  correlated: a 7-0 vote is weaker evidence than seven unrelated models would be.
+  Report `unanimous_share` next to `single_voter_share`, never alone.
+- **A checkpoint earns a slot only if it can vote.** It must be a *sentiment* head
+  whose labels survive `worker._map_sentiment_label`. Base encoders
+  (`ElectraForPreTraining`, `BertForMaskedLM`) load fine, get a randomly
+  initialised head bolted on by `pipeline("sentiment-analysis")`, and emit
+  `LABEL_0`/`LABEL_1` — which maps to nothing. **Four of the roster's original five
+  Bangla entries were that, or did not exist on the Hub at all**, and voted zero
+  times while reading as coverage in the roster.
+- **It also needs a tokenizer this environment can build.** The obvious pick for
+  slot 3, `cardiffnlp/twitter-xlm-roberta-base-sentiment`, ships only
+  `sentencepiece.bpe.model` and no `tokenizer.json`, so transformers 5 raises
+  "`tiktoken` is required". The `-multilingual` sibling is the same family with a
+  fast tokenizer and costs no new dependency.
+- **Where they run.** `STAGE2_CLASSIFIER_DEVICE=cpu` when the GPU is serving the
+  LLM: a 4 GB card hosting `qwen2.5:7b` has ~285 MB free, which fits one head, not
+  seven. Batched CPU inference is the intended configuration, not a fallback.
+
+Fetch and verify the roster with `deploy/prefetch_classifiers.py` — it downloads
+into the local HF cache (`MODEL_STUB_MODE=true` means *download nothing*, so an
+unprefetched box silently runs LLM-only) and then runs each head on a Bangla /
+English / Banglish probe, so "downloaded" is never mistaken for "voting".
 
 **Pick the summary model by measurement, not reputation:**
 

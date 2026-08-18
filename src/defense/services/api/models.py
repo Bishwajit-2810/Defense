@@ -201,6 +201,11 @@ class EngagementResult(BaseModel):
 
 class CommentAnalysisResult(BaseModel):
     analyzed: int
+    # Comments a Stage-2 model actually read. `analyzed` above is the stored row
+    # count for the whole thread, so it cannot answer "how much did the ensemble
+    # cover" — one post stores 87 rows and has 31 read. None on rows written
+    # before the ensemble recorded itself; never silently equal to `analyzed`.
+    analysed_by_models: Optional[int] = None
     coverage: float  # clamped to 1.0 — see coverage_anomaly
     coverage_label: Optional[str] = None  # server-rendered coverage string
     # Set when the stored comment rows exceed the platform's reported

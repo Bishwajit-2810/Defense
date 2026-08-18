@@ -227,10 +227,12 @@ The upstream stores one coarse post `sentiment` (and `viralPotential`); comment
    > configuration: the 69 `photoUrls` are relative object-storage keys and the
    > objects are not in MinIO. The image term therefore contributes nothing
    > today, and OCR is off by default (`STAGE1_OCR_SENTIMENT=false`). The
-   > working corpus is [posts_text_only.json](posts_text_only.json) — the 43
-   > posts that carry a caption, produced by `python -m eval.make_text_corpus`.
-   > The 7 `null`-caption `PHOTO` posts are excluded because with no image and
-   > no OCR there is nothing left to analyse. Post sentiment is consequently a
+   > working corpus is [posts_with_details.json](posts_with_details.json) — all
+   > 50 posts, as uploaded. The 7 `null`-caption `PHOTO` posts yield no *post*
+   > text with no image and no OCR, but their 1,307 comments are unaffected, so
+   > they are kept in the corpus and the emptiness is reported per post rather
+   > than hidden by a filter; `python -m eval.make_text_corpus` still writes the
+   > 43-post caption-only subset. Post sentiment is consequently a
    > **text** measurement, and should be presented as one. The vision code path
    > and these weights are retained, not deleted: restoring the objects plus
    > `STAGE1_OCR_SENTIMENT=true` makes the rule above live again.
@@ -248,12 +250,41 @@ The upstream stores one coarse post `sentiment` (and `viralPotential`); comment
    as coverage above 100%.
 
    Every label carries its provenance: per comment a `method`
-   (`llm`/`model`/`stub`/`fast`/`emoji`/`failed`) and a `kind`
-   (`substantive`/`short`/`emoji`), and per post a `provenance` block with
+   (`llm`/`model`/`stub`/`fast`/`emoji`/`failed`/`ensemble`/`propagated`) and a
+   `kind` (`substantive`/`short`/`emoji`), and per post a `provenance` block with
    `inferred_share`. `stub` is a hash of the text — deterministic, reproducible,
    and **not sentiment** — so a chart can state what produced its numbers.
    Emoji-only comments (2.8% of the corpus) keep their sentiment but never enter
    an LLM batch.
+
+   **The Stage-2 ensemble re-reads a bounded selection of that thread.** Stage 1
+   covers the whole stored sample (above); Stage 2 then re-labels a **subset** with
+   eight model labellers. Two separate facts, and the contract keeps them separate:
+
+   - **Which comments.** By default **every comment with text**
+     (`ROUTER_COMMENT_TOP_N=0`). A positive value keeps only that many
+     most-reacted comments, ranked by `likes`. Either way the choice is recorded in
+     `comment_analysis.stage2_selection` (`total` / `eligible` / `selected` /
+     `skipped` / `cutoff_likes`), so a consumer never has to infer it. Comments below the cut are **kept, persisted and
+     persisted** — they carry `stage2_selected: false` and `escalation_reason:
+     "below_top_n"`, and because no model read them their `sentiment` is
+     `uncertain` with `label_voters: 0`. Their Stage-1 path is still disclosed in
+     `method` / `provenance`, just not as a verdict. Nothing is dropped, so
+     `analyzed` and `coverage` still describe the whole stored sample — but
+     **`sentiment_breakdown` will be mostly `uncertain` whenever the thread is far
+     larger than `ROUTER_COMMENT_TOP_N`.** Chart it with
+     `ensemble.analysed` beside it, or set the cap to 0.
+   - **Who labelled them.** Up to eight verdicts per comment in `parallel_labels`:
+     seven small sentiment heads (`STAGE2_CLASSIFIER_1..7`) and the LLM stance
+     pass — the only one that sees the post. **Only a model may label a comment.**
+     Stage 1's emoji + keyword verdict is *not* a voter (removed 17 Aug 2026): it
+     is a keyword rule, largely the deterministic hash stub, and a free voter that
+     answers on every comment makes abstention unreportable. A voter that cannot
+     vote **abstains**; it is never recorded as a neutral. `label_voters` /
+     `label_sources` say who spoke, and a comment no model read is `uncertain`,
+     not `neutral` — which is the state of every comment outside the selection. Thread-level rollup in
+     `comment_analysis.ensemble`, where `llm_share` is against the whole thread
+     and `llm_share_analysed` against the selection.
 
 6. **Target stance (optional).** When `config/stance_targets.yml` lists entities,
    each comment also carries `target_stances` — its stance *toward each named

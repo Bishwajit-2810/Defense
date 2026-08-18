@@ -50,6 +50,29 @@ LONG_TEXT_CHARS: int = int(config.router_long_text_chars)
 #: to become 100%, because this rule alone is enough to route.
 SUMMARY_ROUTES_TO_STAGE2: bool = bool(config.router_summary_routes)
 
+#: How many comments per post Stage 2 analyses, ranked by reaction count.
+#: **0 (the default) = no cap: every comment with text.** A positive value is a
+#: speed/cost guard that leaves the rest of the thread with no model verdict at
+#: all. See :func:`select_comments_for_stage2`.
+COMMENT_TOP_N: int = int(config.router_comment_top_n)
+#: Minimum word tokens required for a comment to be eligible for Stage 2 analysis (>2 words = 3).
+COMMENT_MIN_WORDS: int = int(getattr(config, "router_comment_min_words", 0))
+
+import re
+_WORD_RE = re.compile(r"[0-9A-Za-zঀ-৿]+")
+
+
+def _word_count(comment: dict) -> int:
+    """Number of alphanumeric/Bangla word tokens in the comment text."""
+    text = str(comment.get("text") or comment.get("comment_text") or "")
+    return len(_WORD_RE.findall(text))
+
+#: Comment kinds with nothing for a model to read. They are never ranked for a
+#: slot — a 900-like ❤️ would take one and produce no verdict — and they are not
+#: marked either, so Stage 2 keeps accounting for them exactly as it does today
+#: (``escalation_reason: "no_text"``, counted in ``reaction_only``).
+TEXTLESS_KINDS: frozenset[str] = frozenset({"emoji", "filtered", "link"})
+
 
 # ---------------------------------------------------------------------------
 # Field readers — tolerate every shape the pipeline emits for one concept
@@ -216,6 +239,113 @@ def should_use_llm(partial_result: dict, options: dict) -> tuple[bool, list[str]
     return bool(reasons), reasons
 
 
+def _likes(comment: dict) -> int:
+    """The comment's reaction count, 0 when absent or unparseable."""
+    try:
+        return int(comment.get("likes") or 0)
+    except (TypeError, ValueError):
+        return 0
+
+
+def select_comments_for_stage2(
+    partial_result: dict,
+    options: dict | None = None,
+    *,
+    limit: int | None = None,
+    min_words: int | None = None,
+    dedup: bool = True,
+) -> dict:
+    """Pick the comments Stage 2 will analyse: deduplicated top-N by reaction count.
+
+    Filters out textless/emoji-only comments, comments below min_words threshold,
+    and duplicate/repeat comments across the thread so Stage 2 receives fresh,
+    unique, substantive comments.
+    """
+    from defense.libs.comment_groups import normalize
+
+    comment_analysis = partial_result.get("comment_analysis") or {}
+    comments = comment_analysis.get("comments") or []
+    if not comments:
+        return {}
+
+    if limit is None:
+        requested = (options or {}).get("comment_top_n")
+        limit = int(requested) if requested is not None else COMMENT_TOP_N
+
+    if min_words is None:
+        req_min = (options or {}).get("comment_min_words")
+        min_words = int(req_min) if req_min is not None else COMMENT_MIN_WORDS
+
+    # Step 1: Collect non-textless comments that meet the min_words threshold
+    candidates: list[tuple[int, dict]] = []
+    for i, c in enumerate(comments):
+        if c.get("kind") in TEXTLESS_KINDS:
+            continue
+        if min_words and min_words > 0 and _word_count(c) < min_words:
+            c["stage2_selected"] = False
+            c["stage2_skip_reason"] = "below_min_words"
+            continue
+        candidates.append((i, c))
+
+    # Sort candidates by likes descending first so the most-liked occurrence is kept
+    candidates.sort(key=lambda pair: (-_likes(pair[1]), pair[0]))
+
+    # Step 2: Deduplicate identical/near-duplicate comment texts
+    seen_keys: dict[str, str] = {}
+    ranked: list[tuple[int, dict]] = []
+    duplicates_count = 0
+
+    for i, c in candidates:
+        text = str(c.get("text") or c.get("comment_text") or "")
+        norm_key = normalize(text)
+        if not norm_key:
+            c["stage2_selected"] = False
+            c["stage2_skip_reason"] = "no_text"
+            continue
+
+        if dedup and norm_key in seen_keys:
+            # Duplicate / repeat comment — skip analysis for repeat occurrences
+            c["stage2_selected"] = False
+            c["stage2_skip_reason"] = "duplicate"
+            c["is_duplicate"] = True
+            c["duplicate_of"] = seen_keys[norm_key]
+            duplicates_count += 1
+            continue
+
+        rep_id = str(c.get("id") or i)
+        seen_keys[norm_key] = rep_id
+        ranked.append((i, c))
+
+    # Step 3: Apply top-N limit to unique, substantive comments
+    if limit and limit > 0:
+        selected, skipped = ranked[:limit], ranked[limit:]
+    else:
+        selected, skipped = ranked, []
+
+    for _, comment in selected:
+        comment["stage2_selected"] = True
+        comment.pop("stage2_skip_reason", None)
+    for _, comment in skipped:
+        comment["stage2_selected"] = False
+        comment["stage2_skip_reason"] = "below_top_n"
+
+    record = {
+        "strategy": "top_reactions",
+        "limit": limit if limit and limit > 0 else 0,
+        "total": len(comments),
+        "eligible": len(ranked),
+        "selected": len(selected),
+        "skipped": len(skipped),
+        "duplicates": duplicates_count,
+        # The reaction count of the lowest-ranked comment that made the cut, so
+        # the cutoff is inspectable without re-sorting the thread.
+        "cutoff_likes": _likes(selected[-1][1]) if selected else 0,
+        "top_likes": _likes(selected[0][1]) if selected else 0,
+    }
+    comment_analysis["stage2_selection"] = record
+    return record
+
+
 def get_task_flags(partial_result: dict, options: dict) -> dict:
     """Derive task flags that tell Stage-2 what to compute.
 
@@ -242,8 +372,9 @@ def get_task_flags(partial_result: dict, options: dict) -> dict:
     # An explicit False always wins — a caller that opted out must not be
     # overridden by the "Stage 1 has no summary" fallback.
     stage1_summary = (partial_result.get("post_summary") or "").strip()
+    is_valid_stage1_summary = bool(stage1_summary) and len(stage1_summary) >= 6
     requested = options.get("want_summary")
-    want_summary: bool = bool(requested) if requested is not None else not stage1_summary
+    want_summary: bool = bool(requested) if requested is not None else not is_valid_stage1_summary
 
     # Need post_type when Stage 1 could not determine one, when it is not
     # confident enough to publish, or when the caller asks. Re-running the LLM

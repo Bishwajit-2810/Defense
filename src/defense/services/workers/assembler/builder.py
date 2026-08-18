@@ -320,11 +320,17 @@ def build_canonical_result(
     post_summary_truncated: bool = False
 
     if stage2_result is not None and stage2_result.get("post_summary"):
-        post_summary = stage2_result.get("post_summary")
-        post_summary_lang = stage2_result.get("post_summary_lang")
-        post_summary_source = stage2_result.get("post_summary_source")
-        post_summary_grounding = stage2_result.get("post_summary_grounding")
-        post_summary_truncated = bool(stage2_result.get("post_summary_truncated"))
+        s2_summ = stage2_result.get("post_summary")
+        if s2_summ and len(s2_summ.strip()) >= 15:
+            post_summary = s2_summ
+            post_summary_lang = stage2_result.get("post_summary_lang")
+            post_summary_source = stage2_result.get("post_summary_source") or "llm"
+            post_summary_grounding = stage2_result.get("post_summary_grounding")
+            post_summary_truncated = bool(stage2_result.get("post_summary_truncated"))
+
+    if post_summary and len(post_summary.strip()) < 15:
+        post_summary = None
+        post_summary_source = None
 
     # ------------------------------------------------------------------
     # Sentiment fields — Stage 1

@@ -57,11 +57,15 @@ matters is **cost per 1,000 threads analyzed**.
 >    See §5 below.
 >
 > **Sizing rule of thumb that replaces the old one:** per thread, budget
-> `ceil(non_emoji_comments / 25)` Stage-1 calls, plus `ceil(.../25)` more if the
-> post routes to Stage 2, plus ~3 post-level calls if it routes. Set
-> `STAGE1_LLM_COMMENT_MAX` / `COMMENT_STANCE_MAX_PER_POST` above 0 to cap this
-> deliberately — full comment coverage is a *chosen* trade, and the caps are how
-> you un-choose it.
+> `ceil(non_emoji_comments / 25)` Stage-1 calls, plus
+> `ceil(min(non_emoji_comments, ROUTER_COMMENT_TOP_N) / 25)` for the Stage-2
+> comment pass, plus ~3 post-level calls if the post routes. **All three coverage
+> knobs default to 0 (no cap)**, so budget the full thread: a 2,857-comment post is
+> ~115 Stage-2 stance batches *and* ~44 min of classifier CPU at 7 heads. Setting
+> `ROUTER_COMMENT_TOP_N=100` bounds the Stage-2 term at **4 calls per post**
+> however large the thread — the single biggest lever in this document, and the one
+> to reach for first if a run is too slow. Full comment coverage is a *chosen*
+> trade; these knobs are how you un-choose it.
 >
 > **Per-backend pricing is now real.** `GET /v1/usage` reports
 > `tokens_by_backend_model` and `cost_by_backend_model`, with **local priced at
@@ -101,6 +105,7 @@ matters is **cost per 1,000 threads analyzed**.
 | LLM GPU (local) | Moderate                                      | Fixed GPU line (only on the `local` backend)                                                                                                                                                                                  |
 | LLM API (groq)  | **Dominant, runaway**                         | Small per-token line (only on the `groq` backend)                                                                                                                                                                             |
 | NLP GPU compute | Moderate                                      | **The main fixed line**, cheap & predictable (batched small models)                                                                                                                                                           |
+| Comment-ensemble CPU | n/a | Small fixed line — the **seven Stage-2 sentiment heads** (135–280M encoders) run batched on **CPU** by design (`STAGE2_CLASSIFIER_DEVICE=cpu`): no per-token bill, no GPU contention with the LLM, ~3 GB of checkpoint disk. **They do scale with thread size** at the shipped `ROUTER_COMMENT_TOP_N=0`: measured ~0.92 s/comment across the seven heads, so a 2,857-comment post is ~44 min of CPU. Setting a positive cap makes this per-post cost constant instead. They buy the agreement signal that decides where the *expensive* voter is needed |
 | Vision compute  | n/a                                           | Small fixed line — cheap **image-sentiment** (SigLIP/CLIP) **+ our OCR** (PaddleOCR/Tesseract) on image posts; the **VLM** summary runs only on the selective slice (GPU on `local`, per-token vision calls on `groq`)        |
 | Agents + MCP    | n/a                                           | Tiny — stateless FastAPI services (a few CPU replicas); their only real cost is **low-volume LLM-B calls** for reports/analyst Q&A, gated + budget-capped, billed under the LLM line ([architecture.md](architecture.md) §11) |
 | Storage         | Small                                         | Small — three stores (Postgres + pgvector, ClickHouse, object), the vector index living inside Postgres rather than a separate service                                                                                       |
@@ -204,6 +209,14 @@ gate governs only 30–55% of calls because comment labelling runs for every pos
 1. **Comment volume per thread.** The dominant driver: 85–96% of LLM calls are
    comment-level, and a thread's cost is `ceil(non_emoji_comments / batch)`.
    Levers, in order of bluntness:
+   - `ROUTER_COMMENT_TOP_N` (default **0 = no cap**): set it to 100 and the router
+     hands Stage 2 only the 100 most-reacted comments with text, so a
+     2,857-comment thread costs `ceil(100/25) = 4` stance calls instead of 115 —
+     and ~1.5 min of classifier CPU instead of ~44. It caps every Stage-2 voter at
+     once, which is the point: a cap on the LLM alone saves the tokens and still
+     runs seven models over the whole thread. Stage-1 comment labelling is *not*
+     capped by it, so Stage-1 coverage is unchanged; what shrinks is the ensemble,
+     and `ensemble.not_analysed` reports by how much.
    - `STAGE1_LLM_COMMENT_MAX` / `COMMENT_STANCE_MAX_PER_POST` (default **0** =
      every comment). Setting these caps the bill directly — but it also caps
      coverage, so the caps and the coverage claim must be quoted together.

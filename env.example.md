@@ -52,12 +52,12 @@ There are **seven roles**. A role is a *job*, not a stage — the mapping lives 
 | Role | Env keys | Who calls it | What it does |
 |---|---|---|---|
 | `stage1` | `STAGE1_LOCAL_MODEL`<br>`STAGE1_GROQ_MODEL` | [`text_analyzer.py:854`](src/defense/services/workers/stage1_nlp/text_analyzer.py#L854), [`worker.py:470`](src/defense/services/workers/stage1_nlp/worker.py#L470), [`comment_analyzer.py:547`](src/defense/services/workers/stage1_nlp/comment_analyzer.py#L547) | The high-volume classifier. One JSON call returns 12 fields per post: `language, sentiment, sentiment_score, emotion, topics, intents, post_type, post_type_confidence, toxicity_score, hate_speech_score, entities, keywords`. Also per-comment labelling — but only when `STAGE1_LLM_COMMENTS=true`. |
-| `stage2` | `STAGE2_LOCAL_MODEL`<br>`STAGE2_GROQ_MODEL` | [`worker.py:1466`](src/defense/services/workers/stage2_llm/worker.py#L1466), [`:1490`](src/defense/services/workers/stage2_llm/worker.py#L1490), [`:942`](src/defense/services/workers/stage2_llm/worker.py#L942) | Post-type, insight, and context-aware comment stance. Every one picks from a fixed vocabulary, so it wants a constrained model, not a creative one. |
-| `summary` | `SUMMARY_LOCAL_MODEL`<br>`SUMMARY_GROQ_MODEL` | [`stage1_nlp/worker.py:451`](src/defense/services/workers/stage1_nlp/worker.py#L451), [`stage2_llm/worker.py:1276`](src/defense/services/workers/stage2_llm/worker.py#L1276) | All prose. **Note this is the model Stage 1 uses for its post summary** — the summary does *not* run on the `stage1` model. Also covers the Stage-2 comment-thread summary, and the Stage-2 post summary on the fallback path. |
-| `agent` | `AGENT_LOCAL_MODEL`<br>`AGENT_GROQ_MODEL` | [`runner.py:500`](src/defense/services/agents/runner.py#L500) | All 9 MCP agents in [`registry.py`](src/defense/services/agents/registry.py). The only role doing multi-turn tool use, so it needs solid native function calling — hence `llama3.1:8b` rather than qwen. |
+| `stage2` | `STAGE2_LOCAL_MODEL`<br>`STAGE2_GROQ_MODEL` | [`worker.py:1509`](src/defense/services/workers/stage2_llm/worker.py#L1509) (post-type), [`:1533`](src/defense/services/workers/stage2_llm/worker.py#L1533) (insight), [`:960`](src/defense/services/workers/stage2_llm/worker.py#L960) (comment stance) | Post-type, insight, and context-aware comment stance. Every one picks from a fixed vocabulary, so it wants a constrained model, not a creative one. |
+| `summary` | `SUMMARY_LOCAL_MODEL`<br>`SUMMARY_GROQ_MODEL` | [`stage1_nlp/worker.py:451`](src/defense/services/workers/stage1_nlp/worker.py#L451), [`stage2_llm/worker.py:1319`](src/defense/services/workers/stage2_llm/worker.py#L1319) | All prose. **Note this is the model Stage 1 uses for its post summary** — the summary does *not* run on the `stage1` model. Also covers the Stage-2 comment-thread summary, and the Stage-2 post summary on the fallback path. |
+| `agent` | `AGENT_LOCAL_MODEL`<br>`AGENT_GROQ_MODEL` | [`runner.py:1784`](src/defense/services/agents/runner.py#L1784) (`role=agent_def.llm_role`) | All 9 MCP agents in [`registry.py`](src/defense/services/agents/registry.py). The only role doing multi-turn tool use, so it needs solid native function calling — hence `llama3.1:8b` rather than qwen. |
 | `llm_b` | `LLM_B_LOCAL_MODEL`<br>`LLM_B_GROQ_MODEL` | [`reports.py:323`](src/defense/services/api/routers/reports.py#L323), [`:501`](src/defense/services/api/routers/reports.py#L501) | The report-generation layer. |
 | `llm_a` | `LLM_A_LOCAL_MODEL`<br>`LLM_A_GROQ_MODEL` | *nothing* | **Dead.** No `role="llm_a"` call site exists in `src/`. Kept only for backward compatibility; safe to delete. |
-| `vlm` | `VLM_LOCAL_MODEL`<br>`VLM_GROQ_MODEL` | [`worker.py:1396`](src/defense/services/workers/stage2_llm/worker.py#L1396) | Image posts. It **substitutes for** the `summary` role rather than adding a call: `role = "vlm" if (has_photos and vlm_enabled) else summary`. If the image bytes don't resolve, the result is tagged `post_summary_source: "llm"` instead of `"vlm"`. |
+| `vlm` | `VLM_LOCAL_MODEL`<br>`VLM_GROQ_MODEL` | [`worker.py:1439`](src/defense/services/workers/stage2_llm/worker.py#L1439) | Image posts. It **substitutes for** the `summary` role rather than adding a call: `role = "vlm" if (has_photos and vlm_enabled) else summary`. If the image bytes don't resolve, the result is tagged `post_summary_source: "llm"` instead of `"vlm"`. |
 
 ### Why the models are split this way
 
@@ -109,7 +109,8 @@ comment ensemble runs with one voter instead of three.
 | `STAGE1_LLM` | `true` = Stage-1 NLP comes from the `stage1` LLM. `false` = deterministic stub. Any LLM or JSON failure falls back to the stub automatically, so this is a preference, not a hard switch. |
 | `STAGE1_LLM_COMMENTS` | Whether Stage 1 *also* LLM-labels every comment. **Off by default and that is deliberate** — Stage 2 already labels comments with a bigger model plus two classifiers, so this re-does the work with the weaker one and its vote is usually outweighed. It is also the slowest step in the pipeline. Turn it on only when running *without* the Stage-2 ensemble. |
 | `STAGE1_LLM_COMMENT_MAX` | `0` = every non-emoji comment reaches the LLM. A positive value caps it for a fast demo run. The old default of 60 meant ~29% of comments got an LLM label while the output described itself as full coverage. |
-| `COMMENT_STANCE_MAX_PER_POST` | Same idea for the Stage-2 stance pass. `0` = no cap. |
+| `ROUTER_COMMENT_TOP_N` | **The per-post comment volume lever, and it ships OFF.** `0` (default) = the router selects **every comment with text** and *every* Stage-2 voter reads that set — the seven cheap HF heads, the near-duplicate cache and the LLM stance pass. A positive value (e.g. `100`) keeps only that many most-reacted comments (by `likes`); the rest are **kept and persisted** but carry `stage2_selected: false` / `escalation_reason: below_top_n` and **no model verdict at all**, so they report `uncertain` and `ensemble.not_analysed` counts them. Only comments with text ever compete for a slot — a 900-like ❤️ gets no model call, so it must not take one. Cap this when a run is too slow (7 heads ≈ 0.92 s/comment on CPU), not by default. |
+| `COMMENT_STANCE_MAX_PER_POST` | A second, tighter cap on the LLM stance pass *inside* the router's set. `0` = no cap, and that is the right value: a positive one gives the LLM fewer comments than the cheap heads got, which is the hole in the per-comment comparison that `ROUTER_COMMENT_TOP_N` exists to avoid. |
 | `STAGE1_LLM_BATCH` / `COMMENT_STANCE_BATCH` | Comments per LLM request (25). |
 | `STAGE1_LLM_CONCURRENCY` / `COMMENT_STANCE_CONCURRENCY` | Batches in flight at once (3). Batches run concurrently with per-batch retry, which is why uncapped coverage doesn't stall a post — a 2,857-comment thread is ~115 batches. |
 | `SUMMARY_MAX_TOKENS` | Ceiling for the post summary (1024). |
@@ -161,20 +162,68 @@ empty is *not* the same as off if `APP_ENV` is still `dev`.
 
 ---
 
+## 9. Offline Evaluation Harness
+
+Read only by the `eval/` scripts, which run the real stage functions with no Redis,
+Postgres or ClickHouse. No service ever reads them.
+
+> **These are the one group here that `.env` does not set.** Every other key in this file
+> is loaded by pydantic-settings into `Settings`; these are read with plain `os.getenv`,
+> and pydantic-settings never copies `.env` into `os.environ`. Putting `CORPUS=...` in
+> `.env` silently does nothing. Pass them on the command line:
+>
+> ```bash
+> MAX_COMMENTS=3 STAGE1_LLM=true python -m eval.measure_routing_rate
+> python -m eval.sweep_threshold --corpus posts_with_details.json
+> ```
+
+They are documented so the corpus a number was measured on is never a guess.
+
+| Key | Default | What it does |
+|---|---|---|
+| `CORPUS` | `posts_with_details.json` | The corpus every eval script reads — the **same file the ingestion path uploads** (50 posts, 10,272 comments). Read by [`measure_routing_rate.py`](eval/measure_routing_rate.py); [`sweep_threshold.py`](eval/sweep_threshold.py) and [`build_gold_set.py`](eval/build_gold_set.py) take the same default via `--corpus`. |
+| `MAX_COMMENTS` | `0` | Comments analysed per post; `0` = all of them, the shipped configuration. No routing rule reads a comment field, so this moves the comment-lane cost estimate and the runtime, **not** the routing rate. Set it low (e.g. `3`) with `STAGE1_LLM=true` to get a routing rate in minutes instead of hours. |
+| `OUT` | *(unset)* | Write the per-post rows as JSON here as well as printing them. |
+
+**On the corpus default.** The 7 null-caption `PHOTO` posts are included. They have no post
+text to analyse — no image bytes are reachable (PROJECT_ASSESSMENT §5.2) — but they carry
+**1,307 comments (12.7%)**, which analyse like any other, so filtering them corpus-wide
+measured a population the running system never processes and under-counted the comment
+lane. Each script prints how many null-caption posts it skipped rather than shrinking its
+pool silently. `python -m eval.make_text_corpus` still writes the 43-post caption-only
+subset for reproducing a number measured before 18 Aug 2026.
+
+---
+
 ## Configured in code, not in this file
 
-These have `Settings` defaults and can be overridden by adding them to `.env`, but they are
-deliberately not in the shipped example:
+These have `Settings` defaults and can be overridden by adding them to `.env`.
+
+> **Ten of them are now in the shipped example after all** — the seven
+> `STAGE2_CLASSIFIER_*` slots, `STAGE2_CLASSIFIERS_ENABLED`, `STAGE2_CLASSIFIER_DEVICE`
+> and `ROUTER_COMMENT_TOP_N` / `ROUTER_COMMENT_MIN_WORDS` were added on 18 Aug 2026 so
+> `.env.example` matches the working `.env`. The **Default** column below is still the
+> `Settings` default, which is what applies when the key is absent — note it differs from
+> the example's shipped value for `STAGE2_CLASSIFIER_DEVICE` (`auto` vs `cpu`). The four
+> coverage knobs shipped as `200`/`3` until 18 Aug 2026; they now ship at `0`, matching
+> the `Settings` defaults, so the shipped configuration is full comment coverage. The rest
+> of this table is unshipped as described.
 
 | Key | Default | Notes |
 |---|---|---|
-| `STAGE2_CLASSIFIERS_ENABLED` | `true` | The two cheap voters in the comment ensemble. Skipped entirely in `MODEL_STUB_MODE`. |
-| `STAGE2_CLASSIFIER_1` | `tabularisai/multilingual-sentiment-analysis` | Voter 1. |
-| `STAGE2_CLASSIFIER_2` | `lxyuan/distilbert-base-multilingual-cased-sentiments-student` | Voter 2. Together with the LLM these are the **three verdicts** you see per comment. |
-| `STAGE2_CLASSIFIER_DEVICE` | `auto` | `auto` tries GPU then falls back to CPU; `cpu` skips the GPU. The GPU usually already hosts the LLM — on a 4 GB card serving `qwen2.5:7b` there is ~285 MB left, which fits one classifier, not two. |
-| `COMMENT_LLM_MODE` | `all` | `all` = every comment with text gets the LLM stance pass. `escalate` = only where the cheap voters disagree or a watchlist entity is mentioned (~20% of comments), at the cost of an empty LLM row on the rest. |
+| `STAGE2_CLASSIFIERS_ENABLED` | `true` | The seven cheap voters in the comment ensemble. In `MODEL_STUB_MODE` each is loaded only if already cached — pre-fetch with `uv run python deploy/prefetch_classifiers.py`. |
+| `STAGE2_CLASSIFIER_1` | `tabularisai/multilingual-sentiment-analysis` | Voter `xlmr` — DistilBERT-multilingual, 5-class. |
+| `STAGE2_CLASSIFIER_2` | `lxyuan/distilbert-base-multilingual-cased-sentiments-student` | Voter `distilbert` — DistilBERT-multilingual student, 3-class. |
+| `STAGE2_CLASSIFIER_3` | `cardiffnlp/twitter-xlm-roberta-base-sentiment-multilingual` | Voter `twitter_xlmr` — XLM-R trained on social media. The non-`-multilingual` repo ships no `tokenizer.json`, so transformers 5 cannot build its tokenizer without adding `tiktoken`/`sentencepiece`. |
+| `STAGE2_CLASSIFIER_4` | `ADn-001/banglabert-sentnob-sentiment` | Voter `banglabert` — BanglaBERT/Electra fine-tuned on SentNoB (noisy Bangla social text). |
+| `STAGE2_CLASSIFIER_5` | `ahs95/banglabert-sentiment-analysis` | Voter `bengali_sentiment_bert` — BanglaBERT/Electra, 5-class. |
+| `STAGE2_CLASSIFIER_6` | `nlptown/bert-base-multilingual-uncased-sentiment` | Voter `mbert` — multilingual BERT, 1–5 stars. |
+| `STAGE2_CLASSIFIER_7` | `clapAI/modernBERT-base-multilingual-sentiment` | Voter `modernbert` — ModernBERT-base multilingual. These seven plus the LLM are the **eight verdicts** per comment; Stage 1's `heuristic` is **not** one of them (it stopped voting 17 Aug 2026 — a keyword rule, largely the hash stub, is not a model reading the comment). Set any slot to `""` to drop that voter. |
+| `STAGE2_CLASSIFIER_DEVICE` | `auto` | `auto` tries GPU then falls back to CPU; `cpu` skips the GPU. The GPU usually already hosts the LLM — on a 4 GB card serving `qwen2.5:7b` there is ~285 MB left, which fits one classifier, not seven. **Set `cpu`** or pay six failed CUDA loads per process. |
+| `COMMENT_LLM_MODE` | `all` | `all` = every comment with text gets the LLM stance pass. `escalate` = only where the cheap voters disagree or a watchlist entity is mentioned, at the cost of an empty LLM row on the rest. Note the roster size changes what `escalate` costs: with seven heads, *any one* dissenter escalates, so the escalated share is far higher than the ~20% measured with two. |
 | `ROUTER_SUMMARY_ROUTES` | `false` | Whether "a summary is wanted" alone justifies Stage 2. **Keep it false** — Stage 1 writes a summary for every post, so setting it true fires the rule on every request and the gate stops gating. |
 | `ROUTER_CONFIDENCE_THRESHOLD` | `0.8` | Plus `ROUTER_TOXICITY_THRESHOLD` (0.7), `ROUTER_LONG_TEXT_CHARS` (1000) — the other gate rules. |
+| `ROUTER_COMMENT_TOP_N` | `0` | How many comments per post the Stage-2 ensemble reads; `0` = all of them with text. See §5. This is the volume knob — `COMMENT_STANCE_MAX_PER_POST` is not. `run_all.py` deliberately sets **no** coverage default, so whatever you put here (or in the environment) is what runs. |
 | `LLM_CACHE_DISABLED` | `false` | Turns off the Redis LLM response cache. |
 | `HF_OFFLINE` | unset | Overrides the `MODEL_STUB_MODE` → offline link in either direction. |
 

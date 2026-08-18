@@ -19,6 +19,22 @@
 > **comment-dominated** (85–96% of LLM calls), so the routing gate is no longer
 > the dominant lever.
 >
+> Three more, as of 17 August 2026:
+>
+> - **The router makes a second decision this document does not describe:** which
+>   comments Stage 2 analyses. It defaults to **every comment with text**
+>   (`ROUTER_COMMENT_TOP_N=0`); a positive value keeps only the top-N by reaction
+>   count and is the knob that bounds the comment bill, since that bill — not the
+>   confidence gate — is 85–96% of LLM calls.
+> - **Comment sentiment is an eight-labeller ensemble**, not the two classifiers
+>   the Stage-2 box below shows: seven small sentiment heads
+>   (`STAGE2_CLASSIFIER_1..7`) + the LLM stance pass, combined by
+>   `libs/ensemble.py`, with abstention rather than fabricated neutrals. **Only a
+>   model may label a comment** — Stage 1's emoji/keyword rule does not vote, so a
+>   comment no model read reports `uncertain`, not a keyword verdict.
+> - **The dashboard is React 19 + Vite + Tailwind** (`dashboard/`). The vanilla
+>   HTML/CSS/JS build this document specifies is preserved at `dashboard_legacy/`.
+>
 > Four more, from the sixth audit pass (§13) — each one a place where this
 > document describes a mechanism that exists but did not reach its consumer:
 >
@@ -224,9 +240,11 @@ object per thread, reporting comment **coverage** since only a sample is shipped
                                       │
                               ┌───────▼───────────────────────────┐
                               │ STAGE 2 — Parallel Execution      │
-                              │ 1. LLM (Target/Watchlist alerts)  │
-                              │ 2. XLM-R Classifier               │
-                              │ 3. DistilBERT Classifier          │
+                              │ Lane A: summary / post-type /      │
+                              │         insight (gated)            │
+                              │ Lane B: comment ensemble — 7 cheap │
+                              │   heads + LLM stance + dedup cache │
+                              │   over the router's top-N comments │
                               └───────┬───────────────────────────┘
                               └─────────────┤
                                 ┌───────────▼───────────┐
@@ -565,7 +583,7 @@ created_at`) is preserved as a subset of the above richer object.
 | Orchestration  | **Kubernetes** (prod), **Docker Compose** (MVP)                                                | Autoscaling + HA vs simplicity                                                                                                                          |
 | Autoscaling    | **KEDA** (scale on queue depth) + HPA                                                          | Workers track backlog, not just CPU                                                                                                                     |
 | Observability  | **Prometheus + Grafana + Loki + OpenTelemetry + Jaeger**                                       | Metrics, logs, traces                                                                                                                                   |
-| Frontend       | **Plain HTML + CSS + JavaScript** (vanilla, no framework)                                      | Simple static dashboard served from a CDN/static host; calls the read APIs directly; no build step or framework runtime                                 |
+| Frontend       | **React 19 + Vite + Tailwind** (`dashboard/`)                                                  | Shipped UI: charts (chart.js), live SSE trace, per-comment labeller comparison. The vanilla no-build dashboard this row originally specified is kept at `dashboard_legacy/` |
 
 ---
 
@@ -1973,7 +1991,8 @@ Goal: prove the hybrid pipeline and output quality end-to-end, cheaply.
   auth (API key + JWT).
 - **Web dashboard (v1) — plain HTML/CSS/JS** (vanilla, no framework): job status,
   results table, per-post sentiment + comment breakdown + reaction chart, static
-  files calling the read APIs.
+  files calling the read APIs. *Shipped as React 19 + Vite + Tailwind instead
+  (`dashboard/`); the vanilla build described here is at `dashboard_legacy/`.*
 - **Monitoring:** Prometheus + Grafana + Loki; track LLM-routing rate + cache hits.
 
 **Exit criteria:** process 1,000-post batches reliably; measured LLM slice in single

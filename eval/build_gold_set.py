@@ -37,7 +37,7 @@ Usage
 -----
     python -m eval.build_gold_set                    # writes eval/gold/comments_gold_300.json
     python -m eval.build_gold_set --size 500         # a bigger set
-    python -m eval.build_gold_set --corpus posts_text_only.json
+    python -m eval.build_gold_set --corpus posts_text_only.json   # caption-filtered subset
 """
 
 from __future__ import annotations
@@ -58,7 +58,13 @@ from defense.services.workers.stage1_nlp.comment_analyzer import (  # noqa: E402
     normalize_for_model,
 )
 
-DEFAULT_CORPUS = REPO / "posts_text_only.json"
+#: The full source corpus — all 50 posts, 10,272 comments. Deliberately *not*
+#: the caption-filtered ``posts_text_only.json``: that filter exists because a
+#: null-caption PHOTO post has no **post** text for Stage 1 to analyse, which
+#: says nothing about its *comments*. The 7 excluded posts carry 1,307 perfectly
+#: analysable comments (12.7% of the corpus), and dropping them shrank the
+#: sampling frame for no reason the sentiment task cares about.
+DEFAULT_CORPUS = REPO / "posts_with_details.json"
 DEFAULT_OUT = REPO / "eval" / "gold" / "comments_gold_300.json"
 SEED = 20260813
 
@@ -247,7 +253,13 @@ def main() -> int:
         json.dumps(doc, ensure_ascii=False, indent=2) + "\n", encoding="utf-8"
     )
     meta = doc["_meta"]
-    print(f"wrote {args.out.relative_to(REPO)}")
+    # --out may point outside the repo; relative_to raises there, and losing the
+    # whole summary to a cosmetic path format would be silly.
+    try:
+        _where = args.out.relative_to(REPO)
+    except ValueError:
+        _where = args.out
+    print(f"wrote {_where}")
     print(f"  {meta['size']} comments · {meta['labelled']} labelled · "
           f"{meta['size'] - meta['labelled']} awaiting adjudication")
     print(f"  kind:   {meta['composition']['kind']}")

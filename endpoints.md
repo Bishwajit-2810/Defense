@@ -5,7 +5,7 @@ system** (post summary, sentiment, topics, toxicity, comment analysis — the
 full canonical result) and for **testing every API endpoint with curl**.
 
 The canonical schema lives in
-[src/defense/libs/schemas/output_schema.json](src/defense/libs/schemas/output_schema.json); the field
+[src/defense/contracts/schemas/output_schema.json](src/defense/contracts/schemas/output_schema.json); the field
 meanings are specified in [data_contract.md](data_contract.md) §4. This file
 shows what actually comes over the wire and how to reshape it.
 
@@ -111,7 +111,31 @@ This is the JSON the whole system exists to produce:
     "top_keywords": ["dam", "taka"],
     "representative_comments": [
       { "text": "Eto dam dile cholbo kemne", "lang": "banglish", "sentiment": "negative", "likes": 89 }
-    ]
+    ],
+    // Which comments the ROUTER put in front of the models: top-N by reaction
+    // count, text-bearing only. Absent on results written before 17 Aug 2026.
+    "stage2_selection": {
+      "strategy": "top_reactions", "limit": 100,
+      "total": 2857,                                // every comment on the post
+      "eligible": 2612,                             // …that had text to read
+      "selected": 100, "skipped": 2512,
+      "cutoff_likes": 7, "top_likes": 946           // the reaction count that made the cut
+    },
+    // How the eight labellers voted, once per thread. `comments` here is the
+    // whole thread; `analysed` is the router's set. Reading one as the other is
+    // how a deliberate cap looks like a half-failed stance pass.
+    "ensemble": {
+      "comments": 2857, "analysed": 100, "not_analysed": 2512,
+      "voters": ["xlmr", "distilbert", "twitter_xlmr", "mbert", "llm"],
+      "llm_labelled": 96, "llm_share": 0.0336, "llm_share_analysed": 0.96,
+      "unanimous": 71, "unanimous_share": 0.71,     // ≥2 voters agreeing
+      "single_voter": 18, "unread": 0,              // 1 labeller, and none at all
+      "abstained": 11, "mean_agreement": 0.83,
+      "deduplicated": 4, "duplicate_share": 0.04,   // exact-text twins reusing a verdict
+      "escalation_reasons": { "llm_all": 96, "near_duplicate": 4, "no_text": 245, "below_top_n": 2512 },
+      "mode": "all", "capped_out": 0,
+      "selection": { "…": "same object as comment_analysis.stage2_selection" }
+    }
   },
 
   // ---- trust & audit ------------------------------------------------------
@@ -152,6 +176,11 @@ Field-level rules worth knowing when consuming this JSON:
 | `processing.degraded_components` | Real-mode components that fell back to a heuristic because their model would not load. `nlp_engine` says which path was *intended*; this says what **ran**. **A non-empty list means no latency or accuracy figure from that run is quotable.** |
 | `comment_analysis.target_stances` | Per-watchlist-entity stance rollup. A **separate measurement** from `sentiment_breakdown` — a comment can be positive in tone while opposing a listed entity, so the two must never be summed or merged. Entities nobody mentioned are **absent**, not zero-filled. |
 | `comment_analysis.comments[].emotion_method` | `heuristic` \| `llm`. Comment emotion is the free emoji+lexicon heuristic at Stage 1 **even in real mode**; only comments Stage 2 re-labelled carry a model emotion. |
+| `comment_analysis.stage2_selection` | Which comments Stage 2 analysed. **`limit: 0` (the default) means every comment with text was analysed** — `selected` then equals `eligible`. A positive `limit` (`ROUTER_COMMENT_TOP_N`) keeps only that many, ranked by reaction count. `total` / `eligible` / `selected` are three different numbers, and reading any one as another is how "every comment was analysed" gets claimed for a capped run. |
+| `comment_analysis.comments[].stage2_selected` | `false` on a comment outside the cut: **no Stage-2 model read it**, its label is Stage 1's, and `escalation_reason` is `below_top_n`. Absent/`true` means it was analysed. Textless comments carry neither — they are never ranked (`escalation_reason: no_text`). |
+| `comment_analysis.comments[].parallel_labels` | `{voter: {sentiment, score, …}}` for each of the eight labellers that spoke — the seven `STAGE2_CLASSIFIER_*` heads and `llm`. A voter that failed to load or answered off-taxonomy is **absent**, never a neutral entry. **There is no `heuristic` key:** Stage 1's emoji/keyword label stopped voting on 17 Aug 2026, so `parallel_labels` contains model verdicts only. |
+| `comment_analysis.comments[].label_voters` / `label_sources` | How many labellers actually voted, and which. Quote them with `label_agreement`: `1.0` over one voter is a single opinion, not a consensus. `label_voters: 0` ⇒ `sentiment: "uncertain"`, and *nothing* about that comment is claimed. |
+| `comment_analysis.ensemble.llm_share` vs `llm_share_analysed` | Against the **whole thread** vs against the **router's selection**. 100 of 2,857 is 3.4% of the post and 100% of what was selected; both are needed or one gets read as the other. |
 | `language_method` | `fasttext` \| `script_heuristic` \| `stub`. fastText is optional; without it the pipeline degrades to script detection rather than failing the post. |
 | `processing.llm_used` | Only routed posts ([router rules](src/defense/services/workers/router/rules.py)) carry Stage-2 latency/cost. Note this is **not** the whole cost lever any more: comment labelling runs for every post and is 85–96% of LLM calls (PROJECT_ASSESSMENT §6.8). |
 
@@ -205,6 +234,30 @@ curl -s -H "$KEY" "$API/v1/analysis/<job_id>?include=results&limit=100"
 ```
 
 All three return `{"results": [ <AnalysisResult>, … ]}` — the §1 JSON.
+
+### 2c-bis. Page through the comments of one post
+
+The per-comment table is bulky, so the list/detail responses strip it
+(`_comment_analysis_summary`) and this endpoint serves it paginated. It backs the
+dashboard's per-comment comparison, and it is the only place the eight labellers'
+individual verdicts are readable:
+
+```bash
+curl -s -H "$KEY" "$API/v1/analysis/post/<post_id>/comments?limit=200&offset=0" \
+  | python -m json.tool
+
+# Only the comments the labellers DISAGREED on — the review queue, and the set a
+# gold standard should be built from:
+curl -s -H "$KEY" "$API/v1/analysis/post/<post_id>/comments?sentiment=disagreed"
+
+# Also: sentiment=positive|negative|neutral|uncertain|all, emotion=<label>|all
+```
+
+Returns the page in `comments[]` plus aggregates computed over the **full** set,
+not the page: `sentiment_breakdown`, `emotion_breakdown`, `method_breakdown`,
+`provenance`, `coverage` / `coverage_label`, `top_authors`, `top_liked`,
+`avg_sentiment_score`, `target_stances`, and the two objects that say how much of
+the thread was actually analysed — `ensemble` and `stage2_selection` (§1).
 
 ### 2d. Extract YOUR custom JSON shape
 
@@ -347,6 +400,14 @@ curl -s -X POST $API/v1/reports -H "$KEY" -H "Content-Type: application/json" \
 
 curl -s -H "$KEY" $API/v1/reports                  # list
 curl -s -H "$KEY" $API/v1/reports/<report_id>      # fetch one
+
+# Download an existing report as a file
+curl -s -H "$KEY" "$API/v1/reports/<report_id>/export?format=pdf" -o report.pdf
+
+# Generate over recent posts AND download in one call — no report_id needed
+curl -s -H "$KEY" \
+  "$API/v1/reports/export_latest?campaign_id=all&type=mass_reaction&format=pdf" \
+  -o latest.pdf     # format=html for the HTML version
 ```
 
 **`clusters` is the SQL topic aggregate; `embedding_clusters` is the LLM one.**
@@ -459,6 +520,40 @@ curl -s -H "$KEY" $API/v1/chat/models
 #    "backends":{"local":{"models":["gemma3:4b","qwen2.5:7b",…],"default":"qwen2.5:7b"},
 #                "groq":{"models":[…],"default":"llama-3.3-70b-versatile"}}}
 ```
+
+### Chat history (server-side conversations)
+
+Persisted per caller, so the dashboard's chat survives a reload. Separate from
+`/v1/chat`, which is stateless — these endpoints store the turns.
+
+```bash
+curl -s -H "$KEY" "$API/v1/chat/conversations?limit=20"          # newest first
+curl -s -X POST $API/v1/chat/conversations -H "$KEY" \
+     -H "Content-Type: application/json" -d '{"title":"fuel price thread"}'
+curl -s -H "$KEY" "$API/v1/chat/conversations/<id>"              # + its turns
+curl -s -X POST $API/v1/chat/conversations/<id>/messages -H "$KEY" \
+     -H "Content-Type: application/json" \
+     -d '{"messages":[{"role":"user","content":"hi"}]}'          # append turns
+curl -s -X PATCH $API/v1/chat/conversations/<id> -H "$KEY" \
+     -H "Content-Type: application/json" -d '{"title":"renamed"}'
+curl -s -X DELETE $API/v1/chat/conversations/<id>                # one
+curl -s -X DELETE $API/v1/chat/conversations                     # all of them
+```
+
+An empty append is a 422, and a role outside `VALID_ROLES` is rejected — a
+conversation must not be able to store a turn the LLM cannot replay.
+
+### Raw pipeline events
+
+```bash
+curl -s -H "$KEY" "$API/v1/events?limit=200"
+# → {"events":[{"stream_id":"1723…-0","event":{…}}, …]}   newest first
+```
+
+The last N frames of the global `pipeline:events` Redis stream, newest first —
+the same frames the Trace tab consumes live via `/v1/pipeline/stream`. Useful when
+a run has already finished and the stream is gone. An unreadable stream returns
+`{"events": [], "error": …}` rather than a 500.
 
 ### Jobs list
 

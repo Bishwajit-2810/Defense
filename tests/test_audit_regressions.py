@@ -172,6 +172,213 @@ def test_stage_2_does_not_re_summarise_what_stage_1_already_wrote():
     assert get_task_flags(without, {"want_summary": False})["want_summary"] is False
 
 
+def _thread(*specs) -> dict:
+    """A stage1_result carrying comments described as (likes, kind) pairs."""
+    return {
+        "comment_analysis": {
+            "comments": [
+                {"id": f"c{i}", "text": f"substantive comment text {i}", "likes": likes, "kind": kind,
+                 "sentiment": "negative", "sentiment_score": -0.5, "method": "fast"}
+                for i, (likes, kind) in enumerate(specs)
+            ]
+        }
+    }
+
+
+def test_router_selects_the_most_reacted_comments_for_stage_2():
+    """The analysis set is top-N by reaction count, chosen once, in the router."""
+    from defense.services.workers.router.rules import select_comments_for_stage2
+
+    result = _thread((5, "substantive"), (100, "substantive"), (50, "substantive"))
+    record = select_comments_for_stage2(result, {}, limit=2)
+
+    comments = result["comment_analysis"]["comments"]
+    assert [c["likes"] for c in comments if c["stage2_selected"]] == [100, 50]
+    assert comments[0]["stage2_selected"] is False
+    assert comments[0]["stage2_skip_reason"] == "below_top_n"
+
+    # Nothing is dropped from the payload — the skipped comment still persists.
+    assert len(comments) == 3
+    assert record["total"] == 3 and record["selected"] == 2 and record["skipped"] == 1
+    assert record["cutoff_likes"] == 50
+    # Written where the assembler and the API can read it.
+    assert result["comment_analysis"]["stage2_selection"] == record
+
+
+def test_the_whole_thread_is_analysed_by_default():
+    """`ROUTER_COMMENT_TOP_N` ships at 0 — every comment with text is analysed.
+
+    A positive default is a silent coverage cut: the comments it drops get no model
+    verdict at all (Stage 1's keyword label does not vote), so they report
+    `uncertain` and the post-level `sentiment_breakdown` fills up with abstentions
+    while the coverage label still says "all N analyzed". Capping is a deliberate,
+    quoted choice, never the default.
+    """
+    from defense.libs.common.config import Settings
+    from defense.services.workers.router import rules
+
+    assert Settings.model_fields["router_comment_top_n"].default == 0
+
+    result = _thread(*[(i, "substantive") for i in range(250)], (900, "emoji"))
+    record = rules.select_comments_for_stage2(result, {}, limit=0)
+
+    assert record["limit"] == 0
+    assert record["selected"] == 250 == record["eligible"]
+    assert record["skipped"] == 0
+    comments = result["comment_analysis"]["comments"]
+    assert all(c["stage2_selected"] for c in comments[:250])
+    # The emoji reaction is still not selected — no model can read it.
+    assert "stage2_selected" not in comments[250]
+
+
+def test_the_launcher_does_not_override_the_coverage_knobs():
+    """`run_all.py`'s env beats .env, so a coverage default set there silently
+    overrides the operator's. It used to force COMMENT_STANCE_MAX_PER_POST=40,
+    which is how a run showed "✓ all 2857 analyzed" beside "⚠ 2606 capped out"."""
+    import run_all
+
+    env = run_all.build_env()
+    for key in ("ROUTER_COMMENT_TOP_N", "STAGE1_LLM_COMMENT_MAX",
+                "COMMENT_STANCE_MAX_PER_POST"):
+        assert key not in env, f"run_all.py must not set {key}"
+
+
+def test_textless_comments_do_not_consume_a_stage_2_slot():
+    """A 900-like emoji reaction gets no model call, so it must not take a slot."""
+    from defense.services.workers.router.rules import select_comments_for_stage2
+
+    result = _thread((900, "emoji"), (3, "substantive"), (2, "substantive"))
+    record = select_comments_for_stage2(result, {}, limit=2)
+
+    comments = result["comment_analysis"]["comments"]
+    # Not ranked, and not marked either — Stage 2's own `no_text` accounting
+    # still sees it.
+    assert "stage2_selected" not in comments[0]
+    assert comments[1]["stage2_selected"] is True and comments[2]["stage2_selected"] is True
+    assert record["eligible"] == 2 and record["skipped"] == 0
+
+
+def test_no_cap_selects_every_comment_with_text():
+    from defense.services.workers.router.rules import select_comments_for_stage2
+
+    result = _thread((1, "substantive"), (2, "substantive"))
+    record = select_comments_for_stage2(result, {}, limit=0)
+    assert record["selected"] == 2 and record["skipped"] == 0
+    assert all(c["stage2_selected"] for c in result["comment_analysis"]["comments"])
+
+
+def test_min_words_filters_comments_with_two_or_fewer_words():
+    from defense.services.workers.router.rules import select_comments_for_stage2
+
+    result = {
+        "comment_analysis": {
+            "comments": [
+                {"id": "c1", "text": "nice", "likes": 50, "kind": "substantive"},  # 1 word -> skip
+                {"id": "c2", "text": "good post", "likes": 40, "kind": "substantive"},  # 2 words -> skip
+                {"id": "c3", "text": "❤️❤️🔥", "likes": 90, "kind": "emoji"},  # emoji -> skip
+                {"id": "c4", "text": "this is great news today", "likes": 30, "kind": "substantive"},  # 5 words -> select
+                {"id": "c5", "text": "আমি কিছু বললাম না ভাই", "likes": 20, "kind": "substantive"},  # 5 words -> select
+            ]
+        }
+    }
+    record = select_comments_for_stage2(result, {}, limit=200, min_words=3)
+    assert record["eligible"] == 2
+    assert record["selected"] == 2
+    comments = result["comment_analysis"]["comments"]
+    assert comments[0]["stage2_selected"] is False and comments[0]["stage2_skip_reason"] == "below_min_words"
+    assert comments[1]["stage2_selected"] is False and comments[1]["stage2_skip_reason"] == "below_min_words"
+    assert "stage2_selected" not in comments[2]  # emoji
+    assert comments[3]["stage2_selected"] is True
+    assert comments[4]["stage2_selected"] is True
+
+
+def test_router_filters_duplicate_repeat_comments():
+    """Duplicate / repeat comments (e.g. spam/reposts/bots) must be filtered in the router so Stage-2 gets fresh unique comments."""
+    from defense.services.workers.router.rules import select_comments_for_stage2
+
+    result = {
+        "comment_analysis": {
+            "comments": [
+                {"id": "c1", "text": "উপদেষ্টা থাইকা কি করছো? মানুষ কিন্তু দেখছে🤣😂🤣", "likes": 50, "kind": "substantive"},
+                {"id": "c2", "text": "উপদেষ্টা থাইকা কি করছো? মানুষ কিন্তু দেখছে🤣😂🤣", "likes": 10, "kind": "substantive"},  # duplicate -> skip
+                {"id": "c3", "text": "উপদেষ্টা থাইকা কি করছো মানুষ কিন্তু দেখছে", "likes": 5, "kind": "substantive"},  # duplicate (near-duplicate) -> skip
+                {"id": "c4", "text": "এই বিষয়ে বিস্তারিত জানতে চাই ভাই", "likes": 30, "kind": "substantive"},  # unique -> select
+                {"id": "c5", "text": "great initiative for our country", "likes": 20, "kind": "substantive"},  # unique -> select
+                {"id": "c6", "text": "❤️❤️🔥", "likes": 100, "kind": "emoji"},  # emoji -> skip
+                {"id": "c7", "text": "ok nice", "likes": 80, "kind": "substantive"},  # <3 words -> skip
+            ]
+        }
+    }
+    record = select_comments_for_stage2(result, {}, limit=200, min_words=3)
+    assert record["total"] == 7
+    assert record["eligible"] == 3  # c1, c4, c5
+    assert record["selected"] == 3
+    assert record["duplicates"] == 2  # c2, c3
+
+    comments = result["comment_analysis"]["comments"]
+    # c1 (highest likes duplicate representative) selected
+    assert comments[0]["stage2_selected"] is True
+    # c2 (duplicate) marked skipped
+    assert comments[1]["stage2_selected"] is False
+    assert comments[1]["stage2_skip_reason"] == "duplicate"
+    assert comments[1]["is_duplicate"] is True
+    # c3 (near duplicate) marked skipped
+    assert comments[2]["stage2_selected"] is False
+    assert comments[2]["stage2_skip_reason"] == "duplicate"
+    # c4, c5 selected
+    assert comments[3]["stage2_selected"] is True
+    assert comments[4]["stage2_selected"] is True
+    # c6 emoji (no stage2_selected)
+    assert "stage2_selected" not in comments[5]
+    # c7 below min words
+    assert comments[6]["stage2_selected"] is False
+    assert comments[6]["stage2_skip_reason"] == "below_min_words"
+
+
+def test_unselected_comments_are_uncertain_not_labelled_by_a_keyword_rule():
+    """Capping cost must not manufacture a verdict either.
+
+    An earlier version of this test asserted the opposite — that a comment outside
+    the router's top-N kept Stage 1's label, seeded into the ensemble as a
+    `heuristic` vote. That seeding was removed on 17 Aug 2026: Stage 1's label is
+    an emoji + keyword rule (mostly the deterministic hash stub in the shipped
+    configuration), and a free voter that answers on every comment makes
+    abstention unreportable. So the honest answer for a comment no MODEL read is
+    `uncertain` at zero voters, and `escalation_reason` says why.
+    """
+    import defense.services.workers.stage2_llm.worker as w
+
+    ca = {
+        "comments": [
+            {"id": "in", "text": "a", "kind": "substantive", "likes": 9,
+             "sentiment": "neutral", "method": "fast", "stage2_selected": True,
+             "parallel_labels": {"llm": {"sentiment": "negative", "sentiment_score": -0.6}}},
+            {"id": "out", "text": "b", "kind": "substantive", "likes": 0,
+             "sentiment": "negative", "sentiment_score": -0.4, "method": "fast",
+             "stage2_selected": False, "stage2_skip_reason": "below_top_n"},
+        ],
+        "stage2_selection": {"limit": 1, "selected": 1, "skipped": 1, "total": 2},
+    }
+    summary = w._merge_ensemble(
+        ca, None, escalation_reasons={"llm_all": 1, "below_top_n": 1},
+        dedup_stats={"duplicates": 0, "duplicate_share": 0.0}, voters_used=["llm"],
+    )
+
+    skipped = ca["comments"][1]
+    assert skipped["sentiment"] == "uncertain"
+    assert skipped["label_voters"] == 0
+    assert skipped["label_sources"] == []
+    assert skipped["escalation_reason"] == "below_top_n"
+    # Stage 1's cheap path is still disclosed — just not as a verdict.
+    assert skipped["method"] == "fast"
+    assert ca["method_breakdown"]["fast"] == 1
+
+    # Coverage of the thread and coverage of the selection are both reported,
+    # so 1-of-2 cannot be read as a half-failed stance pass.
+    assert summary["analysed"] == 1 and summary["not_analysed"] == 1
+    assert summary["llm_share"] == 0.5 and summary["llm_share_analysed"] == 1.0
+
+
 # ---------------------------------------------------------------------------
 # 5. The watchlist example must stay an example
 # ---------------------------------------------------------------------------
@@ -362,15 +569,15 @@ def test_agreement_is_reported_with_its_voter_count():
     from defense.services.workers.stage2_llm import worker as w
 
     c = {"id": "c1", "text": "x", "kind": "substantive", "sentiment": "positive",
-         "sentiment_score": 0.5, "emotion": "neutral", "method": "fast"}
-    w._seed_heuristic_vote(c)
+         "sentiment_score": 0.5, "emotion": "neutral", "method": "fast",
+         "parallel_labels": {"xlmr": {"sentiment": "positive", "score": 0.5}}}
     ca = {"analyzed": 1, "comments": [c]}
     w._merge_ensemble(ca, None, escalation_reasons={}, dedup_stats={},
-                      voters_used=["heuristic"])
+                      voters_used=["xlmr"])
 
     assert c["label_agreement"] == 1.0
     assert c["label_voters"] == 1          # ...out of one. Not a consensus.
-    assert c["label_sources"] == ["heuristic"]
+    assert c["label_sources"] == ["xlmr"]
 
 
 def test_the_destructive_e2e_test_cannot_run_by_accident():
@@ -398,3 +605,42 @@ def test_the_destructive_e2e_test_cannot_run_by_accident():
     if not os.environ.get("RUN_DESTRUCTIVE_E2E"):
         skipif = next(m for m in e2e.pytestmark if m.name == "skipif")
         assert skipif.args[0] is True, "guard is open without the opt-in set"
+
+
+def test_config_json_alone_does_not_count_as_a_cached_checkpoint(monkeypatch):
+    """An interrupted prefetch leaves config.json + tokenizer and no weights.
+
+    `_is_cached` used to answer True for that, so the head passed the stub-mode
+    gate and then failed inside `pipeline(...)` — under the HF_HUB_OFFLINE=1
+    that run_all.py sets, as a connection error rather than the true reason.
+    """
+    import huggingface_hub
+
+    from defense.services.workers.stage2_llm import worker as w
+
+    present: set[str] = {"config.json", "tokenizer.json", "special_tokens_map.json"}
+    monkeypatch.setattr(
+        huggingface_hub,
+        "try_to_load_from_cache",
+        lambda repo_id, filename: f"/cache/{filename}" if filename in present else None,
+    )
+    assert w._is_cached("some/repo") is False
+
+    present.add("model.safetensors")
+    assert w._is_cached("some/repo") is True
+
+
+def test_sharded_checkpoints_count_as_cached(monkeypatch):
+    """A sharded repo has no `model.safetensors`; its index is the marker."""
+    import huggingface_hub
+
+    from defense.services.workers.stage2_llm import worker as w
+
+    monkeypatch.setattr(
+        huggingface_hub,
+        "try_to_load_from_cache",
+        lambda repo_id, filename: (
+            "/cache/index" if filename == "model.safetensors.index.json" else None
+        ),
+    )
+    assert w._is_cached("some/sharded-repo") is True

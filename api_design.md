@@ -12,6 +12,15 @@ For full real input→output examples see [examples.md](examples.md).
 > push path (§1b) remains for external/replay sources. These read/analysis/report
 > endpoints below are what _our_ downstream consumers call.
 
+> **This file is the contract as designed; [endpoints.md](endpoints.md) is the
+> surface as built** — copy-pasteable curl for what the running app serves
+> (**47 distinct `/v1` paths, 58 method+path pairs** as of 17 Aug 2026), including
+> per-comment paging, chat history, the raw event stream and the report export
+> paths. Where the two disagree, endpoints.md is the current one. In particular the
+> `comment_analysis` block below predates the comment ensemble: the shipped shape
+> adds `parallel_labels` per comment, plus `ensemble` and `stage2_selection` — see
+> endpoints.md §1. The live list is always `GET /openapi.json` (or `/docs`).
+
 Conventions:
 
 - `202 Accepted` for async work (returns a job/analysis id to poll or subscribe).

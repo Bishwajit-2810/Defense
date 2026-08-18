@@ -79,6 +79,20 @@ Docker; everything else is a host subprocess run with `.venv/bin/python`. So
 Docker alone is **not** enough — you also need `uv`, Ollama, and the three pulled
 models (`gemma3:4b`, `qwen2.5:7b`, `qwen3-vl:4b`).
 
+Optionally also **pre-fetch the seven Stage-2 comment classifiers** (~3 GB into the
+local HF cache):
+
+```bash
+uv run python deploy/prefetch_classifiers.py
+```
+
+`MODEL_STUB_MODE=true` means *download nothing*, so an un-prefetched host skips
+every uncached head and the ensemble runs LLM-only — logged once per post as
+`stage2_cheap_voters voted=0 declared=7`, never faked as a neutral verdict. This is
+a legitimate reduced configuration, not a broken one; it just must not be quoted as
+an eight-labeller run. In a container image, run the same script at **build** time so
+the weights ship in the layer rather than being fetched per pod start.
+
 ### Mode B — `cd deploy && docker compose up` (everything containerised)
 
 The compose file does define all ten app services — api, ingestion, the four

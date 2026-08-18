@@ -10,15 +10,33 @@ from __future__ import annotations
 # Summary prompt
 # ---------------------------------------------------------------------------
 
-SUMMARY_PROMPT = """You are analyzing a social media post. Write a concise summary (2-3 sentences) in {lang}.
-Ground your summary on all available information.
+_LANG_NAMES = {
+    "bn": "Bengali (বাংলা)",
+    "bengali": "Bengali (বাংলা)",
+    "en": "English",
+    "english": "English",
+    "banglish": "Banglish (Bengali written in Latin script)",
+    "mixed": "Bengali/English",
+}
+
+
+def _format_lang_name(code: str | None) -> str:
+    """Format language code to a descriptive language name for LLM prompting."""
+    if not code:
+        return "the post's original language"
+    c = str(code).strip().lower()
+    return _LANG_NAMES.get(c, code)
+
+
+SUMMARY_PROMPT = """You are analyzing a social media post. Write a complete, coherent, and factual summary (2-3 complete sentences) in {lang}.
+Ground your summary directly on all available information:
 
 Post text: {caption}
 OCR text from image: {ocr_text}
 Image description: {image_description}
 Language detected: {language}
 
-Write the summary in {lang}. Be factual and neutral."""
+Write the full summary in {lang}. State the main event, key actors, and core outcome clearly and completely. Do not output fragmented words or incomplete thoughts."""
 
 # ---------------------------------------------------------------------------
 # Post-type classification prompt
@@ -63,12 +81,13 @@ def build_summary_messages(
     multimodal content format (text part + image_url parts) so a VLM can
     ground the summary on the actual image pixels, not just OCR text.
     """
+    resolved_lang = _format_lang_name(target_lang or language)
     text_content = SUMMARY_PROMPT.format(
-        lang=target_lang or language or "the post's language",
+        lang=resolved_lang,
         caption=caption or "(no text)",
         ocr_text=ocr_text or "(none)",
         image_description=image_description or "(none)",
-        language=language or "unknown",
+        language=_format_lang_name(language) or "unknown",
     )
     if image_urls:
         content: list[dict] = [{"type": "text", "text": text_content}]

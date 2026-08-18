@@ -29,9 +29,13 @@ posts reach the LLM"* — and this script is what supports it.
 
 Env
 ---
-    CORPUS         Corpus path (default posts_text_only.json — the 43 captioned
-                   posts; see eval/make_text_corpus.py and §5.2 for why the 7
-                   image-only posts are excluded).
+    CORPUS         Corpus path (default posts_with_details.json — all 50 posts,
+                   which is what the ingestion path actually uploads). The 7
+                   null-caption PHOTO posts are *included* and reported
+                   separately: measuring on the caption-filtered 43 described a
+                   population the running system never processes, and hid 1,307
+                   comments (12.7%) from the comment-lane cost figures below.
+                   Point at posts_text_only.json to reproduce the old numbers.
     MAX_COMMENTS   Comments analysed per post. Default 0 = ALL of them, matching
                    the shipped configuration since §6.3 lifted the caps. No
                    routing rule reads a comment field, so this affects the
@@ -55,7 +59,14 @@ ROOT = Path(__file__).resolve().parent.parent
 
 # The workers use bare imports (`from dlq import ...`), so their own directories
 # have to be importable the way the containers set them up.
-for _p in (ROOT, ROOT / "libs", ROOT / "services" / "workers" / "stage1_nlp"):
+# NB: the tree moved under src/defense/ — these paths track that layout.
+for _p in (
+    ROOT,
+    ROOT / "src",
+    ROOT / "src" / "defense",
+    ROOT / "src" / "defense" / "libs",
+    ROOT / "src" / "defense" / "services" / "workers" / "stage1_nlp",
+):
     if str(_p) not in sys.path:
         sys.path.insert(0, str(_p))
 
@@ -73,7 +84,7 @@ from services.workers.stage1_nlp.comment_analyzer import (  # noqa: E402
     _comment_kind,
 )
 
-CORPUS = Path(os.getenv("CORPUS", ROOT / "posts_text_only.json"))
+CORPUS = Path(os.getenv("CORPUS", ROOT / "posts_with_details.json"))
 #: 0 = every comment, which is the shipped configuration since §6.3.
 MAX_COMMENTS = int(os.getenv("MAX_COMMENTS", "0"))
 
@@ -91,6 +102,9 @@ async def _stage1_result(raw_post: dict, registry: ModelRegistry) -> dict:
         text_result,
         image_result,
         comment_analysis,
+        post_summary,
+        post_summary_lang,
+        post_summary_grounding,
         overall_sentiment,
         sentiment_score,
     ) = await stage1._process_message(post, registry)
@@ -99,6 +113,9 @@ async def _stage1_result(raw_post: dict, registry: ModelRegistry) -> dict:
         text_result=text_result,
         image_result=image_result,
         comment_analysis=comment_analysis,
+        post_summary=post_summary,
+        post_summary_lang=post_summary_lang,
+        post_summary_grounding=post_summary_grounding,
         overall_sentiment=overall_sentiment,
         sentiment_score=sentiment_score,
         stage1_ms=0.0,
@@ -170,8 +187,18 @@ async def main() -> None:
         engine = "keyword-stub"
     else:
         engine = "small-model suite"
+    # The 7 null-caption PHOTO posts are in the corpus by default (they are what
+    # ingestion uploads), so say so rather than letting the denominator drift
+    # silently between runs pointed at different corpora.
+    captionless = [r for r in rows if not r["caption_chars"]]
+    captionless_note = (
+        f"  ({len(captionless)} null-caption post(s) included, carrying "
+        f"{sum(r['stored_comments'] for r in captionless):,} comments)"
+        if captionless
+        else "  (all posts captioned)"
+    )
     print(
-        f"\nCorpus:         {CORPUS.name}"
+        f"\nCorpus:         {CORPUS.name}{captionless_note}"
         f"\nStage-1 engine: {engine}"
         f"\nROUTING RATE:   {len(routed)}/{len(rows)} = {len(routed) / len(rows):.0%}"
         f"   (bypassed Stage 2: {len(rows) - len(routed)})"

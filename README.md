@@ -29,10 +29,14 @@ threads per batch.
 > Fusion weights renormalise over the terms that actually carry a model verdict,
 > so the absent image term no longer silently shrinks the text signal, and a
 > failed image fetch now reports as a failure instead of as a neutral verdict.
-> The working corpus is [posts_text_only.json](posts_text_only.json) (43
-> captioned posts, 8,965 comments; `python -m eval.make_text_corpus`) — the 7
-> `null`-caption `PHOTO` posts are excluded because without image or OCR there
-> is nothing to analyse. See [data_contract.md](data_contract.md) §4 and
+> The working corpus is [posts_with_details.json](posts_with_details.json) —
+> all 50 posts, 10,272 comments, which is exactly what the ingestion path
+> uploads. The 7 `null`-caption `PHOTO` posts have no *post* text to analyse,
+> but they carry 1,307 perfectly analysable **comments**, so they are no longer
+> excluded corpus-wide: the caption filter now lives in the one script that
+> summarises captions. `python -m eval.make_text_corpus` still writes the
+> 43-post subset for reproducing pre-existing numbers.
+> See [data_contract.md](data_contract.md) §4 and
 > [PROJECT_ASSESSMENT.md](PROJECT_ASSESSMENT.md) §5.2.
 
 > **Input contract:** the real upstream **post-with-details** schema (embedded
@@ -96,8 +100,11 @@ blended rate was wrong for both backends in opposite directions. The hard goals:
 **fast, cost-effective, efficient, and accurate on Bangla/Banglish** (with
 fine-tuning hooks the owner can drive).
 
-The **backend is Python + FastAPI** throughout and the **dashboard is plain
-HTML/CSS/JS** (no framework). Above the per-post pipeline sits a selective
+The **backend is Python + FastAPI** throughout and the **dashboard is React 19 +
+Vite + Tailwind** (`dashboard/`, charts via chart.js). The original vanilla
+HTML/CSS/JS dashboard the design docs specify is kept at `dashboard_legacy/`;
+where a doc still says "plain HTML/CSS/JS, no build step", that is the superseded
+decision. Above the per-post pipeline sits a selective
 **agentic insight layer** — AI agents (on the same LLM-B backend) that reach data
 through **MCP servers** (`analytics` / `retrieval` / `ingest`) for analyst Q&A,
 grounded reports, and targeted deep-dives — **corpus-tier only, never per post**
@@ -139,6 +146,11 @@ concrete input→output, see [examples.md](examples.md).
 | [PROJECT_ASSESSMENT.md](PROJECT_ASSESSMENT.md)       | **Capstone / paper readiness review** — six independent audit passes, every finding with its evidence class (measured / probed / read), what was fixed, and what is still open       |
 | [OPEN_ISSUES.md](OPEN_ISSUES.md)                     | The actionable form of the latest audit pass: per-issue what-to-change, how-to-prove-it, and the regression test each one left behind. **All currently closed**                      |
 | [run.md](run.md) · [easy_run.md](easy_run.md)        | Running it: the one-command quickstart, then the deep reference (every env var, scaling, troubleshooting)                                                                            |
+| [env.example.md](env.example.md)                     | **Every environment variable**, with its default and what happens if you change it — including the dead keys kept only because older docs mention them                               |
+| [AGENTIC_RAG_NOVELTY.md](AGENTIC_RAG_NOVELTY.md)     | The agentic-RAG layer as a research contribution: what is novel, what is assembly, and which claims are measured                                                                     |
+| [RAG_STATE_AND_ROADMAP.md](RAG_STATE_AND_ROADMAP.md) | Current state of retrieval + the agents, per-agent behaviour, and what is still missing to call it RAG rather than SQL-with-an-LLM-on-top                                            |
+| [AUDIT_PASS7.md](AUDIT_PASS7.md) · [AUDIT_PASS8.md](AUDIT_PASS8.md) · [AUDIT_PASS9.md](AUDIT_PASS9.md) | **Dated audit records — historical, not maintained.** Each is a snapshot of what was found and fixed in that pass; where one disagrees with the docs above, the docs above are current |
+| [dashboard/README.md](dashboard/README.md)           | The React dashboard: dev server, build, tests                                                                                                                                       |
 
 Background: the original system-design request has been reconciled with
 [what.txt](what.txt), which is now the authoritative source and supersedes it.
@@ -171,6 +183,26 @@ target (the routing rate) are flagged inline in each document.
   six gates single out ([rules.py](src/defense/services/workers/router/rules.py)). This is the
   central cost-control idea, and the routing rate it produces is reported from the
   router's own counters rather than assumed.
+- **The router makes two decisions, not one.** The six gates decide **post-level**
+  work. Separately, the router picks **which comments** Stage 2 analyses — the
+  by default **every comment with text** (`ROUTER_COMMENT_TOP_N=0`) — and every
+  Stage-2 voter reads that one set, so the post-level breakdown and the
+  per-comment table always describe the same comments. Setting a positive cap
+  keeps only the top-N by reaction count and bounds per-post comment cost at
+  `ceil(N/25)` LLM calls; the comments below the cut are still kept and persisted,
+  and the result reports how many (`ensemble.not_analysed`) rather than implying
+  full coverage.
+- **Comment sentiment is an ensemble, not a model.** Each analysed comment
+  collects up to **eight** verdicts — seven small sentiment heads batched on CPU
+  (`STAGE2_CLASSIFIER_1..7`) and the context-aware LLM stance pass, the only
+  labeller that sees the post. One combiner writes the final label, and the
+  dashboard shows all eight side by side. **Only a model may label a comment:**
+  Stage 1's emoji + keyword rule is not a voter, because it answers on every
+  comment (mostly with the deterministic hash stub) and a voter that can never
+  abstain makes the agreement numbers unfalsifiable. A head that fails to load
+  **abstains**; it is never counted as a neutral, `label_voters` says how many
+  actually spoke, and a comment no model read is reported as `uncertain` rather
+  than given a label.
 - **Two LLM roles, a pluggable backend (local ⇄ Groq), switchable at runtime.**
   The selective stage uses **LLM-A** (fast 7B/8B) for per-post refinement and
   **LLM-B** (larger 14B/32B) for cluster summarization, insight, and grounded
@@ -206,7 +238,8 @@ target (the routing rate) are flagged inline in each document.
   `stage1`, `interactive`, `agent`). `pipeline_tokens` isolates the per-post
   figure from per-question chat and agent spend, so the cost claim cannot be
   inflated by however much anyone used the chatbot.
-- **Backend FastAPI; dashboard plain HTML/CSS/JS.**
+- **Backend FastAPI; dashboard React 19 + Vite + Tailwind** (`dashboard/`; the
+  original vanilla build is preserved in `dashboard_legacy/`).
 - **Deployment:** Docker Compose for MVP, Kubernetes (with KEDA autoscaling on
   queue depth) for Production and beyond.
 

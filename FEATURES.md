@@ -17,16 +17,17 @@ and what the image modality was before §9.3.
 | ⚠️ **Unexercised** | Implemented, but cannot currently produce a signal |
 | 📋 **Planned** | Designed, not built |
 
-**Scale (measured 5 Aug 2026):** **27,537 lines of Python across 124 files** —
-`src/defense/services/` 14,477, `tests/` 6,351, `src/defense/libs/` 3,475, `eval/` 1,109,
-`src/defense/mcp_servers/` 1,160, `run_all.py` 671. **673 tests** across 40 files. Working
-corpus: 43 posts, 8,965 comments.
+**Scale (measured 17 Aug 2026):** **49,341 lines of Python across 170 files** —
+`src/defense/services/` 21,001, `tests/` 17,065, `src/defense/libs/` 5,522,
+`src/defense/mcp_servers/` 3,263, `eval/` 2,337, `run_all.py` 856. **1,261 tests**
+across 62 files, all passing. Working corpus: 43 posts, 8,965 comments.
+*(Was 27,537 lines / 673 tests on 5 Aug.)*
 
-Test code is now 23% of the Python in the repository, up from 14%. That ratio is
-the more meaningful number: the growth is almost entirely regression tests
-pinning findings from [PROJECT_ASSESSMENT.md](PROJECT_ASSESSMENT.md), and §9.12
-records a mutation-testing pass confirming they actually fail when the fixes are
-reverted.
+Test code is now 35% of the Python in the repository, up from 23% and 14% before
+that. That ratio is the more meaningful number: the growth is almost entirely
+regression tests pinning findings from
+[PROJECT_ASSESSMENT.md](PROJECT_ASSESSMENT.md), and §9.12 records a
+mutation-testing pass confirming they actually fail when the fixes are reverted.
 
 ---
 
@@ -39,7 +40,7 @@ reverted.
 | **Idempotent upsert** | Every post has a stable content hash; re-ingesting is safe and re-analysis is a first-class operation. Postgres upserts on `post_id`, object storage writes a deterministic key, and the two ClickHouse tables collapse to the newest row per post — `comment_sentiments` in the engine, `analysis_events` in the queries. **Until 5 Aug 2026 the last of those was missing**, so a re-analysed post was counted twice in every analytics aggregate; see PROJECT_ASSESSMENT §11.2. | ✅ Measured |
 | **Baseline preservation** | The upstream's coarse `sentiment`/`viralPotential` are kept as `baseline_*` and never overwritten, so our recomputation can be compared against theirs. | ✅ Measured |
 | **Near-duplicate reuse** | A post within cosine 0.97 of an already-analysed one reuses that result and skips both stages. The result is **composed, not copied**: identity, engagement, reactions and timestamps come from the new post, only the post-level analysis is reused, and `processing.reused_from` records the source. The **comment thread is never reused** — a caption match is not a thread match, so the new post's thread is reported unanalysed rather than inheriting labels for comments nobody read. Reuse goes through the assembler, so all three stores are written. | 🟡 Works, unmeasured — was a verbatim row copy until 5 Aug 2026 (§13.3) |
-| **Working-corpus filter** | `eval/make_text_corpus.py` writes `posts_text_only.json` (43 captioned posts) and prints exactly what it dropped and why. The source corpus is never modified. | ✅ Measured |
+| **Working-corpus filter** | `eval/make_text_corpus.py` writes `posts_text_only.json` (43 captioned posts) and prints exactly what it dropped and why. The source corpus is never modified. It is no longer any script's default input: eval runs read the full `posts_with_details.json` (50 posts), matching what ingestion uploads, and each script reports any null-caption posts it skips. | ✅ Measured |
 
 ---
 
@@ -74,6 +75,8 @@ reverted.
 | **Env-tunable thresholds** | `ROUTER_CONFIDENCE_THRESHOLD`, `ROUTER_POST_TYPE_CONFIDENCE_THRESHOLD`, `ROUTER_TOXICITY_THRESHOLD`, `ROUTER_LONG_TEXT_CHARS` — which makes the gate sweepable rather than merely arbitrary. | ✅ Measured |
 | **Exercised bypass leg** | A bypassed post is validated end to end against the output schema. That branch had never once executed before §4. | ✅ Measured |
 | **Task flags** | Tells Stage 2 which tasks are actually needed, so a confidently-typed post does not pay for a redundant `post_type` call. | ✅ Measured |
+| **Comment selection (the whole thread, by default)** | A second, separate decision the router makes: which comments Stage 2 analyses. `ROUTER_COMMENT_TOP_N` defaults to **0 = every comment with text**, and the selection is recorded either way (`stage2_selected` per comment, `stage2_selection` per post). A positive value keeps the top-N by reaction count instead — ranked by `likes`, tie-broken by original index so the choice is reproducible — for when a run needs to be fast rather than complete. Marked on the comments rather than filtered out, so all three stores receive the whole thread regardless. | 🟡 Works, unmeasured |
+| **The gate decides post-level work only** | Comment analysis is **not** gated: every post reaches Stage 2 for its comments, and `stats:llm_routed` counts only the posts that got post-level tasks, so `estimated_llm_share` keeps its meaning. Bypassed posts used to go straight to the assembler, which left the majority of posts with three empty columns in the per-comment comparison and nothing saying why. | ✅ Measured |
 
 > **Read the routing rate as a measure of Stage-1 quality, not cost efficiency.**
 > A Stage 1 that types a post confidently bypasses Stage 2, so the rate *falls as
@@ -93,9 +96,14 @@ reverted.
 | **Post-type classification** | Nine-label taxonomy shared from `src/defense/libs/labels.py` so Stage 1, the Stage-2 prompt and the router cannot drift apart. | ✅ Measured |
 | **Insight / topic refinement** | Refines topics and intents, and writes a short one-line `insight`. **This row was wrong until 5 Aug 2026:** the LLM call ran and was paid for, but the assembler read `topics`/`intents` from Stage 1 only and never read `insight` at all, which was also absent from `output_schema.json` — so the entire task's output was discarded before it reached the API, the stores or the dashboard. Merged now (`builder._merge_stage2_labels`, schema `1.3`), pinned by `tests/test_stage2_insight_survives.py`. Pass 5 carried it the last hop: it reached the dashboard only as an untitled row in the bottom "All Fields" dump, and now has its own section beside the summary plus a Trace-tab row (§12.4d). | 🟡 Works, unmeasured |
 | **Context-aware comment stance** | Re-labels comments by stance *toward the post*, with the post as context — a different and better signal than standalone comment sentiment. | ✅ Measured |
+| **Eight-labeller comment ensemble** | Every analysed comment collects up to **eight** independent verdicts in `parallel_labels`: **seven small sentiment heads** batched on CPU (`STAGE2_CLASSIFIER_1..7` → `xlmr`, `distilbert`, `twitter_xlmr`, `banglabert`, `bengali_sentiment_bert`, `mbert`, `modernbert`) and the LLM stance pass. `libs/ensemble.combine()` is the **single writer** of the comment's final `sentiment` — three places used to write it and the last one won, which is how a post could report eight negative comments while every comment in the list read neutral. The dashboard shows all eight columns on one row. | 🟡 Works, unmeasured — the roster grew from 2 heads to 7 on 16 Aug 2026 and has not been scored since |
+| **Only a model may label a comment** | Stage 1's emoji + keyword rule stopped voting on 17 Aug 2026: it answers on every comment (mostly with the deterministic hash stub — 11 of 12 on a real Bangla thread) and a voter that can never abstain makes every agreement number unfalsifiable. Its label is still disclosed in `method` / `provenance`, just never as a verdict. | ✅ Measured |
+| **A voter that can't vote abstains** | A head that fails to load, or returns a label outside the taxonomy, contributes **nothing** — never a fabricated neutral. `label_voters` / `label_sources` report who actually spoke, so `label_agreement: 1.0` cannot render as "100% agree" for a comment one model read. Zero voters is `uncertain`, which is a statement about our confidence, not about the comment. A declared-but-silent head is logged at WARNING (`stage2_cheap_voters voted=2 declared=7`) — five of the original roster's checkpoints were base encoders or did not exist on the Hub, and voted zero times while reading as coverage. | ✅ Measured |
+| **Roster prefetch + vote check** | `deploy/prefetch_classifiers.py` downloads the seven heads into the local HF cache and runs each on a Bangla/English/Banglish probe, so "downloaded" is never mistaken for "voting". `MODEL_STUB_MODE=true` means *download nothing*, so an unprefetched box degrades to LLM-only rather than stalling on a 3 GB fetch. | ✅ Measured |
 | **Comment-thread summary** | A short natural-language account of how commenters reacted, grounded on the recomputed breakdowns. | 🟡 Works, unmeasured |
 | **Bounded-concurrency batch queue** | Comments batch at 25 and run 3 batches in flight with per-batch retry and index-alignment assertions. Replaced a strictly sequential loop — which is why the old caps existed at all. | ✅ Measured |
-| **Full comment coverage** | `STAGE1_LLM_COMMENT_MAX` and `COMMENT_STANCE_MAX_PER_POST` both default to **0 = no cap**. The old 60/40 defaults meant only ~29% of comments ever got an LLM label while the output described itself as full coverage. | ✅ Measured |
+| **Full comment coverage** | `STAGE1_LLM_COMMENT_MAX` and `COMMENT_STANCE_MAX_PER_POST` both default to **0 = no cap**. The old 60/40 defaults meant only ~29% of comments ever got an LLM label while the output described itself as full coverage. **Read this row with the next one:** since 17 Aug 2026 the *router* bounds the Stage-2 comment set to 100 per post, so "no cap" now describes these two knobs, not the pipeline. | ✅ Measured |
+| **One analysis set, all models** | Whatever the router selects, **every** Stage-2 voter reads that same set — the seven cheap heads, the near-duplicate cache and the LLM stance pass. Replaces a cap that lived in the stance pass alone, so the LLM column of the per-comment comparison was empty on comments the cheap heads had all voted on. At the default (`ROUTER_COMMENT_TOP_N=0`) the set is **every comment with text**, so the post-level breakdown and the per-comment table describe the same comments. With a positive cap they diverge and the output says so: `ensemble.analysed` / `not_analysed`, and `uncertain` on each comment no model read. | 🟡 Works, unmeasured |
 | **Response cache** | Content-addressed, 7-day TTL, keyed on `(backend, **resolved model id**, task, content_hash)`. The model id used to be a role label, so switching models re-served the previous model's answers — which would have silently invalidated any model comparison. `LLM_CACHE_DISABLED=1` for eval runs. | ✅ Measured |
 | **VLM image-grounded summary** | Would ground the summary on actual image bytes. | ⚠️ **Unexercised** — no image is fetchable |
 
@@ -193,10 +201,10 @@ Full design: **[stance_targets.md](stance_targets.md)**.
 
 | Feature | What it does | State |
 | ------- | ------------ | ----- |
-| **Plain HTML/CSS/JS dashboard** | No framework. Posts, Overview, Jobs, Trace, Pipeline, Logs, Chat, Reports, Agents. | ✅ Measured |
+| **React dashboard** | React 19 + Vite + Tailwind (`dashboard/`), charts via chart.js: Posts, Overview, Jobs, Trace, Pipeline, Logs, Chat, Reports, Agents. Replaced the vanilla HTML/CSS/JS build the design docs specify, which is preserved at `dashboard_legacy/`. | ✅ Measured |
 | **Per-post live trace** | Streams per-stage events over SSE, including explicit `skipped` frames when Stage 2 is bypassed and the routing gate's own inputs next to its verdict. A live per-post trace during a defense is worth a lot. | ✅ Measured |
 | **Batch progress** | `batch k/N` frames during long comment passes, so a 115-batch thread does not look hung. | ✅ Measured |
-| **XSS-safe rendering** | `escHtml`/`escAttr` on all untrusted text; `renderMarkdown` escapes before applying inline markup and only emits `http(s)` links with `rel="noopener noreferrer"`. Facebook comment text is attacker-controlled input in a hand-written JS dashboard, and there is no XSS in it. | ✅ Measured |
+| **XSS-safe rendering** | Facebook comment text is attacker-controlled input. On the React build, JSX escapes every interpolated value, so comment and caption text cannot inject markup. **One `dangerouslySetInnerHTML` remains** — `Overview.jsx`'s `StatCard subtext`, whose only HTML-bearing caller is a locally-built coverage string of numbers (`coverageHtml`), never upstream text. It is still the one place a future caller could pass through a post field, so it is named here rather than described as absent. The `escHtml`/`escAttr` helpers this row used to describe belong to `dashboard_legacy/`. | 🟡 Works, unmeasured on the React build |
 | **Provenance in the UI** | Label-provenance share, truncation badges, coverage anomalies and the emoji-vs-written split are all surfaced — so a chart can state what produced it. | ✅ Measured |
 | **Prometheus + Grafana + Loki** | Metrics, dashboards, log aggregation. | 🟡 Works, unmeasured |
 

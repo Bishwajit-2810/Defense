@@ -64,7 +64,10 @@ The other docs say _what/why_; this says _what to do next_.
 12. **Agents are corpus-tier ONLY — never per post.** The agentic layer (§11) is
     Phase 2; it does analyst Q&A / reports / deep-dives, gated + cached +
     budget-capped.
-13. **Backend = FastAPI. Dashboard = plain HTML/CSS/JS** (vanilla, no framework).
+13. **Backend = FastAPI. Dashboard = React 19 + Vite + Tailwind** (`/dashboard`).
+    This rule read "plain HTML/CSS/JS, no framework" until 17 Aug 2026; the vanilla
+    build it describes still exists at `/dashboard_legacy` and is no longer the one
+    that ships.
 14. **Validate every output against the JSON Schema** (Task 0.2) before persisting.
 15. **Platform is derived from the `url` host** — never hardcode "facebook".
 
@@ -83,7 +86,7 @@ The other docs say _what/why_; this says _what to do next_.
 | Bus          | **Redis Streams** (MVP) → **Kafka** (Prod), partitioned by `hash(post_id)`                                                                              |
 | Stores       | **PostgreSQL + pgvector** (ops/jobs/results + vectors) · **ClickHouse** (analytics) · **Redis** (cache/dedup) · **S3/MinIO** (raw payloads, reports)    |
 | Agents/tools | Agent orchestrator (FastAPI) + **MCP servers** (FastAPI + MCP SDK) — Phase 2                                                                            |
-| Frontend     | **Plain HTML + CSS + JavaScript** served static                                                                                                         |
+| Frontend     | **React 19 + Vite + Tailwind** (`/dashboard`; the original static HTML/CSS/JS build is kept at `/dashboard_legacy`)                                      |
 | Deploy       | Docker Compose (MVP) → Kubernetes + KEDA (Prod) — see [deployment.md](deployment.md)                                                                    |
 | Config       | `LLM_BACKEND`, `GROQ_API_KEY`, per-tenant policy, model IDs — all in config/secrets                                                                     |
 
@@ -100,11 +103,21 @@ Suggested monorepo layout:
     /assembler    merge → JSON-Schema validate → persist (PG+pgvector/CH/object)
   /agents         orchestrator + agent definitions (Phase 2)
   /mcp            analytics-mcp, retrieval-mcp, ingest-mcp (Phase 2)
+/contracts
+  /schemas        input + output JSON Schemas + validator (the contracts).
+                  NOTE: this lives at src/defense/contracts/schemas, NOT under
+                  /libs, where earlier revisions of this guide put it.
 /libs
-  /schemas        input + output JSON Schemas (the contracts)
   /llm            OpenAI-compatible backend client (local⇄groq) + policy
   /common         normalization, platform-from-url, hashing, config
-/dashboard        plain HTML/CSS/JS
+  ensemble.py     combine the eight per-comment model voters into one verdict
+  comment_groups.py  exact-duplicate grouping, so one verdict serves its twins
+  stance_targets.py / stance_scoring.py  the watchlist matcher and scorer
+  streams.py      stream + consumer-group names (the KEDA manifests are checked
+                  against this file)
+  progress.py     per-post stage events for the dashboard Trace tab
+/dashboard        React 19 + Vite + Tailwind (the shipped UI)
+/dashboard_legacy plain HTML/CSS/JS (the original, superseded)
 /eval             gold sets + harness (see evaluation.md)
 /deploy           docker-compose.yml, k8s manifests
 ```
@@ -119,13 +132,15 @@ Prometheus/Grafana). The Postgres image is `pgvector/pgvector:pg16`; `deploy/ini
 runs `CREATE EXTENSION vector` to enable the extension. **DoD:** `docker compose up`
 brings everything healthy; `GET /v1/health` returns 200.
 
-**Task 0.2 — Lock the two contracts (`/src/defense/libs/schemas`).**
+**Task 0.2 — Lock the two contracts (`/src/defense/contracts/schemas`).**
 
 - **Input schema** = the post-with-details object ([data_contract.md](data_contract.md)
   §1/§1.1/§1.2/§2). Validate against `posts_with_details.json` (all 50 must pass). The **working**
-  corpus for analysis runs is `posts_text_only.json` (43 captioned posts) — the
-  7 null-caption `PHOTO` posts are excluded because no image bytes are reachable
-  (PROJECT_ASSESSMENT §5.2); regenerate it with `python -m eval.make_text_corpus`.
+  corpus for analysis runs is `posts_with_details.json` too — all 50 posts, the
+  same file ingestion uploads. The 7 null-caption `PHOTO` posts have no post text
+  (no image bytes are reachable, PROJECT_ASSESSMENT §5.2) but their 1,307
+  comments analyse normally, so they are no longer filtered out corpus-wide;
+  `python -m eval.make_text_corpus` writes the 43-post subset on demand.
 - **Output schema** = [architecture.md](architecture.md) §6 (post_id, campaign_id,
   platform, platform_post_id, media_type, language, post_type, post_summary,
   post_summary_lang, post_summary_grounding, overall_sentiment, sentiment_score,
@@ -211,10 +226,13 @@ the `embedding` column is populated.
 `GET /v1/search`, auth (API key + JWT). Match [api_design.md](api_design.md).
 **DoD:** contract tests pass; results match the §6 schema.
 
-**Task 1.7 — Dashboard (plain HTML/CSS/JS).** Static page calling the read APIs: job
-status, results table, per-post sentiment + comment breakdown + a `reaction_breakdown`
-chart. **DoD:** loads from static host/CDN, no framework/build step, renders a real
-result.
+**Task 1.7 — Dashboard.** A client of the read APIs: job status, results table,
+per-post sentiment + comment breakdown + a `reaction_breakdown` chart. **DoD:**
+renders a real result, and every panel states the provenance of its numbers
+(`provenance`, `method_breakdown`, `stage2_selection`) — a chart that cannot say
+what produced it is a claim the data does not support. *Shipped as React 19 + Vite
+(`/dashboard`); the original DoD said "no framework/build step", which the vanilla
+`/dashboard_legacy` build met and this one deliberately does not.*
 
 **Task 1.8 — Monitoring + eval harness.** Prometheus/Grafana/Loki; track LLM-routing
 rate + cache hits. Stand up the eval harness + gold sets per
@@ -287,7 +305,9 @@ pools, data-layer scale-out, hybrid local+groq burst, continuous fine-tuning).
       spend (§13.4).
 - [ ] If the watchlist is configured: `target_stances` is a **separate field**
       from `sentiment`, and the file is described as a stated bias model.
-- [ ] Dashboard is plain HTML/CSS/JS; backend is FastAPI.
+- [ ] Dashboard renders from the API only, and a missing value never renders as a
+      neutral one (an absent labeller shows `—`, `label_voters: 0` shows "not
+      read"); backend is FastAPI.
 - [ ] Eval gates green on the per-language gold set ([evaluation.md](evaluation.md)).
 - [ ] (Phase 2) Agents corpus-tier only; MCP servers internal + read-mostly;
       `ingest-mcp` never writes upstream.

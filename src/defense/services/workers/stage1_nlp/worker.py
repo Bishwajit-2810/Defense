@@ -410,10 +410,12 @@ async def _process_message(
     # only by Stage-2 prompts — never sentiment-analysed. Analysing it here is
     # what makes the documented rule the rule that actually runs.
     #
-    # Off by default: no image bytes are reachable today (§5.2), so OCR yields
-    # nothing, and the working corpus (posts_text_only.json) has no null-caption
-    # posts left for this branch to fire on. Kept behind a flag rather than
-    # deleted because the images — and with them OCR — may come back.
+    # Off by default: no image bytes are reachable today (§5.2), so `ocr_text` is
+    # never populated and the `and ocr_text` guard below short-circuits. Note the
+    # corpus does still carry 7 null-caption PHOTO posts — they are ingested and
+    # evaluated like any other — so it is the missing image bytes, not a filtered
+    # corpus, that keeps this branch cold. Kept behind a flag rather than deleted
+    # because the images — and with them OCR — may come back.
     ocr_text = ((image_result or {}).get("ocr_text") or "").strip()
     if _OCR_SENTIMENT and not (caption or "").strip() and ocr_text:
         t = time.monotonic()
@@ -454,12 +456,19 @@ async def _process_message(
                 max_tokens=config.summary_max_tokens,
                 temperature=0.2,
             )
-            post_summary = (resp.get("content") or "").strip()
-            post_summary_lang = target_lang
-            post_summary_grounding = ["caption"] if caption else []
-            if ocr_text: post_summary_grounding.append("ocr")
+            raw_summary = (resp.get("content") or "").strip()
+            # Summary validation: a valid summary must be at least 25 characters and 4 words
+            if len(raw_summary) >= 25 and len(raw_summary.split()) >= 4:
+                post_summary = raw_summary
+                post_summary_lang = target_lang
+                post_summary_grounding = ["caption"] if caption else []
+                if ocr_text: post_summary_grounding.append("ocr")
+            else:
+                log.warning("stage1_summary_too_short_discarded", summary=raw_summary, len=len(raw_summary))
+                post_summary = None
         except Exception as e:
             log.error("stage1_summary_failed", error=str(e))
+            post_summary = None
             
         pt_messages = build_post_type_messages(
             text=caption or ocr_text or "",

@@ -146,6 +146,17 @@ ensemble labels every comment, but none of that text is retrievable by meaning.
 > **Now fixed (§3.2).** Comment vectors live in `comment_embeddings`, written in
 > the same transaction as the analysis row and reachable through the
 > `search_comments` tool.
+>
+> **Retrieval coverage and ensemble coverage are two different caps — do not
+> conflate them.** Embedding is done by the **assembler** over the whole stored
+> thread, bounded by `COMMENT_EMBEDDING_MAX_PER_POST` = **1000** (§5.3.2 below).
+> The Stage-2 ensemble reads every comment with text (`ROUTER_COMMENT_TOP_N=0`,
+> the default), so on a thread under 1000 comments the two coincide. Above it, or
+> with a positive `ROUTER_COMMENT_TOP_N`, they diverge — and then
+> `search_comments` can retrieve a comment that **no model labelled**, whose
+> `sentiment` is `uncertain` (Stage 1's keyword label does not vote). An agent
+> quoting a retrieved comment's sentiment must not imply the ensemble judged it;
+> `stage2_selected` is the field that separates the two.
 
 **(b) In the default configuration the vector is not semantic.**
 `.env` sets `MODEL_STUB_MODE=true`, so
@@ -642,7 +653,7 @@ happy path. Seven things did not survive that.
 7. **Two stale cross-references**, both now fixed: §2's "Now" note still listed
    chunking among what "remains absent" and pointed at a §6 subsection called
    "Deliberately not done" that does not exist, and `.env.example` pointed at
-   `deploy/backfill_comment_embeddings.py` for the backfill, which is
+   `deploy/backfill_embeddings.py` for the backfill, which is
    `deploy/backfill_embeddings.py`.
 
 Also fixed, though not a code defect: the table above could not be reproduced at

@@ -1,5 +1,6 @@
 import React, { useState, useEffect } from 'react';
 import { apiCall, API_BASE, getAuthHeaders } from '../utils/api.js';
+import { commentScrape, scrapeTooltip } from '../utils/coverage';
 import { formatAlertReason } from '../utils/sentiment.js';
 import PostModal from '../components/PostModal';
 
@@ -200,7 +201,7 @@ export default function Posts() {
                 <th className="px-4 py-3 font-medium">Sentiment</th>
                 <th className="px-4 py-3 font-medium">Toxicity</th>
                 <th className="px-4 py-3 font-medium">Summary</th>
-                <th className="px-4 py-3 font-medium">Comment Coverage</th>
+                <th className="px-4 py-3 font-medium" title="Comments a Stage-2 model read, over the rows the scraper delivered, over the total the platform reports.">Comments <span className="font-normal text-slate-400">analysed / scraped / platform</span></th>
                 <th className="px-4 py-3 font-medium">Created At</th>
                 <th className="px-4 py-3 font-medium text-right">Actions</th>
               </tr>
@@ -212,6 +213,7 @@ export default function Posts() {
                 const sentiment = post.overall_sentiment || 'neutral';
                 const toxScore = typeof post.toxicity_score === 'number' ? post.toxicity_score : null;
                 const coverage = (post.comment_analysis && post.comment_analysis.coverage_label) || '—';
+                const scrape = commentScrape(post);
                 const dateStr = post.created_at ? new Date(post.created_at).toLocaleString() : '—';
                 let langStr = post.language || '—';
                 if (post.language_mix && post.language_mix.length > 1) {
@@ -239,7 +241,27 @@ export default function Posts() {
                     </td>
                     <td className="px-4 py-3">{toxScore !== null ? renderToxicityBar(toxScore) : '—'}</td>
                     <td className="px-4 py-3 max-w-[200px] truncate" title={summary}>{summary}</td>
-                    <td className="px-4 py-3">{coverage}</td>
+                    <td className="px-4 py-3 whitespace-nowrap" title={`${scrapeTooltip(scrape, post.platform)}\n\n${coverage}`}>
+                      {/* Numbers only. The scrape-state tag lives on the post
+                          detail, not in a 50-row list where it repeats on almost
+                          every line and says nothing the three numbers don't; the
+                          cell tooltip still carries the full explanation. */}
+                      {scrape ? (
+                        <div>
+                          {/* Analysed first: it is the only one of the three that
+                              says what the models covered. Omitted, rather than
+                              filled in with the stored count, when unknown. */}
+                          {scrape.analysed !== null && (
+                            <span className={scrape.analysed < scrape.stored ? 'font-semibold text-amber-600 dark:text-amber-500' : 'font-semibold'}>
+                              {scrape.analysed.toLocaleString()}
+                              <span className="text-slate-400 dark:text-zinc-500 font-normal"> / </span>
+                            </span>
+                          )}
+                          <span className="font-medium">{scrape.stored.toLocaleString()}</span>
+                          <span className="text-slate-400 dark:text-zinc-500"> / {scrape.total ? scrape.total.toLocaleString() : '?'}</span>
+                        </div>
+                      ) : '—'}
+                    </td>
                     <td className="px-4 py-3 text-xs">{dateStr}</td>
                     <td className="px-4 py-3 text-right">
                       <button 

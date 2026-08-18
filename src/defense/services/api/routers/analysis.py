@@ -667,8 +667,15 @@ def _result_to_html(res: dict) -> str:
     </div>
     """
 
-    # Comments
-    comments = (res.get("comment_analysis") or {}).get("comments", [])
+    # Comments — analysed ones (voted by models / stage2_selected / highest reactions) come first
+    raw_comments = (res.get("comment_analysis") or {}).get("comments", [])
+    comments = sorted(
+        raw_comments,
+        key=lambda c: (
+            0 if (c.get("label_voters", 0) > 0 or c.get("stage2_selected") is True or bool(c.get("parallel_labels"))) else 1,
+            -int(c.get("likes") or 0),
+        ),
+    )
     comments_html = ""
     for c in comments:
         c_text = _esc(c.get("text", c.get("comment_text", "")))
@@ -1236,6 +1243,15 @@ async def get_post_comments(
     if emotion != "all":
         filtered = [c for c in filtered if (c.get("emotion") or "neutral") == emotion]
 
+    # Priority sort: analysed comments (voted by models / stage2_selected / highest reactions) come first
+    filtered = sorted(
+        filtered,
+        key=lambda c: (
+            0 if (c.get("label_voters", 0) > 0 or c.get("stage2_selected") is True or bool(c.get("parallel_labels"))) else 1,
+            -int(c.get("likes") or 0),
+        ),
+    )
+
     page = filtered[offset : offset + limit]
 
     # ---- Aggregates over the FULL comment set (not just the page) ----------
@@ -1275,6 +1291,11 @@ async def get_post_comments(
         # How the labels were produced and how much the labellers agreed —
         # reported next to the counts, like coverage and provenance.
         "ensemble": ca.get("ensemble", {}),
+        # Which comments the router put in front of the models (top-N by reaction
+        # count). Surfaced on its own as well as inside `ensemble`, so a row
+        # written by a run whose comment lane failed still says how much of the
+        # thread was ever meant to be analysed.
+        "stage2_selection": ca.get("stage2_selection", {}),
         "target_stances": ca.get("target_stances", {}),
         "emotion_breakdown": ca.get("emotion_breakdown", {}),
         "method_breakdown": ca.get("method_breakdown", {}),
@@ -1292,28 +1313,61 @@ async def get_post_comments(
     }
 
 
+def _analysed_by_models(ca: dict) -> int | None:
+    """How many of a post's comments a Stage-2 model actually read.
+
+    NOT ``comment_analysis.analyzed`` — that is the number of comment rows Stage 1
+    stored, which equals the whole thread and so cannot say what the ensemble
+    covered. The honest count is ``ensemble.analysed`` (the set every voter read),
+    falling back to the router's ``stage2_selection.selected``.
+
+    Returns None when neither block exists (rows written before the ensemble
+    recorded itself) so callers can omit the number instead of substituting the
+    stored-row count, which would overstate coverage — the case this function
+    exists to prevent: 87 rows stored, 31 read, previously reported as 87.
+    """
+    ens = ca.get("ensemble") or {}
+    sel = ca.get("stage2_selection") or {}
+    for value in (ens.get("analysed"), sel.get("selected")):
+        if value is not None:
+            return int(value)
+    return None
+
+
 def _coverage_label(ca: dict, engagement: dict) -> str:
     """Human-readable comment-coverage string, computed server-side.
 
-    Mirrors what the dashboard used to build in JS: every stored comment is
-    classified, so "✓ all" means we analysed everything the upstream shipped;
-    the "% of N" tail is the honest fraction of the platform's reported total
-    that we ever received.
+    Distinguishes comments analysed by the model ensemble, comments stored in the DB,
+    and total comments reported on the upstream platform.
     """
-    analyzed = int(ca.get("analyzed") or 0)
-    stored = int((engagement or {}).get("stored_comments") or 0)
+    sel = ca.get("stage2_selection") or {}
+    ens = ca.get("ensemble") or {}
+    stored = int((engagement or {}).get("stored_comments") or ca.get("analyzed") or 0)
     total = int((engagement or {}).get("comment_count") or 0)
-    if not analyzed and not stored and not total:
+
+    sel_skipped = sel.get("skipped", 0)
+    analysed = _analysed_by_models(ca)
+
+    if not stored and not total:
         return "—"
-    full = analyzed >= stored if stored > 0 else True
-    head = ("✓ all " if full else "") + f"{analyzed} analyzed"
-    if total > 0 and total > analyzed:
-        head += f" · {round(analyzed / total * 100)}% of {total}"
-    elif total > 0 and analyzed > total:
-        # Storing more comments than the platform says exist is an upstream
-        # inconsistency. The old label just omitted the tail, which read as
-        # "we have everything" — say what actually happened instead.
-        head += f" · more than the {total} reported (upstream mismatch)"
+
+    # Did a model read every stored comment, or only some of them? Both a top-N
+    # cap and the dedup / min-words filters cut the set, and the second pair used
+    # to be invisible here: one post stored 87 rows, had 43 near-duplicates and 13
+    # textless/too-short, and reported "87 stored analyzed" for 31 comments read.
+    if analysed is not None and analysed < stored:
+        prefix = "top " if sel_skipped and sel_skipped > 0 else ""
+        head = f"{prefix}{analysed:,} of {stored:,} stored analyzed"
+    elif total > 0 and stored >= total:
+        head = f"✓ all {stored:,} analyzed (100%)"
+    else:
+        head = f"{stored:,} stored analyzed"
+
+    if total > 0 and total > stored:
+        head += f" · {round(stored / total * 100)}% of {total:,} total"
+    elif total > 0 and stored > total:
+        head += f" · more than the {total:,} reported (upstream mismatch)"
+
     return head
 
 
@@ -1328,6 +1382,10 @@ def _comment_analysis_summary(r: dict) -> dict:
     )
     ca.pop("comments", None)
     ca["coverage_label"] = _coverage_label(ca, r.get("engagement") or {})
+    # The list response is filtered by CommentAnalysisResult, which carries neither
+    # `ensemble` nor `stage2_selection` — so the count behind the label has to be
+    # exposed explicitly or the table can only ever show stored rows.
+    ca["analysed_by_models"] = _analysed_by_models(ca)
     return ca
 
 
