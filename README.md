@@ -222,6 +222,14 @@ target (the routing rate) are flagged inline in each document.
   stage.
 - **Queue: Kafka for Production/Enterprise, Redis Streams for the MVP.** Start
   simple, migrate when throughput and replay/retention demand it.
+- **Jobs can be stopped and resumed, which the queue shape dictates.** A job is
+  N messages across the stage streams, not a process, so **stop** is a flag every
+  stage checks as it picks a message up — bounding the cost of a stop at one post
+  per stage instead of the rest of the batch. **Resume** exists for the failure
+  the pipeline cannot detect on its own: a host that loses power at post 30 of
+  300 leaves a row still reading `running` and no counters, so the remainder is
+  recomputed from Postgres and only those 270 are re-queued, with progress
+  continuing at 30/300 (architecture.md §3, api_design.md §3a).
 - **Storage split by access pattern:** PostgreSQL + pgvector (operational + jobs +
   vectors/semantic search/dedup via the `analysis_results.embedding` `vector(768)`
   column), ClickHouse (analytics/aggregations), Redis (cache + dedup + rate

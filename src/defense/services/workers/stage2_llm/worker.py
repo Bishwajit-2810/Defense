@@ -43,6 +43,7 @@ from defense.libs.ensemble import (  # noqa: E402
 )
 from defense.libs.llm import LLMClient  # noqa: E402
 from defense.libs.llm.usage import LANE_COMMENT, LANE_POST, track_usage  # noqa: E402
+from defense.libs.jobs import is_cancelled  # noqa: E402
 from defense.libs.progress import publish_stage  # noqa: E402
 
 from .cache import get_cached, set_cached  # noqa: E402
@@ -1391,9 +1392,17 @@ async def _process_message(
         except Exception as exc:
             log.warning("llm_backend_override_read_failed", error=str(exc))
 
+    job_id = payload.get("job_id")
+
+    # Stop check (libs/jobs.py) — last one, and the one that saves the most: a
+    # single post here is the post-level summary plus the whole per-comment
+    # ensemble. The caller ACKs on return.
+    if await is_cancelled(redis, job_id):
+        log.info("stage2_skipped_cancelled_job", job_id=job_id, post_id=post_id)
+        return
+
     log.info("stage2_processing", task_flags=task_flags, backend_override=backend_override)
 
-    job_id = payload.get("job_id")
     await publish_stage(
         redis, "stage2", "running",
         job_id=job_id, post_id=post_id,

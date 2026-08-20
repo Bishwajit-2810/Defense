@@ -224,7 +224,11 @@ the `embedding` column is populated.
 **Task 1.6 — Read APIs (FastAPI).** `POST /v1/ingest/sync`, `POST /v1/posts/upload`,
 `POST /v1/analysis/run`, `GET /v1/analysis/{id}`, `GET /v1/reports` (basic),
 `GET /v1/search`, auth (API key + JWT). Match [api_design.md](api_design.md).
-**DoD:** contract tests pass; results match the §6 schema.
+**DoD:** contract tests pass; results match the §6 schema. *Three job-control
+routes were added beyond this list — `POST /v1/analysis/{id}/cancel`,
+`POST /{id}/resume`, `DELETE /{id}` (api_design.md §3a). A queue-based design
+gives an operator no way to stop or continue a batch, and an interrupted run had
+to be paid for from the start; neither is optional once a real run costs money.*
 
 **Task 1.7 — Dashboard.** A client of the read APIs: job status, results table,
 per-post sentiment + comment breakdown + a `reaction_breakdown` chart. **DoD:**
@@ -232,7 +236,11 @@ renders a real result, and every panel states the provenance of its numbers
 (`provenance`, `method_breakdown`, `stage2_selection`) — a chart that cannot say
 what produced it is a claim the data does not support. *Shipped as React 19 + Vite
 (`/dashboard`); the original DoD said "no framework/build step", which the vanilla
-`/dashboard_legacy` build met and this one deliberately does not.*
+`/dashboard_legacy` build met and this one deliberately does not.* The Jobs tab is
+also the one place that writes: stop / resume / re-run / delete per job, and a
+**stalled** badge on any job that has written no progress for five minutes — a
+power-cut job's row reads `running` forever otherwise, which is the worst thing
+that table can claim.
 
 **Task 1.8 — Monitoring + eval harness.** Prometheus/Grafana/Loki; track LLM-routing
 rate + cache hits. Stand up the eval harness + gold sets per
@@ -293,6 +301,12 @@ pools, data-layer scale-out, hybrid local+groq burst, continuous fine-tuning).
 - [ ] Auth: a JWT-shaped credential is verified as a token on **every** transport;
       `tenant_id` comes from `api_keys`/verified claims, never a token body; the
       tenant-policy check fails **closed**; streams use `/v1/auth/sse-ticket`.
+- [ ] An analysis job can be **stopped and resumed**: a stop takes effect at the
+      head of each stage (so it costs one post per stage, not the rest of the
+      batch), `cancelled` is terminal against both the assembler and the status
+      reconciliation, and a resume re-queues **only** the posts the job never
+      finished — derived from Postgres, because the Redis counters do not survive
+      the interruption that makes a resume necessary.
 - [ ] Real-mode runs report `processing.degraded_components`, and it is **empty**
       before any latency or accuracy number is recorded.
 - [ ] Semantic-search results carry `embedding_is_stub`, and no demo of semantic

@@ -43,6 +43,7 @@ from defense.libs.common.utils import (  # noqa: E402
 )
 
 from defense.libs.dlq import record_failure  # noqa: E402
+from defense.libs.jobs import is_cancelled  # noqa: E402
 from defense.libs.progress import publish_stage  # noqa: E402
 
 from defense.libs import streams  # noqa: E402
@@ -671,6 +672,18 @@ async def run_worker() -> None:
                         continue
 
                     job_id = envelope.get("job_id")
+
+                    # Stop check (libs/jobs.py). The whole point of stopping a
+                    # job here is that Stage 1 is upstream of every model call
+                    # in the pipeline — dropping the envelope at this line is
+                    # what makes a cancel cheap instead of merely cosmetic.
+                    if await is_cancelled(redis, job_id):
+                        await redis.xack(INPUT_STREAM, CONSUMER_GROUP, msg_id)
+                        log.info(
+                            "stage1_skipped_cancelled_job",
+                            job_id=job_id, post_id=post_id, msg_id=msg_id,
+                        )
+                        continue
 
                     await publish_stage(
                         redis, "stage1", "running",

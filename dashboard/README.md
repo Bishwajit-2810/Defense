@@ -3,7 +3,9 @@
 The operator UI for the smart layer: posts and their per-comment analysis, live
 pipeline trace, warnings, reports, agents, and a chat tab. It is a **read-mostly
 client of the API** — every number on screen comes from `/v1/...`, nothing is
-computed here that the pipeline could not also report.
+computed here that the pipeline could not also report. The writes it does make
+are the deliberate ones: starting, stopping, resuming and deleting analysis jobs,
+generating a report, and the runtime config toggles.
 
 This replaced the vanilla HTML/CSS/JS dashboard the design docs specify; that one
 is preserved at [`../dashboard_legacy/`](../dashboard_legacy/). Where a design doc
@@ -57,6 +59,25 @@ npm run lint       # oxlint
   `heuristic` is deliberately not one of them — it stopped voting on 17 Aug 2026,
   so a comment no model read shows `uncertain` / "not read" rather than a keyword
   verdict.
+- **A control must not promise more than the pipeline can do.** The Jobs tab's
+  **Stop** says "in-flight posts will finish, the rest are skipped", because that
+  is the actual guarantee — cancellation is a flag each stage checks, so the post
+  already inside a stage completes. **Delete** says the posts' analysis results
+  are kept, because they are (`analysis_results` is keyed by post, not by job).
+  **Resume** reports `30/300 already done, 270 re-queued` rather than just
+  "resumed", which is the difference between a continuation and a no-op. If you
+  reword these, keep the caveat.
+- **`STALE_AFTER_MS` mirrors `_STALE_JOB_SECONDS`** in
+  `routers/analysis.py`. It decides both the **stalled** badge and whether Resume
+  is worth pressing, and the API applies the same threshold when it accepts or
+  refuses a resume — so if one moves, move both, or the tab will offer an action
+  the API rejects. The badge exists because a power-cut job's row reads `running`
+  forever, which is the most misleading thing this table can display.
+- **Action outcomes and stream progress are two different lines.** `notice` holds
+  what the last stop/resume/delete did; `liveProgress` belongs to the SSE stream
+  and is rewritten by every frame. They were one field until resuming a job —
+  which subscribes to its stream immediately — wiped its own summary before it
+  could be read.
 - **Charts state their provenance.** `provenance` / `method_breakdown` /
   `stage2_selection` are rendered beside the counts they describe, because in stub
   mode most labels are not model output and a chart that does not say so is a

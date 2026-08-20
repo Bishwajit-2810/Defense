@@ -220,6 +220,96 @@ curl -N "$API/v1/analysis/<job_id>/stream?api_key=demo"
 # data: {"completed":50,"failed":0,"total":50,…}
 ```
 
+### 2b-bis. Stop a job, or delete its record
+
+```bash
+# Stop — no further post of this job is analysed
+curl -s -X POST -H "$KEY" $API/v1/analysis/<job_id>/cancel
+# → 200 {"analysis_id":"…","status":"cancelled","previous_status":"running",
+#        "progress":{"total":50,"completed":23,"failed":0}}
+# → 409 if the job already finished (nothing to stop)
+
+# Delete the job record — stops it first if it is still running
+curl -s -X DELETE -H "$KEY" $API/v1/analysis/<job_id>
+# → 200 {"analysis_id":"…","deleted":{"jobs":1,"redis_keys":5},
+#        "stopped":true,"previous_status":"running"}
+```
+
+Stopping is **cooperative**, and the reason is structural: a job is N envelopes
+spread across the stage streams, so there is no process to kill and no way to
+pull a message back out of a stream. `POST .../cancel` raises one flag
+(`job:{id}:cancelled`, 24h TTL — `libs/jobs.py`) that **ingestion, Stage 1, the
+router and Stage 2** each check as they pick a message up, and drop the message
+instead of doing the work. So:
+
+* **The stop costs at most one post per stage.** A post already inside a stage
+  finishes and is persisted — its LLM spend is already paid — which is why the
+  progress counter can tick up once or twice after a stop. Everything behind it
+  is skipped.
+* **A stopped job stays stopped.** The row goes to `cancelled`, which is terminal:
+  the assembler's status update excludes it, and the counter reconciliation in
+  `GET /v1/analysis/{id}` excludes it, so the last in-flight post cannot write
+  the job back to `running` or `done`.
+* **Watchers are told immediately.** A terminating `event: cancelled` frame goes
+  out on `analysis:progress:{id}`, so an open SSE stream closes then rather than
+  at its 5-minute timeout.
+* **Re-running is the way to resume.** There is no partial resume; `POST
+  /v1/analysis/run` with the same selector re-analyses the whole set.
+
+`DELETE` removes the job row, its progress counters and its Trace-tab replay
+buffer. It deliberately does **not** touch `analysis_results`: those rows are
+keyed by post and campaign, not by job, and they are what every other tab reads —
+several jobs (plus the original ingest) write the same rows, so deleting them
+here would blank posts another job analysed. Use `DELETE /v1/posts/{post_id}` for
+that. The cancel flag is the one key a delete leaves behind, since it is all that
+still stops the deleted job's in-flight posts.
+
+Both are tenant-scoped: another tenant's job id is a 404, not a stop.
+
+### 2b-ter. Resume an interrupted job
+
+The case this exists for: 300 posts queued, 30 analysed, the machine loses power.
+
+```bash
+curl -s -X POST -H "$KEY" $API/v1/analysis/<job_id>/resume
+# → 200 {"analysis_id":"…","resumed":true,"status":"running","previous_status":"running",
+#        "progress":{"total":300,"completed":30,"remaining":270}}
+# → 409 if the job is still making progress, or already completed
+```
+
+Only the 270 go back on the stream. The 30 are not paid for twice, and the
+progress bar picks up at 30/300 rather than restarting.
+
+**How "what is left" is decided.** Nothing marks a power-cut job as dead: its row
+still reads `running`, and its Redis counters went with the power. So the answer
+is derived from **Postgres alone** — the job's selector gives the full post set,
+and a post counts as done when its `analysis_results` row was written at or after
+the job's `created_at`. That table is `UNIQUE (post_id)` with no job column, so
+the timestamp is the only discriminator available; it also means a post some
+*other* job re-analysed in the meantime counts as done, which is the right answer
+— a fresh result exists either way.
+
+**What resume rebuilds.** `job:{id}:total` and `job:{id}:completed` are re-seeded
+(to 300 and 30), and `job:{id}:failed` is reset because those posts are being
+retried. The seeded `completed` is what makes the assembler finish the job when
+the *last* remaining post lands: with no `total` at all it falls back to
+"first landing wins", and with `completed` at 0 the job could never reach its own
+total. Any stop flag is cleared first — the workers drop anything carrying it, so
+clearing after enqueueing would make the whole resume a no-op.
+
+**When it is refused.** A job that has written progress within the last 5 minutes
+(`_STALE_JOB_SECONDS`) is busy, not interrupted, and re-enqueueing under it would
+duplicate work and corrupt its counters — so it 409s and tells you to stop it
+first. `jobs.updated_at` is the heartbeat: the assembler touches it as every post
+lands. The dashboard shows the same threshold as a **stalled** badge, so a
+power-cut job stops reading as one that is still working.
+
+**What it does not do.** There is no per-post partial resume: a post that was
+mid-flight is redone from Stage 1. The original request's `options` are reused
+(so a job run with summaries resumes with them — this is why `jobs.options` is
+now persisted rather than written as `{}`), but `llm_backend` is re-resolved
+against the tenant's policy, so a stored `groq` does not outlive a privacy lock.
+
 ### 2c. Pull the result JSON
 
 ```bash
@@ -625,7 +715,7 @@ A privacy guarantee that evaporates when the database hiccups is not a guarantee
 
 ## 3b. The rest of the surface — every `/v1` path
 
-The app serves **47 distinct `/v1` paths / 58 method+path pairs** (20 Aug 2026;
+The app serves **49 distinct `/v1` paths / 61 method+path pairs** (20 Aug 2026;
 `python -c "from defense.services.api.main import app; ..."` over `app.routes` is
 the check). §2–§3 cover the ones you drive by hand. These are the remainder — all
 real routes, most of them what the dashboard calls:
@@ -635,6 +725,9 @@ real routes, most of them what the dashboard calls:
 | `GET` | `/v1/auth/verify` | Validate a raw token **without** establishing a session. Lets a client tell "no token" from "expired token" without a refresh. |
 | `GET` | `/v1/analysis/post/{post_id}/comments` | Paginated per-comment sentiment for one post — full coverage, not a sample. Same data as §2c-bis. |
 | `GET` | `/v1/analysis/export` | Download analysis results as a **ZIP of PDFs**, one per post. |
+| `POST` | `/v1/analysis/{analysis_id}/cancel` | Stop a queued/running job — cooperative, see §2b-bis. `409` if it already finished. |
+| `POST` | `/v1/analysis/{analysis_id}/resume` | Re-enqueue only the posts an interrupted job never finished — §2b-ter. `409` while it is still moving. |
+| `DELETE` | `/v1/analysis/{analysis_id}` | Delete the job record (stops it first if running). Keeps the posts' analysis results — §2b-bis. |
 | `GET` | `/v1/pipeline/stats` | Point-in-time stage state (queue depths, in-flight, last completion) — backs the dashboard **Pipeline** tab. |
 | `GET` | `/v1/agents/types` | The registered agent types and their descriptions, read straight off `AGENT_REGISTRY`. Use this rather than hard-coding a list of agent names. |
 | `GET`&nbsp;/&nbsp;`DELETE` | `/v1/agents/runs` | List recent agent runs / clear the history. Aliases of the `/v1/agents` collection. |
@@ -666,6 +759,8 @@ FastAPI serves the full OpenAPI spec with a try-it-out UI:
 - ReDoc → <http://127.0.0.1:8001/redoc>
 - Raw spec → <http://127.0.0.1:8001/openapi.json>
 
-The dashboard (<http://127.0.0.1:8080>) exercises all of the above visually —
-Overview (usage/corpus stats), Posts, Jobs (live SSE progress), Reports,
-Search, and Agents tabs.
+The dashboard (<http://127.0.0.1:8080>) exercises all of the above visually.
+**Eleven tabs** (`dashboard/src/components/NavTabs.jsx` is the list of record):
+Overview (usage/corpus stats), Posts, Jobs (live SSE progress, plus stop /
+resume / re-run / delete per job), Reports, Search, Agents, Chat, Pipeline,
+Trace, Warnings, Logs.

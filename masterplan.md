@@ -1556,6 +1556,29 @@ transparency feature tied to the hybrid design.
 Real-time alternative: `GET /v1/analysis/{id}/stream` (SSE) pushes per-post results
 as they complete, for live dashboards.
 
+### 17.3a Job control — stop, resume, delete
+
+`POST /v1/analysis/{id}/cancel` · `POST /v1/analysis/{id}/resume` ·
+`DELETE /v1/analysis/{id}`. Full request/response shapes and the reasoning are in
+[api_design.md](api_design.md) §3a; the three things that matter at plan level:
+
+- **Stopping is cooperative, because a job is not a process.** It is N envelopes
+  across the stage streams, so there is nothing to kill. One Redis flag
+  (`job:{id}:cancelled`) is checked by ingestion, Stage 1, the router and Stage 2
+  as each picks a message up, which bounds the cost of a stop at one post per stage
+  rather than the rest of the batch. `cancelled` is a **terminal** job status:
+  neither the assembler nor the §17.3 counter reconciliation may overwrite it.
+- **Resume re-enqueues only what an interrupted job never finished**, derived
+  from Postgres alone — the selector for the full set, and an `analysis_results`
+  row written at or after the job's `created_at` for what is done — because the
+  Redis progress counters do not survive the power cut that makes resume
+  necessary. The counters are rebuilt with `completed` seeded, so progress
+  continues at 30/300 rather than restarting, and the job still finishes on its
+  last post. Refused while the job is still writing progress.
+- **Delete removes the job, not the analysis.** `analysis_results` is keyed by
+  post, written by several jobs and by ingest, and is what every read path uses;
+  `DELETE /v1/posts/{id}` is the endpoint that removes a post's data.
+
 ### 17.4 Reporting — `GET /v1/reports`
 
 List and fetch generated reports (trends, brand mentions, political analysis,

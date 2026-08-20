@@ -196,7 +196,14 @@ submit. (Dev mode accepts any key.) The tabs:
 
 - **Overview** — usage/cost counters + corpus charts
 - **Posts** — the ingested posts
-- **Analysis Jobs** — submit / track analysis runs
+- **Analysis Jobs** — submit / track analysis runs, and control them:
+  **Stop** (no further post is analysed; the ones already inside a stage finish,
+  so the counter may tick up once or twice more), **Resume** (re-queues *only*
+  the posts an interrupted job never finished — this is what to press after a
+  power cut, and it continues at 30/300 rather than re-paying for the first 30),
+  **Re-run**, and **Delete** (removes the job record; the posts and their
+  analysis results are kept). A job that has written no progress for five minutes
+  is badged **stalled** rather than left reading "running" forever
 - **Reports** — generate & read reports (headline metrics, topic clusters, **and
   embedding clusters with one LLM summary per cluster**)
 - **Search** — semantic + keyword search over the analyzed posts

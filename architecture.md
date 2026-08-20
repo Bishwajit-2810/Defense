@@ -204,6 +204,35 @@ Q&A, grounded reports, and targeted deep-dives (never per post) — see §11.
 3. **Enqueue.** A `job` row is created in PostgreSQL (`status=queued`). One
    message per post is produced to the bus, partitioned by `post_id` hash so a
    post's ordering is stable and load spreads evenly.
+
+   > **Implementation note — stopping and resuming a job.** The consequence of
+   > this step is that a job has no process to control: it is N messages spread
+   > across the stage streams, each picked up by whichever replica is free, and a
+   > message cannot be recalled once the bus has accepted it. So the two controls
+   > the operator needs are built the only way this shape allows.
+   >
+   > **Stop is cooperative.** One Redis flag (`job:{id}:cancelled`,
+   > `src/defense/libs/jobs.py`) is checked by ingestion, Stage 1, the router and
+   > Stage 2 as each picks a message up; a flagged message is ACKed and dropped
+   > instead of processed. Because the check sits at the head of every stage, a stop costs at
+   > most the one post already in flight *per stage* rather than the remainder of
+   > the batch. Posts already inside a stage finish and are persisted — their
+   > model spend is paid either way — so `cancelled` has to be a **terminal**
+   > status that both the assembler's status write and the stale-row
+   > reconciliation in `GET /v1/analysis/{id}` refuse to overwrite, or the last
+   > landing post would silently reopen the job.
+   >
+   > **Resume is derived from Postgres, not from the queue.** A host that loses
+   > power leaves the row reading `running`, the Redis counters gone and the
+   > in-flight messages lost — nothing in the system marks that job as dead. So
+   > `POST /v1/analysis/{id}/resume` recomputes the remainder from the selector
+   > plus the `analysis_results` rows written at or after the job's `created_at`,
+   > re-enqueues only those posts under the same job id, and rebuilds the counters
+   > with `completed` seeded at what is already done. The seeding is what lets the
+   > assembler finish the job on its last post instead of its first. `jobs.options`
+   > is persisted for the same reason: a job resumed without the options it was
+   > started with would finish half-summarised. See
+   > [api_design.md](api_design.md) §3a.
 4. **Stage 1 — Fast NLP + vision (parallel).** Worker pulls a batch
    (micro-batching) and runs the small-model suite. **Multimodal, post first, then
    comments** (see [data_contract.md](data_contract.md) §4):

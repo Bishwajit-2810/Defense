@@ -14,8 +14,11 @@ Bangla / English / Banglish)
 > [AUDIT_PASS9.md](AUDIT_PASS9.md) (14 Aug, multi-tenant data isolation) — and
 > [OPEN_ISSUES.md](OPEN_ISSUES.md) is the actionable form of the latest one.
 >
-> Current repository: **174 Python files (51,801 LOC), 1,315 tests across 64
-> files.**
+> Current repository: **173 Python files (52,384 LOC) under `src/`, `tests/` and
+> `eval/`; 1,345 tests across 65 files in `tests/`.** (The method is named because
+> the previous figure could not be reproduced without it — a repo-wide count is
+> 199 files / 54,615 LOC, the difference being 24 loose scripts at the root and
+> `deploy/`.)
 >
 > Seven things below are now out of date. In each case the *reasoning* still holds
 > and only the numbers or the mechanism moved:
@@ -29,6 +32,17 @@ Bangla / English / Banglish)
 > | "three agents (`analyst`, `coverage`, `alerting`)" | **Nine.** `stance`, `comparator`, `toxicity`, `narrative`, `quality` and `reporter` shipped from the AGENTIC_RAG_NOVELTY §3 proposal list. They run on a dedicated **`agent`** LLM role, not `llm_b`, defaulting to **`llama3.1:8b-16k`** — a derived tag setting `num_ctx 16384`, because `ollama serve`'s 4,096-token default *silently discarded* the system prompt and the operator's question on any large tool result. Measured: an 11k-token prompt evaluates **24** tokens on `llama3.1:8b` and all **11,045** on the `-16k` tag. The runner also caps tool results at 6,000 chars (serialised `ensure_ascii=False` — the `\uXXXX` escaping of Bengali was *half* the token bill), refuses byte-identical repeat calls, and fails a run whose "answer" is code, payload narration, self-narration, or an empty template. Eight live failures, each with a regression test: [RAG_STATE_AND_ROADMAP.md](RAG_STATE_AND_ROADMAP.md) §6 Section 9. |
 > | "`COMMENT_EMBEDDING_MAX_PER_POST=1000`" | **Now `0` — uncapped** (18 Aug). Disclosure came first (`posts_over_comment_cap` / `comments_dropped_by_cap` on `coverage_stats`), but an honestly-disclosed 82% index is still an 82% index, and the 1,857 hidden comments were the tail of the single most-discussed thread in the corpus. Every knob that can drop a comment is now 0. |
 > | §7.2 "zero gold labels" — **the decisive gap** | **Still open, and still decisive.** The harness now exists (`eval/build_gold_set.py`, `eval/score_gold.py`, and `eval/gold/comments_gold_300.json` with 300 stratified rows) but **0 rows are adjudicated**, by design — labels seeded from a model in this repo would measure agreement with itself. There is still **no measured accuracy** for any labeller. |
+>
+> One addition rather than a correction (20 Aug): **analysis jobs can now be
+> stopped, resumed and deleted** — `POST /v1/analysis/{id}/cancel`,
+> `POST /{id}/resume`, `DELETE /{id}`, reasoned through in
+> [api_design.md](api_design.md) §3a and [architecture.md](architecture.md) §3
+> step 3. It refines two things recorded below rather than contradicting them:
+> `cancelled` joins `done`/`failed` as a terminal status, so the counter
+> reconciliation that closed §9.7 can no longer revive a job the operator stopped;
+> and `jobs.options` is now persisted for analysis runs, where it had been written
+> as a literal `{}` — a separate hole from §13.1's, which is about the report
+> path's `embedding_clusters` living only in that column, and is untouched.
 >
 > One structural note for anyone re-running the audits: the JSON contracts moved
 > from `src/defense/libs/schemas/` to **`src/defense/contracts/schemas/`**.

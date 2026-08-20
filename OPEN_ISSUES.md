@@ -31,7 +31,7 @@
 >   post-level `sentiment_breakdown` is mostly `uncertain`. That is accurate, and it
 >   is a reporting change worth knowing before showing a chart.
 >
-> **Two more (18–20 August 2026), also not regressions of anything here:**
+> **Three more (18–20 August 2026), none of them a regression of anything here:**
 >
 > - **`COMMENT_EMBEDDING_MAX_PER_POST` went 1000 → 0.** This was a *third* cap,
 >   quieter than either discussed above, because it truncates the **vector index**
@@ -50,6 +50,18 @@
 >   Fixed with a 16k model tag, unescaped serialisation, a 6,000-char result cap,
 >   a question restated each round, repeat-call refusal, and four non-answer guards.
 >   Write-up: [RAG_STATE_AND_ROADMAP.md](RAG_STATE_AND_ROADMAP.md) §6 Section 9.
+> - **Analysis jobs can be stopped, resumed and deleted** (20 Aug):
+>   `POST /v1/analysis/{id}/cancel`, `POST /{id}/resume`, `DELETE /{id}`. Two
+>   consequences touch things this file discusses. **`cancelled` is a fourth
+>   terminal job status**, which the stale-row reconciliation in
+>   `GET /v1/analysis/{id}` (the fix for §9.7 / issue 7 here) and the assembler's
+>   status write both now refuse to overwrite — otherwise the last in-flight post
+>   of a stopped job reopens it. And **`jobs.options` is now actually written for
+>   analysis runs**: it was persisted as a literal `{}`, so the request's
+>   `want_summary` / task list was discarded at enqueue time, which a resume has
+>   to reproduce. That is a *different* `jobs.options` gap from issue 4's — the
+>   report path's `embedding_clusters` still lives only in that column, and this
+>   change does not touch it.
 >
 > **One path note.** Every `dashboard/app.js` reference below resolves to
 > [`dashboard_legacy/app.js`](dashboard_legacy/app.js): the shipped dashboard is
