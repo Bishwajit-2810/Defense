@@ -283,6 +283,21 @@ pools, data-layer scale-out, hybrid local+groq burst, continuous fine-tuning).
 
 ---
 
+## 4b. How to run the tests
+
+```bash
+uv run pytest -q                            # 1370 passed, 3 skipped
+cd dashboard && npm test -- --run           # 51 passed
+cd dashboard && npm run lint && npm run build && npm run test:e2e
+```
+
+`uv run` matters: the suite needs the `dev` extra, and without `pytest-asyncio`
+the async tests are **silently not collected** rather than failed. The three
+skips are opt-in by design — one of them wipes the datastores. Full reference,
+including what a green suite does not prove: **[testing.md](testing.md)**.
+
+---
+
 ## 5. Definition of done (whole system)
 
 - [ ] All 50 sample posts ingest, analyze, and emit **JSON-Schema-valid** output

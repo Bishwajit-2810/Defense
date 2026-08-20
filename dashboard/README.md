@@ -38,13 +38,34 @@ proxy and no env var. Point it elsewhere by editing that line; see
 ## Tests
 
 ```bash
-npm test           # vitest + @testing-library/react (jsdom)
-npm run test:e2e   # Playwright, needs the stack running
-npm run lint       # oxlint
+npm test -- --run  # vitest + @testing-library/react (jsdom) — `npm test` alone WATCHES
+npm run test:e2e   # Playwright; starts/reuses the Vite dev server on :5173 itself
+npm run lint       # oxlint — must stay at "Found 0 warnings and 0 errors"
+npm run build      # not optional before pushing, but it does NOT resolve JSX identifiers
+                   # (six chunks by design — vite.config.js splits the vendor libs)
 ```
+
+Seven unit-test files (one per page for AnalysisJobs / Posts / Search / Logs,
+plus `App`, `MarkdownView`, `sentiment`) and two Playwright specs — of which
+`tests/example.spec.ts` is the untouched scaffold that visits playwright.dev, so
+half a green e2e run is not about this dashboard. The backend suite and the
+opt-in groups are in [`../testing.md`](../testing.md).
 
 ## What to keep in mind when editing
 
+- **Keep `npm run lint` at zero, because it catches what the build cannot.** `vite build` does not resolve JSX identifiers: `PostModal` rendered
+  `<AlertCircle>` without importing it, so the branch that *shows* a
+  comment-loading error was itself a `ReferenceError`, and the build passed
+  regardless. oxlint reports it as `react(jsx-no-undef)` — but it sat buried under
+  63 warnings for unused imports, unused `catch (e)` bindings and
+  computed-then-unrendered variables. It is at **0** now — the two
+  `exhaustive-deps` warnings were fixed rather than suppressed (`useCallback` in
+  `Trace.jsx` and `PostModal.jsx`), and oxlint does not honour an inline disable
+  for that rule anyway, so a suppression comment would have been a lie.
+- **A dependency array is evaluated during render.** Naming a `const` declared
+  further down the component throws on the temporal dead zone — which is why
+  `fetchPosts` sits above the effects that depend on it in `Posts.jsx`. The unit
+  tests caught that immediately; the lint fix that introduced it did not.
 - **A missing value and a neutral value must not render the same.** Several
   components exist in their current shape because of this: a labeller that did not
   vote shows `—` rather than vanishing, `label_voters: 0` renders as "not read"
@@ -67,6 +88,15 @@ npm run lint       # oxlint
   **Resume** reports `30/300 already done, 270 re-queued` rather than just
   "resumed", which is the difference between a continuation and a no-op. If you
   reword these, keep the caveat.
+- **One SSE stream per view, and close the one *this* effect opened.** An
+  `async` connect function guarded by `if (ref.current) return` does not work:
+  the guard runs before the first `await`, so StrictMode's double-mount passes it
+  twice while the ref is still null, and the socket the ref does not keep is
+  orphaned and never closed. In the Logs tab that doubled every line and the
+  stream's 60-line backfill with it. The pattern that does work is a `cancelled`
+  flag plus a local `es` closed in the cleanup — see `Logs.jsx`. Also dedupe: the
+  log stream's backfill/live join repeats a line *by design*, so the client owns
+  that, not the server.
 - **A search hit is a whole post, so render it like one.** `/v1/search` returns
   the complete canonical result in `result` (the 200-char `snippet` is a list-view
   convenience, not the limit of what you may show), and that object is exactly

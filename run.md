@@ -514,6 +514,24 @@ match the workers/API; add `pkill -f "[u]vicorn server:app"` and
 
 ---
 
+## 11b. Run the tests
+
+None of the three suites needs this stack running — see
+**[testing.md](testing.md)** for the full reference:
+
+```bash
+uv run pytest -q                                   # backend   → 1370 passed, 3 skipped (~50 s)
+cd dashboard && npm test -- --run                  # dashboard → 51 passed
+cd dashboard && npm run test:e2e                   # browser   → 4 passed (chromium)
+```
+
+Two groups are opt-in and skipped by default. One of them, `RUN_DESTRUCTIVE_E2E=1`,
+runs `run_all.py --reset` — **it FLUSHALLs Redis and truncates Postgres and
+ClickHouse**, i.e. it destroys the stack this document just told you to build. It
+is gated for exactly that reason (AUDIT_PASS8 §2). testing.md §4 has the rest.
+
+---
+
 ## 12. Environment variable reference (every variable)
 
 How to set: **export** them in the launch shell (§4), or put them in a `.env`

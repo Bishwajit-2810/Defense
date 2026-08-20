@@ -321,6 +321,21 @@ block). Full reference in [run.md](run.md).
 
 ---
 
+## 5b. Run the tests
+
+```bash
+uv run pytest -q                            # backend, ~50 s, needs nothing running
+cd dashboard && npm test -- --run           # dashboard unit tests
+cd dashboard && npm run test:e2e            # headless browser
+```
+
+Safe to run while the stack is up: a plain `pytest` cannot touch your datastores
+or your log view — both are opt-in, and one of the opt-ins wipes Redis/Postgres/
+ClickHouse. Details, targeted invocations and the gated groups:
+**[testing.md](testing.md)**.
+
+---
+
 ## 6. If something's off
 
 - **A service didn't come up** → read its log: `/tmp/<name>.log`

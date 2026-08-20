@@ -1,5 +1,5 @@
 import React, { useState } from 'react';
-import { Copy, Check, ExternalLink } from 'lucide-react';
+import { Copy, Check } from 'lucide-react';
 
 /**
  * A lightweight, zero-dependency, robust Markdown renderer for analytical briefings,

@@ -1,5 +1,5 @@
 import React, { useState } from 'react';
-import { Search as SearchIcon, Sparkles, Database, Info, AlertCircle, ExternalLink } from 'lucide-react';
+import { Search as SearchIcon, Sparkles, AlertCircle, ExternalLink } from 'lucide-react';
 import { apiCall } from '../utils/api.js';
 import PostModal from '../components/PostModal';
 

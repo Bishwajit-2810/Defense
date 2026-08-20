@@ -5,8 +5,8 @@ import pytest
 import pytest_asyncio
 from sqlalchemy.ext.asyncio import create_async_engine, AsyncSession
 import redis.asyncio as aioredis
-from testcontainers.postgres import PostgresContainer
-from testcontainers.redis import RedisContainer
+from testcontainers.community.postgres import PostgresContainer
+from testcontainers.community.redis import RedisContainer
 
 # Use the same schema setup script
 import os
@@ -44,7 +44,19 @@ def pytest_configure(config):
 
 
 def pytest_sessionstart(session):
-    """No test may reach the network for model weights.
+    """Isolate the test run from the developer's live environment.
+
+    **The log sink is the important one.** ``Settings.log_to_redis`` defaults to
+    True, and ``libs/common/logging.RedisLogHandler`` mirrors every record into
+    ``logs:recent`` / ``logs:live`` — the exact keys ``GET /v1/logs`` serves to
+    the dashboard's Logs tab. So a plain ``pytest`` published its own output into
+    the operator's log view, where the agent suites' deliberately fabricated
+    fixtures ("post_id='1234567890abcdef'", a table of "#12345 Economic Growth")
+    appeared as real agent runs, at real timestamps, indistinguishable from
+    production events. A test suite must not be able to write to the surface an
+    operator reads. Set ``LOG_TO_REDIS=1`` to opt back in.
+
+    Then: no test may reach the network for model weights.
 
     Several files spent 25-200 seconds each waiting on Hugging Face — for
     models whose ABSENCE was the thing being asserted. Offline mode makes the
@@ -52,6 +64,10 @@ def pytest_sessionstart(session):
     difference between a 5-second file and a 200-second one. Set
     DEFENSE_TEST_ALLOW_DOWNLOADS=1 to opt out.
     """
+    # Set before the early return below — it has nothing to do with downloads,
+    # and a test run must never publish into the live log buffer.
+    os.environ.setdefault("LOG_TO_REDIS", "0")
+
     if os.environ.get("DEFENSE_TEST_ALLOW_DOWNLOADS") == "1":
         return
     os.environ.setdefault("HF_HUB_OFFLINE", "1")

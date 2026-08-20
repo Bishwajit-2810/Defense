@@ -107,7 +107,13 @@ def _hdbscan_labels(x: np.ndarray) -> "list[int] | None":
             from sklearn.cluster import HDBSCAN as _SKHDBSCAN  # type: ignore
         except Exception:
             return None
-        clusterer = _SKHDBSCAN(min_cluster_size=max(2, x.shape[0] // 20))
+        # `copy` defaults to False today and flips to True in sklearn 1.10;
+        # pinning it keeps the behaviour explicit across that change (and
+        # silences the FutureWarning). False is right here: `x` is a local
+        # float array this function owns.
+        clusterer = _SKHDBSCAN(
+            min_cluster_size=max(2, x.shape[0] // 20), copy=False
+        )
         raw = clusterer.fit_predict(x)
     else:
         clusterer = hdbscan.HDBSCAN(min_cluster_size=max(2, x.shape[0] // 20))

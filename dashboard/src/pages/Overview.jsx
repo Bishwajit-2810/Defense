@@ -1,5 +1,5 @@
 import React, { useState, useEffect } from 'react';
-import { Activity, Database, Zap, HardDrive, Cpu, DollarSign, RefreshCw, BarChart2, MessageCircle, Percent } from 'lucide-react';
+import { Activity, Database, Zap, Cpu, DollarSign, RefreshCw, MessageCircle, Percent } from 'lucide-react';
 import { apiCall } from '../utils/api';
 import { sentimentColors } from '../utils/sentiment';
 import { Chart as ChartJS, ArcElement, Tooltip, Legend, CategoryScale, LinearScale, BarElement, Title } from 'chart.js';
@@ -161,17 +161,14 @@ export default function Overview({ isActive }) {
   const postCalls = lanes.post?.calls || 0;
   const commentCalls = lanes.comment?.calls || 0;
   const stage1Calls = lanes.stage1?.calls || 0;
-  const interactiveCalls = lanes.interactive?.calls || 0;
-  const agentCalls = lanes.agent?.calls || 0;
+  // The interactive/agent lanes are not hoisted into consts: the lane table
+  // below iterates LANE_HINTS and reads `lanes[laneKey]`, so it already renders
+  // all five. Hoisting only the two nobody reads was leftover from before.
 
   const postTokens = lanes.post?.tokens || 0;
   const commentTokens = lanes.comment?.tokens || 0;
-  const stage1Tokens = lanes.stage1?.tokens || 0;
-  const interactiveTokens = lanes.interactive?.tokens || 0;
-  const agentTokens = lanes.agent?.tokens || 0;
 
   const pipelineCalls = postCalls + commentCalls + stage1Calls;
-  const pipelineTokens = postTokens + commentTokens + stage1Tokens;
   const totalTokens = usage?.total_tokens || 0;
   const estimatedCost = Number(usage?.estimated_cost_usd || 0);
 
@@ -182,9 +179,6 @@ export default function Overview({ isActive }) {
   const costSavings = Number(
     usage?.cost_savings_usd ?? Math.max(0, marketPriceEquiv - estimatedCost)
   );
-
-  const commentCallPct = pipelineCalls ? Math.round((commentCalls / pipelineCalls) * 100) : 0;
-  const commentTokenPct = pipelineTokens ? Math.round((commentTokens / pipelineTokens) * 100) : 0;
 
   const byModel = usage?.tokens_by_backend_model || {};
   const costByModel = usage?.cost_by_backend_model || {};
@@ -201,7 +195,6 @@ export default function Overview({ isActive }) {
   
   const commentMarketCost = (commentTokens / 1000) * 0.005;
   const postMarketCost = (postTokens / 1000) * 0.005;
-  const pipelineMarketCost = (pipelineTokens / 1000) * 0.005;
 
   return (
     <div className="space-y-6 animate-in fade-in slide-in-from-bottom-4 duration-500 pb-12">

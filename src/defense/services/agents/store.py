@@ -59,10 +59,12 @@ class AgentRunStore:
 
         if self._redis is not None:
             try:
-                await self._redis.setex(
+                # `setex` is deprecated in redis-py; SET with `ex` is the
+                # same command with the arguments in the documented order.
+                await self._redis.set(
                     key,
-                    _TTL_SECONDS,
                     json.dumps(data, default=str),
+                    ex=_TTL_SECONDS,
                 )
                 # Maintain a sorted set of run IDs ordered by creation time
                 # so list_recent() can page without scanning all keys.

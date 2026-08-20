@@ -1,5 +1,5 @@
 import React, { useState, useEffect, useRef } from 'react';
-import { Play, FileText, CheckCircle2, Clock, AlertCircle, Download, Square, Trash2, RotateCw } from 'lucide-react';
+import { Download, Square, Trash2, RotateCw } from 'lucide-react';
 import { apiCall, API_BASE, getAuthHeaders, getSseQueryAsync } from '../utils/api.js';
 
 // Wording for the shared confirm dialog. `dismiss` is per-action because a
@@ -74,7 +74,7 @@ export default function AnalysisJobs() {
     window.addEventListener('auto-refresh', handleAutoRefresh);
     return () => {
       window.removeEventListener('auto-refresh', handleAutoRefresh);
-      Object.values(streamsRef.current).forEach(es => { try { es.close(); } catch (e) {} });
+      Object.values(streamsRef.current).forEach(es => { try { es.close(); } catch {} });
       streamsRef.current = {};
     };
   }, []);
@@ -98,7 +98,7 @@ export default function AnalysisJobs() {
         else if (data && Array.isArray(data.jobs)) jobsArr = data.jobs;
         else if (data && Array.isArray(data.results)) jobsArr = data.results;
         setJobs(jobsArr);
-      } catch(e) {}
+      } catch {}
     }
   };
 
@@ -139,7 +139,7 @@ export default function AnalysisJobs() {
   const closeStream = (jobId) => {
     const es = streamsRef.current[jobId];
     if (es) {
-      try { es.close(); } catch (e) {}
+      try { es.close(); } catch {}
       delete streamsRef.current[jobId];
     }
   };
@@ -323,7 +323,7 @@ export default function AnalysisJobs() {
         } else if (e.type === 'connected') {
           setLiveProgress(`Progress: 0% Connected. Waiting for progress...`);
         }
-      } catch (err) {}
+      } catch {}
     };
 
     es.addEventListener('progress', handleEvent);

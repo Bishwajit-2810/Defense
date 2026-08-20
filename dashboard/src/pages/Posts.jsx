@@ -1,4 +1,4 @@
-import React, { useState, useEffect, useMemo, useRef } from 'react';
+import React, { useState, useEffect, useMemo, useRef, useCallback } from 'react';
 import { Search as SearchIcon, X, Copy, Check } from 'lucide-react';
 import { apiCall, API_BASE, getAuthHeaders } from '../utils/api.js';
 import { commentScrape, scrapeTooltip } from '../utils/coverage';
@@ -42,21 +42,11 @@ export default function Posts() {
   const [wantSummary, setWantSummary] = useState(true);
   const [selectedPost, setSelectedPost] = useState(null);
 
-  useEffect(() => {
-    const handleAutoRefresh = () => fetchPosts();
-    window.addEventListener('auto-refresh', handleAutoRefresh);
-    return () => window.removeEventListener('auto-refresh', handleAutoRefresh);
-  }, [campaignId]);
-
-  // The campaign box used to change state and nothing else: it only took effect
-  // when you also pressed Refresh, so it read as a filter that did not work.
-  // Debounced so typing an id is not one request per keystroke.
-  useEffect(() => {
-    const t = setTimeout(fetchPosts, campaignId ? 350 : 0);
-    return () => clearTimeout(t);
-  }, [campaignId]);
-
-  const fetchPosts = async () => {
+  // useCallback so the two effects below can name it as a dependency. Without
+  // it the identity changes every render, so listing it would refetch in a loop
+  // and omitting it is a lint warning that hides a real class of stale-closure
+  // bug — a fetch that captured an old `campaignId`.
+  const fetchPosts = useCallback(async () => {
     try {
       let url = '/v1/analysis/latest?limit=100&include=results';
       if (campaignId) url += '&campaign_id=' + encodeURIComponent(campaignId);
@@ -65,8 +55,22 @@ export default function Posts() {
     } catch (err) {
       console.error(err);
     }
-  };
+  }, [campaignId]);
   
+  useEffect(() => {
+    const handleAutoRefresh = () => fetchPosts();
+    window.addEventListener('auto-refresh', handleAutoRefresh);
+    return () => window.removeEventListener('auto-refresh', handleAutoRefresh);
+  }, [fetchPosts]);
+
+  // The campaign box used to change state and nothing else: it only took effect
+  // when you also pressed Refresh, so it read as a filter that did not work.
+  // Debounced so typing an id is not one request per keystroke.
+  useEffect(() => {
+    const t = setTimeout(fetchPosts, campaignId ? 350 : 0);
+    return () => clearTimeout(t);
+  }, [fetchPosts, campaignId]);
+
   // Two tiers, in this order:
   //   1. filter the rows already on screen — instant, no request;
   //   2. only if that finds nothing, ask the server, which searches the whole
@@ -109,7 +113,7 @@ export default function Posts() {
       await navigator.clipboard.writeText(id);
       setCopied(id);
       setTimeout(() => setCopied(c => (c === id ? null : c)), 1200);
-    } catch (err) { /* clipboard blocked — the full id is in the title tooltip */ }
+    } catch { /* clipboard blocked — the full id is in the title tooltip */ }
   };
 
   const downloadZip = async () => {

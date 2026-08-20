@@ -785,8 +785,8 @@ real routes, most of them what the dashboard calls:
 | `GET` | `/v1/reports/{report_id}` | Fetch a generated report by id. |
 | `GET` | `/v1/reports/{report_id}/export` | Export that report as a downloadable PDF or HTML file. |
 | `GET` | `/v1/reports/export_latest/export` | Generate a **fresh** grounded mass-reaction report and stream it straight back — no id round-trip. |
-| `GET` | `/v1/logs/services` | Which services are present in the log buffer (populates the Logs tab's filter). |
-| `GET` | `/v1/logs/stream` | Tail server-side logs over SSE. Needs an SSE ticket, like every other stream — see §3. |
+| `GET` | `/v1/logs/services` | Which services are present in the log buffer (populates the Logs tab's filter). Every entry read `service: "-"` until 21 Aug 2026: the Redis sink is a stdlib handler reading `record.service`, while `setup_logging` binds the name through structlog's contextvars, which never touch the stdlib record. |
+| `GET` | `/v1/logs/stream` | Tail server-side logs over SSE. Needs an SSE ticket, like every other stream — see §3. **Replays `backfill` lines (default 60) before tailing**, subscribing to `logs:live` *before* reading `logs:recent` so no line can fall between the two — which means the line straddling the join arrives twice by construction. A client must dedupe (ts + level + message) and must open exactly one stream per view; two open streams double every line *and* the backfill, which is precisely how the Logs tab came to look like the backend was doing everything twice. |
 
 Two of these are easy to get wrong from the outside:
 

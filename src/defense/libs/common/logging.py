@@ -29,6 +29,17 @@ _redis_sink_client = None
 _redis_sink_fails = 0
 _REDIS_SINK_GIVE_UP = 5
 
+# The name this process called `setup_logging` with.
+#
+# `setup_logging` binds `service` through `structlog.contextvars`, which puts it
+# in the structlog event dict — NOT on the stdlib `LogRecord`. The Redis handler
+# is a stdlib handler reading `record.service`, so it always fell back to "-":
+# every entry in `logs:recent` was attributed to "-", which is why the Logs tab's
+# service filter had exactly one option and could not filter anything, and why a
+# line's origin had to be guessed from `module`. Keeping the name here is what
+# lets a stdlib record carry it.
+_service_name = "-"
+
 
 def _redis_enabled() -> bool:
     return config.log_to_redis
@@ -68,7 +79,12 @@ class RedisLogHandler(logging.Handler):
             entry = {
                 "ts": record.created,
                 "level": record.levelname,
-                "service": getattr(record, "service", "-"),
+                # Prefer an explicitly-bound record attribute, then the name
+                # this process was configured with, and only then "-". The final
+                # fallback is here rather than left to `setup_logging`'s
+                # normalisation so the entry cannot carry an empty service no
+                # matter how the module was initialised.
+                "service": getattr(record, "service", None) or _service_name or "-",
                 "message": clean_msg[:_MAX_MSG],
                 "fields": {},
                 "module": f"{record.module}:{record.lineno}",
@@ -90,7 +106,10 @@ class RedisLogHandler(logging.Handler):
 
 def setup_logging(service_name: str) -> None:
     """Configure structlog as the one sink."""
-    global _CONFIGURED
+    global _CONFIGURED, _service_name
+    # Recorded even on the early return below, so a second call cannot leave the
+    # sink attributing this process's lines to "-".
+    _service_name = service_name or "-"
     if _CONFIGURED:
         return
 

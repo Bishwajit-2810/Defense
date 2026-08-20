@@ -1,7 +1,7 @@
-import React, { useRef, useState, useEffect } from 'react';
-import { X, Download, Heart, MessageCircle, Share2, ThumbsUp, ThumbsDown, Minus, ChevronLeft, ChevronRight } from 'lucide-react';
+import React, { useRef, useState, useEffect, useCallback } from 'react';
+import { X, Download, Heart, MessageCircle, Share2, ChevronLeft, ChevronRight, AlertCircle } from 'lucide-react';
 import { Chart as ChartJS, ArcElement, Tooltip, Legend, CategoryScale, LinearScale, BarElement, Title } from 'chart.js';
-import { Doughnut, Bar } from 'react-chartjs-2';
+import { Bar } from 'react-chartjs-2';
 import { apiCall } from '../utils/api';
 import { formatAlertReason } from '../utils/sentiment';
 import { commentScrape, SCRAPE_TAG, scrapeTooltip } from '../utils/coverage';
@@ -51,19 +51,22 @@ export default function PostModal({ post, onClose }) {
   const [commentFilter, setCommentFilter] = useState('all');
   const [commentOffset, setCommentOffset] = useState(0);
   const limit = 100;
+  // One source for the id both the loader and its effect key on.
+  const postId = post?.post_id;
 
-  useEffect(() => {
-    if (post?.post_id) {
-      loadComments(0, 'all');
-    }
-  }, [post?.post_id]);
-
-  const loadComments = async (offset, sentiment) => {
+  // Declared above the effect that depends on it, and keyed on the post id
+  // rather than on `post`: a parent refetch hands this component a new object
+  // with the same id on every poll, and re-requesting up to 2,000 comment rows
+  // each time is the cost of getting that wrong. Identity therefore changes
+  // exactly when the post does — which is also what makes it safe to name in the
+  // dependency array below instead of suppressing the warning.
+  const loadComments = useCallback(async (offset, sentiment) => {
+    if (!postId) return;
     setCommentsLoading(true);
     setCommentsError(null);
     try {
       const qs = `?limit=${limit}&offset=${offset}&sentiment=${encodeURIComponent(sentiment)}`;
-      const data = await apiCall(`/v1/analysis/post/${encodeURIComponent(post.post_id)}/comments${qs}`);
+      const data = await apiCall(`/v1/analysis/post/${encodeURIComponent(postId)}/comments${qs}`);
       setCommentsData(data);
       setCommentOffset(offset);
       setCommentFilter(sentiment);
@@ -72,7 +75,13 @@ export default function PostModal({ post, onClose }) {
     } finally {
       setCommentsLoading(false);
     }
-  };
+  }, [postId]);
+
+  useEffect(() => {
+    if (postId) {
+      loadComments(0, 'all');
+    }
+  }, [postId, loadComments]);
 
   const handleFilterChange = (f) => loadComments(0, f);
   const handlePage = (delta) => loadComments(Math.max(0, commentOffset + delta * limit), commentFilter);
@@ -96,7 +105,7 @@ export default function PostModal({ post, onClose }) {
         img.style.height = liveCanvas[i].style.height || liveCanvas[i].offsetHeight + 'px';
         img.style.display = 'block';
         clonedCanvas[i].parentNode.replaceChild(img, clonedCanvas[i]);
-      } catch (e) {}
+      } catch {}
     }
 
     const headStyles = Array.from(document.head.querySelectorAll('style, link[rel="stylesheet"]'))

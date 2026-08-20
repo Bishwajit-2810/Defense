@@ -121,7 +121,7 @@ def _normalise_backend(requested: Optional[str]) -> Optional[str]:
     if r in _VALID_BACKENDS:
         return r
     raise HTTPException(
-        status_code=status.HTTP_422_UNPROCESSABLE_ENTITY,
+        status_code=status.HTTP_422_UNPROCESSABLE_CONTENT,
         detail=f'backend must be one of {list(_VALID_BACKENDS)}, "auto", or null',
     )
 
@@ -133,12 +133,12 @@ def _build_messages(body: ChatRequest) -> list[dict]:
         history = [ChatMessage(role="user", content=body.message)]
     if not history:
         raise HTTPException(
-            status_code=status.HTTP_422_UNPROCESSABLE_ENTITY,
+            status_code=status.HTTP_422_UNPROCESSABLE_CONTENT,
             detail="provide either `message` (string) or `messages` (non-empty list)",
         )
     if len(history) > _MAX_MESSAGES:
         raise HTTPException(
-            status_code=status.HTTP_422_UNPROCESSABLE_ENTITY,
+            status_code=status.HTTP_422_UNPROCESSABLE_CONTENT,
             detail=f"too many messages (max {_MAX_MESSAGES})",
         )
 
@@ -150,14 +150,14 @@ def _build_messages(body: ChatRequest) -> list[dict]:
     for m in history:
         if m.role not in _VALID_MSG_ROLES:
             raise HTTPException(
-                status_code=status.HTTP_422_UNPROCESSABLE_ENTITY,
+                status_code=status.HTTP_422_UNPROCESSABLE_CONTENT,
                 detail=f"invalid message role {m.role!r}; use one of {list(_VALID_MSG_ROLES)}",
             )
         total += len(m.content)
         msgs.append({"role": m.role, "content": m.content})
     if total > _MAX_CHARS:
         raise HTTPException(
-            status_code=status.HTTP_422_UNPROCESSABLE_ENTITY,
+            status_code=status.HTTP_422_UNPROCESSABLE_CONTENT,
             detail=f"conversation too long (max {_MAX_CHARS} characters)",
         )
     return msgs
@@ -403,7 +403,7 @@ def _split_turns(body: ChatAgentRequest) -> tuple[str, list[dict]]:
         turns = [{"role": "user", "content": body.message}]
     if not turns or turns[-1]["role"] != "user":
         raise HTTPException(
-            status_code=status.HTTP_422_UNPROCESSABLE_ENTITY,
+            status_code=status.HTTP_422_UNPROCESSABLE_CONTENT,
             detail="the conversation must end with a user message",
         )
     return turns[-1]["content"], turns[:-1]
@@ -526,7 +526,7 @@ async def chat_agent(
         agent_name, reason = requested, "pinned by the operator"
     else:
         raise HTTPException(
-            status_code=status.HTTP_422_UNPROCESSABLE_ENTITY,
+            status_code=status.HTTP_422_UNPROCESSABLE_CONTENT,
             detail=f"unknown agent {body.agent!r}; known: {sorted(registry)} (or 'auto'/'none')",
         )
 

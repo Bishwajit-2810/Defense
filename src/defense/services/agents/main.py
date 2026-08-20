@@ -18,6 +18,8 @@ Architecture constraints (Architecture.md §11):
 
 from __future__ import annotations
 
+from contextlib import asynccontextmanager
+
 import asyncio
 import os
 from defense.libs.common.config import get_settings
@@ -59,6 +61,21 @@ _SYNC_TIMEOUT: float = config.agent_sync_timeout
 # Application factory
 # ---------------------------------------------------------------------------
 
+@asynccontextmanager
+async def lifespan(app: FastAPI):  # noqa: ARG001 - FastAPI passes the app in
+    """Startup/shutdown for the agents service.
+
+    Replaces the deprecated `@app.on_event` pair. The startup half wires the
+    module-level MCP client, run store and runner, so it must run before any
+    route is served — which a lifespan guarantees and, unlike `on_event`, will
+    keep guaranteeing. `_on_startup` / `_on_shutdown` live further down with the
+    rest of the lifecycle code and resolve at call time.
+    """
+    await _on_startup()
+    yield
+    await _on_shutdown()
+
+
 app = FastAPI(
     title="Defense Agent Orchestrator",
     version="1.0.0",
@@ -68,6 +85,7 @@ app = FastAPI(
     ),
     docs_url="/docs",
     redoc_url="/redoc",
+    lifespan=lifespan,
 )
 
 app.add_middleware(
@@ -321,8 +339,7 @@ async def _run_agent_task(
 # ---------------------------------------------------------------------------
 
 
-@app.on_event("startup")
-async def on_startup() -> None:
+async def _on_startup() -> None:
     global _mcp_client, _run_store, _agent_runner, _redis_client
 
     # Initialise Redis (optional — store falls back to in-memory on failure)
@@ -356,8 +373,7 @@ async def on_startup() -> None:
     )
 
 
-@app.on_event("shutdown")
-async def on_shutdown() -> None:
+async def _on_shutdown() -> None:
     log.info("agents_service_stopping")
 
 

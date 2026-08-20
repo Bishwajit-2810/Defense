@@ -94,12 +94,12 @@ def _derive_title(messages: list[ChatTurnIn] | None) -> str:
 def _validate(turn: ChatTurnIn) -> None:
     if turn.role not in _VALID_ROLES:
         raise HTTPException(
-            status_code=status.HTTP_422_UNPROCESSABLE_ENTITY,
+            status_code=status.HTTP_422_UNPROCESSABLE_CONTENT,
             detail=f"invalid role {turn.role!r}; use one of {list(_VALID_ROLES)}",
         )
     if len(turn.content) > _CONTENT_MAX:
         raise HTTPException(
-            status_code=status.HTTP_422_UNPROCESSABLE_ENTITY,
+            status_code=status.HTTP_422_UNPROCESSABLE_CONTENT,
             detail=f"message too long (max {_CONTENT_MAX} characters)",
         )
 
@@ -308,7 +308,7 @@ async def append_messages(
 ) -> dict:
     if not body:
         raise HTTPException(
-            status_code=status.HTTP_422_UNPROCESSABLE_ENTITY,
+            status_code=status.HTTP_422_UNPROCESSABLE_CONTENT,
             detail="provide at least one message",
         )
     try:
@@ -337,7 +337,7 @@ async def rename_conversation(
     title = body.title.strip()[:_TITLE_MAX]
     if not title:
         raise HTTPException(
-            status_code=status.HTTP_422_UNPROCESSABLE_ENTITY, detail="title cannot be blank"
+            status_code=status.HTTP_422_UNPROCESSABLE_CONTENT, detail="title cannot be blank"
         )
     try:
         result = await db.execute(

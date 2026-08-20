@@ -235,7 +235,7 @@ async def analysis_run(
     """
     if not body.post_ids and not body.campaign_id:
         raise HTTPException(
-            status_code=status.HTTP_422_UNPROCESSABLE_ENTITY,
+            status_code=status.HTTP_422_UNPROCESSABLE_CONTENT,
             detail="Provide at least one of 'post_ids' or 'campaign_id'",
         )
 
@@ -556,7 +556,7 @@ async def resume_analysis(
 
     if not campaign_id and not post_ids:
         raise HTTPException(
-            status_code=status.HTTP_422_UNPROCESSABLE_ENTITY,
+            status_code=status.HTTP_422_UNPROCESSABLE_CONTENT,
             detail=(
                 f"Job '{analysis_id}' has no campaign_id or post_ids in its selector, "
                 "so there is no post set to resume — start a new run instead"

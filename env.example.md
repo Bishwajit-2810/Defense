@@ -165,7 +165,7 @@ empty is *not* the same as off if `APP_ENV` is still `dev`.
 
 | Key | What it does |
 |---|---|
-| `LOG_LEVEL` | Standard level. Companion settings `LOG_TO_REDIS`, `LOG_REDIS_MAX`, `LOG_REDIS_TTL` control the live dashboard log buffer. |
+| `LOG_LEVEL` | Standard level. Companion settings `LOG_TO_REDIS`, `LOG_REDIS_MAX`, `LOG_REDIS_TTL` control the live dashboard log buffer. `LOG_TO_REDIS` defaults **on**, and the buffer it writes (`logs:recent` / `logs:live`) is the one the Logs tab reads — so any process using `setup_logging` publishes into the operator's log view. `tests/conftest.py` forces it to `0` for the whole session: a bare `pytest` used to file the agent suites' deliberately fabricated fixtures (`post_id='1234567890abcdef'`, a table of "#12345 Economic Growth") into that view as real agent runs. Set `LOG_TO_REDIS=1` to opt a test run back in. |
 | `PUBLIC_BASE_URL` | The externally-reachable API base. The agents service uses it to build links in generated output ([`agents/main.py:449`](src/defense/services/agents/main.py#L449)) — if it is wrong, links point somewhere unreachable while everything else still works. |
 | `AGENTS_SERVICE_URL` | Where the API reaches the agents service. `docker-compose.yml` overrides this to `http://agents:8010` for containers, so the value here is the one used for direct host runs. |
 | `ANALYTICS_MCP_PORT` / `RETRIEVAL_MCP_PORT` / `INGEST_MCP_PORT` | Listen ports for the three MCP servers (8100 / 8101 / 8102). |

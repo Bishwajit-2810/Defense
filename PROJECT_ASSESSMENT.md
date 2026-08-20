@@ -14,8 +14,8 @@ Bangla / English / Banglish)
 > [AUDIT_PASS9.md](AUDIT_PASS9.md) (14 Aug, multi-tenant data isolation) — and
 > [OPEN_ISSUES.md](OPEN_ISSUES.md) is the actionable form of the latest one.
 >
-> Current repository: **173 Python files (52,384 LOC) under `src/`, `tests/` and
-> `eval/`; 1,345 tests across 65 files in `tests/`.** (The method is named because
+> Current repository: **175 Python files (53,019 LOC) under `src/`, `tests/` and
+> `eval/`; 1,373 tests across 67 files in `tests/`.** (The method is named because
 > the previous figure could not be reproduced without it — a repo-wide count is
 > 199 files / 54,615 LOC, the difference being 24 loose scripts at the root and
 > `deploy/`.)
@@ -43,6 +43,11 @@ Bangla / English / Banglish)
 > and `jobs.options` is now persisted for analysis runs, where it had been written
 > as a literal `{}` — a separate hole from §13.1's, which is about the report
 > path's `embedding_clusters` living only in that column, and is untouched.
+>
+> How to run any of it is now one document — **[testing.md](testing.md)** — which
+> also records what a green suite does *not* prove, §7.2 below being the headline:
+> 1,370 passing tests are correctness and contract tests, and there is still no
+> measured accuracy for any labeller.
 >
 > One structural note for anyone re-running the audits: the JSON contracts moved
 > from `src/defense/libs/schemas/` to **`src/defense/contracts/schemas/`**.

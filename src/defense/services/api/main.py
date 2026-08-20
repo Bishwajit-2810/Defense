@@ -2,6 +2,8 @@
 
 from __future__ import annotations
 
+from contextlib import asynccontextmanager
+
 import logging
 import os
 import time
@@ -41,6 +43,20 @@ logging.getLogger("uvicorn.access").setLevel(logging.WARNING)
 # Application
 # ---------------------------------------------------------------------------
 
+@asynccontextmanager
+async def lifespan(app: FastAPI):  # noqa: ARG001 - FastAPI passes the app in
+    """Startup/shutdown for the app.
+
+    Replaces `@app.on_event("startup")`, which FastAPI deprecated in favour of a
+    lifespan context. Same behaviour: the body before `yield` runs on startup,
+    after it on shutdown. Defined here because it is a constructor argument, and
+    it calls `_on_startup` (declared further down with the other lifecycle code)
+    — resolved at call time, so the ordering is fine.
+    """
+    await _on_startup()
+    yield
+
+
 app = FastAPI(
     title="Defense Analysis API",
     version="1.0.0",
@@ -51,6 +67,7 @@ app = FastAPI(
     docs_url="/docs",
     redoc_url="/redoc",
     openapi_url="/openapi.json",
+    lifespan=lifespan,
 )
 
 # ---------------------------------------------------------------------------
@@ -180,6 +197,5 @@ app.include_router(events_router)
 # ---------------------------------------------------------------------------
 
 
-@app.on_event("startup")
-async def on_startup() -> None:
+async def _on_startup() -> None:
     log.info("API started", version=app.version, title=app.title)

@@ -1,8 +1,24 @@
 import React, { useState, useEffect, useRef } from 'react';
-import { Terminal, Play, Square, Trash2, Filter, AlertCircle, Info, Bug } from 'lucide-react';
+import { Terminal, Play, Square, Trash2 } from 'lucide-react';
 import { API_BASE, getSseQueryAsync } from '../utils/api';
 
+// The Redis log sink strips ANSI before storing, but `run_all.py` tees worker
+// stdout through the same buffer, so a colourised line can still arrive. Matching
+// ESC by its escape is the point of this regex, hence the rule exemption; a
+// \u001b escape trips the same rule, so a disable is the only way to say
+// "intentional".
+// oxlint-disable-next-line no-control-regex
 const stripAnsi = (str) => (typeof str === 'string' ? str.replace(/\x1b\[[0-9;]*[a-zA-Z]/g, '') : str);
+
+// Identity of a log line, for dropping a repeat.
+//
+// The stream is *designed* to overlap: `/v1/logs/stream` replays `backfill`
+// lines from `logs:recent` and then tails `logs:live`, subscribing before it
+// reads so no line can fall between the two — which means the line straddling
+// the join arrives twice by construction. Timestamp + level + message is enough
+// to identify it; `ts` is a float from `record.created`, so two genuinely
+// distinct lines would have to share a microsecond AND their text.
+const lineKey = (e) => `${e?.ts ?? e?.time ?? ''}|${e?.level ?? ''}|${e?.message ?? ''}`;
 
 export default function Logs() {
   const [logs, setLogs] = useState([]);
@@ -11,43 +27,68 @@ export default function Logs() {
   const [filterLevel, setFilterLevel] = useState('DEBUG');
   const logsEndRef = useRef(null);
   const eventSourceRef = useRef(null);
+  // Keys already rendered, so a replayed line is dropped instead of appended.
+  // A ref rather than state: it must be read inside the event handler without
+  // re-subscribing, and it is not rendered.
+  const seenRef = useRef(new Set());
 
-  const connectStream = async () => {
-    if (eventSourceRef.current) return;
-    
-    const qs = await getSseQueryAsync();
-    const ampersand = qs ? '&' : '?';
-    const es = new EventSource(`${API_BASE}/v1/logs/stream${qs}${ampersand}level=${filterLevel}&format=json`);
-    
-    es.addEventListener('log', (e) => {
-      try {
-        const parsed = JSON.parse(e.data);
-        if (parsed && parsed.message) {
-          parsed.message = stripAnsi(parsed.message);
-        }
-        setLogs(prev => [...prev.slice(-999), parsed]);
-      } catch (err) {
-        // ignore malformed
-      }
-    });
-    
-    es.onopen = () => setIsConnected(true);
-    es.onerror = () => setIsConnected(false);
-    
-    eventSourceRef.current = es;
-  };
-
-  const disconnectStream = () => {
-    if (eventSourceRef.current) {
-      eventSourceRef.current.close();
-      eventSourceRef.current = null;
-      setIsConnected(false);
-    }
-  };
-
+  // Open ONE stream for the current filter level, and close exactly the one this
+  // effect opened.
+  //
+  // This used to be an `async connectStream()` guarded by `if
+  // (eventSourceRef.current) return` and called from an effect. The guard cannot
+  // work: it runs before the `await getSseQueryAsync()`, so under StrictMode's
+  // double-mount both invocations pass it while the ref is still null, and two
+  // EventSources end up open — the ref keeps the second, the first is orphaned
+  // and never closed. Every line then arrived twice, and so did the stream's
+  // 60-line backfill, which is what made the log view read as if the backend
+  // were doing everything twice. Changing the filter leaked another one.
   useEffect(() => {
-    connectStream();
-    return () => disconnectStream();
+    let cancelled = false;
+    let es = null;
+
+    (async () => {
+      const qs = await getSseQueryAsync();
+      // The effect was torn down while we were awaiting the ticket — do not
+      // open a socket nobody will close.
+      if (cancelled) return;
+
+      const ampersand = qs ? '&' : '?';
+      es = new EventSource(`${API_BASE}/v1/logs/stream${qs}${ampersand}level=${filterLevel}&format=json`);
+      eventSourceRef.current = es;
+
+      es.addEventListener('log', (e) => {
+        try {
+          const parsed = JSON.parse(e.data);
+          if (parsed && parsed.message) {
+            parsed.message = stripAnsi(parsed.message);
+          }
+          // Belt and braces on top of the single-stream fix: the backfill/live
+          // join legitimately repeats a line, and a reconnect replays the whole
+          // backfill again.
+          const key = lineKey(parsed);
+          if (seenRef.current.has(key)) return;
+          seenRef.current.add(key);
+          if (seenRef.current.size > 4000) {
+            // Bounded: keep the newest half rather than growing without limit.
+            seenRef.current = new Set(Array.from(seenRef.current).slice(-2000));
+          }
+          setLogs(prev => [...prev.slice(-999), parsed]);
+        } catch {
+          // ignore malformed
+        }
+      });
+
+      es.onopen = () => setIsConnected(true);
+      es.onerror = () => setIsConnected(false);
+    })();
+
+    return () => {
+      cancelled = true;
+      if (es) es.close();
+      if (eventSourceRef.current === es) eventSourceRef.current = null;
+      setIsConnected(false);
+    };
   }, [filterLevel]);
 
   useEffect(() => {
@@ -56,7 +97,12 @@ export default function Logs() {
     }
   }, [logs, isFollowing]);
 
-  const clearLogs = () => setLogs([]);
+  // Clearing has to forget the keys too, or a reconnect's backfill would be
+  // deduped away and the view would stay empty.
+  const clearLogs = () => {
+    seenRef.current = new Set();
+    setLogs([]);
+  };
 
   const getLevelColor = (level) => {
     switch(level) {
