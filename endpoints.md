@@ -623,6 +623,41 @@ A privacy guarantee that evaporates when the database hiccups is not a guarantee
 
 ---
 
+## 3b. The rest of the surface — every `/v1` path
+
+The app serves **47 distinct `/v1` paths / 58 method+path pairs** (20 Aug 2026;
+`python -c "from defense.services.api.main import app; ..."` over `app.routes` is
+the check). §2–§3 cover the ones you drive by hand. These are the remainder — all
+real routes, most of them what the dashboard calls:
+
+| Method | Path | What it is |
+| :--- | :--- | :--- |
+| `GET` | `/v1/auth/verify` | Validate a raw token **without** establishing a session. Lets a client tell "no token" from "expired token" without a refresh. |
+| `GET` | `/v1/analysis/post/{post_id}/comments` | Paginated per-comment sentiment for one post — full coverage, not a sample. Same data as §2c-bis. |
+| `GET` | `/v1/analysis/export` | Download analysis results as a **ZIP of PDFs**, one per post. |
+| `GET` | `/v1/pipeline/stats` | Point-in-time stage state (queue depths, in-flight, last completion) — backs the dashboard **Pipeline** tab. |
+| `GET` | `/v1/agents/types` | The registered agent types and their descriptions, read straight off `AGENT_REGISTRY`. Use this rather than hard-coding a list of agent names. |
+| `GET`&nbsp;/&nbsp;`DELETE` | `/v1/agents/runs` | List recent agent runs / clear the history. Aliases of the `/v1/agents` collection. |
+| `POST` | `/v1/chat/agent` | Route a chat message to an MCP-backed agent — the Chat tab's path into the agent layer. |
+| `GET`&nbsp;/&nbsp;`PATCH`&nbsp;/&nbsp;`DELETE` | `/v1/chat/conversations/{conversation_id}` | Read a conversation and its turns / rename it / delete it. |
+| `POST` | `/v1/chat/conversations/{conversation_id}/messages` | Append turns to a conversation. |
+| `GET` | `/v1/reports/{report_id}` | Fetch a generated report by id. |
+| `GET` | `/v1/reports/{report_id}/export` | Export that report as a downloadable PDF or HTML file. |
+| `GET` | `/v1/reports/export_latest/export` | Generate a **fresh** grounded mass-reaction report and stream it straight back — no id round-trip. |
+| `GET` | `/v1/logs/services` | Which services are present in the log buffer (populates the Logs tab's filter). |
+| `GET` | `/v1/logs/stream` | Tail server-side logs over SSE. Needs an SSE ticket, like every other stream — see §3. |
+
+Two of these are easy to get wrong from the outside:
+
+```bash
+# Agent types — the roster is nine, and it comes from the registry, not a constant.
+curl -s http://127.0.0.1:8001/v1/agents/types -H "X-API-Key: demo" | python -m json.tool
+# → [{"name":"analyst","description":…,"tools":[…],"llm_role":"agent","max_tool_calls":10}, …]
+
+# A report you want but have not generated: export_latest builds and streams in one call.
+curl -s -o report.pdf http://127.0.0.1:8001/v1/reports/export_latest/export -H "X-API-Key: demo"
+```
+
 ## 4. Interactive docs
 
 FastAPI serves the full OpenAPI spec with a try-it-out UI:

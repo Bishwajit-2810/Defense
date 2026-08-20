@@ -478,10 +478,17 @@ output — see [models.md](models.md) §5 and [architecture.md](architecture.md)
 
 ## 4a. Analyst Q&A (agentic) — `POST /v1/agents/query`
 
-Ask a natural-language question over the analyzed corpus; the **Insight/Analyst
-agent** plans across the MCP tools (analytics + retrieval, +VLM if images matter)
-and returns a grounded, cited answer. Async (`202` + `status_url`) since it may make
-several tool/LLM calls; budget-capped per run.
+Ask a natural-language question over the analyzed corpus; an agent plans across the
+MCP tools (analytics + retrieval, +VLM if images matter) and returns a grounded,
+cited answer. Async (`202` + `status_url`) since it may make several tool/LLM calls;
+budget-capped per run.
+
+`agent_type` selects which of the **nine** agents runs — `analyst` (the default,
+general-purpose one), `coverage`, `alerting`, `stance`, `comparator`, `toxicity`,
+`narrative`, `quality`, `reporter`. Each has its own tool allowlist and default
+budget; `GET /v1/agents/types` returns the live roster with both, so a client
+should read it rather than hard-code a list. `options.max_tool_calls` overrides
+the agent's default for one run.
 
 ### Request
 
@@ -546,6 +553,11 @@ egresses to Groq.
 | `POST /v1/chat/stream`             | Same as `/v1/chat` but streams the reply token-by-token (SSE)                          |
 | `GET /v1/chat/models`              | Models available per backend (+ defaults) for the chat model picker                    |
 | `DELETE /v1/posts/{id}`            | Data deletion (retention / GDPR-style)                                                 |
+
+> This table is the **designed** surface. The app currently serves 47 distinct
+> `/v1` paths; [endpoints.md](endpoints.md) §3b lists the ones not covered here —
+> chat conversations, report export, pipeline stats, log streaming and the agent
+> registry introspection routes.
 
 > The **MCP servers** (`analytics-mcp`, `retrieval-mcp`, `ingest-mcp` — see
 > [architecture.md](architecture.md) §11) are **internal** tool interfaces consumed

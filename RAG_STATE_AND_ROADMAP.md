@@ -25,6 +25,10 @@ the encoder fall back to hash vectors, so retrieval degraded to ranking noise
 intermittently — and it had already corrupted two analyses during the audit
 before an assertion caught it.
 
+**Section 9** covers what broke in the *agent* layer once retrieval started
+returning real Bengali payloads — a silent 4k context window, `ensure_ascii`
+doubling the token bill, repeat-call loops, and two new shapes of non-answer.
+
 Everything in the table below still holds and the measurements re-run unchanged,
 but read both sections before trusting this table on its own. Section 8 also
 stratifies the eval by query leakage, which changes how the headline numbers
@@ -149,10 +153,12 @@ ensemble labels every comment, but none of that text is retrievable by meaning.
 >
 > **Retrieval coverage and ensemble coverage are two different caps — do not
 > conflate them.** Embedding is done by the **assembler** over the whole stored
-> thread, bounded by `COMMENT_EMBEDDING_MAX_PER_POST` = **1000** (§5.3.2 below).
-> The Stage-2 ensemble reads every comment with text (`ROUTER_COMMENT_TOP_N=0`,
-> the default), so on a thread under 1000 comments the two coincide. Above it, or
-> with a positive `ROUTER_COMMENT_TOP_N`, they diverge — and then
+> thread, bounded by `COMMENT_EMBEDDING_MAX_PER_POST`, which as of 18 Aug 2026 is
+> **`0` — uncapped** (it was `1000`; see §6 item 2 and §5.3.2 below for what that
+> cap was hiding). The Stage-2 ensemble reads every comment with text
+> (`ROUTER_COMMENT_TOP_N=0`, the default), so with both at `0` the two now
+> coincide on every thread. Set either to a positive value and they diverge — and
+> then
 > `search_comments` can retrieve a comment that **no model labelled**, whose
 > `sentiment` is `uncertain` (Stage 1's keyword label does not vote). An agent
 > quoting a retrieved comment's sentiment must not imply the ensemble judged it;
@@ -160,7 +166,7 @@ ensemble labels every comment, but none of that text is retrievable by meaning.
 
 **(b) In the default configuration the vector is not semantic.**
 `.env` sets `MODEL_STUB_MODE=true`, so
-[`embeddings.py:47`](src/defense/libs/embeddings.py#L47) returns a SHA-256-seeded
+[`embeddings.py:62`](src/defense/libs/embeddings.py#L62) returns a SHA-256-seeded
 random unit vector — correct dimension, correct HNSW index, arbitrary
 neighbours. `EMBEDDING_ALLOW_STUB` defaults to `true`
 ([`config.py:329`](src/defense/libs/common/config.py#L329)), so persistence
@@ -248,7 +254,7 @@ filter**. Retrieval quality is entirely whatever the raw kNN returns.
 
 ### Clustering as the LLM cost lever
 
-[`get_clusters`](src/defense/mcp_servers/retrieval_mcp/server.py#L510) pulls
+[`get_clusters`](src/defense/mcp_servers/retrieval_mcp/server.py#L1315) pulls
 vectors, runs seeded k-means (or HDBSCAN), and returns one representative post
 per cluster so the report summarises a handful of slices instead of N posts
 ([`clustering.py`](src/defense/libs/clustering.py)).
@@ -321,7 +327,7 @@ precision and citation granularity.
 
 ### 3.6 Fix two silent truncations
 
-- [`get_clusters`](src/defense/mcp_servers/retrieval_mcp/server.py#L528) hardcodes
+- [`get_clusters`](src/defense/mcp_servers/retrieval_mcp/server.py#L1315) hardcodes
   `LIMIT 100 ORDER BY created_at DESC`. "Corpus themes" is really "themes of the
   100 newest posts, in at most 8 buckets" — and it reads as corpus-wide.
 - `semantic_search` accepts no date window, even though `_date_filter` already
@@ -414,7 +420,7 @@ comments by walking `top_posts` → `get_thread`, i.e. it can find toxic *posts*
 and then read their threads, but cannot search for a harassment pattern
 directly. Also `analyst`, `stance`, and `narrative`.
 
-**A runner change.** [`_extract_post_ids`](src/defense/services/agents/runner.py#L335)
+**A runner change.** [`_extract_post_ids`](src/defense/services/agents/runner.py#L475)
 and the citation verifier are built around post ids. Comment-level results
 introduce `comment_id`s that the verifier does not recognise, so a fabricated
 comment citation would pass unchallenged while a real one might be flagged. The
@@ -422,8 +428,15 @@ guard needs a comment-id shape before this tool ships — otherwise the change
 that most improves grounding also opens the largest hole in the fabrication
 checks.
 
-**Budget review.** `toxicity` and `stance` sit at `max_tool_calls=10`. Comment
+**Budget review.** `toxicity` and `stance` sat at `max_tool_calls=10`. Comment
 search encourages more, narrower calls; watch for agents truncating mid-analysis.
+*Shipped values (20 Aug 2026):* `coverage` 5, `alerting` 8, `quality` 8, `analyst`
+10, `stance` 12, `narrative` 12, `toxicity` 14, `comparator` 15, `reporter` 15 —
+[`registry.py`](src/defense/services/agents/registry.py) is the source of truth.
+`alerting` went 5 → 8 after a live run hit the cap and returned
+`[Budget cap of 5 tool calls reached]` **as the briefing**, having answered
+nothing; the runner now also refuses to dispatch a byte-identical repeat, which
+is what was consuming the budget in the first place (§6, agent hardening).
 
 ### 5.4 A live prompt/tool mismatch worth fixing now
 
@@ -615,6 +628,15 @@ happy path. Seven things did not survive that.
    truncation at warning rather than debug, and the `quality` prompt is told to
    report it as a retrieval blind spot distinct from a fault.
 
+   **Then the cap itself was removed (18 Aug 2026).** Disclosure was the right
+   first move, but the honest disclosure of an 82% index is still an 82% index,
+   and the 1,857 hidden comments were the tail of the single most-discussed post
+   in the corpus — the last place a blind spot is acceptable. The default is now
+   `COMMENT_EMBEDDING_MAX_PER_POST=0`, which matches `ROUTER_COMMENT_TOP_N=0` and
+   makes comment-vector coverage a question about the *encoder* again rather than
+   about a knob. `posts_over_comment_cap` / `comments_dropped_by_cap` stay: the
+   cap can still be set, and if it is, it must still say so.
+
 3. **`score` was an RRF score presented as relevance.** A top hit scores
    `1/(60+1) = 0.0164` no matter how good it is, and nothing said so — an LLM
    handed `score: 0.0164` can reasonably describe the best match in the corpus as
@@ -756,6 +778,78 @@ p=0.125, the last from a clean 4–0 split). The direction is consistent; the se
 is too small to call it. Reporting recall@1 alongside recall@10 would also help:
 at k=1 the dense arm *displaces* correct top hits (lexical 19/32, chunked 16/32),
 which the k=10-only table hides.
+
+### Section 9 — the agent layer, once real retrieval was behind it
+
+§5.5 said the tool-use loop and the fabrication guards could stay as they were.
+That held right up until the retrieval got good: real embeddings over a Bengali
+corpus return **large** results, and every failure below is the agent layer
+meeting a payload the stub never produced. All are live-observed, not reasoned
+about, and each has a regression test
+([`test_agent_context_window.py`](tests/test_agent_context_window.py),
+[`test_agent_placeholder_post_ids.py`](tests/test_agent_placeholder_post_ids.py)).
+
+1. **The context window was 4,096 tokens and nothing said so.** `ollama serve`
+   defaults to `num_ctx 4096` and *silently discards* a longer prompt, oldest
+   message first, reporting only what it evaluated. The oldest messages are the
+   system prompt and the operator's question. Measured: an 11k-token prompt
+   evaluates **24** tokens on `llama3.1:8b` and all **11,045** on a derived
+   `llama3.1:8b-16k` tag ([`config/Modelfile.llama31-16k`](config/Modelfile.llama31-16k)),
+   which is now the `AGENT_LOCAL_MODEL` default.
+
+2. **Half the token bill was `\uXXXX` escaping.** `json.dumps` defaults to
+   `ensure_ascii=True`, so every Bengali character cost six bytes. One
+   `semantic_search(limit=50)` result — 32 rows — serialised to 76,666 characters
+   (~39,000 tokens); the same rows at `ensure_ascii=False` are 23,194 characters
+   (~18,600). Zero added information for half the context.
+
+3. **A single result must not dominate the window.** Results are capped at 6,000
+   characters, dropping **whole rows** (truncating mid-JSON hands the model
+   malformed data), and the model is told what was withheld — a silently
+   shortened list reads as a complete answer. Citations are extracted from what
+   the model was *shown*, so a row past the cut cannot be credited as grounding.
+
+4. **The question is re-appended after every round of tool results.** It is the
+   second message, so it is the first casualty of an overflow; and even inside
+   the window, a small model that has just read thousands of tokens of JSON
+   answers the payload instead of the operator.
+
+5. **Byte-identical repeats are not dispatched.** With the window fixed, the
+   model stopped bailing early and started looping: one run spent 11 of 15 calls
+   on identical `semantic_search(query="comment sentiment", campaign_id="all")`
+   and shipped the budget-cap notice as the briefing. A repeat is now answered
+   from the first result, with a note naming the tools the run has **not** tried;
+   after two, the tools are withdrawn for the rest of the run.
+
+6. **Two more non-answer shapes joined the two in §5.2.** *Self-narration* — "The
+   original user question was not provided… the operator is attempting to
+   retrieve data using the `top_posts` tool with an invalid metric", recorded
+   `completed` with 32 citations attached — is conclusive on a single hit,
+   because only a truncated context makes that claim. The *empty template* is
+   the more dangerous: correct headings, correct columns, every cell `...`, and
+   "the actual values will be filled in based on the data retrieved", written
+   after 14 tool calls and 20,411 prompt tokens of real data.
+
+7. **An honest escape hatch became an unconditional phrase.** Given a way to say
+   "no post-level tool ran", an 8B model says it regardless. A run called
+   `top_posts`, printed its ten real post_ids in the metrics table, and then
+   wrote *"No trigger posts identified: no post-level data was retrieved"*. That
+   is worse than the `[insert post ID]` placeholder it replaced — a placeholder
+   is visibly unfinished; this is a confident false statement about the run. The
+   guard is in code, checked against the run record rather than the answer's own
+   table.
+
+8. **An off-watchlist `target_id` returned `[]`, indistinguishable from silence.**
+   `stance_over_time(target_id="primary_political_figures")` was briefed as "no
+   stance data exists for the primary political figures" while the one tracked
+   entity had rows in seven posts. The roster is an operator-owned file the model
+   never sees and there is no tool to list it, so it invents an id — and an
+   invented id looked exactly like an empty corpus. Unknown ids are now
+   **rejected** the way `_clean_campaign_id` rejects a placeholder, with every
+   valid id named in the error, so the correction costs one turn. Ids, display
+   names and aliases (Bangla and Banglish included, because that is what the
+   corpus contains) all resolve. A *tracked* target with no rows still returns
+   empty — that is a real answer, and it is the one the docstrings promise.
 
 ### Still not done
 

@@ -348,7 +348,7 @@ strategy — see §7.
 | **Stage-2 LLM/VLM Workers**      | Selective summarization (text **and image-grounded via a VLM**) / insight / report / hard cases                                                                                       | Thin worker → local vLLM (LLM-A+LLM-B + VLM) **or** Groq API (text + vision) | GPU pool, stateless |
 | **Result Assembler**             | Merge, JSON-schema validate, compute aggregate confidence                                                                                                                             | Python consumer                                                              | stateless replicas  |
 | **Reporting/Query Service**      | Read APIs, report generation, exports                                                                                                                                                 | FastAPI + ClickHouse + PostgreSQL                                            | stateless replicas  |
-| **Agent Orchestrator**           | Selective **AI agents** (insight/analyst, coverage deep-dive, alerting) — corpus/report tier only, never per-post (§14.6)                                                             | FastAPI + agent loop → LLM-B/VLM backend + MCP tools                         | stateless replicas  |
+| **Agent Orchestrator**           | Selective **AI agents** — nine of them (§14.6) — corpus/report tier only, never per-post                                                             | FastAPI + agent loop → the dedicated `agent` LLM role + MCP tools                         | stateless replicas  |
 | **MCP Servers**                  | Standardized tools for the agents: `analytics-mcp` (ClickHouse/Postgres), `retrieval-mcp` (pgvector), `ingest-mcp` (upstream pull / more comments)                                    | FastAPI + MCP SDK (internal)                                                 | stateless replicas  |
 | **User Management**              | Tenants, users, roles, billing/usage metering                                                                                                                                         | FastAPI + PostgreSQL                                                         | stateless replicas  |
 
@@ -995,21 +995,31 @@ Q&A, grounded reports, targeted deep-dives. **Agents never run per post.**
   (trigger an upstream post-with-details pull / fetch more comments to raise coverage).
   One consistent tool interface, same auth/tenant scoping; read-mostly (`ingest-mcp`
   writes only into our own DB, never upstream).
-- **AI agents** (LLM-B on the pluggable `local`⇄`groq` backend — Qwen/Llama both do
-  tool calling; a **VLM** step when images matter):
-  - **Insight/Analyst agent** — `trend_query → semantic_search → get_thread →
-synthesize → cite`; generates reports and answers `POST /v1/agents/query`,
-    replacing single-shot RAG with a grounded tool-using loop.
-  - **Coverage deep-dive agent** — when `comment_analysis.coverage` is low or a post
-    is flagged viral, calls `ingest-mcp.fetch_more_comments`, re-runs the comment
-    pass, escalates.
-  - **Alerting agent** (scheduled) — watches `reaction_breakdown` spikes / sentiment
-    shifts / viral signals and raises alerts.
+- **AI agents** — **nine**, on the dedicated `agent` role over the pluggable
+  `local`⇄`groq` backend (`llama3.1:8b-16k` / `llama-3.3-70b-versatile`, both do
+  tool calling; a **VLM** step when images matter). Tools and budgets live in
+  [`registry.py`](src/defense/services/agents/registry.py) and are served live by
+  `GET /v1/agents/types`:
+  - **Insight/Analyst agent** (budget 10) — `trend_query → semantic_search →
+    get_thread → synthesize → cite`; answers `POST /v1/agents/query`, replacing
+    single-shot RAG with a grounded tool-using loop.
+  - **Coverage deep-dive agent** (5) — when `comment_analysis.coverage` is low or a
+    post is flagged viral, calls `ingest-mcp.fetch_more_comments`, re-runs the
+    comment pass, escalates.
+  - **Alerting agent** (8, scheduled) — checks negative sentiment >50% and avg
+    toxicity >0.6 as two separate verdicts, each required to quote its figure.
+  - **Stance** (12), **Comparator** (15), **Toxicity** (14), **Narrative** (12),
+    **Quality** (8) and **Reporter** (15) — see
+    [architecture.md](architecture.md) §11 for what each is for.
 - **Guardrails:** invoked by request/schedule/router escalation (not per post);
   per-run tool-call + token budgets; cached by `(agent, inputs, backend, model)`;
   grounded + cited + auditable (records backend/model/tools/tokens → `/v1/usage`);
-  privacy-locked tenants keep agent calls on `local`. Not required for the MVP —
-  lands with the reporting/insight phase (§20).
+  privacy-locked tenants keep agent calls on `local`. Tool results are capped at
+  6,000 characters and serialised unescaped so one result cannot displace the
+  system prompt; byte-identical repeats are refused; and a run only reports
+  `completed` if the answer answers something. Was not required for the MVP —
+  landed with the reporting/insight phase (§20), and is now built in full but
+  still **unmeasured** for answer accuracy.
 
 ---
 

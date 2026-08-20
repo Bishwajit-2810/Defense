@@ -273,6 +273,53 @@ Reuse the existing lane rather than adding one:
   per-target number as LLM-judged.
 - **The deterministic scorer fills in** for bypassed posts and stub-mode runs.
 
+### 6.1 The agent-facing surface — and why an unknown `target_id` raises
+
+Two retrieval-MCP tools expose the rollup: `stance_by_target` (distribution per
+entity) and `stance_over_time` (one row per period × entity). Both take an
+optional `target_id`, and the `stance` agent reaches them.
+
+That id used to be applied as a plain equality filter against whatever string the
+model passed, which made **two very different situations look identical**:
+
+```
+stance_over_time(target_id="primary_political_figures")  ->  []
+```
+
+was briefed to the operator as *"no stance data exists for the primary political
+figures"* — while the one entity actually on the watchlist had stance rows in
+seven posts the whole time. The model cannot guess an id (this file is
+gitignored; it never sees it) and it has no tool that lists one, so it invents
+one — and an invented id is indistinguishable from a quiet corpus.
+
+So the roster is the authority. An id that is not on the watchlist now **raises**,
+the way a placeholder `campaign_id` does, and the error names every valid id:
+
+```
+target_id 'primary_political_figures' is not on the watchlist, so no stance was
+ever scored for it. The watchlist tracks exactly: <id> (<display>), … Pass one of
+those ids, or omit target_id to get every tracked target. Do not report this as
+an absence of data in the corpus.
+```
+
+The runner turns that into a tool result the model reads, so the correction costs
+one turn out of the budget rather than the whole run. Three details that follow
+from §3.1:
+
+- **Aliases resolve too** — id, display name, or any alias, including the Bangla
+  and Banglish spellings, because those are what the retrieved comments contain
+  and therefore what the model has in front of it when it picks an argument.
+- **Comma-separated ids are split, not rejected.** It is the shape a model reaches
+  for when the question names a group of people; every part still has to resolve.
+- **A *tracked* target with no rows still returns empty.** That is a real answer —
+  nobody mentioned them, or the aliases need work (`unmatched_targets` in
+  [`stance_targets.py`](src/defense/libs/stance_targets.py) is the signal for the
+  second) — and it is the answer the tool docstrings promise.
+
+If the watchlist file cannot be read at all, the filter falls back to the old
+unvalidated behaviour and logs `target_id_unvalidated` rather than taking the
+stance tools down with a bad config file.
+
 ---
 
 ## 7. Validating it — ~150 labelled comments

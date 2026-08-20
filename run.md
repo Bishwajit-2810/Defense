@@ -304,6 +304,20 @@ change it:
 
 - **Different Ollama model:** `export LLM_A_LOCAL_MODEL=gemma4:e4b` (or any tag from
   `ollama list`); `ollama pull <model>` first if it isn't listed.
+- **The agents need a derived tag, not just a pull.** `AGENT_LOCAL_MODEL` defaults
+  to `llama3.1:8b-16k`, which does not exist until you build it:
+
+  ```bash
+  ollama pull llama3.1:8b
+  ollama create llama3.1:8b-16k -f config/Modelfile.llama31-16k
+  ```
+
+  It is plain `llama3.1:8b` with `num_ctx 16384`. `ollama serve` otherwise runs a
+  **4,096-token** window and silently drops the overflow oldest-message-first —
+  the system prompt and the operator's question — so the agent answers from the
+  tail of a tool result and still reports `completed`. `OLLAMA_CONTEXT_LENGTH` on
+  the service is the broader fix, but a `PARAMETER` inside a model overrides it;
+  if you go that route, set `AGENT_LOCAL_MODEL=llama3.1:8b`.
 - **Groq (cloud):** `export LLM_BACKEND=groq GROQ_API_KEY=sk-…`.
 - **Self-hosted vLLM:** `export LLM_BACKEND=local LOCAL_LLM_BASE_URL=http://<vllm>:8000/v1`
   and set `LLM_*_LOCAL_MODEL` to the served model id.
@@ -470,7 +484,7 @@ curl -s -X POST http://127.0.0.1:8001/v1/agents/query \
   | python -m json.tool
 ```
 
-> `agent_type` is one of `analyst`, `coverage`, `alerting`. The agents service
+> `agent_type` is one of `analyst`, `coverage`, `alerting`, `stance`, `comparator`, `toxicity`, `narrative`, `quality`, `reporter` — `GET /v1/agents/types` returns the live list. The agents service
 > runs the LLM agentic loop, so it uses the §4 `LLM_BACKEND=local` + Ollama env.
 > To exercise **real** pgvector semantic search via retrieval-mcp, drop
 > `RETRIEVAL_MCP_STUB`, run `uv sync --extra ml` (which includes

@@ -258,10 +258,14 @@ Scale + reliability ([plan.md](plan.md) Phase 2), then the agents.
   - **MCP servers** (FastAPI + MCP SDK, internal `ClusterIP`-only): `analytics-mcp`
     (ClickHouse/Postgres), `retrieval-mcp` (pgvector semantic search + fetch), `ingest-mcp` (trigger
     upstream pull / fetch more comments — writes only to OUR db).
-  - **Agent orchestrator** (FastAPI, CPU-only) running on the LLM-B backend:
-    **Insight/Analyst** (`POST /v1/agents/query` + report generation),
+  - **Agent orchestrator** (FastAPI, CPU-only) running on the dedicated `agent`
+    LLM role — **nine** agents, all defined in
+    [`registry.py`](src/defense/services/agents/registry.py):
+    **Insight/Analyst** (`POST /v1/agents/query`),
     **Coverage deep-dive** (low `coverage`/viral → `fetch_more_comments`),
-    **Alerting** (scheduled, on reaction/sentiment spikes).
+    **Alerting** (scheduled, on reaction/sentiment/toxicity thresholds),
+    plus **Stance**, **Comparator**, **Toxicity**, **Narrative**, **Quality** and
+    **Reporter**.
   - **DoD:** agents are corpus-tier only (never invoked per post), gated + cached +
     budget-capped; runs record backend/model/tools/tokens; reports are grounded +
     cited; tenant `local` policy honored.

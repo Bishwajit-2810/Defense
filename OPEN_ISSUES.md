@@ -30,6 +30,32 @@
 >   zero voters, so on a thread much larger than `ROUTER_COMMENT_TOP_N` the
 >   post-level `sentiment_breakdown` is mostly `uncertain`. That is accurate, and it
 >   is a reporting change worth knowing before showing a chart.
+>
+> **Two more (18–20 August 2026), also not regressions of anything here:**
+>
+> - **`COMMENT_EMBEDDING_MAX_PER_POST` went 1000 → 0.** This was a *third* cap,
+>   quieter than either discussed above, because it truncates the **vector index**
+>   rather than the analysis: the comments past it were still stored and still
+>   labelled, so nothing in `ensemble.not_analysed` or the label provenance showed
+>   a gap — only `comment_vector_coverage` dipped, and it read as an encoder
+>   shortfall. It accounted for exactly the corpus's 10,272-vs-8,415 shortfall:
+>   1,857 comments, 18% of the corpus, unreachable by `search_comments` and
+>   `get_clusters`. Now uncapped, so all five coverage knobs sit at 0.
+> - **The agent layer was hardened against eight live failures**, all of which
+>   appeared *after* real retrieval landed — the stub never returned payloads large
+>   enough to trigger them. The root cause of most: `ollama serve` defaults to a
+>   4,096-token window and silently discards the overflow oldest-message-first,
+>   which is the system prompt and then the operator's question. Runs were recorded
+>   `completed` while briefing the operator on the agent's own tool-argument errors.
+>   Fixed with a 16k model tag, unescaped serialisation, a 6,000-char result cap,
+>   a question restated each round, repeat-call refusal, and four non-answer guards.
+>   Write-up: [RAG_STATE_AND_ROADMAP.md](RAG_STATE_AND_ROADMAP.md) §6 Section 9.
+>
+> **One path note.** Every `dashboard/app.js` reference below resolves to
+> [`dashboard_legacy/app.js`](dashboard_legacy/app.js): the shipped dashboard is
+> now React 19 + Vite + Tailwind under `dashboard/`, and the vanilla build these
+> findings were made against was moved, not deleted. The findings stand as
+> written against that file.
 
 **Found:** 5 August 2026, fresh-eyes audit of the whole tree (the third such pass).
 **Status: ALL TEN ARE FIXED** and regression-tested, 5 August 2026.

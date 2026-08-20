@@ -105,9 +105,10 @@ Vite + Tailwind** (`dashboard/`, charts via chart.js). The original vanilla
 HTML/CSS/JS dashboard the design docs specify is kept at `dashboard_legacy/`;
 where a doc still says "plain HTML/CSS/JS, no build step", that is the superseded
 decision. Above the per-post pipeline sits a selective
-**agentic insight layer** — AI agents (on the same LLM-B backend) that reach data
-through **MCP servers** (`analytics` / `retrieval` / `ingest`) for analyst Q&A,
-grounded reports, and targeted deep-dives — **corpus-tier only, never per post**
+**agentic insight layer** — **nine** AI agents on a dedicated `agent` LLM role that
+reach data through **MCP servers** (`analytics` / `retrieval` / `ingest`) for
+analyst Q&A, watchlist stance, toxicity and narrative deep-dives, quality audits
+and grounded reports — **corpus-tier only, never per post**
 (see [architecture.md](architecture.md) §11).
 
 This folder answers the system-design request described by the owner in
@@ -225,10 +226,14 @@ target (the routing rate) are flagged inline in each document.
   vectors/semantic search/dedup via the `analysis_results.embedding` `vector(768)`
   column), ClickHouse (analytics/aggregations), Redis (cache + dedup + rate
   limits), object storage (raw payloads + reports).
-- **Agentic insight layer (MCP + AI agents).** A selective, corpus-tier agent
-  layer (FastAPI orchestrator on LLM-B) reaches data via **MCP servers**
-  (`analytics`/`retrieval`/`ingest`) for analyst Q&A, grounded reports, and
-  coverage deep-dives — gated, cached, budget-capped, never per post.
+- **Agentic insight layer (MCP + AI agents).** A selective, corpus-tier layer of
+  **nine** agents (FastAPI orchestrator on the dedicated `agent` role) reaches data
+  via **MCP servers** (`analytics`/`retrieval`/`ingest`) for analyst Q&A, grounded
+  reports, watchlist stance, and coverage deep-dives — gated, cached,
+  budget-capped, never per post. The runner is hardened against the ways a small
+  local model fails on real payloads: tool results are capped so one cannot
+  displace the system prompt, byte-identical repeat calls are refused, and a run
+  only reports `completed` if the answer actually answers something.
 - **Free-form chatbot (`POST /v1/chat`, `/v1/chat/stream`).** Ask the platform
   LLM anything from the API or the dashboard **Chat** tab; replies stream token
   by token (SSE) and use whichever backend the toggle points at (local ⇄ Groq),

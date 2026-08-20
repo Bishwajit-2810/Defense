@@ -16,10 +16,10 @@ graph TB
     end
 
     subgraph "Agent Layer (Agentic RAG)"
-        Runner["AgentRunner — tool-use loop"]
-        Analyst["Analyst Agent"]
-        Coverage["Coverage Agent"]
-        Alerting["Alerting Agent"]
+        Runner["AgentRunner — tool-use loop<br/>result cap · repeat guard · non-answer guards"]
+        Analyst["analyst · coverage · alerting"]
+        Coverage["stance · comparator · toxicity"]
+        Alerting["narrative · quality · reporter"]
     end
 
     subgraph "MCP Tool Servers"
@@ -52,11 +52,27 @@ graph TB
 
 ### Current Agent Inventory
 
-| Agent | MCP Tools | Purpose |
-| :--- | :--- | :--- |
-| **Analyst** | `semantic_search`, `get_post`, `get_thread`, `representative_comments`, `trend_query`, `sentiment_over_time`, `top_posts`, `reaction_mix` | Corpus-level Q&A — answer natural language questions about campaigns using real data |
-| **Coverage** | `top_posts`, `get_post`, `fetch_more_comments` | Find under-covered posts (analyzed/total < 10%) and trigger deeper comment pulls |
-| **Alerting** | `trend_query`, `sentiment_over_time`, `top_posts` | Scheduled monitoring for sentiment/toxicity spikes |
+All nine are registered in
+[`registry.py`](src/defense/services/agents/registry.py), which is the source of
+truth for tools and budgets — the six below the rule were the §3 proposals and
+have all shipped.
+
+| Agent | Budget | MCP Tools | Purpose |
+| :--- | :---: | :--- | :--- |
+| **Analyst** | 10 | `trend_query`, `sentiment_over_time`, `top_posts`, `reaction_mix`, `semantic_search`, `search_comments`, `get_post`, `get_thread`, `representative_comments` | Corpus-level Q&A — answer natural language questions about campaigns using real data |
+| **Coverage** | 5 | `top_posts`, `get_post`, `fetch_more_comments` | Find under-covered posts (analyzed/total < 10%) and trigger deeper comment pulls |
+| **Alerting** | 8 | `trend_query`, `sentiment_over_time`, `top_posts` | Threshold monitoring — negative sentiment >50% and avg toxicity >0.6, assessed **separately** |
+| **Stance** | 12 | `stance_by_target`, `stance_over_time`, `semantic_search`, `search_comments`, `get_post`, `get_thread`, `representative_comments` | Target-dependent stance across the operator watchlist |
+| **Comparator** | 15 | `trend_query`, `sentiment_over_time`, `top_posts`, `reaction_mix`, `semantic_search` | Cross-campaign and cross-period comparison |
+| **Toxicity** | 14 | `top_posts`, `get_thread`, `representative_comments`, `search_comments`, `trend_query`, `semantic_search` | Harm patterns; `search_comments` lets it find a harassment pattern directly rather than walking posts |
+| **Narrative** | 12 | `get_clusters`, `semantic_search`, `search_comments`, `get_post`, `trend_query`, `top_posts` | Theme and narrative discovery over embedding clusters |
+| **Quality** | 8 | `coverage_stats`, `agreement_stats`, `top_posts`, `get_post` | Coverage, ensemble agreement and vector provenance — the "how reliable?" agent |
+| **Reporter** | 15 | `trend_query`, `sentiment_over_time`, `top_posts`, `reaction_mix`, `semantic_search`, `get_post`, `representative_comments` | Drafts the grounded report end to end |
+
+Every agent runs on the dedicated **`agent`** LLM role (`AGENT_LOCAL_MODEL`,
+default `llama3.1:8b-16k` / `AGENT_GROQ_MODEL`, default
+`llama-3.3-70b-versatile`) — not the architectural `llm_b` the §3 proposals
+below still name.
 
 ### Current Search Modes
 
@@ -87,7 +103,7 @@ text, which is an under-resourced setting where out-of-the-box solutions fail.
 | Retrieves raw documents from a vector store | Retrieves **structured NLP outputs** (sentiment distributions, stance verdicts, toxicity scores, topic clusters) from its own pipeline |
 | Answers are grounded in document text | Answers are grounded in **quantitative analytical data** — the agent cites specific `post_id`s and real numbers |
 | Single tool: vector search | **8 specialized MCP tools** across 3 servers — the LLM chooses which tools, with what filters, in what order |
-| No tool budget awareness | **Budget-capped tool loop** (max 10 calls) with partial-answer degradation |
+| No tool budget awareness | **Budget-capped tool loop** (5–15 calls per agent) with partial-answer degradation, plus a repeat-call guard that refuses to spend the budget re-running a deterministic query |
 
 This is an **analytical RAG**, not a document RAG. The distinction is that the
 retrieval context is not the text the user might have read anyway — it is the
@@ -510,7 +526,19 @@ examiner sees the entire flow in one artifact.
 | 🟢 P2 | **Toxicity Agent** | Low | 0 (minor enhancement) | Content moderation application angle |
 
 All six are implemented and registered in
-[registry.py](file:///home/bk/code/defense/src/defense/services/agents/registry.py).
+[`registry.py`](src/defense/services/agents/registry.py).
+
+> [!NOTE]
+> **The §3 code blocks are the original proposals, kept as the design record.**
+> What shipped differs in three ways, and `registry.py` is authoritative:
+> `llm_role` is **`agent`**, not `llm_b`; the budgets are the ones in the §1
+> inventory table above; and the system prompts have been rewritten against live
+> failures — most heavily `alerting` (which now names which tool serves which
+> threshold, because it was asserting toxicity verdicts from
+> `sentiment_over_time`, a tool with no toxicity field) and `stance` (which is
+> now told the watchlist is a closed list it cannot see and must not guess at).
+> §7 of [RAG_STATE_AND_ROADMAP.md](RAG_STATE_AND_ROADMAP.md#section-9--the-agent-layer-once-real-retrieval-was-behind-it)
+> records the eight failures those rewrites answer.
 
 ### 4.1 Honesty Invariants for Agent-Facing Tools
 
@@ -583,7 +611,7 @@ Use these when explaining:
 | *"How is this different from just putting ChatGPT on a database?"* | The agents use **specialized MCP tools** with typed parameters — `semantic_search(query, campaign_id, sentiment_filter)` is not a freeform SQL query. The tools enforce tenant isolation, rate limits, and data contracts. The agent loop has a budget cap, prompt-injection hardening, and usage tracking. |
 | *"Is the RAG actually retrieval-augmented or just a chatbot?"* | It is genuinely retrieval-augmented: the agent **must call tools** to answer analytical questions. The system prompt forbids fabricating statistics. The answer includes `citations` (post_ids extracted from tool results). Without the tools, the agent has no data. |
 | *"What happens when the semantic search uses stub embeddings?"* | The system tracks `embedding_is_stub` on every vector. When a semantic search runs over stub vectors, a warning is logged (`semantic_search_over_stub_vectors`), the search result includes `embedding_is_stub: true`, and the agent's answer reflects that the results are ordered by recency, not semantic relevance. |
-| *"How do you prevent the agent from hallucinating?"* | (1) The system prompt requires tool calls for all data claims. (2) Post-IDs are extracted from tool results via CUID regex and returned as `citations`. (3) The budget cap prevents infinite loops. (4) The `<tool_data>` wrapper prevents adversarial content from being treated as instructions. |
+| *"How do you prevent the agent from hallucinating?"* | Prompting is the weakest layer, so it is not the answer. (1) IDs and quotes asserted in the answer are checked against what the tools actually returned — and against what the model was **shown**, since a result trimmed to fit the context is not grounding. Unverified ones are appended to the answer as a warning block, not silently dropped. (2) A run is only `completed` if the answer answers something: code output, payload narration, self-narration and the empty-template shape each fail it. (3) The mirror case is caught too — an answer that says "no post-level data was retrieved" in a run that retrieved ten post_ids gets contradicted in writing. (4) An off-watchlist `target_id` is rejected with the valid ids named, so "nobody tracks that entity" cannot be reported as "the corpus is silent". (5) The `<tool_data trust="untrusted">` wrapper keeps retrieved comment text from reading as instructions. (6) The budget cap prevents infinite loops. |
 | *"Can you add new analytical capabilities without changing the agent code?"* | Yes — add an MCP tool to a server, add the tool name to the agent's `tools` list in `registry.py`. The agent discovers the tool manifest at runtime. No changes to `runner.py` or the agent loop. |
 
 ---

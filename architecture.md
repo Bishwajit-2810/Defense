@@ -322,7 +322,7 @@ Q&A, grounded reports, and targeted deep-dives (never per post) — see §11.
 | **Stage-2 LLM/VLM Workers**      | Two lanes, run concurrently: **Lane A** selective summarization (text **and image-grounded via a VLM**) / post type / insight, gated; **Lane B** the per-comment ensemble — 7 batched sentiment heads + the context-aware LLM stance pass + dedup propagation, ungated | Thin worker → local vLLM (LLM-A+LLM-B + a VLM) **or** Groq API (text + vision model); the 7 heads are `transformers` pipelines on CPU (`STAGE2_CLASSIFIER_DEVICE`) | GPU pool, stateless |
 | **Result Assembler**             | Merge, JSON-schema validate, compute aggregate confidence                                                                                                                                  | Python consumer                                                                            | stateless replicas  |
 | **Reporting/Query Service**      | Read APIs, report generation, exports                                                                                                                                                      | FastAPI + ClickHouse + PostgreSQL                                                          | stateless replicas  |
-| **Agent Orchestrator**           | Runs the **selective AI agents** (insight/analyst, coverage deep-dive, alerting) — corpus/report tier only, never per-post (§11)                                                           | FastAPI + agent loop → pluggable LLM-B/VLM backend + MCP tools                             | stateless replicas  |
+| **Agent Orchestrator**           | Runs the **selective AI agents** — nine of them (§11) — corpus/report tier only, never per-post                                                           | FastAPI + agent loop → the dedicated `agent` LLM role + MCP tools                             | stateless replicas  |
 | **MCP Servers**                  | Standardized tool/resource interfaces the agents call: `analytics-mcp` (ClickHouse/Postgres), `retrieval-mcp` (Postgres + pgvector + fetch), `ingest-mcp` (trigger upstream pull / fetch more comments) | FastAPI + MCP SDK (stdio/HTTP)                                                             | stateless replicas  |
 | **User Management**              | Tenants, users, roles, billing/usage metering                                                                                                                                              | FastAPI + PostgreSQL                                                                       | stateless replicas  |
 
@@ -790,22 +790,38 @@ own DB, never into upstream.
 
 ### AI agents (selective, corpus/report tier)
 
-Each agent is an LLM loop on the **pluggable backend** — **LLM-B** (Qwen/Llama,
-`local` vLLM ⇄ `groq`); both support tool/function calling, which MCP builds on. A
-**VLM** step is used when an answer needs the images.
+Each agent is an LLM loop on the dedicated **`agent`** role (`AGENT_LOCAL_MODEL`,
+default `llama3.1:8b-16k`, ⇄ `AGENT_GROQ_MODEL`, default
+`llama-3.3-70b-versatile`); both support tool/function calling, which MCP builds
+on. A **VLM** step is used when an answer needs the images. The roster is **nine**
+agents, defined in [`registry.py`](src/defense/services/agents/registry.py) — that
+file is the source of truth for tools and budgets, and `GET /v1/agents/types`
+serves it live:
 
-- **Insight / Analyst agent** — answers questions ("what are people saying about X
-  this week?") and generates **trend / brand / political reports** by planning
+- **Insight / Analyst agent** (budget 10) — answers questions ("what are people
+  saying about X this week?") by planning
   `trend_query → semantic_search → get_thread → synthesize → cite`. This replaces
   single-shot RAG generation ([models.md](models.md) §5) with a tool-using loop, and
   every claim is grounded in retrieved posts/comments.
-- **Coverage deep-dive agent** — fires when a post's `comment_analysis.coverage` is
-  low (`storedCommentRows ≪ commentCount`) or a post is flagged viral; calls
+- **Coverage deep-dive agent** (5) — fires when a post's `comment_analysis.coverage`
+  is low (`storedCommentRows ≪ commentCount`) or a post is flagged viral; calls
   `ingest-mcp.fetch_more_comments`, re-runs the comment pass, and escalates a richer
   thread analysis. This is the agentic way to spend effort only where it matters.
-- **Alerting / monitoring agent** (scheduled) — watches reaction-mix spikes
-  (`reaction_breakdown`), sentiment shifts, and viral signals via `analytics-mcp`,
-  investigates, and raises alerts/digests.
+- **Alerting / monitoring agent** (8, scheduled) — checks two thresholds
+  **separately**: negative sentiment >50% in a period, and avg toxicity >0.6. Its
+  prompt names which tool serves which, because `sentiment_over_time` has no
+  toxicity field and `trend_query` returns `avg_toxicity` on every row — and a run
+  that read neither still delivered a confident toxicity verdict.
+- **Stance agent** (12) — target-dependent stance across the operator watchlist,
+  the system's most novel signal made interactive.
+- **Comparator** (15) — cross-campaign and cross-period comparison.
+- **Toxicity agent** (14) — harm patterns; `search_comments` lets it find a
+  harassment pattern directly instead of walking `top_posts → get_thread`.
+- **Narrative agent** (12) — theme discovery over embedding clusters.
+- **Quality agent** (8) — coverage, ensemble agreement and vector provenance: the
+  agent that answers "how reliable is this?".
+- **Reporter** (15) — drafts the grounded **trend / brand / political report** end
+  to end.
 
 ### Guardrails (so agents don't blow the cost model)
 
@@ -815,9 +831,24 @@ Each agent is an LLM loop on the **pluggable backend** — **LLM-B** (Qwen/Llama
   `(agent, inputs, backend, model)`; repeated questions are free.
 - **Grounded & auditable.** Reports cite the posts/comments retrieved; each run
   records the backend, model, tools called, and token usage (ties into `/v1/usage`).
+- **A result cannot eat the context window.** Tool results are serialised with
+  `ensure_ascii=False` (the escaping alone was half the token bill on a Bengali
+  corpus) and capped at 6,000 characters, dropping **whole rows** with a note
+  saying what was withheld. Citations are read off what the model was *shown*.
+- **A repeat is not dispatched.** A byte-identical call is answered from the first
+  result with the untried tools named; after two, the tools are withdrawn — a model
+  repeating itself has stopped gathering evidence.
+- **A run is only `completed` if it answered something.** Code output, payload
+  narration, self-narration and the empty-template shape each get one
+  markdown-synthesis retry and then fail the run. An answer that denies retrieving
+  post-level data in a run that retrieved it is contradicted in writing, and
+  ungrounded ids and quotes are appended as a warning block rather than dropped.
 - **Backend-agnostic & policy-bound.** Agents honor the same `local`⇄`groq` policy
   as Stage 2 — privacy-locked tenants keep agent calls on `local` so retrieved
   content never egresses (§9).
 
-This layer is **not required for the MVP** (the core pipeline ships first); it lands
-with the reporting/insight phase — see [plan.md](plan.md).
+This layer was **not required for the MVP** (the core pipeline shipped first) — see
+[plan.md](plan.md), which is the dated plan record. It has since landed in full:
+nine agents, the MCP tool servers, and the hardening above. What it still lacks is
+a *measurement* — the agent answers are unmeasured for accuracy, which is the
+`🟡 Works, unmeasured` in [FEATURES.md](FEATURES.md) §9.

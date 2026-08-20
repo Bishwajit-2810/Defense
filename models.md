@@ -129,12 +129,27 @@ with its own model id so the stages and tasks run on **different models**:
 | `stage1` | `STAGE1_LOCAL_MODEL` / `STAGE1_GROQ_MODEL` | `gemma3:4b` / `llama-3.1-8b-instant` | **Stage-1 Fast NLP** — sentiment/emotion/topic/intent/toxicity/NER/keywords over caption + comments (`STAGE1_LLM=true`) |
 | `stage2` | `STAGE2_LOCAL_MODEL` / `STAGE2_GROQ_MODEL` | `qwen2.5:7b` / `llama-3.3-70b-versatile` | **Stage-2 classification** — post-type, insight, context-aware comment stance |
 | `summary` | `SUMMARY_LOCAL_MODEL` / `SUMMARY_GROQ_MODEL` | `qwen2.5:7b` / `llama-3.3-70b-versatile` | **Stage-2 summarization** — post summary and comment summary |
+| `agent` | `AGENT_LOCAL_MODEL` / `AGENT_GROQ_MODEL` | `llama3.1:8b-16k` / `llama-3.3-70b-versatile` | **All nine MCP agents** ([`registry.py`](src/defense/services/agents/registry.py)). The only role doing multi-turn tool use, so it wants solid native function calling — llama rather than qwen — and the **`-16k` suffix is load-bearing**: see the note below. |
+| `vlm` | `VLM_LOCAL_MODEL` / `VLM_GROQ_MODEL` | `qwen3-vl:4b` / — | **Image-grounded summaries.** *Substitutes for* the `summary` role rather than adding a call. If the image bytes do not resolve, the result is tagged `post_summary_source: "llm"`, not `"vlm"`. |
 
 `stage1` is the LLM realization of the small-model suite in §1 (a small fast model
-carries the high-volume per-post + per-comment NLP). `llm_a` / `llm_b` remain the
-architectural fast / quality roles for the agents + report layer (§5), and the VLM
-role is unchanged. On local Ollama all of these can be time-sliced on one GPU; on
+carries the high-volume per-post + per-comment NLP). `llm_a` / `llm_b` remain as the
+architectural fast / quality roles and are still what `reports.py` asks for, but the
+**agents no longer use them** — they resolve through the dedicated `agent` role above. On local Ollama all of these can be time-sliced on one GPU; on
 Groq they are just distinct model IDs.
+
+**Why the agent model carries a `-16k` tag.** `ollama serve` runs with no
+`OLLAMA_CONTEXT_LENGTH` here, so it defaults to a **4,096-token** window and
+*silently discards* anything longer — oldest messages first, which is the system
+prompt and then the operator's question. It reports only what it evaluated, so
+nothing in the response says this happened. `llama3.1:8b-16k` is a derived tag
+([`config/Modelfile.llama31-16k`](config/Modelfile.llama31-16k)) setting
+`num_ctx 16384`; llama3.1 itself supports 131,072, and 16k is what this machine
+evaluates quickly (~960 tok/s prompt eval, ~2 GB of KV cache). Measured: an
+11k-token prompt evaluates **24** tokens on `llama3.1:8b` and all **11,045** on
+`llama3.1:8b-16k`. Setting `OLLAMA_CONTEXT_LENGTH` on the service is the better
+fix because it covers the pipeline models too — but a `PARAMETER` inside a model
+wins over it, so retag or drop the suffix if you go that route.
 
 **Why `summary` is separate from `stage2`.** The two Stage-2 jobs have opposite
 requirements: classification picks from a **fixed vocabulary** and wants a cheap,
@@ -347,10 +362,11 @@ backend.
 
 ### Delivered as an agentic loop over MCP tools
 
-In practice RAG here is driven by the **Insight/Analyst agent**
-([architecture.md](architecture.md) §11), not a single retrieve→generate call. The
-agent runs on **LLM-B** (Qwen/Llama — both support tool/function calling, which MCP
-builds on) and plans over **MCP tools**: `retrieval-mcp.semantic_search` /
+In practice RAG here is driven by the **agent layer** — nine agents, of which
+`analyst` is the general-purpose one ([architecture.md](architecture.md) §11) — not
+a single retrieve→generate call. They run on the dedicated **`agent` role**
+(`llama3.1:8b-16k` locally, `llama-3.3-70b-versatile` on Groq; both support
+tool/function calling, which MCP builds on) and plan over **MCP tools**: `retrieval-mcp.semantic_search` /
 `get_thread` (Postgres + pgvector) for grounding, `analytics-mcp.trend_query` /
 `reaction_mix` (ClickHouse) for the numbers, and a **VLM** step when an answer needs
 the images. This keeps reports **grounded and cited**, lets the agent decide _how
