@@ -1591,6 +1591,116 @@ async def _stub_get_clusters(
 _STANCE_KEYS = ("supportive", "opposing", "neutral")
 
 
+# ---------------------------------------------------------------------------
+# The watchlist roster — what a `target_id` is allowed to be
+#
+# Both stance tools take an optional `target_id`, and it used to be applied as a
+# plain equality filter against whatever string the model passed. An id nobody
+# tracks then produced exactly the same empty list as a quiet corpus, so:
+#
+#     stance_over_time(target_id="primary_political_figures")  ->  []
+#
+# was reported to the operator as "no stance data exists for the primary
+# political figures" — while the one entity actually on the watchlist had stance
+# rows in seven posts the whole time. The model cannot guess an id (the roster
+# is an operator-owned file it never sees) and it has no tool to list one, so it
+# invents one, and inventing one is indistinguishable from finding nothing.
+#
+# The roster is the authority, so an unknown id is now REJECTED the way
+# `_clean_campaign_id` rejects a placeholder: the runner turns the raised error
+# into a tool result the model reads, and the message names every valid id so
+# the correction costs one turn out of the budget rather than the whole run.
+#
+# A target that IS on the watchlist and has no rows still returns empty. That is
+# a real answer ("nobody mentioned them" — or an alias-coverage bug, which is
+# what `libs/stance_targets.unmatched_targets` is for), and it is the answer the
+# tool docstrings promise.
+# ---------------------------------------------------------------------------
+
+#: Loaded watchlist, or ``False`` once loading has failed (so it is tried once).
+_WATCHLIST_CACHE: Any = None
+
+
+def _watchlist() -> Any:
+    """The operator watchlist, cached. ``None`` when it could not be read."""
+    global _WATCHLIST_CACHE
+    if _WATCHLIST_CACHE is None:
+        path = config.stance_targets_file
+        try:
+            from defense.libs.stance_targets import load_targets  # noqa: PLC0415
+
+            _WATCHLIST_CACHE = load_targets(path)
+            log.info(
+                "watchlist_loaded",
+                path=path,
+                targets=[t.id for t in _WATCHLIST_CACHE.targets],
+            )
+        except Exception as exc:
+            # Do not take the stance tools down with a bad config file: fall
+            # back to the unvalidated filter and say so in the log.
+            log.error("watchlist_load_failed", path=path, error=str(exc))
+            _WATCHLIST_CACHE = False
+    return _WATCHLIST_CACHE or None
+
+
+def _clean_target_ids(target_id: Any) -> set[str] | None:
+    """Resolve an LLM-supplied target to watchlist ids, or raise if unknown.
+
+    Accepts an id, a display name, or any alias — including the Bangla and
+    Banglish spellings, since those are what the corpus and therefore the
+    retrieved comments actually contain. Several-in-one-string
+    ("pm_hasina, imran_khan") is split on commas rather than rejected: it is the
+    shape a model reaches for when the question names a group of people, and
+    every part still has to resolve.
+
+    ``None`` means "no filter" and is the only value that widens the query.
+    """
+    if target_id is None:
+        return None
+    parts = [p.strip() for p in str(target_id).split(",")]
+    wanted = [p for p in parts if p and p.lower() not in _UNSPECIFIED]
+    if not wanted:
+        return None
+    # "all" is a real intent here and it is the *unfiltered* query, not an
+    # entity — rejecting it as an unknown target would be pedantry.
+    if any(w.lower() in _ALL_CAMPAIGNS for w in wanted):
+        return None
+
+    wl = _watchlist()
+    if wl is None or not wl.targets:
+        # No roster to check against — behave as before rather than reject
+        # everything, but leave a trail explaining why nothing was validated.
+        log.warning("target_id_unvalidated", target_id=target_id)
+        return set(wanted)
+
+    lookup: dict[str, str] = {}
+    for t in wl.targets:
+        for key in (t.id, t.display, *t.aliases):
+            k = str(key or "").strip().lower()
+            if k:
+                lookup.setdefault(k, t.id)
+
+    resolved: set[str] = set()
+    unknown: list[str] = []
+    for w in wanted:
+        tid = lookup.get(w.lower())
+        if tid:
+            resolved.add(tid)
+        else:
+            unknown.append(w)
+
+    if unknown:
+        roster = ", ".join(f"{t.id} ({t.display})" for t in wl.targets)
+        raise ValueError(
+            f"target_id {', '.join(repr(u) for u in unknown)} is not on the "
+            f"watchlist, so no stance was ever scored for it. The watchlist "
+            f"tracks exactly: {roster}. Pass one of those ids, or omit target_id "
+            f"to get every tracked target. Do not report this as an absence of "
+            f"data in the corpus."
+        )
+    return resolved
+
+
 def _date_filter(
     where_parts: list[str],
     params: dict[str, Any],
@@ -1681,13 +1791,13 @@ def _blank_bucket(target_id: str) -> dict:
 def _fold_target_stances(
     rollup: dict[str, dict],
     blob: Any,
-    target_id: str | None,
+    target_ids: set[str] | None,
 ) -> None:
     """Merge one post's target_stances dict into the corpus-level rollup."""
     if not isinstance(blob, dict):
         return
     for tid, entry in blob.items():
-        if target_id and tid != target_id:
+        if target_ids and tid not in target_ids:
             continue
         if not isinstance(entry, dict):
             continue
@@ -1730,7 +1840,7 @@ async def stance_by_target(
     campaign_id: Annotated[str | None, Field(description="Campaign to scope to; 'all' for every campaign.")] = None,
     from_date: Annotated[str | None, Field(description="Optional inclusive start date (YYYY-MM-DD).")] = None,
     to_date: Annotated[str | None, Field(description="Optional inclusive end date (YYYY-MM-DD).")] = None,
-    target_id: Annotated[str | None, Field(description="Optional watchlist target id to filter to (e.g. 'pm_hasina').")] = None,
+    target_id: Annotated[str | None, Field(description="Optional watchlist target: an id, display name or alias from the operator watchlist. An entity that is not on the watchlist is rejected (the error lists the valid ids) — it was never scored, so there is nothing to filter to. Omit to report every tracked target.")] = None,
     tenant_id: Annotated[str | None, Field(description="Optional tenant ID filter.")] = None,
 ) -> list[dict]:
     """Stance distribution per watchlist target entity (supportive / opposing / neutral
@@ -1738,16 +1848,18 @@ async def stance_by_target(
     posts of a campaign. Targets nobody mentioned are absent, not zero-filled — an
     empty result means no watchlist entity was mentioned in the selected posts."""
     clean_cid = _clean_campaign_id(campaign_id)
+    target_ids = _clean_target_ids(target_id)
     log.info(
         "tool_call", tool="stance_by_target", campaign_id=clean_cid,
-        target_id=target_id, scope="all_campaigns" if clean_cid is None else "campaign",
+        target_id=target_id, resolved_target_ids=sorted(target_ids or ()),
+        scope="all_campaigns" if clean_cid is None else "campaign",
     )
 
     rows = await _latest_target_stances(clean_cid, tenant_id, from_date, to_date)
 
     rollup: dict[str, dict] = {}
     for row in rows:
-        _fold_target_stances(rollup, row.get("target_stances"), target_id)
+        _fold_target_stances(rollup, row.get("target_stances"), target_ids)
 
     out = [_finalise_target(b) for b in rollup.values()]
     out.sort(key=lambda t: t["mentions"], reverse=True)
@@ -1761,16 +1873,18 @@ async def stance_over_time(
     from_date: Annotated[str | None, Field(description="Optional inclusive start date (YYYY-MM-DD).")] = None,
     to_date: Annotated[str | None, Field(description="Optional inclusive end date (YYYY-MM-DD).")] = None,
     granularity: Annotated[str, Field(description="Bucket size: 'hour', 'day' or 'week'.")] = "day",
-    target_id: Annotated[str | None, Field(description="Optional watchlist target id; omit to sum all targets.")] = None,
+    target_id: Annotated[str | None, Field(description="Optional watchlist target: an id, display name or alias from the operator watchlist. An entity that is not on the watchlist is rejected (the error lists the valid ids) — it was never scored, so there is nothing to filter to. Omit to sum all tracked targets.")] = None,
     tenant_id: Annotated[str | None, Field(description="Optional tenant ID filter.")] = None,
 ) -> list[dict]:
     """Time series of per-target stance (supportive / opposing / neutral and net polarity),
     bucketed by the analysis timestamp. One row per (period, target)."""
     clean_cid = _clean_campaign_id(campaign_id)
+    target_ids = _clean_target_ids(target_id)
     bucket = granularity if granularity in ("hour", "day", "week") else "day"
     log.info(
         "tool_call", tool="stance_over_time", campaign_id=clean_cid,
-        target_id=target_id, granularity=bucket,
+        target_id=target_id, resolved_target_ids=sorted(target_ids or ()),
+        granularity=bucket,
     )
 
     rows = await _latest_target_stances(
@@ -1781,7 +1895,7 @@ async def stance_over_time(
     for row in rows:
         period = row.get("period")
         key = period.isoformat() if hasattr(period, "isoformat") else str(period)
-        _fold_target_stances(periods.setdefault(key, {}), row.get("target_stances"), target_id)
+        _fold_target_stances(periods.setdefault(key, {}), row.get("target_stances"), target_ids)
 
     out: list[dict] = []
     for period in sorted(periods):

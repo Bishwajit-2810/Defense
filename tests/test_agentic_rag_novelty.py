@@ -96,6 +96,23 @@ def _stances(**targets):
     }
 
 
+# The stance tools validate target_id against the operator watchlist, which is a
+# machine-local config file. These tests assert FILTERING, so they supply their own
+# roster — otherwise they would pass or fail on whoever happens to be on the real
+# list, and their synthetic ids ("pm", "army") are on nobody's.
+def _fake_watchlist(monkeypatch, **ids):
+    from defense.libs.stance_targets import Target, Targets
+
+    monkeypatch.setattr(
+        retrieval,
+        "_WATCHLIST_CACHE",
+        Targets(targets=tuple(
+            Target(id=tid, display=display, polarity="neutral", aliases=(tid,))
+            for tid, display in ids.items()
+        )),
+    )
+
+
 def test_all_nine_agents_registered():
     """Ensure all 9 agents are properly registered."""
     expected_agents = {
@@ -212,15 +229,52 @@ async def test_stance_by_target_filters_and_reports_absence(monkeypatch):
     """A target nobody mentioned is absent, never zero-filled or invented."""
     rows = [{"post_id": "p1", "target_stances": _stances(pm=("The PM", 1, 2, 0, "llm"))}]
     monkeypatch.setattr(retrieval, "_AsyncSessionLocal", _fake_pg(rows))
+    _fake_watchlist(monkeypatch, pm="The PM", nobody="Nobody At All")
 
     only_pm = await retrieval.stance_by_target(campaign_id="all", target_id="pm")
     assert len(only_pm) == 1 and only_pm[0]["target_id"] == "pm"
 
+    # Tracked, but unmentioned in these posts — a real answer, not an error.
     missing = await retrieval.stance_by_target(campaign_id="all", target_id="nobody")
     assert missing == []
 
     monkeypatch.setattr(retrieval, "_AsyncSessionLocal", _fake_pg([]))
     assert await retrieval.stance_by_target(campaign_id="all") == []
+
+
+@pytest.mark.asyncio
+async def test_stance_tools_reject_an_invented_target(monkeypatch):
+    """An id nobody tracks must not read as an empty corpus.
+
+    The model cannot see the watchlist and has no tool that lists it, so asked
+    about "the primary political figures" it invents an id. Filtering on it
+    returned `[]`, which the stance agent reported as "no stance over time data
+    is available" while the one tracked entity had rows in seven posts. The error
+    has to name the roster: that is the only way the model learns what to ask for.
+    """
+    rows = [{"post_id": "p1", "target_stances": _stances(pm=("The PM", 1, 2, 0, "llm"))}]
+    monkeypatch.setattr(retrieval, "_AsyncSessionLocal", _fake_pg(rows))
+    _fake_watchlist(monkeypatch, pm="The PM")
+
+    for tool in (retrieval.stance_by_target, retrieval.stance_over_time):
+        with pytest.raises(ValueError) as exc:
+            await tool(campaign_id="all", target_id="primary_political_figures")
+        assert "pm" in str(exc.value)          # the roster is in the message
+        assert "watchlist" in str(exc.value).lower()
+
+    # The several-in-one-string shape a model reaches for when the question names
+    # a group: every part is resolved, and one bad part fails the call.
+    with pytest.raises(ValueError) as exc:
+        await retrieval.stance_by_target(campaign_id="all", target_id="pm, imran_khan")
+    assert "imran_khan" in str(exc.value) and "'pm'" not in str(exc.value)
+
+    # Display names and aliases resolve, so a target named in prose still works.
+    by_display = await retrieval.stance_by_target(campaign_id="all", target_id="The PM")
+    assert [t["target_id"] for t in by_display] == ["pm"]
+
+    # "all" means the unfiltered query, not an entity nobody tracks.
+    assert retrieval._clean_target_ids("all") is None
+    assert retrieval._clean_target_ids("  ") is None
 
 
 @pytest.mark.asyncio
@@ -237,6 +291,7 @@ async def test_stance_over_time_buckets_by_period(monkeypatch):
          "target_stances": _stances(pm=("The PM", 0, 5, 0, "llm"))},
     ]
     monkeypatch.setattr(retrieval, "_AsyncSessionLocal", _fake_pg(rows))
+    _fake_watchlist(monkeypatch, pm="The PM")
 
     series = await retrieval.stance_over_time(campaign_id="all", granularity="day", target_id="pm")
 

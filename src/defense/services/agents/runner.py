@@ -171,7 +171,20 @@ _PAYLOAD_NARRATION_RE = re.compile(
     r"|json (?:dump|output|payload|data)"
     r"|(?:with|has|contains) the following (?:keys|fields)"
     r"|(?:each|every) \w+ is represented by"
-    r"|(?:a |the )?unique identifier for (?:the|each)",
+    r"|(?:a |the )?unique identifier for (?:the|each)"
+    # The shape that got through: a field-by-field walkthrough, phrased as "The
+    # <field_name> field indicates/contains/is set to …". A live answer used it
+    # five times over — "The overall_sentiment field indicates…", "The
+    # embedding_is_stub field is set to True…", "The chunk_idx field is set to
+    # 0…" — and tripped only ONE of the patterns above ("provided text"), so the
+    # two-hit threshold was never reached and the walkthrough shipped as a
+    # briefing. Field names are snake_case or quoted; requiring that keeps this
+    # off prose like "the sentiment field of public opinion".
+    r"|(?:the|each|every) [`'\"]?[a-z][a-z0-9]*_[a-z0-9_]*[`'\"]? (?:field|key|column|attribute)"
+    r"|(?:the|each|every) [`'\"][a-z_]+[`'\"] (?:field|key|column|attribute)"
+    r"|(?:field|key|column) is set to"
+    r"|(?:breakdown|walkthrough|explanation) of the (?:data|json|payload|output|result)"
+    r"|(?:each|every) (?:post|row|record|comment|entry) has a unique",
     re.IGNORECASE,
 )
 
@@ -186,6 +199,103 @@ def _describes_the_payload(text: str) -> bool:
     if not text:
         return False
     return len(set(_PAYLOAD_NARRATION_RE.findall(text))) >= 2
+
+
+# ---------------------------------------------------------------------------
+# The third non-answer shape: a briefing about the agent's own plumbing
+# ---------------------------------------------------------------------------
+# Neither guard above fires on this one, and a live run produced it in full:
+#
+#     "The original user question was not provided. However, based on the tool
+#      call response, I can infer that the operator is attempting to retrieve
+#      data using the top_posts tool with an invalid metric."
+#
+# followed by a table of valid `metric` values and a request that the operator
+# rephrase. The run was recorded `completed` with 32 citations attached.
+#
+# The immediate cause was context-window overflow discarding the question (see
+# _cap_tool_result), but the guard is worth having on its own terms: an answer
+# whose subject is the agent's tool arguments is never an answer about the
+# corpus, whatever put it there.
+#
+# `_QUESTION_LOST_RE` is treated as conclusive on a single hit. A briefing does
+# not claim the operator asked nothing — only a truncated context does — and it
+# is the highest-value signal available, because the model is reporting the exact
+# failure the operator otherwise cannot see.
+_QUESTION_LOST_RE = re.compile(
+    r"(?:original |user'?s? |the )?question (?:was|is) not (?:provided|given|specified|included)"
+    r"|no (?:user )?question (?:was|has been) (?:provided|given|asked)"
+    r"|you (?:did ?n'?o?t|have not) (?:provide|ask|specify|give)[a-z ]{0,12} question"
+    r"|(?:i |i'm |am )?(?:do ?n'?o?t|cannot|can'?t) see (?:a|any|the) (?:user )?question"
+    r"|conversation just started",
+    re.IGNORECASE,
+)
+
+# Weaker on their own — a legitimate answer may mention a failed call once while
+# explaining a gap — so these need two distinct hits, matching the payload rule.
+_SELF_NARRATION_RE = re.compile(
+    r"the tool call (?:failed|response|result)"
+    r"|(?:is|are) not (?:a )?valid (?:value|values|metric|argument|parameter)"
+    r"|valid (?:values|metrics|arguments|parameters) (?:are|include|listed)"
+    r"|please (?:rephrase|clarify|provide more)"
+    r"|(?:i can |i )infer that the operator"
+    r"|(?:call|specify|pass) (?:the tool|it) with a valid"
+    r"|based on the tool call",
+    re.IGNORECASE,
+)
+
+
+def _answers_about_the_run(text: str) -> bool:
+    """True when the answer is about the agent's own tool calls, not the corpus."""
+    if not text:
+        return False
+    if _QUESTION_LOST_RE.search(text):
+        return True
+    return len(set(_SELF_NARRATION_RE.findall(text))) >= 2
+
+
+# ---------------------------------------------------------------------------
+# The fourth shape: the empty template
+# ---------------------------------------------------------------------------
+# A live run with the context fixes in place made 14 tool calls across 5 tools,
+# read 20,411 prompt tokens of real data — and then wrote the PLAN instead of the
+# answer: three fenced tool-call objects, the briefing's headings, tables whose
+# every cell was `...`, and a closing "Note: The actual values will be filled in
+# based on the data retrieved from the function calls."
+#
+# It is the most dangerous shape of the four, because it is structurally a
+# briefing: correct headings, correct columns, correct sections. Skimmed or
+# screenshotted it reads as a report whose numbers happen to be missing, and the
+# fenced JSON is not caught by `_is_code_output` (which looks for Python).
+_PLACEHOLDER_ANSWER_RE = re.compile(
+    r"(?:actual )?values will be (?:filled|populated|inserted)"
+    r"|will be filled in based on"
+    r"|\[?(?:insert|fill in|to be determined|tbd)[\]:]",
+    re.IGNORECASE,
+)
+
+#: A table cell holding nothing but an ellipsis. One can be legitimate elision;
+#: a table built entirely out of them is a template.
+_EMPTY_CELL_RE = re.compile(r"\|\s*(?:\.\.\.|…|-{3,}\s*\?)\s*(?=\|)")
+
+
+def _answers_with_placeholders(text: str) -> bool:
+    """True when the answer is the shape of a briefing with no findings in it."""
+    if not text:
+        return False
+    if _PLACEHOLDER_ANSWER_RE.search(text):
+        return True
+    return len(_EMPTY_CELL_RE.findall(text)) >= 3
+
+
+def _is_non_answer(text: str) -> bool:
+    """True for every shape of "completed" run that answers no question."""
+    return (
+        _is_code_output(text)
+        or _describes_the_payload(text)
+        or _answers_about_the_run(text)
+        or _answers_with_placeholders(text)
+    )
 
 
 # ---------------------------------------------------------------------------
@@ -372,6 +482,139 @@ def _walk_ids(node: Any, post_ids: list[str], comment_ids: list[str]) -> None:
     elif isinstance(node, list):
         for item in node:
             _walk_ids(item, post_ids, comment_ids)
+
+
+# ---------------------------------------------------------------------------
+# How much of a tool result reaches the model
+# ---------------------------------------------------------------------------
+# Two measurements, both taken against the live corpus and the live model:
+#
+#   * This corpus is Bengali, and `json.dumps` defaults to ensure_ascii=True, so
+#     every Bengali character left here as a six-byte `\uXXXX` escape. One
+#     `semantic_search(limit=50)` result — 32 rows — serialised to 76,666
+#     characters costing ~39,000 tokens. The same rows with ensure_ascii=False
+#     are 23,194 characters and ~18,600 tokens: the escaping alone was HALF the
+#     token bill, for zero added information.
+#
+#   * Ollama silently discards a prompt that exceeds its context window, oldest
+#     messages first, and reports only what it actually evaluated. With the
+#     default 4096-token window that 39,000-token result pushed the system
+#     prompt and the operator's question out of the context entirely. The model
+#     then answered from whatever survived at the tail: one live run described
+#     the JSON's field names, and the next opened "The original user question was
+#     not provided" and briefed the operator on a tool-argument error instead.
+#     Both were recorded `completed`.
+#
+# So a single result must not be allowed to dominate the window no matter how
+# large the window is. Rows are dropped whole — truncating mid-JSON hands the
+# model malformed data to reason over — and the model is TOLD what was dropped,
+# because a silently shortened list reads as a complete answer to the query.
+#
+# 6000 characters is ~4,300 tokens of this corpus (measured: 1.41 chars/token
+# unescaped, against 1.89 escaped). The agent model runs a 16,384-token window
+# (config.agent_local_model), which that leaves room to use: system prompt ~1k +
+# two rounds of results ~8.6k + the 2048-token completion budget ~= 12k. A third
+# round rotates the oldest result out, and the question survives that because
+# `_question_reminder` re-appends it after every round.
+_MAX_TOOL_RESULT_CHARS = 6_000
+
+
+def _dumps(value: Any) -> str:
+    """Serialise a tool result for the model. Never escapes non-ASCII."""
+    return json.dumps(value, default=str, ensure_ascii=False)
+
+
+def _cap_tool_result(result: Any) -> tuple[Any, str, str | None]:
+    """``(kept, serialised, note)`` — the part of a result that fits the budget.
+
+    ``kept`` is what the model is shown, and is what citations must be taken
+    from: attributing an id the model never saw is the citation-inflation bug one
+    layer down.
+    """
+    text = _dumps(result)
+    if len(text) <= _MAX_TOOL_RESULT_CHARS:
+        return result, text, None
+
+    if isinstance(result, list) and len(result) > 1:
+        kept = list(result)
+        while kept and len(_dumps(kept)) > _MAX_TOOL_RESULT_CHARS:
+            kept.pop()
+        if kept:
+            note = (
+                f"TRUNCATED: showing {len(kept)} of {len(result)} rows — the rest "
+                "would not fit in the context window and were NOT sent. This is "
+                "not the whole result set: narrow the query, lower `limit`, or add "
+                "a filter, and do not describe it as complete."
+            )
+            return kept, _dumps(kept), note
+        # Even the first row alone is over budget, so there is no whole-row
+        # subset to send. Falls through to text truncation rather than returning
+        # a row that busts the window it exists to protect.
+
+    # A dict or a scalar too big to trim structurally. `kept` is None rather than
+    # the full object: the caller reads citations off the truncated TEXT instead,
+    # so an id past the cut cannot be credited to an answer that never saw it.
+    note = (
+        f"TRUNCATED: this result was {len(text)} characters and was cut to "
+        f"{_MAX_TOOL_RESULT_CHARS}. The tail was NOT sent; treat it as partial."
+    )
+    return None, text[:_MAX_TOOL_RESULT_CHARS], note
+
+
+# ---------------------------------------------------------------------------
+# Keeping the question in view
+# ---------------------------------------------------------------------------
+# The question is the second message in the conversation, so it is the first
+# thing a context-window overflow discards — and even inside the window a small
+# local model that has just read several thousand tokens of JSON reliably answers
+# the payload instead of the operator. Restating it after each round of tool
+# results costs one line and puts it back at the tail, where the model is
+# looking. It must not read as "stop and answer now": a run that still needs a
+# second hop has to be free to take it.
+# ---------------------------------------------------------------------------
+# The same call, over and over
+# ---------------------------------------------------------------------------
+# With the context window fixed the model stopped bailing out early and started
+# looping instead: one live run spent 11 of its 15 calls on BYTE-IDENTICAL
+# `semantic_search(query="comment sentiment", campaign_id="all")` calls, hit the
+# budget cap, and returned the cap notice as the operator's briefing.
+#
+# Re-running a deterministic query cannot produce new rows, so the repeat is not
+# dispatched: the model is told the call already ran and that the rows are above.
+# After `_MAX_REPEATED_CALLS` of them the tools are WITHDRAWN for the rest of the
+# run — a model that is repeating itself has stopped gathering evidence, and the
+# only remaining useful act is to write the answer from what it already has.
+_MAX_REPEATED_CALLS = 2
+
+
+def _call_signature(tool_name: str, arguments: dict) -> str:
+    """Identity of a tool call: the name plus its meaningful arguments.
+
+    Absent and explicitly-null arguments are the same call — models fill every
+    optional field with null on one turn and omit it on the next.
+    """
+    meaningful = {k: v for k, v in sorted((arguments or {}).items()) if v is not None}
+    return f"{tool_name}({json.dumps(meaningful, sort_keys=True, ensure_ascii=False)})"
+
+
+def _repeat_note(tool_name: str, first_call: int) -> str:
+    return (
+        f"REPEAT: this exact `{tool_name}` call already ran as call #{first_call} "
+        "and its rows are already above. It was NOT run again — the same arguments "
+        "cannot return different rows. Do not call it a third time. Either call a "
+        "DIFFERENT tool or different arguments, or answer the operator's question "
+        "now from the data you already have."
+    )
+
+
+def _question_reminder(query: str) -> str:
+    return (
+        f"The operator's question, unchanged: {query}\n"
+        "Call another tool if you still need data. Otherwise answer THIS question "
+        "now, in markdown, using the data above. Do not describe the tool output, "
+        "its fields or its format, and do not report on your own tool calls — the "
+        "operator can see those."
+    )
 
 
 def _ids_from_result(result: Any, result_str: str) -> tuple[list[str], list[str]]:
@@ -1166,6 +1409,9 @@ class AgentRunner:
         text_recoveries = 0
         retrieval_retries = 0
         second_hop_retries = 0
+        # signature -> (call_number, serialised result) for calls already made.
+        seen_calls: dict[str, tuple[int, str]] = {}
+        repeated_calls = 0
         answer_is_tool_call = False
         answer_is_not_an_answer = False
         # Tools that have actually returned data. "representative_comments was
@@ -1177,11 +1423,20 @@ class AgentRunner:
         retrieved_post_ids: list[str] = []
 
         while True:
+            # A model that is repeating a call has stopped gathering evidence.
+            # Taking the tools away is what ends the loop: asking nicely does not,
+            # and the budget cap ends the RUN instead of the looping.
+            offer_tools = repeated_calls < _MAX_REPEATED_CALLS
+            if not offer_tools and tools:
+                run_log.warning(
+                    "tools_withdrawn_after_repeats", repeats=repeated_calls
+                )
+
             # Call the LLM with tool definitions via the OpenAI tool_calls API
             llm_response = await self._llm_chat_with_tools(
                 agent_def=agent_def,
                 messages=messages,
-                tools=tools,
+                tools=tools if offer_tools else [],
                 tenant_policy=tenant_policy,
                 backend_override=backend_override,
             )
@@ -1338,15 +1593,12 @@ class AgentRunner:
 
                 # If the model emitted code, or a tool call we could not recover,
                 # prompt once for direct markdown synthesis
-                if (
-                    _is_code_output(content)
-                    or _describes_the_payload(content)
-                    or _recover_text_tool_calls(content)
-                ):
+                if _is_non_answer(content) or _recover_text_tool_calls(content):
                     run_log.info(
                         "non_answer_detected_requesting_markdown_synthesis",
                         code=_is_code_output(content),
                         payload_narration=_describes_the_payload(content),
+                        self_narration=_answers_about_the_run(content),
                     )
                     synth_messages = list(messages)
                     synth_messages.append({"role": "assistant", "content": content})
@@ -1380,8 +1632,7 @@ class AgentRunner:
                         synth_content = synth_resp.get("content") or ""
                         if (
                             synth_content
-                            and not _is_code_output(synth_content)
-                            and not _describes_the_payload(synth_content)
+                            and not _is_non_answer(synth_content)
                             and not _recover_text_tool_calls(synth_content)
                         ):
                             content = synth_content
@@ -1395,8 +1646,16 @@ class AgentRunner:
                 # fabricated — but it answers no question, and reporting it as
                 # `completed` tells the operator a briefing is waiting when what
                 # is waiting is a description of a JSON object.
-                if _is_code_output(content) or _describes_the_payload(content):
-                    run_log.error("answer_is_not_an_answer", chars=len(content or ""))
+                if _is_non_answer(content) or _recover_text_tool_calls(content):
+                    run_log.error(
+                        "answer_is_not_an_answer",
+                        chars=len(content or ""),
+                        code=_is_code_output(content),
+                        payload_narration=_describes_the_payload(content),
+                        self_narration=_answers_about_the_run(content),
+                        placeholders=_answers_with_placeholders(content),
+                        still_a_tool_call=bool(_recover_text_tool_calls(content)),
+                    )
                     answer_is_not_an_answer = True
                     run.error = (
                         "The model described the tool output instead of answering "
@@ -1539,27 +1798,72 @@ class AgentRunner:
                 await emit()
 
                 started = time.monotonic()
+                # What the model is shown, which may be less than what the tool
+                # returned — see _cap_tool_result.
+                shown = None
+                cap_note: str | None = None
+                signature = _call_signature(tool_name, arguments)
+                prior = seen_calls.get(signature)
+                if prior is not None and not shape_errors:
+                    first_call, prior_result = prior
+                    repeated_calls += 1
+                    run_log.warning(
+                        "duplicate_tool_call_skipped",
+                        tool=tool_name,
+                        first_call=first_call,
+                        repeats=repeated_calls,
+                    )
+                    entry.update(
+                        status="skipped",
+                        error=None,
+                        duration_ms=0,
+                        result_size=None,
+                        repeat_of=first_call,
+                    )
+                    await emit()
+                    messages.append(
+                        {
+                            "role": "tool",
+                            "tool_call_id": tc["id"],
+                            "content": _wrap_tool_result(
+                                tool_name,
+                                prior_result,
+                                note=_repeat_note(tool_name, first_call),
+                            ),
+                        }
+                    )
+                    continue
+
                 if shape_errors:
                     # The call is malformed in a way no coercion can decide.
                     # Dispatching it would spend a round trip to be told the
                     # same thing in language the model has already misread.
                     result = None
                     error_str = " ".join(shape_errors)
-                    result_str = json.dumps({"error": error_str})
+                    result_str = _dumps({"error": error_str})
                     run_log.warning("tool_call_rejected", tool=tool_name, error=error_str)
                 else:
                     try:
                         result = await self.mcp.call_tool(tool_name, arguments)
-                        result_str = json.dumps(result, default=str)
+                        shown, result_str, cap_note = _cap_tool_result(result)
+                        if cap_note:
+                            run_log.warning(
+                                "tool_result_truncated",
+                                tool=tool_name,
+                                returned=len(result) if isinstance(result, list) else None,
+                                shown=len(shown) if isinstance(shown, list) else None,
+                                chars=len(_dumps(result)),
+                            )
                         error_str = None
                     except Exception as exc:
                         result = None
-                        result_str = json.dumps({"error": str(exc)})
+                        result_str = _dumps({"error": str(exc)})
                         error_str = str(exc)
                         run_log.warning("tool_call_error", tool=tool_name, error=str(exc))
 
                 if not error_str:
                     succeeded_tools.add(tool_name)
+                    seen_calls[signature] = (tool_call_count, result_str)
 
                 entry.update(
                     status="error" if error_str else "ok",
@@ -1572,7 +1876,10 @@ class AgentRunner:
                 # Extract IDs from the result for citations. Post and comment IDs
                 # are both CUIDs in this corpus, so they are told apart by the
                 # FIELD they arrived in, not by their shape.
-                found_posts, found_comments = _ids_from_result(result, result_str)
+                # `shown`, not `result`: ids trimmed out by the cap never
+                # reached the model, and citing them would credit the answer with
+                # grounding it does not have.
+                found_posts, found_comments = _ids_from_result(shown, result_str)
                 for pid in found_posts:
                     if pid not in seen_post_ids:
                         retrieved_post_ids.append(pid)
@@ -1609,10 +1916,20 @@ class AgentRunner:
                                     if dropped_args
                                     else None,
                                     _describe_empty(result),
+                                    cap_note,
                                 )
                             ),
                         ),
                     }
+                )
+
+            # The question, restated at the tail of the context after every round
+            # of tool results — see _question_reminder. Guarded on having actually
+            # dispatched something so a round that only hit the budget cap does
+            # not add a turn.
+            if tool_calls:
+                messages.append(
+                    {"role": "user", "content": _question_reminder(query)}
                 )
 
         # ----------------------------------------------------------------

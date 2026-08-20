@@ -13,7 +13,7 @@ export default function NavTabs({ activeTab, setActiveTab }) {
     { id: 'pipeline', label: 'Pipeline', icon: GitCommit },
     { id: 'trace', label: 'Trace', icon: GitCommit },
     { id: 'warnings', label: 'Warnings', icon: AlertTriangle },
-    { id: 'logs', label: 'Logs', icon: Terminal, badge: 0 },
+    { id: 'logs', label: 'Logs', icon: Terminal },
   ];
 
   return (

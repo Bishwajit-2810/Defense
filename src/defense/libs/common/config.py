@@ -379,7 +379,19 @@ class Settings(BaseSettings):
     summary_local_model: str = "qwen2.5:7b"
 
     # Agent Model (Dedicated 3rd model for Agentic RAG & reasoning)
-    agent_local_model: str = "llama3.1:8b"
+    #
+    # `-16k` is a derived tag over plain llama3.1:8b that sets `num_ctx 16384`
+    # (config/Modelfile.llama31-16k). `ollama serve` defaults to a 4096-token
+    # window and silently DISCARDS anything longer, oldest messages first — so a
+    # large tool result pushed the system prompt and the operator's question out
+    # of context and the agent answered from the tail of a JSON payload. Measured
+    # on this machine: an 11k-token prompt evaluates 24 tokens on `llama3.1:8b`
+    # and all 11,045 on `llama3.1:8b-16k`.
+    #
+    # Setting OLLAMA_CONTEXT_LENGTH on the ollama service is the better fix — it
+    # covers the pipeline models too — but a PARAMETER in the model wins over it,
+    # so retag or drop the `-16k` suffix here if you go that route.
+    agent_local_model: str = "llama3.1:8b-16k"
     agent_groq_model: str = "llama-3.3-70b-versatile"
 
     # Backward-compatible role models
