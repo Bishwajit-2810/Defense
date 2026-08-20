@@ -37,13 +37,49 @@ Format your response as a structured analytical audit report with:
 - Queued Actions Summary
 DO NOT output Python code or scripts."""
 
+# This agent checks two thresholds from three tools, and the prompt has to say
+# which tool serves which threshold, because two live failures came from it not
+# saying so.
+#
+# 1. Post IDs. "Key Trigger Posts with IDs and citations" cannot be filled from
+#    the trend tools — both return one row per time bucket with no post_id in
+#    them. A run called only those, repeated one until the tool budget withdrew,
+#    and wrote the section as `Post ID: [insert post ID]` with two invented
+#    comment quotes underneath; `top_posts`, the one tool that returns post_ids,
+#    was never called.
+#
+# 2. Toxicity. A later run asserted "no sudden spikes in negative sentiment
+#    (>50% neg) or elevated toxicity" — and an earlier one, on identical data,
+#    asserted the opposite. Neither had grounds: `sentiment_over_time` has no
+#    toxicity field, and while `trend_query` DOES return `avg_toxicity` on every
+#    row, the model called it for `avg_sentiment` and never read the column. So
+#    the data was in its context both times and the verdict was a coin flip.
+#    Naming the column, and requiring the figure be quoted either way, is what
+#    makes the verdict checkable by the operator reading it.
 ALERTING_SYSTEM_PROMPT = """You are a monitoring agent for social media campaigns.
-Check for: sudden spikes in negative sentiment (>50% negative in last 24h), toxicity spikes (avg toxicity > 0.6), and viral posts with no analysis yet.
-Format your response as a structured alert intelligence briefing with:
-- Alert Level & Immediate Threat Assessment
-- Metrics & Spike Data Table
-- Key Trigger Posts with IDs and citations
-DO NOT output Python code or scripts."""
+Check for two threshold breaches, separately: negative sentiment >50% in a period, and avg toxicity >0.6.
+
+Your tools:
+- `trend_query` — one row per period, each carrying count, avg_sentiment AND avg_toxicity. One call gets all three; do not call it again for a different `metric`. Its `avg_toxicity` column is your only source for the toxicity threshold.
+- `sentiment_over_time` — one row per period with positive/negative/neutral/mixed POST COUNTS. No toxicity field.
+- `top_posts` — the only tool that returns post_ids. `metric` must be one of "total_reactions", "comment_count", "toxicity_score", "hate_speech_score"; `overall_sentiment` is a row field, not a metric, and passing it wastes a call.
+
+Write exactly three sections:
+
+## Alert Level & Immediate Threat Assessment
+Alert Level: Normal, Elevated or High.
+**Negative sentiment:** verdict, with the periods and counts behind it.
+**Toxicity:** verdict, with the peak avg_toxicity value and its period — e.g. "No breach (peak avg_toxicity 0.47, 2026-05-06)".
+
+Both lines are required. Never write a toxicity verdict without its figure, and never infer toxicity from negative sentiment — they are different measurements. If you never called `trend_query`, that line reads "not assessed — `trend_query` was not called".
+
+## Metrics & Spike Data Table
+Every period the tools returned.
+
+## Key Trigger Posts with IDs and citations
+The post_ids `top_posts` returned, copied character for character. If you did not call it, write "No trigger posts identified: no post-level data was retrieved". Never write a placeholder such as `[insert post ID]`.
+
+Never quote comment text — no tool here returns any, so a quoted sentence is fabricated. DO NOT output Python code or scripts."""
 
 ANALYST_AGENT = AgentDefinition(
     name="analyst",
@@ -90,7 +126,11 @@ ALERTING_AGENT = AgentDefinition(
     system_prompt=ALERTING_SYSTEM_PROMPT,
     tools=["trend_query", "sentiment_over_time", "top_posts"],
     llm_role="agent",
-    max_tool_calls=5,
+    # Five was set when the prompt named no tools and the model used one or two.
+    # It now routes two thresholds across three tools, and a repeat still spends
+    # the count — a live run reached the cap and returned "[Budget cap of 5 tool
+    # calls reached]" as the briefing, having answered nothing.
+    max_tool_calls=8,
 )
 
 STANCE_SYSTEM_PROMPT = """You are a stance analysis expert. You investigate how public opinion distributes across specific targets (political figures, organizations, policies) in social media campaigns.

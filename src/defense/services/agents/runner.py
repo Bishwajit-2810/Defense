@@ -267,10 +267,36 @@ def _answers_about_the_run(text: str) -> bool:
 # briefing: correct headings, correct columns, correct sections. Skimmed or
 # screenshotted it reads as a report whose numbers happen to be missing, and the
 # fenced JSON is not caught by `_is_code_output` (which looks for Python).
+
+# A bracketed instruction to the writer, left in the writing. The live Spike
+# Alerting run wrote its whole "Key Trigger Posts" section as
+#
+#     Post ID: [insert post ID]
+#         + "This is a terrible product. I'm so disappointed."
+#
+# and got away with it: _PLACEHOLDER_ANSWER_RE's last alternative was
+# `\[?(?:insert|...)[\]:]`, which requires the closing bracket to follow the
+# verb immediately, so "[insert]" was caught and "[insert post ID]" — the form a
+# model actually writes, because the placeholder names the field it stands in
+# for — was not. The run was recorded `completed`, no synthesis retry fired, and
+# an operator was handed a template with fabricated quotes under it.
+#
+# The verb list is deliberately short. A hit here fails an otherwise good run,
+# and a briefing's recommendations section legitimately writes bracketed
+# imperatives — "[Add a campaign filter]", "[Enter the watchlist id]" — so
+# "add" and "enter" are left out. Every verb kept is one that only ever stands
+# in for a value the writer did not have.
+_PLACEHOLDER_SPAN_RE = re.compile(
+    r"[\[<]\s*(?:insert|fill in|fill|specify|your|placeholder|todo|"
+    r"to be determined|tbd|n/?a|xxx+)\b[^\]>\n]{0,40}[\]>]",
+    re.IGNORECASE,
+)
+
 _PLACEHOLDER_ANSWER_RE = re.compile(
     r"(?:actual )?values will be (?:filled|populated|inserted)"
     r"|will be filled in based on"
-    r"|\[?(?:insert|fill in|to be determined|tbd)[\]:]",
+    r"|\[?(?:insert|fill in|to be determined|tbd)[\]:]"
+    rf"|{_PLACEHOLDER_SPAN_RE.pattern}",
     re.IGNORECASE,
 )
 
@@ -597,14 +623,35 @@ def _call_signature(tool_name: str, arguments: dict) -> str:
     return f"{tool_name}({json.dumps(meaningful, sort_keys=True, ensure_ascii=False)})"
 
 
-def _repeat_note(tool_name: str, first_call: int) -> str:
-    return (
+def _repeat_note(
+    tool_name: str, first_call: int, untried: list[str] | None = None
+) -> str:
+    """Tell the model the call did not run, and name where it can go instead.
+
+    ``untried`` is the tools it has not called at all yet. Naming them is what
+    turned the note into a usable instruction: the Spike Alerting run spent
+    calls 2, 3 and 4 on byte-identical `sentiment_over_time`, which withdrew the
+    tools at _MAX_REPEATED_CALLS with `top_posts` — the ONLY tool in that
+    agent's roster returning post_ids — never called. Told to write "Key Trigger
+    Posts with IDs", the model had no IDs and wrote `[insert post ID]` twice.
+    "Call a DIFFERENT tool" was already in this note; an 8B model needed the
+    list.
+    """
+    note = (
         f"REPEAT: this exact `{tool_name}` call already ran as call #{first_call} "
         "and its rows are already above. It was NOT run again — the same arguments "
         "cannot return different rows. Do not call it a third time. Either call a "
         "DIFFERENT tool or different arguments, or answer the operator's question "
         "now from the data you already have."
     )
+    if untried:
+        note += (
+            "\nYou have NOT yet called: "
+            + ", ".join(f"`{t}`" for t in sorted(untried))
+            + ". If your answer needs post IDs, quotes or per-post detail, the "
+            "aggregate rows above cannot supply them — call one of those tools."
+        )
+    return note
 
 
 def _question_reminder(query: str) -> str:
@@ -693,9 +740,17 @@ _TOKEN_RE = re.compile(r"[A-Za-z0-9_-]{4,}")
 
 
 def _unverified_citations(answer: str, tool_output: str) -> list[str]:
-    """Post or comment IDs asserted in the answer that no tool ever returned."""
+    """Post or comment IDs asserted in the answer that no tool ever returned.
+
+    Placeholder spans are removed before the ID patterns run. "Post ID: [insert
+    post ID]" matched _CITED_ID_RE on the word `insert`, so the warning block
+    told the operator that `insert` was an ungrounded citation — which is both
+    untrue (nothing was cited) and noise on top of the real finding, that the
+    answer is a template. _answers_with_placeholders is what reports that.
+    """
     if not answer:
         return []
+    answer = _PLACEHOLDER_SPAN_RE.sub(" ", answer)
     claimed = (
         set(_CITED_ID_RE.findall(answer))
         | set(_CITED_NUMERIC_ID_RE.findall(answer))
@@ -734,8 +789,19 @@ _CODE_SPAN_RE = re.compile(r"```.*?```|``.*?``|`[^`\n]*`", re.DOTALL)
 
 
 def _strip_code(text: str) -> str:
-    """Drop fenced blocks and inline code, keeping the prose around them."""
-    stripped = _CODE_SPAN_RE.sub(" ", text or "")
+    """Drop fenced blocks, inline code and leaked <tool_data> tags.
+
+    The tags matter for the same reason JSON does: they are mostly quote
+    characters. A model that copies its own framing back out — the Spike
+    Alerting run wrote `(cited from <tool_data source="sentiment_over_time"
+    trust="untrusted">)` — leaves `"` pairs that span from prose into an
+    attribute, and _QUOTED_SPAN_RE reported two of them as ungrounded comment
+    text: `(cited from <tool_data source=` and `>) * Post ID: [insert post ID]
+    +`. Neither is a claim about the corpus, and the one real fabrication in
+    that answer was listed alongside them.
+    """
+    stripped = _TOOL_DATA_TAG_RE.sub(" ", text or "")
+    stripped = _CODE_SPAN_RE.sub(" ", stripped)
     # An unclosed fence — the model hit the token ceiling mid-block — leaves the
     # remainder of the message as code with nothing to terminate it.
     fence = stripped.find("```")
@@ -779,6 +845,52 @@ def _unverified_quotes(answer: str, tool_output: str) -> list[str]:
             continue
         ungrounded.append(_WHITESPACE_RE.sub(" ", raw).strip())
     return ungrounded
+
+
+# ---------------------------------------------------------------------------
+# The answer that denies its own retrieval
+# ---------------------------------------------------------------------------
+# The mirror image of a fabrication, and it arrived as a direct consequence of
+# fixing one. The Spike Alerting prompt used to demand "Key Trigger Posts with
+# IDs" with no way to satisfy it, so the model wrote `[insert post ID]`; the
+# prompt now supplies an honest out for the case where no post-level tool ran.
+# A live run then called `top_posts`, put its ten real post_ids in the metrics
+# table, and wrote the out anyway:
+#
+#     ## Key Trigger Posts with IDs and citations
+#     No trigger posts identified: no post-level data was retrieved.
+#
+# That is worse than the placeholder it replaced. `[insert post ID]` is visibly
+# unfinished; "no post-level data was retrieved" is a confident false statement
+# about the run, and an operator has no way to see that nine posts were sitting
+# in the context when it was written. A canned phrase in a prompt is a phrase an
+# 8B model will emit whether or not its condition holds, so the guard is here
+# rather than in the wording.
+# Only claims about what THIS RUN retrieved. "No posts were found mentioning the
+# new policy" is a claim about a query — an analyst run whose semantic_search
+# came back empty writes it while an earlier top_posts legitimately returned
+# rows — so "found" is excluded and "retrieved"/"returned" are not.
+_DENIES_RETRIEVAL_RE = re.compile(
+    r"no (?:post-level|post level|post) data was (?:retrieved|returned|available)"
+    r"|no trigger posts identified"
+    r"|no posts were (?:retrieved|returned)"
+    r"|(?:no|zero) post[_\s]?ids? were (?:retrieved|returned)",
+    re.IGNORECASE,
+)
+
+
+def _denies_retrieved_posts(answer: str, retrieved_post_ids: list[str]) -> list[str]:
+    """Post IDs the run retrieved while the answer said it retrieved none.
+
+    Empty unless BOTH are true: the answer denies having post-level data, and
+    tools returned some. A run that genuinely retrieved nothing and says so is
+    the honest case this leaves alone.
+    """
+    if not answer or not retrieved_post_ids:
+        return []
+    if not _DENIES_RETRIEVAL_RE.search(answer):
+        return []
+    return sorted(set(retrieved_post_ids))
 
 
 # A claim about what comments contain, as opposed to how many there are.
@@ -1828,7 +1940,18 @@ class AgentRunner:
                             "content": _wrap_tool_result(
                                 tool_name,
                                 prior_result,
-                                note=_repeat_note(tool_name, first_call),
+                                note=_repeat_note(
+                                    tool_name,
+                                    first_call,
+                                    untried=sorted(
+                                        available_tools
+                                        - {
+                                            e["tool_name"]
+                                            for e in run.tools_used
+                                            if e.get("tool_name")
+                                        }
+                                    ),
+                                ),
                             ),
                         }
                     )
@@ -2017,6 +2140,23 @@ class AgentRunner:
                     "comment text from the corpus and must not be reported as "
                     f"such:\n{shown}{more}"
                 )
+
+        # An answer that denies retrieving post-level data in a run that
+        # retrieved it. Checked against `seen_post_ids` rather than the answer's
+        # own table: the observed run printed the IDs in the wrong section and
+        # then denied having them, so the answer contradicts itself and only the
+        # run record settles which half is true.
+        denied = _denies_retrieved_posts(model_answer, sorted(seen_post_ids))
+        if denied:
+            run_log.warning("answer_denies_retrieved_posts", count=len(denied))
+            shown = ", ".join(f"`{c}`" for c in denied[:10])
+            more = f" …and {len(denied) - 10} more" if len(denied) > 10 else ""
+            run.answer = (run.answer or "") + (
+                "\n\n---\n**Contradicts the run.** The text above says no "
+                "post-level data was retrieved, but this run's tool calls "
+                f"returned {len(denied)} post ID(s): {shown}{more}. Treat the "
+                "'no data' statement as wrong, not the retrieval."
+            )
 
         # Statistics about comment content, in a run that never read a comment.
         # Only checked in that case: once a comment tool has returned rows, a
