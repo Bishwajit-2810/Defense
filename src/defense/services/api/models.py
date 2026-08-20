@@ -491,3 +491,12 @@ class SearchResponse(BaseModel):
     semantic: bool
     total: int
     results: List[SearchResult]
+    # Which arm actually answered: "exact_id" | "keyword" | "semantic" | "hybrid".
+    # A UI must be able to tell "this IS the post you named" from "these are
+    # posts that read like your words" — a pasted post id used to come back as 20
+    # cosine neighbours, which looks identical to a successful search.
+    match_type: Optional[str] = None
+    # Set when the query looked like an identifier and matched nothing. Without
+    # it, "no such post" and "no post mentions this phrase" are the same empty
+    # list, and the semantic arm answers the first question with 20 wrong posts.
+    id_lookup_missed: bool = False

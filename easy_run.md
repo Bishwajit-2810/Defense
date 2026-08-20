@@ -195,7 +195,11 @@ Open **<http://127.0.0.1:8080>** in your browser.
 submit. (Dev mode accepts any key.) The tabs:
 
 - **Overview** — usage/cost counters + corpus charts
-- **Posts** — the ingested posts
+- **Posts** — the ingested posts, searchable by **post id / platform id / URL /
+  campaign** or by caption, summary, topic and keyword. An id search checks the
+  whole corpus, not just the rows on screen, so "no post has that id" and "not on
+  this page" are different answers; the id cell has a copy button because it shows
+  only the first 8 characters
 - **Analysis Jobs** — submit / track analysis runs, and control them:
   **Stop** (no further post is analysed; the ones already inside a stage finish,
   so the counter may tick up once or twice more), **Resume** (re-queues *only*

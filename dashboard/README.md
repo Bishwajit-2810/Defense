@@ -67,6 +67,21 @@ npm run lint       # oxlint
   **Resume** reports `30/300 already done, 270 re-queued` rather than just
   "resumed", which is the difference between a continuation and a no-op. If you
   reword these, keep the caveat.
+- **A search hit is a whole post, so render it like one.** `/v1/search` returns
+  the complete canonical result in `result` (the 200-char `snippet` is a list-view
+  convenience, not the limit of what you may show), and that object is exactly
+  what `PostModal` takes. Both the Search tab and the Posts tab's server-fallback
+  rows pass it straight in — no second request for the analysis, only for the
+  comment pages. The Search tab showed the truncated snippet and dropped `result`
+  until 21 Aug 2026, which left a post found by id unreadable and unopenable.
+- **The Posts search is two-tier, and the tiers mean different things.** It
+  filters the loaded rows first (instant, no request), and only falls back to
+  `/v1/search` when that finds nothing — because the table holds the latest 100
+  posts, so a filter over "what happens to be loaded" would report *not found*
+  for a post that exists. The empty state therefore has three branches, not one:
+  nothing uploaded, nothing matched anywhere, and **no post has that id**
+  (`id_lookup_missed` from the API). Collapsing them back into one line is how
+  this page came to answer an id search with "Upload posts to get started".
 - **`STALE_AFTER_MS` mirrors `_STALE_JOB_SECONDS`** in
   `routers/analysis.py`. It decides both the **stalled** badge and whether Resume
   is worth pressing, and the API applies the same threshold when it accepts or

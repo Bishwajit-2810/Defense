@@ -629,7 +629,7 @@ egresses to Groq.
 | `POST /v1/auth/sse-ticket`         | Single-use, ~60s, hash-stored ticket for `EventSource` — which cannot send headers      |
 | `GET /v1/health` / `GET /v1/ready` | Liveness / readiness probes                                                            |
 | `GET /v1/usage`                    | Per-tenant usage + cost metering (posts, LLM calls, by backend incl. Groq tokens/cost) |
-| `GET /v1/search?q=&semantic=true`  | Semantic/keyword search over analyzed posts (pgvector + ClickHouse)                    |
+| `GET /v1/search?q=&semantic=true`  | Search analyzed posts: keyword (JSONB), semantic (pgvector), `mode=hybrid` (RRF). A `post_id` / `platform_post_id` / URL / `campaign_id` is matched **exactly, ahead of every mode** — `match_type` says which arm answered, and `id_lookup_missed` flags an id that matched nothing rather than embedding it |
 | `GET /v1/agents/{id}`              | Poll an agent run (analyst query / report) — status, answer, citations, usage          |
 | `POST /v1/chat`                    | Free-form chatbot over the pipeline LLM (backend follows the toggle)                   |
 | `POST /v1/chat/stream`             | Same as `/v1/chat` but streams the reply token-by-token (SSE)                          |

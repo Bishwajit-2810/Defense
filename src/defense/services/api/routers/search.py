@@ -24,6 +24,144 @@ log = structlog.get_logger(__name__)
 router = APIRouter(prefix="/v1/search", tags=["search"])
 
 
+# An identifier is looked up, not searched for.
+#
+# Every post carries three ids — the upstream CUID (`post_id`), the platform's
+# own numeric id (`platform_post_id`) and its URL — and pasting one of them was
+# the one query the search could not answer. Keyword search read only
+# summary/caption/keywords/topics/themes, so a real post id returned **0
+# results**; semantic search embedded the id and returned **20 cosine
+# neighbours**, none of them the post asked for, which is worse because it looks
+# like a successful search.
+#
+# So an exact identifier match short-circuits ahead of the requested mode. It is
+# not a ranking tweak: "show me this post" and "show me posts that read like
+# these words" are different questions, and only one of them has a right answer.
+# Shape test. It may only decide two things: whether to *also* try a partial-id
+# lookup, and whether to warn that an id matched nothing. It can never suppress
+# a search — a false positive here must cost an extra query and a notice, never
+# results, because "one long word" is a perfectly ordinary text query.
+#
+# Requiring a digit is what keeps it off natural language: `bangladesh`,
+# `মুসলিমদের` and `disinformation` are words, while a CUID
+# (`cmp58e24s04pgwglq7g9u9jz0`) and a platform id (`122162468462710684`) both
+# carry digits. A URL is taken as an id on its prefix alone.
+_ID_MIN_LEN = 8
+
+
+def _looks_like_identifier(q: str) -> bool:
+    q = q.strip()
+    if q.startswith(("http://", "https://")):
+        return True
+    if len(q) < _ID_MIN_LEN or " " in q:
+        return False
+    body = q.replace("-", "").replace("_", "")
+    return body.isalnum() and any(c.isdigit() for c in body)
+
+
+async def _partial_id_search(
+    db: AsyncSession,
+    q: str,
+    limit: int,
+    tenant_id: str,
+) -> list[SearchResult]:
+    """Identifier *prefix/substring* match — the clipboard case.
+
+    The dashboard's post table renders `post_id.slice(0, 8)`, so what an operator
+    actually copies is a prefix. Exact match cannot answer that, and in semantic
+    mode nothing else would either.
+    """
+    needle = q.strip().lower()
+    if not needle:
+        return []
+    escaped = needle.replace("\\", "\\\\").replace("%", "\\%").replace("_", "\\_")
+    rows = (
+        await db.execute(
+            text(
+                r"""
+                SELECT ar.post_id, ar.campaign_id,
+                       ar.result->>'post_summary' AS snippet,
+                       ar.result
+                FROM analysis_results ar
+                WHERE ar.tenant_id = :tid
+                  AND (
+                        LOWER(ar.post_id) LIKE :pattern ESCAPE ''
+                     OR LOWER(COALESCE(ar.result->>'platform_post_id', '')) LIKE :pattern ESCAPE ''
+                     OR LOWER(COALESCE(ar.result->>'url', '')) LIKE :pattern ESCAPE ''
+                     OR LOWER(COALESCE(ar.campaign_id, '')) LIKE :pattern ESCAPE ''
+                  )
+                ORDER BY ar.created_at DESC
+                LIMIT :limit
+                """
+            ),
+            {"pattern": f"%{escaped}%", "tid": tenant_id, "limit": limit},
+        )
+    ).mappings().all()
+
+    return [
+        SearchResult(
+            post_id=r["post_id"],
+            campaign_id=r["campaign_id"],
+            score=1.0,
+            snippet=(r["snippet"] or "")[:200] or None,
+            result=r["result"],
+            embedding_is_stub=bool((r["result"] or {}).get("embedding_is_stub")),
+        )
+        for r in rows
+    ]
+
+
+async def _exact_id_search(
+    db: AsyncSession,
+    q: str,
+    limit: int,
+    tenant_id: str,
+) -> list[SearchResult]:
+    """Return the post(s) whose identifier IS *q*, or an empty list.
+
+    Matched case-insensitively on the CUID, the platform id and the URL.
+    `campaign_id` is matched too, so pasting a campaign id lists its posts
+    instead of returning nothing.
+    """
+    needle = q.strip()
+    if not needle:
+        return []
+    rows = (
+        await db.execute(
+            text(
+                """
+                SELECT ar.post_id, ar.campaign_id,
+                       ar.result->>'post_summary' AS snippet,
+                       ar.result
+                FROM analysis_results ar
+                WHERE ar.tenant_id = :tid
+                  AND (
+                        LOWER(ar.post_id) = LOWER(:needle)
+                     OR LOWER(COALESCE(ar.result->>'platform_post_id', '')) = LOWER(:needle)
+                     OR LOWER(COALESCE(ar.result->>'url', '')) = LOWER(:needle)
+                     OR LOWER(COALESCE(ar.campaign_id, '')) = LOWER(:needle)
+                  )
+                ORDER BY ar.created_at DESC
+                LIMIT :limit
+                """
+            ),
+            {"needle": needle, "tid": tenant_id, "limit": limit},
+        )
+    ).mappings().all()
+
+    return [
+        SearchResult(
+            post_id=r["post_id"],
+            campaign_id=r["campaign_id"],
+            score=1.0,  # An exact id match is not a similarity.
+            snippet=(r["snippet"] or "")[:200] or None,
+            result=r["result"],
+            embedding_is_stub=bool((r["result"] or {}).get("embedding_is_stub")),
+        )
+        for r in rows
+    ]
+
+
 # ---------------------------------------------------------------------------
 # GET /v1/search
 # ---------------------------------------------------------------------------
@@ -68,17 +206,73 @@ async def search(
     tenant_id = current_user.get("tenant_id", "default")
 
     requested = (mode or ("semantic" if semantic else "keyword")).strip().lower()
+
+    # Identifier first, in EVERY mode. Runs unconditionally — no shape test gates
+    # it — so a query that happens to be an id can never be answered by cosine
+    # distance instead.
+    exact = await _exact_id_search(db, q=q, limit=limit, tenant_id=tenant_id)
+    if exact:
+        log.info("exact_id_search_hit", q=q, total=len(exact))
+        return SearchResponse(
+            query=q,
+            semantic=False,
+            total=len(exact),
+            results=exact,
+            match_type="exact_id",
+        )
+
+    # Looks like an id but no exact match: try it as a prefix before falling
+    # back. This is the case the post table creates by rendering 8 characters of
+    # a 25-character id.
+    id_shaped = _looks_like_identifier(q)
+    if id_shaped:
+        partial = await _partial_id_search(db, q=q, limit=limit, tenant_id=tenant_id)
+        if partial:
+            log.info("partial_id_search_hit", q=q, total=len(partial))
+            return SearchResponse(
+                query=q,
+                semantic=False,
+                total=len(partial),
+                results=partial,
+                match_type="id_prefix",
+            )
+
+    # No identifier matched, and the query is id-shaped. Downgrade to the keyword
+    # arm whatever was asked for: an identifier has no meaning to embed, so the
+    # semantic arm answers it with its nearest neighbours in the vector space —
+    # 20 unrelated posts that look exactly like a successful search. The keyword
+    # arm is kept (rather than returning nothing) because an id-shaped string can
+    # legitimately appear in a caption, and because the shape test is a guess.
+    if id_shaped and requested in ("semantic", "hybrid"):
+        results = await _keyword_search(
+            db, q=q, campaign_id=campaign_id, limit=limit, tenant_id=tenant_id
+        )
+        log.info("id_lookup_missed_downgraded_to_keyword", q=q, requested=requested, total=len(results))
+        return SearchResponse(
+            query=q, semantic=False, total=len(results), results=results,
+            match_type="keyword", id_lookup_missed=True,
+        )
+
+    # Otherwise run exactly the mode that was asked for. `id_lookup_missed`
+    # travels with the response so a UI can lead with "no post has that id"
+    # rather than presenting text matches as if they were the post.
     if requested == "hybrid":
         results = await _hybrid_search(
             db, q=q, campaign_id=campaign_id, limit=limit, tenant_id=tenant_id
         )
         log.info("hybrid_search_completed", q=q, total=len(results))
-        return SearchResponse(query=q, semantic=True, total=len(results), results=results)
+        return SearchResponse(
+            query=q, semantic=True, total=len(results), results=results,
+            match_type="hybrid", id_lookup_missed=id_shaped,
+        )
 
     if requested == "semantic":
         results = await _semantic_search(db, q=q, campaign_id=campaign_id, limit=limit, tenant_id=tenant_id)
         log.info("semantic_search_completed", q=q, total=len(results))
-        return SearchResponse(query=q, semantic=True, total=len(results), results=results)
+        return SearchResponse(
+            query=q, semantic=True, total=len(results), results=results,
+            match_type="semantic", id_lookup_missed=id_shaped,
+        )
 
     # --- Keyword search via Postgres JSONB ---
     results = await _keyword_search(db, q=q, campaign_id=campaign_id, limit=limit, tenant_id=tenant_id)
@@ -89,7 +283,10 @@ async def search(
         campaign_id=campaign_id,
         total=len(results),
     )
-    return SearchResponse(query=q, semantic=False, total=len(results), results=results)
+    return SearchResponse(
+        query=q, semantic=False, total=len(results), results=results,
+        match_type="keyword", id_lookup_missed=id_shaped,
+    )
 
 
 async def _semantic_search(
@@ -221,12 +418,18 @@ async def _keyword_search(
 ) -> list[SearchResult]:
     """Run a keyword search against analysis_results using JSONB operators.
 
-    Searches the following JSONB fields (case-insensitive):
+    Searches the following (case-insensitive substring):
       - result->>'post_summary'
       - result->>'post_text'   (the post's own caption)
       - result->'keywords' (array contains)
       - result->'topics'   (array contains)
       - result->'comment_analysis'->'themes' (array contains)
+      - the identifiers: post_id, platform_post_id, url, campaign_id
+
+    The identifiers are here for the **partial** case; an exact one is answered
+    before this function is reached. It matters because the dashboard's post
+    table renders only the first 8 characters of a post id, so the string an
+    operator has in their clipboard is usually a prefix, not the whole thing.
 
     LIKE metacharacters in ``q`` are escaped, so a query of ``%`` searches for a
     literal percent sign rather than matching every row.
@@ -240,8 +443,12 @@ async def _keyword_search(
     pattern = f"%{escaped}%"
     params: dict[str, Any] = {"pattern": pattern, "limit": limit, "tid": tenant_id}
 
-    # Base WHERE clause — text fields
+    # Base WHERE clause — text fields, then the identifiers
     where_clauses = [
+        r"LOWER(ar.post_id) LIKE :pattern ESCAPE '\'",
+        r"LOWER(COALESCE(ar.result->>'platform_post_id', '')) LIKE :pattern ESCAPE '\'",
+        r"LOWER(COALESCE(ar.result->>'url', '')) LIKE :pattern ESCAPE '\'",
+        r"LOWER(COALESCE(ar.campaign_id, '')) LIKE :pattern ESCAPE '\'",
         r"LOWER(ar.result->>'post_summary') LIKE :pattern ESCAPE '\'",
         r"LOWER(ar.result->>'post_text') LIKE :pattern ESCAPE '\'",
         r"EXISTS (SELECT 1 FROM jsonb_array_elements_text(ar.result->'keywords') kw WHERE LOWER(kw) LIKE :pattern ESCAPE '\')",

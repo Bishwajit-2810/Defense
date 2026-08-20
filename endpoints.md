@@ -460,7 +460,48 @@ An **unknown** key is accepted only in dev (`ALLOW_UNKNOWN_API_KEYS`, which
 defaults on for `APP_ENV=dev` and off everywhere else) — so a deployment that
 forgot to provision keys fails **closed** rather than open.
 
-### Search (keyword & semantic)
+### Search (identifier, keyword & semantic)
+
+**An identifier is looked up, not searched for.** Paste a `post_id`,
+`platform_post_id`, post URL or `campaign_id` and it is matched exactly, ahead of
+whichever mode you asked for, and the response says so with
+`match_type: "exact_id"`:
+
+```bash
+curl -s -H "$KEY" "$API/v1/search?q=cmp58e24s04pgwglq7g9u9jz0" | python -m json.tool
+# → {"query":"cmp58e24…","semantic":false,"total":1,"match_type":"exact_id",
+#    "id_lookup_missed":false,"results":[{…that post…}]}
+
+# A prefix works too — the dashboard's post table renders only the first 8
+# characters of an id, so a prefix is usually what is in your clipboard.
+curl -s -H "$KEY" "$API/v1/search?q=cmp58e24"          # → match_type "id_prefix"
+
+# An id that matches nothing says so, instead of answering with neighbours:
+curl -s -H "$KEY" "$API/v1/search?q=cmzzzz9999zzzz9999zzzz999&semantic=true"
+# → {"total":0,"match_type":"keyword","id_lookup_missed":true}
+```
+
+This exists because both arms got an id query wrong, in opposite directions.
+Keyword search read only `post_summary` / `post_text` / `keywords` / `topics` /
+comment `themes`, so a **real post id returned 0 results** — the id being the one
+string most likely to be pasted in. Semantic search embedded the id and returned
+**20 cosine neighbours**, none of them the post asked for, which is the worse
+failure of the two: an empty result reads as "not found", twenty ranked results
+read as a successful search. Hence:
+
+* an exact identifier match short-circuits **every** mode, and its `score` is 1.0
+  because an exact match is not a similarity;
+* an id-shaped query that matches no identifier is **downgraded to the keyword
+  arm** rather than embedded, and carries `id_lookup_missed: true` so a client
+  can lead with "no post has that id";
+* the shape test requires a digit, so `bangladesh` and `মুসলিমদের` are words, not
+  ids — and a false positive can only cost an extra query, never results, because
+  the keyword arm always still runs;
+* the keyword arm now also covers the identifier columns, for the partial case.
+
+`match_type` is `exact_id` | `id_prefix` | `keyword` | `semantic` | `hybrid`.
+
+Free-text search is unchanged:
 
 ```bash
 curl -s -H "$KEY" "$API/v1/search?q=politics&semantic=false&limit=10" | python -m json.tool
@@ -475,7 +516,14 @@ curl -s -H "$KEY" "$API/v1/search?q=fuel%20price%20anger&semantic=true&limit=10"
 # downstream — the stub is the same 768 dims as a real vector, and deriving it
 # from the dimension is why every row was recorded as `false` until 5 Aug 2026
 # (PROJECT_ASSESSMENT §13.2).
-# → {"query":"…","semantic":true,"total":N,"results":[{"post_id","score","snippet","result":{<full §1 JSON>}}]}
+# → {"query":"…","semantic":true,"total":N,"match_type":"…","id_lookup_missed":false,
+#    "results":[{"post_id","score","snippet","result":{<full §1 JSON>}}]}
+#
+# `snippet` is the summary truncated to 200 chars for the list view; `result` is
+# the COMPLETE canonical object, so a client never needs a second request to show
+# a hit in full. The dashboard's Search tab opens it in the same detail modal the
+# Posts tab uses (it rendered only the snippet until 21 Aug 2026, which left the
+# post you had just found by id unreadable).
 ```
 
 ### Reports (grounded = LLM-written executive summary)
