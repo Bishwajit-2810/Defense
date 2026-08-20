@@ -3,6 +3,8 @@ honouring the dashboard's runtime backend toggle (local Ollama ↔ Groq Cloud).
 
     POST /v1/chat          → {"reply", "backend", "model", "usage"}
     POST /v1/chat/stream    → Server-Sent Events (token streaming)
+    POST /v1/chat/agent     → route the message to an MCP-backed agent, or
+                              back to plain chat when no agent fits
 
 Backend resolution, per request:
 
@@ -20,9 +22,10 @@ from __future__ import annotations
 
 import json
 import os
-from typing import AsyncGenerator, Optional
+from typing import Any, AsyncGenerator, Optional
 from defense.libs.common.config import get_settings
 
+import httpx
 import redis.asyncio as aioredis
 import structlog
 from fastapi import APIRouter, Depends, HTTPException, status
@@ -118,7 +121,7 @@ def _normalise_backend(requested: Optional[str]) -> Optional[str]:
     if r in _VALID_BACKENDS:
         return r
     raise HTTPException(
-        status_code=status.HTTP_422_UNPROCESSABLE_ENTITY,
+        status_code=status.HTTP_422_UNPROCESSABLE_CONTENT,
         detail=f'backend must be one of {list(_VALID_BACKENDS)}, "auto", or null',
     )
 
@@ -130,12 +133,12 @@ def _build_messages(body: ChatRequest) -> list[dict]:
         history = [ChatMessage(role="user", content=body.message)]
     if not history:
         raise HTTPException(
-            status_code=status.HTTP_422_UNPROCESSABLE_ENTITY,
+            status_code=status.HTTP_422_UNPROCESSABLE_CONTENT,
             detail="provide either `message` (string) or `messages` (non-empty list)",
         )
     if len(history) > _MAX_MESSAGES:
         raise HTTPException(
-            status_code=status.HTTP_422_UNPROCESSABLE_ENTITY,
+            status_code=status.HTTP_422_UNPROCESSABLE_CONTENT,
             detail=f"too many messages (max {_MAX_MESSAGES})",
         )
 
@@ -147,14 +150,14 @@ def _build_messages(body: ChatRequest) -> list[dict]:
     for m in history:
         if m.role not in _VALID_MSG_ROLES:
             raise HTTPException(
-                status_code=status.HTTP_422_UNPROCESSABLE_ENTITY,
+                status_code=status.HTTP_422_UNPROCESSABLE_CONTENT,
                 detail=f"invalid message role {m.role!r}; use one of {list(_VALID_MSG_ROLES)}",
             )
         total += len(m.content)
         msgs.append({"role": m.role, "content": m.content})
     if total > _MAX_CHARS:
         raise HTTPException(
-            status_code=status.HTTP_422_UNPROCESSABLE_ENTITY,
+            status_code=status.HTTP_422_UNPROCESSABLE_CONTENT,
             detail=f"conversation too long (max {_MAX_CHARS} characters)",
         )
     return msgs
@@ -299,3 +302,287 @@ async def chat_stream(
         media_type="text/event-stream",
         headers={"Cache-Control": "no-cache", "X-Accel-Buffering": "no"},
     )
+
+
+# --------------------------------------------------------------------------- #
+# Agent routing
+# --------------------------------------------------------------------------- #
+# Plain chat cannot see the corpus — it has no tools. The agents service can:
+# it runs a real MCP tool loop over the analytics / retrieval / ingest servers.
+# This endpoint decides, per message, which of the two should answer, so the
+# operator gets one chat box instead of having to know in advance whether their
+# question is a "data question".
+#
+# The decision is a small LLM classification over the agent registry's own
+# descriptions, so adding an agent to the registry is enough to make it
+# reachable from chat — there is no second list here to keep in sync.
+
+# The fast role (llm_a): the routing call must be cheap enough that it is not a
+# reason to skip routing. It classifies; it never answers.
+_ROUTER_ROLE = "llm_a"
+
+# Messages this short and this conversational are not corpus questions, and a
+# round-trip to classify "thanks" is pure latency.
+_SMALL_TALK = {
+    "hi", "hello", "hey", "yo", "thanks", "thank you", "ty", "ok", "okay",
+    "cool", "nice", "got it", "bye", "goodbye", "sup", "hola",
+}
+
+# Fallback only — consulted when the classifier errors or names an agent that
+# does not exist. Deliberately NOT a pre-pass: "what does toxicity mean?" is a
+# definitional question that a keyword match would hand to the toxicity agent
+# and a language model correctly sends to plain chat.
+_KEYWORD_FALLBACK: tuple[tuple[tuple[str, ...], str], ...] = (
+    (("compare", "versus", " vs ", "difference between"), "comparator"),
+    (("toxic", "hate speech", "harass", "abusive"), "toxicity"),
+    (("stance", "support", "oppose", "in favour", "in favor"), "stance"),
+    (("narrative", "theme", "topic", "cluster"), "narrative"),
+    (("coverage", "how many comments", "under-analysed", "under-analyzed"), "coverage"),
+    (("quality", "agreement", "confidence", "how reliable"), "quality"),
+    (("report", "briefing", "summary of the campaign"), "reporter"),
+    (("alert", "spike", "surge"), "alerting"),
+)
+
+_ROUTER_SYSTEM = """You are a router for a social-media analysis platform. You do not answer questions — you choose who should.
+
+You get the user's latest message. Decide whether answering it requires querying the platform's own data (posts, comments, sentiment, stance, toxicity, engagement, clusters, coverage statistics), or whether it is general conversation, a definition, a how-does-this-work question, or anything else a plain assistant can answer without data.
+
+If it requires the platform's data, pick the single best-fitting agent from this list:
+
+{agents}
+
+Reply with ONLY a JSON object, no prose:
+{{"agent": "<agent name, or null for plain chat>", "reason": "<one short clause>"}}
+
+Rules:
+- "agent": null when no data lookup is needed. Prefer null when genuinely unsure — a wrong agent wastes a tool budget and answers the wrong question.
+- Never invent an agent name; use one from the list exactly as written.
+- A follow-up that refers to earlier data ("and for the other campaign?") still needs an agent.
+- If an agent already answered earlier in this conversation, it is named below. Keep it when the new message continues the same line of enquiry; switch only when the question genuinely needs a different capability. Do not switch for rephrasings, clarifications, or "show me more of that"."""
+
+
+class ChatAgentRequest(BaseModel):
+    """A chat message plus how the caller wants it routed."""
+
+    message: Optional[str] = Field(None, description="Single-turn convenience: one user message")
+    messages: Optional[list[ChatMessage]] = Field(
+        None, description="Full conversation history (the last user turn is the question)"
+    )
+    agent: str = Field(
+        "auto",
+        description=(
+            '"auto" to let the router choose, "none" to force plain chat, or an '
+            "agent name from /v1/agents/types to pin one."
+        ),
+    )
+    campaign_id: Optional[str] = Field(None, description="Campaign to scope the run to")
+    backend: Optional[str] = Field(None, description='"local" | "groq" | "auto"/null')
+    previous_agent: Optional[str] = Field(
+        None,
+        description=(
+            "Agent that answered the last turn of this conversation. Makes the "
+            "router prefer continuity, and lets the response report a switch."
+        ),
+    )
+
+
+def _agent_registry() -> dict:
+    from defense.services.agents.registry import AGENT_REGISTRY  # noqa: PLC0415
+
+    return AGENT_REGISTRY
+
+
+def _split_turns(body: ChatAgentRequest) -> tuple[str, list[dict]]:
+    """Return ``(question, prior_turns)`` from either request shape."""
+    turns = [
+        {"role": m.role, "content": m.content}
+        for m in (body.messages or [])
+        if m.role in ("user", "assistant")
+    ]
+    if not turns and body.message:
+        turns = [{"role": "user", "content": body.message}]
+    if not turns or turns[-1]["role"] != "user":
+        raise HTTPException(
+            status_code=status.HTTP_422_UNPROCESSABLE_CONTENT,
+            detail="the conversation must end with a user message",
+        )
+    return turns[-1]["content"], turns[:-1]
+
+
+def _keyword_agent(question: str) -> Optional[str]:
+    lowered = f" {question.lower()} "
+    for needles, agent in _KEYWORD_FALLBACK:
+        if any(n in lowered for n in needles):
+            return agent
+    return None
+
+
+async def _route(
+    question: str,
+    prior: list[dict],
+    backend_override: Optional[str],
+    redis: aioredis.Redis,
+    previous_agent: Optional[str] = None,
+) -> tuple[Optional[str], str]:
+    """Choose an agent for ``question``, or ``None`` to answer as plain chat.
+
+    Returns ``(agent_name, reason)``. Routing never raises: a router that is
+    down must degrade to answering the message, not to failing it.
+    """
+    stripped = question.strip().lower().rstrip("!.?")
+    if stripped in _SMALL_TALK:
+        return None, "small talk"
+
+    registry = _agent_registry()
+    catalogue = "\n".join(f"- {a.name}: {a.description}" for a in registry.values())
+
+    from defense.libs.llm.client import LLMClient  # noqa: PLC0415
+
+    # Two turns of context are enough to resolve "and the other campaign?"
+    # without paying to classify the whole conversation.
+    context = "".join(
+        f"{t['role']}: {t['content'][:300]}\n" for t in prior[-2:]
+    )
+    user_content = (
+        (f"Recent context:\n{context}\n" if context else "")
+        + (
+            f"Agent that answered the previous turn: {previous_agent}\n"
+            if previous_agent
+            else ""
+        )
+        + f"Latest message: {question}"
+    )
+
+    try:
+        result = await LLMClient().chat(
+            role=_ROUTER_ROLE,
+            messages=[
+                {"role": "system", "content": _ROUTER_SYSTEM.format(agents=catalogue)},
+                {"role": "user", "content": user_content},
+            ],
+            backend_override=backend_override,
+            response_format={"type": "json_object"},
+            max_tokens=200,
+            temperature=0.0,
+            usage_redis=redis,
+            usage_task="chat_route",
+        )
+        parsed = json.loads(result.get("content") or "{}")
+    except Exception as exc:
+        fallback = _keyword_agent(question)
+        log.warning("chat_route_failed", error=str(exc), fallback=fallback)
+        return fallback, f"router unavailable ({exc}); keyword fallback"
+
+    choice = parsed.get("agent")
+    reason = str(parsed.get("reason") or "").strip() or "router choice"
+
+    if choice in (None, "", "null", "none", "chat"):
+        return None, reason
+    if choice in registry:
+        return choice, reason
+
+    # The classifier named something that is not an agent. Its judgement that
+    # this needs data is still worth something; its spelling is not.
+    fallback = _keyword_agent(question)
+    log.warning("chat_route_unknown_agent", proposed=choice, fallback=fallback)
+    return fallback, f"router proposed unknown agent {choice!r}; keyword fallback"
+
+
+@router.post("/agent", summary="Route a chat message to an MCP-backed agent")
+async def chat_agent(
+    body: ChatAgentRequest,
+    redis: aioredis.Redis = Depends(get_redis),
+    db: AsyncSession = Depends(get_db),
+    current_user: dict = Depends(get_current_user),
+    _rl: None = Depends(rate_limit),
+) -> dict:
+    """Decide who answers this message, and if it's an agent, start the run.
+
+    Returns ``{"mode": "chat", ...}`` when the message needs no corpus data —
+    the caller should then use ``POST /v1/chat/stream`` as before. Otherwise
+    returns ``{"mode": "agent", ...}`` merged with the agents-service response,
+    which is either a finished run or a ``run_id`` to poll at
+    ``GET /v1/agents/{run_id}``.
+    """
+    question, prior = _split_turns(body)
+
+    explicit = _normalise_backend(body.backend)
+    backend_override = explicit if explicit is not None else await _toggle_backend(redis)
+    effective = backend_override or get_settings().llm_backend
+    await check_llm_backend_policy(db, current_user, {"llm_backend": effective})
+
+    requested = (body.agent or "auto").strip().lower()
+    registry = _agent_registry()
+
+    previous = body.previous_agent if body.previous_agent in registry else None
+
+    if requested in ("none", "chat", "off"):
+        return {"mode": "chat", "agent": None, "reason": "plain chat requested"}
+    if requested in ("auto", ""):
+        agent_name, reason = await _route(
+            question, prior, backend_override, redis, previous_agent=previous
+        )
+    elif requested in registry:
+        agent_name, reason = requested, "pinned by the operator"
+    else:
+        raise HTTPException(
+            status_code=status.HTTP_422_UNPROCESSABLE_CONTENT,
+            detail=f"unknown agent {body.agent!r}; known: {sorted(registry)} (or 'auto'/'none')",
+        )
+
+    # A handover mid-conversation is a fact about the answer, not a UI detail:
+    # the operator asked one follow-up question and a different analyst with a
+    # different toolset picked it up. Say which, and why.
+    switched_from = previous if (previous and previous != agent_name) else None
+
+    if agent_name is None:
+        return {
+            "mode": "chat",
+            "agent": None,
+            "reason": reason,
+            "switched_from": previous,
+        }
+
+    payload: dict[str, Any] = {
+        "question": question,
+        "agent": agent_name,
+        "history": prior,
+        "want_citations": True,
+    }
+    if body.campaign_id and body.campaign_id.strip():
+        payload["campaign_id"] = body.campaign_id.strip()
+    if backend_override:
+        payload["llm_backend"] = backend_override
+
+    agents_url = get_settings().agents_service_url
+    try:
+        async with httpx.AsyncClient(timeout=35.0) as client:
+            resp = await client.post(f"{agents_url}/v1/agents/query", json=payload)
+    except httpx.RequestError as exc:
+        # The agent layer is optional in this deployment. Telling the caller to
+        # fall back to plain chat keeps the chat box working; a 502 would make
+        # a missing sidecar look like a broken chat.
+        log.warning("chat_agent_unreachable", error=str(exc))
+        return {
+            "mode": "chat",
+            "agent": None,
+            "reason": f"agents service unreachable ({exc}); answering without tools",
+            "degraded": True,
+        }
+
+    if resp.status_code >= 500:
+        log.error("chat_agent_upstream_error", code=resp.status_code, body=resp.text[:200])
+        raise HTTPException(
+            status_code=status.HTTP_502_BAD_GATEWAY,
+            detail="Agents service returned an error",
+        )
+    if resp.status_code >= 400:
+        raise HTTPException(status_code=resp.status_code, detail=resp.text[:300])
+
+    return {
+        "mode": "agent",
+        "agent": agent_name,
+        "reason": reason,
+        "switched_from": switched_from,
+        **resp.json(),
+    }

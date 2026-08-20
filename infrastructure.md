@@ -77,6 +77,22 @@ LLM GPU sizing from the equation entirely (you size only the NLP fleet).
   on the **`groq`** backend the VLM is just a hosted vision model id — no extra GPU.
 - CPU-only is even possible for the smallest NLP models if no GPU is available,
   at lower throughput (pair with the `groq` backend to skip GPUs entirely).
+- **The seven Stage-2 comment classifiers belong on CPU, and that is not a
+  fallback.** They are 135–280M-parameter encoders that batch well, and the GPU is
+  normally already hosting the LLM: measured on a 4 GB card serving `qwen2.5:7b`
+  there is **~285 MB free**, which fits *one* head, not seven — the rest fail to
+  load, and a head that cannot load abstains for the life of the process.
+  `STAGE2_CLASSIFIER_DEVICE=cpu` is therefore the right setting on a
+  single-GPU box; `auto` tries the GPU first and falls back per head, which is
+  how you get a run where 2 of 7 voters spoke. Budget **~3 GB of disk** for their
+  HF checkpoints (`deploy/prefetch_classifiers.py`) and a few CPU cores. **Size for
+  the whole thread:** `ROUTER_COMMENT_TOP_N` defaults to 0, so the seven heads run
+  on every comment with text — measured **~0.92 s/comment** on this CPU, i.e. ~9
+  min for a 570-comment post and ~44 min for a 2,857-comment one. A positive
+  `ROUTER_COMMENT_TOP_N` is the knob that makes per-post cost independent of thread
+  size. All seven heads stay by decision, so budget for seven: `modernbert` alone is
+  47% of the roster's CPU, and the answer to that is a faster host or a cap, not a
+  thinner ensemble.
 - **Recommendation:** single workstation/server with one 24 GB consumer GPU, or a
   single cloud GPU instance — or, with the `groq` backend, no GPU. Docker Compose.
 

@@ -35,13 +35,28 @@ EMBEDDING_DIM: int = config.embedding_dim
 # 768-dim multilingual default — matches the pgvector column in init-db.sql.
 DEFAULT_EMBEDDING_MODEL = "paraphrase-multilingual-mpnet-base-v2"
 
+#: The name recorded in ``analysis_results.embedding_model`` for a hash stub.
+#: A sentinel rather than NULL: "which model produced this vector" and "no model
+#: produced this vector" are different facts, and only the first is a NULL.
+STUB_MODEL_NAME = "stub:sha256"
+
 _model: Any = None
 _model_failed = False
 _dim_warned = False
 
 
 def _stub_mode() -> bool:
-    return config.model_stub_mode
+    """Whether to hash instead of encode.
+
+    ``EMBEDDING_STUB_MODE`` overrides ``MODEL_STUB_MODE`` for the sentence
+    encoder alone, in either direction. Read through ``get_settings()`` rather
+    than the module-level snapshot so a test (or a backfill run) can flip it
+    without re-importing.
+    """
+    settings = get_settings()
+    if settings.embedding_stub_mode is not None:
+        return settings.embedding_stub_mode
+    return settings.model_stub_mode
 
 
 def stub_embedding(text: str) -> list[float]:
@@ -59,22 +74,85 @@ def stub_embedding(text: str) -> list[float]:
 
 
 def _get_model() -> Optional[Any]:
-    """Lazy-load the SentenceTransformer; None in stub mode or when unavailable."""
+    """Lazy-load the SentenceTransformer; None in stub mode or when unavailable.
+
+    Falls back to CPU before it falls back to hashes. That order matters more
+    than it looks: this project's GPU is a 4 GB card that normally already hosts
+    the LLM (ollama holds ~2.6 GB of it), so loading the encoder on CUDA fails
+    with `CUDA out of memory` intermittently — depending on nothing more than
+    what the LLM is doing at that moment. The old behaviour caught that
+    exception and returned None, which means every vector silently became a
+    SHA-256 hash: `semantic_search` degraded to ranking noise, and it did so
+    transiently, so the same query could be answered from real vectors once and
+    from hashes a minute later.
+
+    CPU is a completely adequate device for this: 99 ms for one query, 133 ms
+    for a batch of 64, and bit-identical output (the EN/BN cross-lingual probe
+    scores 0.771 on both). Losing 99 ms is not a cost worth paying hash noise to
+    avoid, and unlike the GPU it does not contend with the LLM.
+    """
     global _model, _model_failed
     if _stub_mode() or _model_failed:
         return None
-    if _model is None:
-        try:
-            from sentence_transformers import SentenceTransformer  # type: ignore
+    if _model is not None:
+        return _model
 
-            name = config.embedding_model
-            _model = SentenceTransformer(name)
-            log.info("embedding model loaded", name=name)
-        except Exception as exc:  # ImportError or download failure
+    try:
+        from sentence_transformers import SentenceTransformer  # type: ignore
+    except Exception as exc:  # not installed — no device can help
+        _model_failed = True
+        log.error(
+            "embedding model unavailable — falling back to STUB embeddings; "
+            "semantic search and clustering will return arbitrary neighbours. "
+            "Install it with `uv sync --extra embeddings`.",
+            model=config.embedding_model,
+            error=str(exc),
+        )
+        return None
+
+    name = config.embedding_model
+    # An explicit EMBEDDING_DEVICE is honoured first; otherwise let
+    # sentence-transformers pick (CUDA when present). CPU is always the last
+    # attempt, because the alternative to a slow real vector is a fast wrong one.
+    attempts: list[str | None] = [config.embedding_device or None]
+    if "cpu" not in attempts:
+        attempts.append("cpu")
+
+    for device in attempts:
+        try:
+            _model = SentenceTransformer(name, device=device)
+            log.info("embedding model loaded", name=name, device=device or "auto")
+            return _model
+        except Exception as exc:
+            if device != attempts[-1]:
+                # Not terminal — there is another device to try. WARNING rather
+                # than ERROR: retrieval is about to be correct, just slower.
+                log.warning(
+                    "embedding model failed to load on this device — retrying on CPU",
+                    model=name, device=device or "auto", error=str(exc),
+                )
+                continue
             _model_failed = True
-            log.warning("embedding model unavailable — using stub embeddings", error=str(exc))
+            log.error(
+                "embedding model unavailable on every device — falling back to STUB "
+                "embeddings; semantic search and clustering will return arbitrary "
+                "neighbours, and every result row will report embedding_is_stub.",
+                model=name, device=device, error=str(exc),
+            )
             return None
-    return _model
+    return _model  # pragma: no cover — the loop always returns
+
+
+def active_model_name() -> str:
+    """Which model is actually producing vectors right now.
+
+    ``STUB_MODEL_NAME`` when the hash stub is in use — including the case where
+    ``MODEL_STUB_MODE=false`` but the library or weights are missing, which is
+    the one an operator is most likely to mistake for the real thing. Recorded
+    on every row so a later ``EMBEDDING_MODEL`` change is detectable rather than
+    silently mixing two vector spaces in one index (§3.7).
+    """
+    return STUB_MODEL_NAME if _get_model() is None else config.embedding_model
 
 
 def fit_dim(vec: list[float]) -> list[float]:
@@ -120,6 +198,35 @@ def embed_text_with_provenance(text: str) -> tuple[list[float], bool]:
         return stub_embedding(text), True
     vec = model.encode(text or "", normalize_embeddings=True)
     return fit_dim([float(v) for v in vec]), False
+
+
+def embed_texts_with_provenance(texts: list[str]) -> tuple[list[list[float]], bool]:
+    """Embed many texts in ONE model call, and report whether they are stubs.
+
+    Comment threads are the reason this exists: a post carries hundreds of
+    comments, and ``model.encode(list_of_texts)`` batches them through the
+    transformer in a handful of forward passes where a loop over
+    ``embed_text`` pays the per-call overhead hundreds of times (§3.2).
+
+    The provenance flag is per-BATCH, not per-text, because the model is either
+    loaded or it is not — there is no path where one element of a batch is
+    semantic and the next is a hash.
+    """
+    if not texts:
+        return [], _get_model() is None
+    model = _get_model()
+    if model is None:
+        return [stub_embedding(t) for t in texts], True
+    vectors = model.encode(
+        [t or "" for t in texts], normalize_embeddings=True, batch_size=32
+    )
+    return [fit_dim([float(v) for v in vec]) for vec in vectors], False
+
+
+def embed_texts(texts: list[str]) -> list[list[float]]:
+    """Batch form of :func:`embed_text`, discarding the provenance flag."""
+    vectors, _ = embed_texts_with_provenance(texts)
+    return vectors
 
 
 def to_pgvector_literal(vector: list[float]) -> str:

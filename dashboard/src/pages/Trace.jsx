@@ -1,5 +1,5 @@
-import React, { useState, useEffect, useRef } from 'react';
-import { Activity, GitCommit, Play, Square } from 'lucide-react';
+import React, { useState, useEffect, useRef, useCallback } from 'react';
+import { GitCommit } from 'lucide-react';
 import { Chart as ChartJS, ArcElement, Tooltip, Legend, CategoryScale, LinearScale, BarElement, Title } from 'chart.js';
 import { Doughnut, Bar } from 'react-chartjs-2';
 import { apiCall, API_BASE, getSseQueryAsync } from '../utils/api.js';
@@ -93,36 +93,54 @@ export default function Trace() {
   const [selectedPostId, setSelectedPostId] = useState('');
   const [wantSummary, setWantSummary] = useState(true);
   const [status, setStatus] = useState('idle');
-  const [jobId, setJobId] = useState(null);
   const [traceState, setTraceState] = useState({});
   const [tape, setTape] = useState([]);
   const [result, setResult] = useState(null);
   const eventSourceRef = useRef(null);
 
-  useEffect(() => {
-    fetchPosts();
-    return () => stopTrace();
-  }, []);
-
-  const fetchPosts = async () => {
-    try {
-      const data = await apiCall('/v1/analysis/latest?limit=50&include=results');
-      const results = (data && data.results) || (Array.isArray(data) ? data : []);
-      setPosts(results);
-      if (results.length > 0 && !selectedPostId) {
-        setSelectedPostId(results[0].post_id || results[0].id);
-      }
-    } catch (err) {
-      console.error('Failed to load trace posts', err);
-    }
-  };
-
-  const stopTrace = () => {
+  // Declared above the effects that depend on them: a dependency array is
+  // evaluated during render, so naming a `const` from further down the component
+  // throws on the temporal dead zone.
+  const stopTrace = useCallback(() => {
     if (eventSourceRef.current) {
       eventSourceRef.current.close();
       eventSourceRef.current = null;
     }
-  };
+  }, []);
+
+  // Loading the list and choosing a default are two concerns, and mixing them is
+  // what made this un-declarable as a dependency: the fetch closed over
+  // `selectedPostId`, so any honest dependency array refetched all 50 posts
+  // every time the operator picked a different one from the dropdown. Split, the
+  // fetch depends on nothing and the preselect is a separate effect over `posts`.
+  const fetchPosts = useCallback(async () => {
+    try {
+      const data = await apiCall('/v1/analysis/latest?limit=50&include=results');
+      const results = (data && data.results) || (Array.isArray(data) ? data : []);
+      setPosts(results);
+    } catch (err) {
+      console.error('Failed to load trace posts', err);
+    }
+  }, []);
+
+  useEffect(() => {
+    fetchPosts();
+    return () => stopTrace();
+  }, [fetchPosts, stopTrace]);
+
+  // Default to the first post, and only while nothing is selected.
+  //
+  // The update is functional (`prev => prev || …`) rather than guarded by a read
+  // of `selectedPostId`, because the guard loses a race that a real operator can
+  // win: pick a post in the moment between the list arriving and this effect
+  // committing, and a preselect computed from the stale value overwrites the
+  // choice. Reading `prev` at apply time cannot do that, and it takes
+  // `selectedPostId` out of the dependency array as a bonus.
+  useEffect(() => {
+    if (posts.length > 0) {
+      setSelectedPostId(prev => prev || posts[0].post_id || posts[0].id);
+    }
+  }, [posts]);
 
   const handleRunTrace = async () => {
     if (!selectedPostId) {
@@ -150,7 +168,6 @@ export default function Trace() {
       const newJobId = resp.analysis_id || resp.id || resp.job_id;
       if (!newJobId) throw new Error('No job ID in response');
       
-      setJobId(newJobId);
       setStatus('live');
       
       const qs = await getSseQueryAsync();
@@ -172,19 +189,19 @@ export default function Trace() {
               [data.stage]: { status: data.status, detail: data.detail || {} }
             }));
           }
-        } catch (err) {}
+        } catch {}
       };
 
       es.addEventListener('progress', handleEvent);
       es.addEventListener('stage', handleEvent);
       
-      es.addEventListener('done', (e) => {
+      es.addEventListener('done', () => {
         setStatus('done');
         es.close();
         fetchFinalResult(newJobId);
       });
 
-      es.addEventListener('error', (e) => {
+      es.addEventListener('error', () => {
         setStatus('failed');
         es.close();
       });
@@ -206,7 +223,7 @@ export default function Trace() {
       const data = await apiCall(`/v1/analysis/${id}?include=results`);
       const finalRes = (data.results && data.results[0]) ? data.results[0] : data;
       setResult(finalRes);
-    } catch (e) {}
+    } catch {}
   };
 
   const clearTrace = () => {
@@ -215,7 +232,6 @@ export default function Trace() {
     setTape([]);
     setTraceState({});
     setResult(null);
-    setJobId(null);
   };
 
   return (

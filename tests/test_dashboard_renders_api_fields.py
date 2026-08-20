@@ -155,5 +155,51 @@ def test_hard_won_fields_still_reach_the_dashboard(field, section):
     assert field in _APP_CODE, f"{field} ({section}) is no longer referenced by the dashboard"
 
 
+# ---------------------------------------------------------------------------
+# The Agents page — the grounding verdict, not a permanent green shield
+# ---------------------------------------------------------------------------
+#
+# The header carried a hardcoded "Prompt-Injection Hardened <tool_data>" chip:
+# the same emerald shield for a grounded briefing, for a run whose every tool
+# call failed, and for a run whose answer was four JSON tool calls and no data.
+# The runner computes a real verdict per run — `unverified_citations`,
+# `unverified_quotes`, `unverified_stats` and the per-call `status` — and the
+# API returns all four. Nothing on this surface read any of them.
+
+_AGENTS_JSX = _code_only(
+    (_REPO / 'dashboard/src/pages/Agents.jsx').read_text(encoding='utf-8')
+)
+
+
+@pytest.mark.parametrize("field", [
+    "unverified_citations",
+    "unverified_quotes",
+    "unverified_stats",
+])
+def test_the_grounding_guards_reach_the_agents_page(field):
+    """Each guard exists because a live run fabricated something. A verdict the
+    operator never sees is the same as no verdict."""
+    assert field in _AGENTS_JSX, f"the Agents page no longer reads {field}"
+
+
+def test_the_grounding_verdict_is_computed_not_hardcoded():
+    """The chip must be derived from the run, not printed unconditionally."""
+    assert "Prompt-Injection Hardened" not in _AGENTS_JSX, (
+        "the header chip is a static claim again; it must reflect the run"
+    )
+    assert "groundingStatus" in _AGENTS_JSX
+
+
+def test_the_fields_the_page_reads_are_the_fields_the_api_returns():
+    """Both ends of the last hop, so a rename on either side fails here."""
+    from defense.services.agents.main import AgentQueryResponse
+
+    returned = set(AgentQueryResponse.model_fields)
+    for field in ("unverified_citations", "unverified_quotes", "unverified_stats",
+                  "tools_used", "status"):
+        assert field in returned, f"the API stopped returning {field}"
+        assert field in _AGENTS_JSX, f"the Agents page stopped reading {field}"
+
+
 if __name__ == "__main__":  # pragma: no cover
     sys.exit(pytest.main([__file__, "-v"]))

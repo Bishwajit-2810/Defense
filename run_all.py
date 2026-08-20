@@ -237,11 +237,56 @@ def cleanup(down: bool = False) -> None:
 # --------------------------------------------------------------------------- #
 # Phases
 # --------------------------------------------------------------------------- #
+def _needs_real_encoder() -> bool:
+    """Whether this configuration requires a REAL sentence encoder to function.
+
+    Two settings make the encoder load-bearing rather than optional:
+
+    * ``EMBEDDING_STUB_MODE=false`` — the operator asked for semantic vectors.
+    * ``EMBEDDING_ALLOW_STUB=false`` — persistence *refuses* to write a hash
+      stub, so an absent encoder does not degrade the run, it fails every post.
+
+    ``EMBEDDING_STUB_MODE`` unset follows ``MODEL_STUB_MODE``, mirroring
+    ``libs/embeddings._stub_mode()``.
+    """
+    stub_mode = (_dotenv_value("EMBEDDING_STUB_MODE") or "").strip().lower()
+    if not stub_mode:
+        stub_mode = (_dotenv_value("MODEL_STUB_MODE") or "true").strip().lower()
+    allow_stub = (_dotenv_value("EMBEDDING_ALLOW_STUB") or "true").strip().lower()
+    return stub_mode == "false" or allow_stub == "false"
+
+
 def ensure_deps() -> str:
-    """uv sync (best-effort) and return the interpreter to launch services with."""
+    """uv sync (best-effort) and return the interpreter to launch services with.
+
+    Syncs the ``embeddings`` extra when the configuration needs a real encoder.
+    This is not a nicety — a bare ``uv sync`` **uninstalls** it, because it is an
+    optional extra. So this function used to guarantee the exact failure the
+    stub-refusal switch exists to make loud:
+
+        uv sync                -> removes sentence-transformers
+        --reset                -> truncates posts / analysis_results / chunks /
+                                  comment vectors
+        ingestion              -> encoder unavailable -> hash stub ->
+                                  EMBEDDING_ALLOW_STUB=false raises
+                                  StubEmbeddingRefused for EVERY post
+
+    Nothing catches that exception, so each post retried to
+    ``ASSEMBLER_MAX_RETRIES`` and dead-lettered. The wipe had already happened,
+    so the run ended with an empty database and the whole corpus in
+    ``assembler:queue:dlq`` — and the reason was three steps upstream in a
+    dependency sync.
+    """
     if shutil.which("uv"):
-        log("uv sync …")
-        if subprocess.run(["uv", "sync"], cwd=str(REPO)).returncode != 0:
+        cmd = ["uv", "sync"]
+        if _needs_real_encoder():
+            # Keep the encoder installed. Without this the sync silently removes
+            # it and the pipeline cannot persist a single post.
+            cmd += ["--extra", "embeddings"]
+            log("uv sync --extra embeddings … (config requires a real encoder)")
+        else:
+            log("uv sync …")
+        if subprocess.run(cmd, cwd=str(REPO)).returncode != 0:
             warn("`uv sync` failed — continuing with whatever is installed")
     else:
         warn("`uv` not found on PATH — assuming dependencies are already installed")
@@ -318,28 +363,30 @@ def build_env() -> dict:
         "STAGE1_LLM": "true",
         # Stage 1 uses the LLM for the post (summary + post-type) but NOT for
         # the comments: Stage 2 labels every post's comments with qwen2.5:7b
-        # plus both classifiers, so doing it here as well spends the slowest
+        # plus the seven classifiers, so doing it here as well spends the slowest
         # calls in the pipeline re-deriving a label that then gets outvoted.
         # Measured on a live run: one 25-comment gemma3:4b batch took 120 s and
         # returned invalid JSON (16 of 25 labels salvaged).
+        #
+        # STAGE1_LLM_COMMENT_MAX is deliberately NOT set here. It used to be 60,
+        # which was inert while the line above is "false" — and a silent 60-comment
+        # coverage cap the moment anyone flipped it to "true", overriding whatever
+        # .env said. Coverage knobs belong to the operator; see the note in
+        # build_env's tail.
         "STAGE1_LLM_COMMENTS": "false",
-        "STAGE1_LLM_COMMENT_MAX": "60",
         "LLM_A_LOCAL_MODEL": "qwen2.5:7b",
         "LLM_B_LOCAL_MODEL": "qwen2.5:7b",
         "VLM_LOCAL_MODEL": "qwen3-vl:4b",
-        # Per-post context-aware comment labelling. Every comment is ALWAYS
-        # analysed by the instant Stage-1 heuristic (full coverage); this only
-        # bounds the slow premium LLM pass to the top-N most-liked comments so a
-        # post with thousands of comments can't stall Stage-2. Set 0 to LLM-label
-        # EVERY comment (only practical on Groq / a GPU — slow on local CPU).
-        "COMMENT_STANCE_MAX_PER_POST": "40",
         "COMMENT_STANCE_BATCH": "40",
         "MODEL_STUB_MODE": "true",
-        # The two Stage-2 comment classifiers (XLM-R + DistilBERT) that vote
-        # alongside the LLM. They load from the local HF cache only — stub mode
-        # means "download nothing", not "refuse models you already have" — so a
-        # machine without the checkpoints degrades to LLM-only rather than
-        # stalling on a 1 GB fetch.
+        # The seven Stage-2 comment classifiers that vote alongside the LLM
+        # (see STAGE2_CLASSIFIER_1..7). They load from the local HF cache only —
+        # stub mode means "download nothing", not "refuse models you already
+        # have" — so a machine without the checkpoints degrades to LLM-only
+        # rather than stalling on a 3 GB fetch. Fetch them once with
+        # `uv run python deploy/prefetch_classifiers.py`; until then the
+        # `stage2_cheap_voters` log line reports voted<declared and names the
+        # heads that stayed silent.
         "STAGE2_CLASSIFIERS_ENABLED": "true",
         # ...strictly from the local HF cache. Set in the process environment
         # (not from Python) because transformers reads these at import time, so
@@ -366,6 +413,21 @@ def build_env() -> dict:
         # in host mode — so the host URL must be in the API's env too.
         "AGENTS_SERVICE_URL": "http://127.0.0.1:8010",
     })
+
+    # NO COVERAGE CAPS ARE SET HERE, deliberately. `env.update` above beats .env
+    # (pydantic-settings ranks the process environment above the file), so any
+    # coverage default hardcoded in this launcher silently overrides a deliberate
+    # setting — which is how `COMMENT_STANCE_MAX_PER_POST=0` in .env still ran with
+    # a cap of 40, and the post detail read "✓ all 2857 analyzed" next to
+    # "⚠ 2606 capped out".
+    #
+    # The full payload is analysed: ROUTER_COMMENT_TOP_N, STAGE1_LLM_COMMENT_MAX and
+    # COMMENT_STANCE_MAX_PER_POST all default to 0 in `Settings`. On local CPU that
+    # is slow on a long thread — seven heads are ~0.92 s/comment, so a
+    # 2,857-comment post is ~44 min of classifier time plus ~115 LLM stance
+    # batches. Cap it for a quick demo by exporting `ROUTER_COMMENT_TOP_N=100`, or
+    # run `--fast` (Groq) — but do it in the environment, not here, so the run's
+    # own setting is the one that shows up in the output.
     return env
 
 
@@ -392,13 +454,23 @@ def _dotenv_value(key: str) -> str:
     return ""
 
 
+def _env_flag(env: dict, key: str, default: str = "false") -> str:
+    """Resolve a boolean env flag from the process env, then .env, then default.
+
+    Same reason as _dotenv_value: services started outside the repo root cannot
+    find .env themselves, so flags they need have to be injected explicitly.
+    """
+    return env.get(key) or os.environ.get(key) or _dotenv_value(key) or default
+
+
 def apply_fast_preset(env: dict) -> None:
     """--fast: route Stage-2 + agents through Groq Cloud instead of local Ollama.
 
     Groq is dramatically faster than CPU Ollama, so this is the recommended way
     to get quick, high-quality summaries + comment stance. Requires GROQ_API_KEY
-    (exported, or in .env). Combine with COMMENT_STANCE_MAX_PER_POST=0 to LLM-label
-    every comment (now tractable on Groq).
+    (exported, or in .env). Combine with ROUTER_COMMENT_TOP_N=0 to analyse every
+    comment on every post rather than the top 100 by reaction count — tractable on
+    Groq, and the setting a scoring run wants so the ensemble also labels the tail.
     """
     key = env.get("GROQ_API_KEY") or os.environ.get("GROQ_API_KEY") or _dotenv_value("GROQ_API_KEY")
     if not key:
@@ -462,7 +534,15 @@ def start_agents(py: str, env: dict) -> None:
         "AGENTS_SERVICE_URL": "http://127.0.0.1:8010",
         "CLICKHOUSE_HOST": ipof("clickhouse"), "CLICKHOUSE_PORT": "9000",
         "CLICKHOUSE_DB": "defense", "CLICKHOUSE_USER": "defense", "CLICKHOUSE_PASSWORD": "defense",
-        "ANALYTICS_MCP_STUB": "true", "RETRIEVAL_MCP_STUB": "true",
+        # Stub mode is a deployment choice, not a launcher one. Hardcoding it to
+        # "true" here silently overrode ANALYTICS_MCP_STUB=false in .env, so an
+        # operator who had configured real ClickHouse got synthetic numbers with
+        # no indication — /health said stub_mode:true and nothing else did.
+        # Injected explicitly rather than left to the settings layer because
+        # retrieval_mcp and ingest_mcp are started from their own directories,
+        # where the repo-root .env is not on the search path.
+        "ANALYTICS_MCP_STUB": _env_flag(env, "ANALYTICS_MCP_STUB"),
+        "RETRIEVAL_MCP_STUB": _env_flag(env, "RETRIEVAL_MCP_STUB"),
     })
     uvi = [py, "-m", "uvicorn", "--host", "127.0.0.1", "--log-level", _uvicorn_level()]
     # analytics_mcp + agents launch by module path from the repo root; retrieval/
@@ -500,6 +580,70 @@ def serve_dashboard(py: str, env: dict) -> int:
         
     start("dashboard", ["npm", "run", "dev", "--", "--port", str(port)], env, dash_dir)
     return port
+
+
+def preflight_encoder(py: str) -> None:
+    """Refuse to continue if the encoder cannot produce a real vector.
+
+    Runs BEFORE ``reset_data()``, which is the whole point. With
+    ``EMBEDDING_ALLOW_STUB=false`` a missing encoder does not degrade the run —
+    ``_resolve_embedding`` raises ``StubEmbeddingRefused`` for every post, the
+    assembler retries to its cap and dead-letters, and because the wipe already
+    happened the operator is left with an empty database and the corpus sitting
+    in ``assembler:queue:dlq``. The failure is discovered minutes later, several
+    layers from its cause.
+
+    ``ensure_deps`` fixes the common cause (a bare ``uv sync`` dropping the
+    extra). This catches every other one — CUDA OOM on a GPU already hosting the
+    LLM, undownloaded weights, ``HF_OFFLINE=true`` blocking the fetch — by
+    asking the encoder for one vector and checking its provenance flag rather
+    than by inferring anything.
+
+    Checked in the CHILD interpreter (``.venv/bin/python``), because that is what
+    the workers will use; a check run under a different interpreter would prove
+    nothing about them.
+    """
+    if not _needs_real_encoder():
+        return
+    log("preflight: verifying the sentence encoder produces real vectors …")
+    probe = (
+        "import sys;"
+        "sys.path.insert(0, 'src');"
+        "from defense.libs.embeddings import embed_text_with_provenance, active_model_name;"
+        "vec, is_stub = embed_text_with_provenance('preflight probe');"
+        "print('STUB' if is_stub else 'REAL', active_model_name(), len(vec))"
+    )
+    try:
+        r = subprocess.run([py, "-c", probe], cwd=str(REPO),
+                           capture_output=True, text=True, timeout=300)
+    except subprocess.TimeoutExpired:
+        die("preflight: the encoder took over 5 minutes to load — aborting before "
+            "any data is touched. Check the model download, or set "
+            "EMBEDDING_ALLOW_STUB=true to run on hash vectors deliberately.")
+        return
+    out = (r.stdout or "").strip().splitlines()
+    verdict = out[-1] if out else ""
+    if verdict.startswith("REAL"):
+        ok(f"preflight: encoder OK — {verdict.split(maxsplit=1)[1]}")
+        return
+    detail = (r.stderr or "").strip().splitlines()
+    tail = detail[-1][:300] if detail else "(no error output)"
+    die(
+        "preflight: the sentence encoder is NOT producing real vectors "
+        f"({verdict or 'probe failed'}).\n"
+        "         Nothing has been modified — this check runs before any wipe.\n\n"
+        "         EMBEDDING_ALLOW_STUB=false means persistence REFUSES a hash stub, so "
+        "every post would\n"
+        "         fail to persist and dead-letter to assembler:queue:dlq. With --reset "
+        "the wipe would\n"
+        "         already have happened, leaving an empty database.\n\n"
+        f"         encoder error: {tail}\n\n"
+        "         Fix one of these:\n"
+        "           uv sync --extra embeddings     # install the encoder\n"
+        "           EMBEDDING_DEVICE=cpu           # if CUDA is out of memory\n"
+        "           HF_OFFLINE=false               # if the weights need downloading\n"
+        "           EMBEDDING_ALLOW_STUB=true      # accept hash vectors deliberately"
+    )
 
 
 def reset_data() -> None:
@@ -663,6 +807,10 @@ def main() -> None:
     start_infra()
     ensure_ollama()
     env = build_env()
+    # BEFORE the wipe, never after: with EMBEDDING_ALLOW_STUB=false a dead
+    # encoder makes every post fail to persist, and --reset has already thrown
+    # the old data away by the time the first failure appears.
+    preflight_encoder(py)
     if args.reset:
         reset_data()               # full wipe (Redis + Postgres + ClickHouse)
     elif defer_load:

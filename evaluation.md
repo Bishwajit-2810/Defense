@@ -52,7 +52,7 @@ Two data facts shape the whole plan (from [data_contract.md](data_contract.md)):
 
 | Set                      | Built from                                                                                                                                                                                                            | Used for                                                          |
 | ------------------------ | --------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- | ----------------------------------------------------------------- |
-| **Gold eval set**        | A stratified, **human-labeled** sample drawn from [posts_text_only.json](posts_text_only.json) (43 captioned posts, 8,965 comments — see the sampling-frame note below) and ongoing pulls — stratified by `postType` (TEXT/PHOTO_TEXT), language bucket, and comment `kind` | Per-task accuracy, the ship/no-ship gate                          |
+| **Gold eval set**        | A stratified, **human-labeled** sample drawn from [posts_with_details.json](posts_with_details.json) (all 50 posts, 10,272 comments — see the sampling-frame note below) and ongoing pulls — stratified by `postType` (TEXT/PHOTO_TEXT), language bucket, and comment `kind` | Per-task accuracy, the ship/no-ship gate                          |
 | **Banglish-heavy slice** | Comments + captions that are romanized/code-mixed                                                                                                                                                                     | The hardest, highest-priority bucket — gets first labeling effort |
 | **Comment gold set**     | Human-labeled sentiment on a sample of **embedded** comments per post                                                                                                                                                 | Per-comment sentiment + thread `sentiment_breakdown`              |
 | **Image gold set**       | *Blocked* — no image bytes are reachable (§5.2), so there is nothing to label. Restore when the 69 objects are uploaded.                                                                                               | `image_sentiment` and OCR (CER/WER)                               |
@@ -78,13 +78,25 @@ labels can support (PROJECT_ASSESSMENT §5.4, §7.3):
   *"the sentiment of the most-engaged N comments per post."* Not defensible:
   *"public sentiment on this post."* Report coverage-weighted intervals, or
   restrict the claim — and state which, once, in writing.
+- **The ensemble analyses the whole stored thread** (`ROUTER_COMMENT_TOP_N=0`,
+  the default), so ensemble accuracy is scoreable over any comment in the sample —
+  no need to condition on which ones a cap admitted. If a run *does* set a positive
+  cap for speed, the selection is engagement-ordered on top of an already
+  engagement-ordered sample, which deepens the bias in §1 rather than fixing it:
+  record `stage2_selected` per comment in that case and keep "ensemble accuracy on
+  the analysed set" separate from "the tail nothing read". `stage2_selection` and
+  `ensemble.not_analysed` report it per post.
 - **Five posts store more comments than the platform reports** (up to 112 against
   42). Coverage is clamped to 1.0 and the discrepancy surfaces as
   `coverage_anomaly`; exclude those posts from any coverage-weighted statistic or
   say why you did not.
-- **The working corpus excludes 7 image-only posts** (43 of 50 remain, 8,965 of
-  10,272 comments). They have null captions and no reachable image, so there is
-  nothing to label. Regenerate with `python -m eval.make_text_corpus`.
+- **The 7 image-only posts are in the frame** (all 50 posts, 10,272 comments).
+  They have null captions and no reachable image, so there is nothing to label
+  *about the post itself* — but they carry **1,307 comments** (12.7%) that label
+  like any other, and excluding them shrank the frame for a reason the comment
+  tasks never had. Post-level labels on those 7 are the ones to omit, not their
+  comments. `python -m eval.make_text_corpus` still writes the 43-post subset if
+  you need to reproduce a number measured under the old frame.
 
 **Labeling discipline.** Written annotation guidelines per task; **≥2 annotators**
 on a subset with **inter-annotator agreement** (Cohen's κ) reported — if humans
@@ -278,26 +290,33 @@ it and the repository.
 | --- | --- |
 | **Structural checks** | [eval/harness.py](eval/harness.py) — `run_input_validation`, `run_platform_detection`, `run_coverage_check`. These pass and are real. |
 | **System-property measurement** | [eval/measure_routing_rate.py](eval/measure_routing_rate.py) (routing rate, comment volume, post-vs-comment call split), [eval/make_text_corpus.py](eval/make_text_corpus.py) (corpus + what it dropped), [eval/bakeoff_summary.py](eval/bakeoff_summary.py) (per-model latency, truncation, language fidelity), [eval/sweep_threshold.py](eval/sweep_threshold.py) (cost-vs-threshold and cost-vs-comment-cap curves), `GET /v1/usage` (tokens + cost per backend/model). |
-| **Regression coverage** | **549 tests across 30 files.** Every finding in PROJECT_ASSESSMENT that was fixed has a test that fails if it regresses — which is the property that matters more than the count. |
-| **Accuracy metrics** | **None.** Zero gold labels, zero F1, no scorecard. |
+| **Regression coverage** | **1,315 tests across 64 files** (20 Aug 2026). Every finding in PROJECT_ASSESSMENT that was fixed has a test that fails if it regresses — which is the property that matters more than the count. |
+| **Accuracy harness** | **Built.** `eval/build_gold_set.py` writes the stratified 300-comment sample; `eval/score_gold.py` scores every labelling system against it — per-stratum, with abstention and accuracy-when-answered reported separately, and it refuses to print a confident percentage over a handful of rows. Since 16 Aug 2026 it scores the **configured roster** (`config.stage2_classifier_roster`), not a hardcoded pair: scoring 2 of the 7 voters and calling it "the ensemble" measures a system that is not in production. |
+| **Accuracy numbers** | **None.** `eval/gold/comments_gold_300.json` holds 300 sampled rows and **0 adjudicated labels** — every `label` is `null` by design, because seeding them from any model in this repo and then scoring that model would measure agreement with itself. |
 
-The third row is the decisive gap and the only remaining blocker on the research
-side ([PROJECT_ASSESSMENT.md](PROJECT_ASSESSMENT.md) §7.2). Nothing in the
-codebase can produce a results table, and a paper *is* its results table.
+The last row is the decisive gap and the only remaining blocker on the research
+side ([PROJECT_ASSESSMENT.md](PROJECT_ASSESSMENT.md) §7.2). The harness exists and
+the sample exists; what does not exist is a human's afternoon. Until then the
+project has **no measured accuracy**, and a paper *is* its results table.
 
 ### 8.1 The shortest path to a first accuracy number
 
 Deliberately smaller than the full plan above — the point is to have **one honest
 number with a confidence interval**, not a complete scorecard:
 
-1. **Label ~300 comments** from `posts_text_only.json`, stratified by language
-   bucket and comment `kind`. One annotator is enough for a first number; say so,
+1. **Adjudicate the 300 rows already sampled**
+   (`python -m eval.build_gold_set` regenerates them; the file is stratified by
+   comment `kind` and script). One annotator is enough for a first number; say so,
    and report the small-n caveat.
-2. **Score the existing pipeline against them.** Filter to comments whose
-   `method` is `model` or `llm` — scoring a `stub` label measures a hash of the
-   text, not a model (see `provenance`).
+2. **Score every system in one pass:** `python -m eval.score_gold` — each of the
+   seven heads, the LLM, and Stage 1's heuristic (which the harness still scores
+   as a *baseline*, even though it no longer votes in the ensemble; "the models
+   beat the keyword rule" is a claim worth a number). Filter to comments whose
+   `method` is `model` or `llm` when comparing against Stage 1: scoring a `stub`
+   label measures a hash of the text, not a model (see `provenance`).
 3. **Report macro-F1 per language bucket** with a confidence interval, and state
-   the sampling frame from §1 in the same breath.
+   the sampling frame from §1 in the same breath — including which rows were in the
+   router's analysed set (`stage2_selected`) and which carry a Stage-1 label only.
 
 That converts "we have no idea how well it works" into "here is how well it
 works, on this much data, with this much uncertainty" — which is the difference
@@ -329,6 +348,10 @@ and none of it needs labels:
 - **Post-level vs comment-level call split** — the cost axis any efficiency
   claim has to be plotted against. `eval/sweep_threshold.py` emits it per
   threshold and per comment-cap.
+- **Ensemble coverage, per post** — `ensemble.analysed` / `not_analysed` (how much
+  of the thread the eight model labellers read) and `voters` / `single_voter_share` (how
+  many of them actually spoke). A post labelled by 2 of 7 voters is a degraded run,
+  and `unanimous_share` computed over the survivors cannot say so on its own.
 - **`processing.degraded_components`** — which real-mode components fell back to
   a heuristic because their model would not load. **Check this is empty before
   recording any accuracy or latency figure**: a run where every component

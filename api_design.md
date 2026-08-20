@@ -12,6 +12,15 @@ For full real input→output examples see [examples.md](examples.md).
 > push path (§1b) remains for external/replay sources. These read/analysis/report
 > endpoints below are what _our_ downstream consumers call.
 
+> **This file is the contract as designed; [endpoints.md](endpoints.md) is the
+> surface as built** — copy-pasteable curl for what the running app serves
+> (**49 distinct `/v1` paths, 61 method+path pairs** as of 20 Aug 2026), including
+> per-comment paging, chat history, the raw event stream and the report export
+> paths. Where the two disagree, endpoints.md is the current one. In particular the
+> `comment_analysis` block below predates the comment ensemble: the shipped shape
+> adds `parallel_labels` per comment, plus `ensemble` and `stage2_selection` — see
+> endpoints.md §1. The live list is always `GET /openapi.json` (or `/docs`).
+
 Conventions:
 
 - `202 Accepted` for async work (returns a job/analysis id to poll or subscribe).
@@ -403,6 +412,88 @@ results as they complete, for live dashboards.
 
 ---
 
+---
+
+## 3a. Job control — `POST /v1/analysis/{id}/cancel` · `POST /{id}/resume` · `DELETE /{id}`
+
+A job is not a process. It is N envelopes spread across four Redis streams, each
+picked up by whichever worker replica is free — no PID, no task handle, and no
+way to pull a message back out of a stream once `XADD` has accepted it. Both
+controls below are shaped by that, and neither is a queue operation.
+
+### Stop — `POST /v1/analysis/{id}/cancel`
+
+```json
+{
+  "analysis_id": "an_01J0A...",
+  "status": "cancelled",
+  "previous_status": "running",
+  "progress": { "total": 300, "completed": 23, "failed": 0 }
+}
+```
+
+Cooperative: one Redis flag (`job:{id}:cancelled`, 24 h TTL) that ingestion,
+Stage 1, the router and Stage 2 each check as they pick a message up, dropping the
+message instead of doing the work. Consequences that the response wording has to
+carry:
+
+- **A stop costs at most one post per stage**, not the rest of the batch — so
+  `completed` may tick up once or twice after the call. Those posts finish and
+  are persisted; their model spend is already paid.
+- **`cancelled` is terminal.** The assembler's status update excludes it, and so
+  does the counter reconciliation in §3, so the last in-flight post cannot write
+  the job back to `running` or `done`.
+- A terminating `event: cancelled` frame goes out on the SSE stream, which
+  otherwise sits open to its 5-minute timeout.
+- `409` if the job already reached a final state.
+
+### Resume — `POST /v1/analysis/{id}/resume`
+
+```json
+{
+  "analysis_id": "an_01J0A...",
+  "resumed": true,
+  "status": "running",
+  "progress": { "total": 300, "completed": 30, "remaining": 270 }
+}
+```
+
+For the interruption the pipeline cannot detect on its own: the host lost power
+with 30 of 300 posts analysed. Nothing marks that job as dead — its row still
+reads `running` and its Redis counters went with the power — so **what is left is
+derived from Postgres alone**: the selector gives the full post set, and a post
+counts as done when its `analysis_results` row was written at or after the job's
+`created_at`. That table is `UNIQUE (post_id)` with no job column, so the
+timestamp is the only discriminator there is; it also means a post another job
+re-analysed in the meantime counts as done, which is the right answer — a fresh
+result exists either way.
+
+Only the 270 are re-enqueued, under the same job id. The counters are rebuilt
+with `completed` **seeded** at 30, which is what makes the assembler finish the
+job when the last remaining post lands (with no `total` it falls back to
+"first landing wins") and what makes progress continue at 30/300 instead of
+restarting. Any stop flag is cleared first — the workers drop anything carrying
+it, so clearing it afterwards would make the whole resume a no-op.
+
+The job's stored `options` are reused, so a run started with `want_summary`
+resumes with it; `llm_backend` is **re-resolved** against the tenant's policy
+rather than trusted, so a stored `groq` cannot outlive a privacy lock.
+
+`409` while the job is still writing progress (it is busy, not interrupted —
+stop it first), and there is no per-post partial resume: a post that was
+mid-flight is redone from Stage 1.
+
+### Delete — `DELETE /v1/analysis/{id}`
+
+Removes the job row, its progress counters and its Trace-tab replay buffer, and
+stops it first if it is still running. It deliberately does **not** touch
+`analysis_results`: those rows are keyed by post and campaign, not by job, and
+several jobs (plus the original ingest) write the same rows — deleting them here
+would blank posts a different job analysed. `DELETE /v1/posts/{id}` is the
+endpoint for that.
+
+All three are tenant-scoped: another tenant's job id is a `404`, not a stop.
+
 ## 4. Reporting — `GET /v1/reports`
 
 List and fetch generated reports (trends, brand mentions, political analysis,
@@ -469,10 +560,17 @@ output — see [models.md](models.md) §5 and [architecture.md](architecture.md)
 
 ## 4a. Analyst Q&A (agentic) — `POST /v1/agents/query`
 
-Ask a natural-language question over the analyzed corpus; the **Insight/Analyst
-agent** plans across the MCP tools (analytics + retrieval, +VLM if images matter)
-and returns a grounded, cited answer. Async (`202` + `status_url`) since it may make
-several tool/LLM calls; budget-capped per run.
+Ask a natural-language question over the analyzed corpus; an agent plans across the
+MCP tools (analytics + retrieval, +VLM if images matter) and returns a grounded,
+cited answer. Async (`202` + `status_url`) since it may make several tool/LLM calls;
+budget-capped per run.
+
+`agent_type` selects which of the **nine** agents runs — `analyst` (the default,
+general-purpose one), `coverage`, `alerting`, `stance`, `comparator`, `toxicity`,
+`narrative`, `quality`, `reporter`. Each has its own tool allowlist and default
+budget; `GET /v1/agents/types` returns the live roster with both, so a client
+should read it rather than hard-code a list. `options.max_tool_calls` overrides
+the agent's default for one run.
 
 ### Request
 
@@ -531,12 +629,17 @@ egresses to Groq.
 | `POST /v1/auth/sse-ticket`         | Single-use, ~60s, hash-stored ticket for `EventSource` — which cannot send headers      |
 | `GET /v1/health` / `GET /v1/ready` | Liveness / readiness probes                                                            |
 | `GET /v1/usage`                    | Per-tenant usage + cost metering (posts, LLM calls, by backend incl. Groq tokens/cost) |
-| `GET /v1/search?q=&semantic=true`  | Semantic/keyword search over analyzed posts (pgvector + ClickHouse)                    |
+| `GET /v1/search?q=&semantic=true`  | Search analyzed posts: keyword (JSONB), semantic (pgvector), `mode=hybrid` (RRF). A `post_id` / `platform_post_id` / URL / `campaign_id` is matched **exactly, ahead of every mode** — `match_type` says which arm answered, and `id_lookup_missed` flags an id that matched nothing rather than embedding it |
 | `GET /v1/agents/{id}`              | Poll an agent run (analyst query / report) — status, answer, citations, usage          |
 | `POST /v1/chat`                    | Free-form chatbot over the pipeline LLM (backend follows the toggle)                   |
 | `POST /v1/chat/stream`             | Same as `/v1/chat` but streams the reply token-by-token (SSE)                          |
 | `GET /v1/chat/models`              | Models available per backend (+ defaults) for the chat model picker                    |
 | `DELETE /v1/posts/{id}`            | Data deletion (retention / GDPR-style)                                                 |
+
+> This table is the **designed** surface. The app currently serves 49 distinct
+> `/v1` paths; [endpoints.md](endpoints.md) §3b lists the ones not covered here —
+> chat conversations, report export, pipeline stats, log streaming and the agent
+> registry introspection routes.
 
 > The **MCP servers** (`analytics-mcp`, `retrieval-mcp`, `ingest-mcp` — see
 > [architecture.md](architecture.md) §11) are **internal** tool interfaces consumed

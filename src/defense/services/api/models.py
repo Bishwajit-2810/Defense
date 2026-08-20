@@ -201,6 +201,11 @@ class EngagementResult(BaseModel):
 
 class CommentAnalysisResult(BaseModel):
     analyzed: int
+    # Comments a Stage-2 model actually read. `analyzed` above is the stored row
+    # count for the whole thread, so it cannot answer "how much did the ensemble
+    # cover" — one post stores 87 rows and has 31 read. None on rows written
+    # before the ensemble recorded itself; never silently equal to `analyzed`.
+    analysed_by_models: Optional[int] = None
     coverage: float  # clamped to 1.0 — see coverage_anomaly
     coverage_label: Optional[str] = None  # server-rendered coverage string
     # Set when the stored comment rows exceed the platform's reported
@@ -486,3 +491,12 @@ class SearchResponse(BaseModel):
     semantic: bool
     total: int
     results: List[SearchResult]
+    # Which arm actually answered: "exact_id" | "keyword" | "semantic" | "hybrid".
+    # A UI must be able to tell "this IS the post you named" from "these are
+    # posts that read like your words" — a pasted post id used to come back as 20
+    # cosine neighbours, which looks identical to a successful search.
+    match_type: Optional[str] = None
+    # Set when the query looked like an identifier and matched nothing. Without
+    # it, "no such post" and "no post mentions this phrase" are the same empty
+    # list, and the semantic arm answers the first question with 20 wrong posts.
+    id_lookup_missed: bool = False

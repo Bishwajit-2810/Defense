@@ -5,7 +5,7 @@ system** (post summary, sentiment, topics, toxicity, comment analysis — the
 full canonical result) and for **testing every API endpoint with curl**.
 
 The canonical schema lives in
-[src/defense/libs/schemas/output_schema.json](src/defense/libs/schemas/output_schema.json); the field
+[src/defense/contracts/schemas/output_schema.json](src/defense/contracts/schemas/output_schema.json); the field
 meanings are specified in [data_contract.md](data_contract.md) §4. This file
 shows what actually comes over the wire and how to reshape it.
 
@@ -111,7 +111,31 @@ This is the JSON the whole system exists to produce:
     "top_keywords": ["dam", "taka"],
     "representative_comments": [
       { "text": "Eto dam dile cholbo kemne", "lang": "banglish", "sentiment": "negative", "likes": 89 }
-    ]
+    ],
+    // Which comments the ROUTER put in front of the models: top-N by reaction
+    // count, text-bearing only. Absent on results written before 17 Aug 2026.
+    "stage2_selection": {
+      "strategy": "top_reactions", "limit": 100,
+      "total": 2857,                                // every comment on the post
+      "eligible": 2612,                             // …that had text to read
+      "selected": 100, "skipped": 2512,
+      "cutoff_likes": 7, "top_likes": 946           // the reaction count that made the cut
+    },
+    // How the eight labellers voted, once per thread. `comments` here is the
+    // whole thread; `analysed` is the router's set. Reading one as the other is
+    // how a deliberate cap looks like a half-failed stance pass.
+    "ensemble": {
+      "comments": 2857, "analysed": 100, "not_analysed": 2512,
+      "voters": ["xlmr", "distilbert", "twitter_xlmr", "mbert", "llm"],
+      "llm_labelled": 96, "llm_share": 0.0336, "llm_share_analysed": 0.96,
+      "unanimous": 71, "unanimous_share": 0.71,     // ≥2 voters agreeing
+      "single_voter": 18, "unread": 0,              // 1 labeller, and none at all
+      "abstained": 11, "mean_agreement": 0.83,
+      "deduplicated": 4, "duplicate_share": 0.04,   // exact-text twins reusing a verdict
+      "escalation_reasons": { "llm_all": 96, "near_duplicate": 4, "no_text": 245, "below_top_n": 2512 },
+      "mode": "all", "capped_out": 0,
+      "selection": { "…": "same object as comment_analysis.stage2_selection" }
+    }
   },
 
   // ---- trust & audit ------------------------------------------------------
@@ -152,6 +176,11 @@ Field-level rules worth knowing when consuming this JSON:
 | `processing.degraded_components` | Real-mode components that fell back to a heuristic because their model would not load. `nlp_engine` says which path was *intended*; this says what **ran**. **A non-empty list means no latency or accuracy figure from that run is quotable.** |
 | `comment_analysis.target_stances` | Per-watchlist-entity stance rollup. A **separate measurement** from `sentiment_breakdown` — a comment can be positive in tone while opposing a listed entity, so the two must never be summed or merged. Entities nobody mentioned are **absent**, not zero-filled. |
 | `comment_analysis.comments[].emotion_method` | `heuristic` \| `llm`. Comment emotion is the free emoji+lexicon heuristic at Stage 1 **even in real mode**; only comments Stage 2 re-labelled carry a model emotion. |
+| `comment_analysis.stage2_selection` | Which comments Stage 2 analysed. **`limit: 0` (the default) means every comment with text was analysed** — `selected` then equals `eligible`. A positive `limit` (`ROUTER_COMMENT_TOP_N`) keeps only that many, ranked by reaction count. `total` / `eligible` / `selected` are three different numbers, and reading any one as another is how "every comment was analysed" gets claimed for a capped run. |
+| `comment_analysis.comments[].stage2_selected` | `false` on a comment outside the cut: **no Stage-2 model read it**, its label is Stage 1's, and `escalation_reason` is `below_top_n`. Absent/`true` means it was analysed. Textless comments carry neither — they are never ranked (`escalation_reason: no_text`). |
+| `comment_analysis.comments[].parallel_labels` | `{voter: {sentiment, score, …}}` for each of the eight labellers that spoke — the seven `STAGE2_CLASSIFIER_*` heads and `llm`. A voter that failed to load or answered off-taxonomy is **absent**, never a neutral entry. **There is no `heuristic` key:** Stage 1's emoji/keyword label stopped voting on 17 Aug 2026, so `parallel_labels` contains model verdicts only. |
+| `comment_analysis.comments[].label_voters` / `label_sources` | How many labellers actually voted, and which. Quote them with `label_agreement`: `1.0` over one voter is a single opinion, not a consensus. `label_voters: 0` ⇒ `sentiment: "uncertain"`, and *nothing* about that comment is claimed. |
+| `comment_analysis.ensemble.llm_share` vs `llm_share_analysed` | Against the **whole thread** vs against the **router's selection**. 100 of 2,857 is 3.4% of the post and 100% of what was selected; both are needed or one gets read as the other. |
 | `language_method` | `fasttext` \| `script_heuristic` \| `stub`. fastText is optional; without it the pipeline degrades to script detection rather than failing the post. |
 | `processing.llm_used` | Only routed posts ([router rules](src/defense/services/workers/router/rules.py)) carry Stage-2 latency/cost. Note this is **not** the whole cost lever any more: comment labelling runs for every post and is 85–96% of LLM calls (PROJECT_ASSESSMENT §6.8). |
 
@@ -191,6 +220,96 @@ curl -N "$API/v1/analysis/<job_id>/stream?api_key=demo"
 # data: {"completed":50,"failed":0,"total":50,…}
 ```
 
+### 2b-bis. Stop a job, or delete its record
+
+```bash
+# Stop — no further post of this job is analysed
+curl -s -X POST -H "$KEY" $API/v1/analysis/<job_id>/cancel
+# → 200 {"analysis_id":"…","status":"cancelled","previous_status":"running",
+#        "progress":{"total":50,"completed":23,"failed":0}}
+# → 409 if the job already finished (nothing to stop)
+
+# Delete the job record — stops it first if it is still running
+curl -s -X DELETE -H "$KEY" $API/v1/analysis/<job_id>
+# → 200 {"analysis_id":"…","deleted":{"jobs":1,"redis_keys":5},
+#        "stopped":true,"previous_status":"running"}
+```
+
+Stopping is **cooperative**, and the reason is structural: a job is N envelopes
+spread across the stage streams, so there is no process to kill and no way to
+pull a message back out of a stream. `POST .../cancel` raises one flag
+(`job:{id}:cancelled`, 24h TTL — `libs/jobs.py`) that **ingestion, Stage 1, the
+router and Stage 2** each check as they pick a message up, and drop the message
+instead of doing the work. So:
+
+* **The stop costs at most one post per stage.** A post already inside a stage
+  finishes and is persisted — its LLM spend is already paid — which is why the
+  progress counter can tick up once or twice after a stop. Everything behind it
+  is skipped.
+* **A stopped job stays stopped.** The row goes to `cancelled`, which is terminal:
+  the assembler's status update excludes it, and the counter reconciliation in
+  `GET /v1/analysis/{id}` excludes it, so the last in-flight post cannot write
+  the job back to `running` or `done`.
+* **Watchers are told immediately.** A terminating `event: cancelled` frame goes
+  out on `analysis:progress:{id}`, so an open SSE stream closes then rather than
+  at its 5-minute timeout.
+* **Re-running is the way to resume.** There is no partial resume; `POST
+  /v1/analysis/run` with the same selector re-analyses the whole set.
+
+`DELETE` removes the job row, its progress counters and its Trace-tab replay
+buffer. It deliberately does **not** touch `analysis_results`: those rows are
+keyed by post and campaign, not by job, and they are what every other tab reads —
+several jobs (plus the original ingest) write the same rows, so deleting them
+here would blank posts another job analysed. Use `DELETE /v1/posts/{post_id}` for
+that. The cancel flag is the one key a delete leaves behind, since it is all that
+still stops the deleted job's in-flight posts.
+
+Both are tenant-scoped: another tenant's job id is a 404, not a stop.
+
+### 2b-ter. Resume an interrupted job
+
+The case this exists for: 300 posts queued, 30 analysed, the machine loses power.
+
+```bash
+curl -s -X POST -H "$KEY" $API/v1/analysis/<job_id>/resume
+# → 200 {"analysis_id":"…","resumed":true,"status":"running","previous_status":"running",
+#        "progress":{"total":300,"completed":30,"remaining":270}}
+# → 409 if the job is still making progress, or already completed
+```
+
+Only the 270 go back on the stream. The 30 are not paid for twice, and the
+progress bar picks up at 30/300 rather than restarting.
+
+**How "what is left" is decided.** Nothing marks a power-cut job as dead: its row
+still reads `running`, and its Redis counters went with the power. So the answer
+is derived from **Postgres alone** — the job's selector gives the full post set,
+and a post counts as done when its `analysis_results` row was written at or after
+the job's `created_at`. That table is `UNIQUE (post_id)` with no job column, so
+the timestamp is the only discriminator available; it also means a post some
+*other* job re-analysed in the meantime counts as done, which is the right answer
+— a fresh result exists either way.
+
+**What resume rebuilds.** `job:{id}:total` and `job:{id}:completed` are re-seeded
+(to 300 and 30), and `job:{id}:failed` is reset because those posts are being
+retried. The seeded `completed` is what makes the assembler finish the job when
+the *last* remaining post lands: with no `total` at all it falls back to
+"first landing wins", and with `completed` at 0 the job could never reach its own
+total. Any stop flag is cleared first — the workers drop anything carrying it, so
+clearing after enqueueing would make the whole resume a no-op.
+
+**When it is refused.** A job that has written progress within the last 5 minutes
+(`_STALE_JOB_SECONDS`) is busy, not interrupted, and re-enqueueing under it would
+duplicate work and corrupt its counters — so it 409s and tells you to stop it
+first. `jobs.updated_at` is the heartbeat: the assembler touches it as every post
+lands. The dashboard shows the same threshold as a **stalled** badge, so a
+power-cut job stops reading as one that is still working.
+
+**What it does not do.** There is no per-post partial resume: a post that was
+mid-flight is redone from Stage 1. The original request's `options` are reused
+(so a job run with summaries resumes with them — this is why `jobs.options` is
+now persisted rather than written as `{}`), but `llm_backend` is re-resolved
+against the tenant's policy, so a stored `groq` does not outlive a privacy lock.
+
 ### 2c. Pull the result JSON
 
 ```bash
@@ -205,6 +324,30 @@ curl -s -H "$KEY" "$API/v1/analysis/<job_id>?include=results&limit=100"
 ```
 
 All three return `{"results": [ <AnalysisResult>, … ]}` — the §1 JSON.
+
+### 2c-bis. Page through the comments of one post
+
+The per-comment table is bulky, so the list/detail responses strip it
+(`_comment_analysis_summary`) and this endpoint serves it paginated. It backs the
+dashboard's per-comment comparison, and it is the only place the eight labellers'
+individual verdicts are readable:
+
+```bash
+curl -s -H "$KEY" "$API/v1/analysis/post/<post_id>/comments?limit=200&offset=0" \
+  | python -m json.tool
+
+# Only the comments the labellers DISAGREED on — the review queue, and the set a
+# gold standard should be built from:
+curl -s -H "$KEY" "$API/v1/analysis/post/<post_id>/comments?sentiment=disagreed"
+
+# Also: sentiment=positive|negative|neutral|uncertain|all, emotion=<label>|all
+```
+
+Returns the page in `comments[]` plus aggregates computed over the **full** set,
+not the page: `sentiment_breakdown`, `emotion_breakdown`, `method_breakdown`,
+`provenance`, `coverage` / `coverage_label`, `top_authors`, `top_liked`,
+`avg_sentiment_score`, `target_stances`, and the two objects that say how much of
+the thread was actually analysed — `ensemble` and `stage2_selection` (§1).
 
 ### 2d. Extract YOUR custom JSON shape
 
@@ -317,7 +460,48 @@ An **unknown** key is accepted only in dev (`ALLOW_UNKNOWN_API_KEYS`, which
 defaults on for `APP_ENV=dev` and off everywhere else) — so a deployment that
 forgot to provision keys fails **closed** rather than open.
 
-### Search (keyword & semantic)
+### Search (identifier, keyword & semantic)
+
+**An identifier is looked up, not searched for.** Paste a `post_id`,
+`platform_post_id`, post URL or `campaign_id` and it is matched exactly, ahead of
+whichever mode you asked for, and the response says so with
+`match_type: "exact_id"`:
+
+```bash
+curl -s -H "$KEY" "$API/v1/search?q=cmp58e24s04pgwglq7g9u9jz0" | python -m json.tool
+# → {"query":"cmp58e24…","semantic":false,"total":1,"match_type":"exact_id",
+#    "id_lookup_missed":false,"results":[{…that post…}]}
+
+# A prefix works too — the dashboard's post table renders only the first 8
+# characters of an id, so a prefix is usually what is in your clipboard.
+curl -s -H "$KEY" "$API/v1/search?q=cmp58e24"          # → match_type "id_prefix"
+
+# An id that matches nothing says so, instead of answering with neighbours:
+curl -s -H "$KEY" "$API/v1/search?q=cmzzzz9999zzzz9999zzzz999&semantic=true"
+# → {"total":0,"match_type":"keyword","id_lookup_missed":true}
+```
+
+This exists because both arms got an id query wrong, in opposite directions.
+Keyword search read only `post_summary` / `post_text` / `keywords` / `topics` /
+comment `themes`, so a **real post id returned 0 results** — the id being the one
+string most likely to be pasted in. Semantic search embedded the id and returned
+**20 cosine neighbours**, none of them the post asked for, which is the worse
+failure of the two: an empty result reads as "not found", twenty ranked results
+read as a successful search. Hence:
+
+* an exact identifier match short-circuits **every** mode, and its `score` is 1.0
+  because an exact match is not a similarity;
+* an id-shaped query that matches no identifier is **downgraded to the keyword
+  arm** rather than embedded, and carries `id_lookup_missed: true` so a client
+  can lead with "no post has that id";
+* the shape test requires a digit, so `bangladesh` and `মুসলিমদের` are words, not
+  ids — and a false positive can only cost an extra query, never results, because
+  the keyword arm always still runs;
+* the keyword arm now also covers the identifier columns, for the partial case.
+
+`match_type` is `exact_id` | `id_prefix` | `keyword` | `semantic` | `hybrid`.
+
+Free-text search is unchanged:
 
 ```bash
 curl -s -H "$KEY" "$API/v1/search?q=politics&semantic=false&limit=10" | python -m json.tool
@@ -332,7 +516,14 @@ curl -s -H "$KEY" "$API/v1/search?q=fuel%20price%20anger&semantic=true&limit=10"
 # downstream — the stub is the same 768 dims as a real vector, and deriving it
 # from the dimension is why every row was recorded as `false` until 5 Aug 2026
 # (PROJECT_ASSESSMENT §13.2).
-# → {"query":"…","semantic":true,"total":N,"results":[{"post_id","score","snippet","result":{<full §1 JSON>}}]}
+# → {"query":"…","semantic":true,"total":N,"match_type":"…","id_lookup_missed":false,
+#    "results":[{"post_id","score","snippet","result":{<full §1 JSON>}}]}
+#
+# `snippet` is the summary truncated to 200 chars for the list view; `result` is
+# the COMPLETE canonical object, so a client never needs a second request to show
+# a hit in full. The dashboard's Search tab opens it in the same detail modal the
+# Posts tab uses (it rendered only the snippet until 21 Aug 2026, which left the
+# post you had just found by id unreadable).
 ```
 
 ### Reports (grounded = LLM-written executive summary)
@@ -347,6 +538,14 @@ curl -s -X POST $API/v1/reports -H "$KEY" -H "Content-Type: application/json" \
 
 curl -s -H "$KEY" $API/v1/reports                  # list
 curl -s -H "$KEY" $API/v1/reports/<report_id>      # fetch one
+
+# Download an existing report as a file
+curl -s -H "$KEY" "$API/v1/reports/<report_id>/export?format=pdf" -o report.pdf
+
+# Generate over recent posts AND download in one call — no report_id needed
+curl -s -H "$KEY" \
+  "$API/v1/reports/export_latest?campaign_id=all&type=mass_reaction&format=pdf" \
+  -o latest.pdf     # format=html for the HTML version
 ```
 
 **`clusters` is the SQL topic aggregate; `embedding_clusters` is the LLM one.**
@@ -460,6 +659,40 @@ curl -s -H "$KEY" $API/v1/chat/models
 #                "groq":{"models":[…],"default":"llama-3.3-70b-versatile"}}}
 ```
 
+### Chat history (server-side conversations)
+
+Persisted per caller, so the dashboard's chat survives a reload. Separate from
+`/v1/chat`, which is stateless — these endpoints store the turns.
+
+```bash
+curl -s -H "$KEY" "$API/v1/chat/conversations?limit=20"          # newest first
+curl -s -X POST $API/v1/chat/conversations -H "$KEY" \
+     -H "Content-Type: application/json" -d '{"title":"fuel price thread"}'
+curl -s -H "$KEY" "$API/v1/chat/conversations/<id>"              # + its turns
+curl -s -X POST $API/v1/chat/conversations/<id>/messages -H "$KEY" \
+     -H "Content-Type: application/json" \
+     -d '{"messages":[{"role":"user","content":"hi"}]}'          # append turns
+curl -s -X PATCH $API/v1/chat/conversations/<id> -H "$KEY" \
+     -H "Content-Type: application/json" -d '{"title":"renamed"}'
+curl -s -X DELETE $API/v1/chat/conversations/<id>                # one
+curl -s -X DELETE $API/v1/chat/conversations                     # all of them
+```
+
+An empty append is a 422, and a role outside `VALID_ROLES` is rejected — a
+conversation must not be able to store a turn the LLM cannot replay.
+
+### Raw pipeline events
+
+```bash
+curl -s -H "$KEY" "$API/v1/events?limit=200"
+# → {"events":[{"stream_id":"1723…-0","event":{…}}, …]}   newest first
+```
+
+The last N frames of the global `pipeline:events` Redis stream, newest first —
+the same frames the Trace tab consumes live via `/v1/pipeline/stream`. Useful when
+a run has already finished and the stream is gone. An unreadable stream returns
+`{"events": [], "error": …}` rather than a 500.
+
 ### Jobs list
 
 ```bash
@@ -528,6 +761,44 @@ A privacy guarantee that evaporates when the database hiccups is not a guarantee
 
 ---
 
+## 3b. The rest of the surface — every `/v1` path
+
+The app serves **49 distinct `/v1` paths / 61 method+path pairs** (20 Aug 2026;
+`python -c "from defense.services.api.main import app; ..."` over `app.routes` is
+the check). §2–§3 cover the ones you drive by hand. These are the remainder — all
+real routes, most of them what the dashboard calls:
+
+| Method | Path | What it is |
+| :--- | :--- | :--- |
+| `GET` | `/v1/auth/verify` | Validate a raw token **without** establishing a session. Lets a client tell "no token" from "expired token" without a refresh. |
+| `GET` | `/v1/analysis/post/{post_id}/comments` | Paginated per-comment sentiment for one post — full coverage, not a sample. Same data as §2c-bis. |
+| `GET` | `/v1/analysis/export` | Download analysis results as a **ZIP of PDFs**, one per post. |
+| `POST` | `/v1/analysis/{analysis_id}/cancel` | Stop a queued/running job — cooperative, see §2b-bis. `409` if it already finished. |
+| `POST` | `/v1/analysis/{analysis_id}/resume` | Re-enqueue only the posts an interrupted job never finished — §2b-ter. `409` while it is still moving. |
+| `DELETE` | `/v1/analysis/{analysis_id}` | Delete the job record (stops it first if running). Keeps the posts' analysis results — §2b-bis. |
+| `GET` | `/v1/pipeline/stats` | Point-in-time stage state (queue depths, in-flight, last completion) — backs the dashboard **Pipeline** tab. |
+| `GET` | `/v1/agents/types` | The registered agent types and their descriptions, read straight off `AGENT_REGISTRY`. Use this rather than hard-coding a list of agent names. |
+| `GET`&nbsp;/&nbsp;`DELETE` | `/v1/agents/runs` | List recent agent runs / clear the history. Aliases of the `/v1/agents` collection. |
+| `POST` | `/v1/chat/agent` | Route a chat message to an MCP-backed agent — the Chat tab's path into the agent layer. |
+| `GET`&nbsp;/&nbsp;`PATCH`&nbsp;/&nbsp;`DELETE` | `/v1/chat/conversations/{conversation_id}` | Read a conversation and its turns / rename it / delete it. |
+| `POST` | `/v1/chat/conversations/{conversation_id}/messages` | Append turns to a conversation. |
+| `GET` | `/v1/reports/{report_id}` | Fetch a generated report by id. |
+| `GET` | `/v1/reports/{report_id}/export` | Export that report as a downloadable PDF or HTML file. |
+| `GET` | `/v1/reports/export_latest/export` | Generate a **fresh** grounded mass-reaction report and stream it straight back — no id round-trip. |
+| `GET` | `/v1/logs/services` | Which services are present in the log buffer (populates the Logs tab's filter). Every entry read `service: "-"` until 21 Aug 2026: the Redis sink is a stdlib handler reading `record.service`, while `setup_logging` binds the name through structlog's contextvars, which never touch the stdlib record. |
+| `GET` | `/v1/logs/stream` | Tail server-side logs over SSE. Needs an SSE ticket, like every other stream — see §3. **Replays `backfill` lines (default 60) before tailing**, subscribing to `logs:live` *before* reading `logs:recent` so no line can fall between the two — which means the line straddling the join arrives twice by construction. A client must dedupe (ts + level + message) and must open exactly one stream per view; two open streams double every line *and* the backfill, which is precisely how the Logs tab came to look like the backend was doing everything twice. |
+
+Two of these are easy to get wrong from the outside:
+
+```bash
+# Agent types — the roster is nine, and it comes from the registry, not a constant.
+curl -s http://127.0.0.1:8001/v1/agents/types -H "X-API-Key: demo" | python -m json.tool
+# → [{"name":"analyst","description":…,"tools":[…],"llm_role":"agent","max_tool_calls":10}, …]
+
+# A report you want but have not generated: export_latest builds and streams in one call.
+curl -s -o report.pdf http://127.0.0.1:8001/v1/reports/export_latest/export -H "X-API-Key: demo"
+```
+
 ## 4. Interactive docs
 
 FastAPI serves the full OpenAPI spec with a try-it-out UI:
@@ -536,6 +807,8 @@ FastAPI serves the full OpenAPI spec with a try-it-out UI:
 - ReDoc → <http://127.0.0.1:8001/redoc>
 - Raw spec → <http://127.0.0.1:8001/openapi.json>
 
-The dashboard (<http://127.0.0.1:8080>) exercises all of the above visually —
-Overview (usage/corpus stats), Posts, Jobs (live SSE progress), Reports,
-Search, and Agents tabs.
+The dashboard (<http://127.0.0.1:8080>) exercises all of the above visually.
+**Eleven tabs** (`dashboard/src/components/NavTabs.jsx` is the list of record):
+Overview (usage/corpus stats), Posts, Jobs (live SSE progress, plus stop /
+resume / re-run / delete per job), Reports, Search, Agents, Chat, Pipeline,
+Trace, Warnings, Logs.

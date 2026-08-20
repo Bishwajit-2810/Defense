@@ -147,7 +147,7 @@ async def put_llm_config(
         log.info("llm_backend_override_set", backend=body.backend)
     else:
         raise HTTPException(
-            status_code=status.HTTP_422_UNPROCESSABLE_ENTITY,
+            status_code=status.HTTP_422_UNPROCESSABLE_CONTENT,
             detail=f"backend must be one of {list(_VALID_BACKENDS)} or null",
         )
     return await _current(redis)
@@ -204,12 +204,12 @@ async def put_nlp_config(
         log.info("sentiment_model_override_cleared")
     elif body.model not in sentiment_models.valid_keys():
         raise HTTPException(
-            status_code=status.HTTP_422_UNPROCESSABLE_ENTITY,
+            status_code=status.HTTP_422_UNPROCESSABLE_CONTENT,
             detail=f"model must be one of {sentiment_models.valid_keys()} or null",
         )
     elif not sentiment_models.is_available(body.model):
         raise HTTPException(
-            status_code=status.HTTP_422_UNPROCESSABLE_ENTITY,
+            status_code=status.HTTP_422_UNPROCESSABLE_CONTENT,
             detail=(
                 f"model {body.model!r} has no checkpoint configured "
                 "(set its *_SENTIMENT_MODEL env var first)"

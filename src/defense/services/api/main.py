@@ -2,6 +2,8 @@
 
 from __future__ import annotations
 
+from contextlib import asynccontextmanager
+
 import logging
 import os
 import time
@@ -15,7 +17,7 @@ from defense.libs.common.config import get_settings
 
 sys_config = get_settings()
 
-from defense.services.api.routers import analysis, auth, chat, config, health, ingest, pipeline, reports, search
+from defense.services.api.routers import analysis, auth, chat, chat_history, config, health, ingest, pipeline, reports, search
 from defense.services.api.routers.agents import router as agents_router
 from defense.services.api.routers.logs import router as logs_router
 from defense.services.api.routers.usage import router as usage_router
@@ -41,6 +43,20 @@ logging.getLogger("uvicorn.access").setLevel(logging.WARNING)
 # Application
 # ---------------------------------------------------------------------------
 
+@asynccontextmanager
+async def lifespan(app: FastAPI):  # noqa: ARG001 - FastAPI passes the app in
+    """Startup/shutdown for the app.
+
+    Replaces `@app.on_event("startup")`, which FastAPI deprecated in favour of a
+    lifespan context. Same behaviour: the body before `yield` runs on startup,
+    after it on shutdown. Defined here because it is a constructor argument, and
+    it calls `_on_startup` (declared further down with the other lifecycle code)
+    — resolved at call time, so the ordering is fine.
+    """
+    await _on_startup()
+    yield
+
+
 app = FastAPI(
     title="Defense Analysis API",
     version="1.0.0",
@@ -51,6 +67,7 @@ app = FastAPI(
     docs_url="/docs",
     redoc_url="/redoc",
     openapi_url="/openapi.json",
+    lifespan=lifespan,
 )
 
 # ---------------------------------------------------------------------------
@@ -168,6 +185,7 @@ app.include_router(reports.router)
 app.include_router(search.router)
 app.include_router(config.router)
 app.include_router(chat.router)
+app.include_router(chat_history.router)
 app.include_router(pipeline.router)
 app.include_router(agents_router)
 app.include_router(usage_router)
@@ -179,6 +197,5 @@ app.include_router(events_router)
 # ---------------------------------------------------------------------------
 
 
-@app.on_event("startup")
-async def on_startup() -> None:
+async def _on_startup() -> None:
     log.info("API started", version=app.version, title=app.title)

@@ -1,14 +1,34 @@
 """Ensemble combination for per-comment sentiment — and the escalation gate.
 
-Stage 2 collects up to four independent opinions about a comment:
+Stage 2 collects up to eight independent opinions about a comment:
 
-    heuristic   Stage-1's emoji + lexicon rule (free, every comment)
-    xlmr        a multilingual sentiment head    (cheap, local)
-    distilbert  a second multilingual head       (cheap, local)
-    llm         the context-aware stance pass    (expensive, per batch)
+    xlmr                    DistilBERT-multilingual, 5-class      (cheap, local)
+    distilbert              DistilBERT-multilingual student       (cheap, local)
+    twitter_xlmr            XLM-R trained on social media         (cheap, local)
+    banglabert              BanglaBERT/Electra on SentNoB         (cheap, local)
+    bengali_sentiment_bert  BanglaBERT/Electra, 5-class           (cheap, local)
+    mbert                   multilingual BERT, 1-5 stars          (cheap, local)
+    modernbert              ModernBERT-base multilingual          (cheap, local)
+    llm                     the context-aware stance pass   (expensive, per batch)
 
-Before this module they were displayed side by side and nothing consumed them:
-the comment's own ``sentiment`` stayed at Stage-1's heuristic while the
+**Every voter here is a model.** Stage-1's emoji + lexicon heuristic used to be
+listed as an eighth cheap voter under the name ``heuristic``; it no longer votes
+at all (17 Aug 2026). It is a keyword rule, and in the shipped configuration a
+large share of its verdicts are the deterministic hash stub — a label that is
+reproducible and is not sentiment. Letting it vote meant a comment could be
+labelled by a rule that never read it, and on the corpus's Bangla threads that
+rule was the *majority* voter. The consequence is deliberate and must not be
+patched around: **a comment no model read now reports** :data:`UNCERTAIN` **with**
+``label_voters: 0``, which is the true state of it.
+
+"Cheap" is per comment, not per run: the seven heads are ~135-280M-parameter
+encoders that batch, while the LLM is a per-batch generation call. What they are
+NOT is seven independent readings — five of the seven are multilingual heads
+trained on overlapping data, so their agreement is correlated and a 7-0 vote is
+weaker evidence than seven unrelated models would be.
+
+Before this module the opinions were displayed side by side and nothing consumed
+them: the comment's own ``sentiment`` stayed at Stage-1's heuristic while the
 post-level breakdown was recomputed from the LLM alone, so one payload carried
 two aggregates that disagreed and `method_breakdown` reported 0% LLM for a run
 in which every comment had been sent to one.
@@ -45,22 +65,28 @@ VALID_LABELS: frozenset[str] = frozenset({"positive", "negative", "neutral"})
 UNCERTAIN: str = "uncertain"
 
 #: Voters that cost nothing per comment beyond a forward pass already batched.
+#: These names must match `Settings.stage2_classifier_names` exactly — a voter
+#: missing here is collected into `parallel_labels` and then ignored by
+#: `should_escalate`, which is a silent way to buy a model and not use it;
+#: `tests/test_ensemble.py` asserts the two lists agree.
+#:
+#: ``heuristic`` was removed on 17 Aug 2026 — see the module docstring. Do not add
+#: it back to make abstentions go away.
 CHEAP_SOURCES: tuple[str, ...] = (
-    "heuristic",
     "xlmr",
     "distilbert",
-    "banglabert",
-    "banglabert_base",
-    "bengali_sentiment_bert",
     "twitter_xlmr",
-    "distilmbert_bengali",
+    "banglabert",
+    "bengali_sentiment_bert",
+    "mbert",
+    "modernbert",
 )
 
 #: The expensive one.
 LLM_SOURCE: str = "llm"
 
-#: Below this share of voters behind the winner, the ensemble abstains.
-DEFAULT_MIN_AGREEMENT: float = 0.6
+#: Below this share of voters behind the winner, the ensemble abstains (0.0 = max vote / plurality wins).
+DEFAULT_MIN_AGREEMENT: float = 0.0
 
 
 @dataclass
@@ -124,7 +150,7 @@ def combine(
     abstain: bool = True,
     prefer_on_tie: str | None = LLM_SOURCE,
 ) -> Verdict:
-    """Combine per-source labels into one verdict.
+    """Combine per-source labels into one verdict by maximum votes (plurality).
 
     ``labels`` is ``{source: {"sentiment": ..., "sentiment_score"|"score": ...}}``.
     Sources with no usable label do not vote.
@@ -133,16 +159,8 @@ def combine(
     never "neutral", which would be indistinguishable from a comment every model
     read and judged neutral.
 
-    ``prefer_on_tie`` breaks an exact tie in favour of one source. It defaults to
-    the LLM because the LLM is the only labeller that sees the POST: it judges
-    stance toward what was said, while the small heads judge the comment's text
-    in isolation. On an even number of voters a 2-2 split is common, and calling
-    every one of those "uncertain" would throw away the one opinion that had the
-    context.
-
-    A tie-break is NOT consensus, and the verdict says so: ``agreement`` still
-    reports the real 0.5 and ``tie_broken_by`` names the source that decided it,
-    so the UI keeps flagging the comment as contested.
+    The label with the most votes wins. In case of an exact tie for first place,
+    ``prefer_on_tie`` decides the tie; otherwise the ensemble abstains as UNCERTAIN.
     """
     votes = _votes(labels)
     if not votes:
@@ -158,35 +176,22 @@ def combine(
     agreement = len(top_voters) / n
     tied = len(ranked) > 1 and len(ranked[1][1]) == len(top_voters)
 
-    # Half-the-room rule. With four voters an exact 2-2 split, or a 2-1-1
-    # plurality, is common — and calling all of those "uncertain" throws away
-    # the one opinion that had the post as context. So: when at least half the
-    # voters back a label and `prefer_on_tie` is one of them, that label stands.
-    # Below half, or with the preferred source dissenting, it still abstains.
+    # Tie-break rule: when there is an exact tie for first place, prefer_on_tie decides.
     tie_broken_by: str | None = None
-    if prefer_on_tie and (tied or agreement < min_agreement):
+    if tied and prefer_on_tie:
         preferred = next(
             (label for source, label, _ in votes if source == prefer_on_tie), None
         )
-        if preferred is not None and len(tally[preferred]) / n >= 0.5:
+        if preferred is not None and len(tally.get(preferred, [])) == len(top_voters):
             top_label, top_voters = preferred, tally[preferred]
             agreement = len(top_voters) / n
             tie_broken_by = prefer_on_tie
             tied = False
 
     mean_score = sum(s for _, s in top_voters) / len(top_voters)
-    # Unanimity needs a room. One voter agreeing with itself is not consensus,
-    # and `unanimous_share` is documented as "the share the expensive model
-    # never needed to see" — which inverts the truth precisely when the LLM was
-    # the ONLY labeller (stub-mode Stage 1 abstains, no classifier weights
-    # cached, every comment sent to the LLM: unanimous_share read 1.0).
     unanimous = len(tally) == 1 and n >= 2
 
-    # A deliberately broken tie is 0.5 agreement by definition, so the
-    # threshold must not then reject what the tie-break just decided.
     if abstain and (tied or (tie_broken_by is None and agreement < min_agreement)):
-        # Keep the score of the plurality so a downstream chart can still show
-        # which way it leaned, but do not claim the label.
         return Verdict(
             label=UNCERTAIN,
             score=mean_score,
@@ -236,8 +241,13 @@ def should_escalate(
     reason consumes is a measured quantity rather than an assumption — the same
     standard the post-level router is held to.
     """
-    # Nothing to read: an emoji reaction or an empty/filtered comment has no
-    # text for an LLM, and the emoji heuristic is the appropriate label for it.
+    # Nothing to read: an emoji reaction or an empty/filtered comment has no text
+    # for an LLM, and sending it is the cheapest possible way to waste tokens.
+    # Note what follows from Stage 1's rule no longer voting: these comments end
+    # up with NO verdict at all — `uncertain` at zero voters — and are counted in
+    # `reaction_only` instead. An emoji reaction is crowd signal, not a sentiment
+    # measurement, and the output now says so rather than passing off a lexicon
+    # guess as a label.
     if kind in ("emoji", "filtered", "link"):
         return False, "no_text"
 

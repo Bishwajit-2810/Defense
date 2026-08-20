@@ -19,6 +19,7 @@ from sqlalchemy.ext.asyncio import AsyncSession
 
 import redis.asyncio as aioredis
 from defense.libs.labels import label_provenance
+from defense.libs.jobs import clear_cancelled, mark_cancelled, purge_job_keys
 from defense.libs.progress import publish_stage, replay_events
 from defense.services.api.deps import get_current_user, get_db, get_redis, rate_limit, resolve_llm_backend
 from defense.services.api.models import (
@@ -42,12 +43,28 @@ except Exception:  # pragma: no cover - depends on system libs, not just the whe
 router = APIRouter(prefix="/v1/analysis", tags=["analysis"])
 
 # Job statuses that are final; anything else is reconcilable from the counters.
-_TERMINAL_JOB_STATUSES = frozenset({"done", "failed"})
+_TERMINAL_JOB_STATUSES = frozenset({"done", "failed", "cancelled"})
+
+# The same set, rendered for the `status NOT IN (...)` guards below, so a SQL
+# guard can never fall out of step with the Python check.
+_TERMINAL_STATUS_SQL = ", ".join(f"'{s}'" for s in sorted(_TERMINAL_JOB_STATUSES))
 
 # Re-analysis jobs feed the same Stage-1 stream the ingestion service uses —
 # there is no separate analysis worker; the normal pipeline does the work and
 # the assembler flips the job to done via job_id.
 _NLP_STAGE1_STREAM = "nlp:stage1:queue"
+
+# How long a non-terminal job must sit without a progress write before resume
+# treats it as dead rather than busy.
+#
+# `jobs.updated_at` is the heartbeat: the assembler writes "running" to the row
+# as every post lands, so a job that is genuinely moving touches it continuously.
+# Nothing else in the system can tell a power-cut job from a slow one — a killed
+# process leaves no marker — so resume needs a threshold, and it has to clear the
+# slowest single post (a full comment ensemble plus summary on a long thread),
+# not the average one. Below this a resume is refused and the operator is told to
+# stop the job first, which is unambiguous.
+_STALE_JOB_SECONDS = 300
 
 
 async def _create_analysis_job(
@@ -55,7 +72,20 @@ async def _create_analysis_job(
     analysis_id: str,
     selector: dict,
     tenant_id: str = "default",
+    options: dict | None = None,
 ) -> None:
+    """Insert the jobs row for an analysis run.
+
+    ``options`` is persisted because resume has to re-enqueue the job's
+    remaining posts with the SAME per-request options it started with — a job
+    run with ``want_summary`` and resumed without it would finish with half its
+    posts summarised and nothing saying why. This column used to be written as a
+    literal ``{}``, so that request detail was thrown away at enqueue time.
+
+    ``llm_backend`` is stored with the rest but deliberately NOT trusted on
+    resume: it is re-resolved against the tenant's policy, which may have been
+    privacy-locked in the meantime (§13.5).
+    """
     now = datetime.now(tz=timezone.utc)
     selector["tenant_id"] = tenant_id
     await db.execute(
@@ -72,11 +102,109 @@ async def _create_analysis_job(
             "type": "analysis_run",
             "status": "queued",
             "selector": json.dumps(selector, default=str),
-            "options": json.dumps({}),
+            "options": json.dumps(options or {}, default=str),
             "created_at": now,
             "updated_at": now,
         },
     )
+
+
+async def _posts_for_selector(
+    db: AsyncSession,
+    tenant_id: str,
+    campaign_id: str | None,
+    post_ids: list[str] | None,
+) -> list[Any]:
+    """Resolve a job selector to its ``(id, raw_payload)`` rows, tenant-scoped.
+
+    NOTE: the selector's optional ``filter`` block (platform / posted_from /
+    posted_to / sentiment bounds) is stored on the job but has never been
+    applied here — a filtered run analyses the whole campaign. That is
+    pre-existing behaviour, left alone deliberately so resume selects exactly
+    the set its original run did; fixing it would change which posts a run
+    covers, which is a separate decision.
+    """
+    where, params = ["tenant_id = :tenant_id"], {"tenant_id": tenant_id}
+    if campaign_id:
+        where.append("campaign_id = :campaign_id")
+        params["campaign_id"] = campaign_id
+    if post_ids:
+        where.append("id = ANY(:post_ids)")
+        params["post_ids"] = post_ids
+    return (
+        await db.execute(
+            text(f"SELECT id, raw_payload FROM posts WHERE {' AND '.join(where)}"),
+            params,
+        )
+    ).mappings().all()
+
+
+async def _enqueue_for_analysis(
+    redis: aioredis.Redis,
+    rows: list[Any],
+    *,
+    analysis_id: str,
+    options: dict[str, Any],
+    tenant_id: str,
+) -> int:
+    """Re-normalize each post and push it onto Stage 1 under *analysis_id*.
+
+    Returns how many were enqueued. Shared by the initial run and by resume so
+    the two cannot drift in what they put on the stream — a resume that built a
+    slightly different envelope would produce results the first half of the job
+    is not comparable with.
+    """
+    from defense.services.ingestion.normalizer import normalize_post  # noqa: PLC0415
+
+    enqueued = 0
+    for row in rows:
+        raw = row["raw_payload"] or {}
+        try:
+            normalized = normalize_post(raw)
+        except Exception as exc:
+            log.warning("analysis_run_normalize_failed", post_id=row["id"], error=str(exc))
+            continue
+        envelope = {
+            "post_id": normalized["post_id"],
+            "raw_post": raw,
+            "normalized_post": normalized,
+            "options": options,
+            "job_id": analysis_id,
+            "tenant_id": tenant_id,
+        }
+        await redis.xadd(
+            _NLP_STAGE1_STREAM,
+            {"data": json.dumps(envelope, ensure_ascii=False, default=str)},
+        )
+        enqueued += 1
+
+        # Opening frame for the dashboard's Trace tab. This path re-enqueues
+        # directly rather than going through the ingestion worker, so it has
+        # to report the ingest layer itself.
+        eng = normalized.get("engagement") or {}
+        await publish_stage(
+            redis,
+            "ingest",
+            "done",
+            job_id=analysis_id,
+            post_id=normalized["post_id"],
+            detail={
+                "source": "re-normalized from stored raw_payload",
+                "platform": normalized.get("platform"),
+                "media_type": normalized.get("media_type"),
+                "caption_chars": len(normalized.get("caption") or ""),
+                "photo_count": len(normalized.get("photo_urls") or []),
+                "comment_rows": len(normalized.get("comments") or []),
+                "comment_count": eng.get("comment_count"),
+                "coverage": eng.get("coverage"),
+                "content_hash": (normalized.get("content_hash") or "")[:16],
+                "baseline_sentiment": normalized.get("baseline_sentiment"),
+                "options": options,
+                "next_stream": _NLP_STAGE1_STREAM,
+            },
+            log=log,
+        )
+    return enqueued
 
 
 # ---------------------------------------------------------------------------
@@ -107,7 +235,7 @@ async def analysis_run(
     """
     if not body.post_ids and not body.campaign_id:
         raise HTTPException(
-            status_code=status.HTTP_422_UNPROCESSABLE_ENTITY,
+            status_code=status.HTTP_422_UNPROCESSABLE_CONTENT,
             detail="Provide at least one of 'post_ids' or 'campaign_id'",
         )
 
@@ -127,19 +255,7 @@ async def analysis_run(
         selector["filter"] = body.filter.model_dump(exclude_none=True)
 
     # --- Find the posts to (re-)analyze (tenant-scoped) --------------------
-    where, params = ["tenant_id = :tenant_id"], {"tenant_id": tenant_id}
-    if body.campaign_id:
-        where.append("campaign_id = :campaign_id")
-        params["campaign_id"] = body.campaign_id
-    if body.post_ids:
-        where.append("id = ANY(:post_ids)")
-        params["post_ids"] = body.post_ids
-    rows = (
-        await db.execute(
-            text(f"SELECT id, raw_payload FROM posts WHERE {' AND '.join(where)}"),
-            params,
-        )
-    ).mappings().all()
+    rows = await _posts_for_selector(db, tenant_id, body.campaign_id, body.post_ids)
 
     if not rows:
         raise HTTPException(
@@ -148,58 +264,13 @@ async def analysis_run(
         )
 
     # Re-normalize from the stored raw payload (same path ingestion uses).
-    from defense.services.ingestion.normalizer import normalize_post  # noqa: PLC0415
-
     try:
-        await _create_analysis_job(db, analysis_id, selector, tenant_id=tenant_id)
-        enqueued = 0
-        for row in rows:
-            raw = row["raw_payload"] or {}
-            try:
-                normalized = normalize_post(raw)
-            except Exception as exc:
-                log.warning("analysis_run_normalize_failed", post_id=row["id"], error=str(exc))
-                continue
-            envelope = {
-                "post_id": normalized["post_id"],
-                "raw_post": raw,
-                "normalized_post": normalized,
-                "options": options,
-                "job_id": analysis_id,
-                "tenant_id": tenant_id,
-            }
-            await redis.xadd(
-                _NLP_STAGE1_STREAM,
-                {"data": json.dumps(envelope, ensure_ascii=False, default=str)},
-            )
-            enqueued += 1
-
-            # Opening frame for the dashboard's Trace tab. This path re-enqueues
-            # directly rather than going through the ingestion worker, so it has
-            # to report the ingest layer itself.
-            eng = normalized.get("engagement") or {}
-            await publish_stage(
-                redis,
-                "ingest",
-                "done",
-                job_id=analysis_id,
-                post_id=normalized["post_id"],
-                detail={
-                    "source": "re-normalized from stored raw_payload",
-                    "platform": normalized.get("platform"),
-                    "media_type": normalized.get("media_type"),
-                    "caption_chars": len(normalized.get("caption") or ""),
-                    "photo_count": len(normalized.get("photo_urls") or []),
-                    "comment_rows": len(normalized.get("comments") or []),
-                    "comment_count": eng.get("comment_count"),
-                    "coverage": eng.get("coverage"),
-                    "content_hash": (normalized.get("content_hash") or "")[:16],
-                    "baseline_sentiment": normalized.get("baseline_sentiment"),
-                    "options": options,
-                    "next_stream": _NLP_STAGE1_STREAM,
-                },
-                log=log,
-            )
+        await _create_analysis_job(
+            db, analysis_id, selector, tenant_id=tenant_id, options=options
+        )
+        enqueued = await _enqueue_for_analysis(
+            redis, rows, analysis_id=analysis_id, options=options, tenant_id=tenant_id
+        )
         if enqueued == 0:
             raise HTTPException(
                 status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,
@@ -308,6 +379,392 @@ async def list_analysis_jobs(
                 }
             )
     return {"jobs": jobs, "total": len(jobs)}
+
+
+# ---------------------------------------------------------------------------
+# POST /v1/analysis/{analysis_id}/cancel  —  DELETE /v1/analysis/{analysis_id}
+# ---------------------------------------------------------------------------
+
+
+async def _job_row_for_tenant(db: AsyncSession, analysis_id: str, tenant_id: str) -> Any:
+    """Fetch a job scoped to the caller's tenant, or 404.
+
+    Both selectors are checked because `jobs.tenant_id` was added after the
+    fact (init-db.sql backfills it to 'default'); older rows carry the tenant
+    only inside `selector`, and the Jobs list reads them the same way.
+    """
+    row = (
+        await db.execute(
+            text(
+                "SELECT id, status, selector, options, created_at, updated_at FROM jobs "
+                "WHERE id = :id AND (tenant_id = :tid OR selector->>'tenant_id' = :tid)"
+            ),
+            {"id": analysis_id, "tid": tenant_id},
+        )
+    ).mappings().first()
+    if row is None:
+        raise HTTPException(
+            status_code=status.HTTP_404_NOT_FOUND,
+            detail=f"Analysis job '{analysis_id}' not found",
+        )
+    return row
+
+
+async def _progress_snapshot(redis: aioredis.Redis, analysis_id: str) -> dict[str, Any]:
+    """Best-effort {total, completed, failed} for a job, for stop/delete replies."""
+    try:
+        raw_total = await redis.get(f"job:{analysis_id}:total")
+        return {
+            "total": int(raw_total) if raw_total is not None else None,
+            "completed": int(await redis.get(f"job:{analysis_id}:completed") or 0),
+            "failed": int(await redis.get(f"job:{analysis_id}:failed") or 0),
+        }
+    except Exception:
+        return {"total": None, "completed": 0, "failed": 0}
+
+
+@router.post(
+    "/{analysis_id}/cancel",
+    summary="Stop a queued or running analysis job",
+)
+async def cancel_analysis(
+    analysis_id: str,
+    db: AsyncSession = Depends(get_db),
+    redis: aioredis.Redis = Depends(get_redis),
+    current_user: dict = Depends(get_current_user),
+) -> dict:
+    """Stop *analysis_id*: no further post of this job is analysed.
+
+    Cancellation is cooperative — see ``libs/jobs.py``. A job is N envelopes
+    spread across four Redis streams, so there is nothing to kill; this raises a
+    flag that Stage 1, the router and Stage 2 each check as they pick a message
+    up. Posts already mid-flight in a stage finish and are persisted (the LLM
+    spend on them is already paid); everything behind them is dropped, so the
+    stop costs at most one post per stage rather than the rest of the batch.
+
+    The job row goes to ``cancelled``, which the assembler cannot overwrite, and
+    a terminating ``cancelled`` frame closes any open SSE stream.
+    """
+    tenant_id = current_user.get("tenant_id", "default")
+    job_row = await _job_row_for_tenant(db, analysis_id, tenant_id)
+
+    job_status = job_row["status"]
+    if job_status in _TERMINAL_JOB_STATUSES:
+        raise HTTPException(
+            status_code=status.HTTP_409_CONFLICT,
+            detail=f"Job '{analysis_id}' is already in a final state (status: {job_status}) — nothing to stop",
+        )
+
+    # The flag IS the mechanism. If it did not land, the workers were never
+    # told, so report the failure rather than a job row that lies about it.
+    if not await mark_cancelled(redis, analysis_id, reason="stopped via API"):
+        raise HTTPException(
+            status_code=status.HTTP_503_SERVICE_UNAVAILABLE,
+            detail="Could not reach Redis to signal the workers — job not stopped",
+        )
+
+    await db.execute(
+        text(
+            "UPDATE jobs SET status = 'cancelled', updated_at = NOW(), "
+            "error = 'cancelled by operator' "
+            f"WHERE id = :id AND status NOT IN ({_TERMINAL_STATUS_SQL})"
+        ),
+        {"id": analysis_id},
+    )
+    await db.commit()
+
+    progress = await _progress_snapshot(redis, analysis_id)
+
+    # Terminating SSE frame so a watching dashboard stops immediately instead of
+    # sitting on the stream until its 5-minute timeout. `_sse_generator` breaks
+    # on this event name.
+    try:
+        await redis.publish(
+            f"analysis:progress:{analysis_id}",
+            json.dumps(
+                {
+                    "event": "cancelled",
+                    "job_id": analysis_id,
+                    "status": "cancelled",
+                    "reason": "stopped by operator",
+                    **progress,
+                },
+                ensure_ascii=False,
+            ),
+        )
+    except Exception as exc:
+        log.warning("analysis_cancel_publish_failed", analysis_id=analysis_id, error=str(exc))
+
+    log.info(
+        "analysis_cancelled",
+        analysis_id=analysis_id,
+        tenant_id=tenant_id,
+        previous_status=job_status,
+        **progress,
+    )
+    return {
+        "analysis_id": analysis_id,
+        "status": "cancelled",
+        "previous_status": job_status,
+        "progress": progress,
+    }
+
+
+@router.post(
+    "/{analysis_id}/resume",
+    summary="Re-enqueue only the posts an interrupted job never finished",
+)
+async def resume_analysis(
+    analysis_id: str,
+    db: AsyncSession = Depends(get_db),
+    redis: aioredis.Redis = Depends(get_redis),
+    current_user: dict = Depends(get_current_user),
+) -> dict:
+    """Continue *analysis_id* from where it stopped, under the same job id.
+
+    Written for the case the pipeline cannot detect on its own: the machine lost
+    power (or the workers were killed) with 30 of 300 posts analysed. Nothing
+    marks that job as dead — its row still reads ``running``, its Redis counters
+    may be gone entirely, and the envelopes it had in flight were lost with the
+    streams. A plain re-run would re-analyse all 300 and pay for the 30 again.
+
+    So "what is left" is derived from **Postgres alone**, the only thing that
+    survives the power cut: the job's selector gives the full post set, and a
+    post counts as done when its ``analysis_results`` row was written at or
+    after the job started. ``analysis_results`` is keyed ``UNIQUE (post_id)``
+    with no job column, so that timestamp is the only available discriminator;
+    it means a post another job re-analysed in the meantime also counts as done,
+    which is correct — a fresh result exists either way.
+
+    The Redis counters are then rebuilt to match (``total`` = the whole set,
+    ``completed`` = what is already done, ``failed`` reset), which is what lets
+    the assembler finish the job when the remaining posts land instead of
+    flipping it done on the first one. Progress therefore continues from 30/300
+    rather than restarting at 0.
+
+    Refused with 409 while the job still looks alive — stop it first, then
+    resume — and there is no per-post partial resume: a post that was mid-flight
+    is redone from Stage 1.
+    """
+    tenant_id = current_user.get("tenant_id", "default")
+    job_row = await _job_row_for_tenant(db, analysis_id, tenant_id)
+
+    job_status: str = job_row["status"]
+    selector: dict = job_row["selector"] or {}
+    campaign_id: str | None = selector.get("campaign_id")
+    post_ids: list[str] = selector.get("post_ids") or []
+
+    if not campaign_id and not post_ids:
+        raise HTTPException(
+            status_code=status.HTTP_422_UNPROCESSABLE_CONTENT,
+            detail=(
+                f"Job '{analysis_id}' has no campaign_id or post_ids in its selector, "
+                "so there is no post set to resume — start a new run instead"
+            ),
+        )
+
+    if job_status == "done":
+        raise HTTPException(
+            status_code=status.HTTP_409_CONFLICT,
+            detail=f"Job '{analysis_id}' already completed — nothing to resume",
+        )
+
+    # A job that is still writing progress is not interrupted, it is busy.
+    # Re-enqueueing under it would duplicate work and corrupt its counters.
+    if job_status not in _TERMINAL_JOB_STATUSES:
+        updated_at = job_row["updated_at"] or job_row["created_at"]
+        idle_for: float | None = None
+        if updated_at is not None:
+            now = datetime.now(tz=timezone.utc)
+            if updated_at.tzinfo is None:
+                updated_at = updated_at.replace(tzinfo=timezone.utc)
+            idle_for = (now - updated_at).total_seconds()
+        if idle_for is not None and idle_for < _STALE_JOB_SECONDS:
+            raise HTTPException(
+                status_code=status.HTTP_409_CONFLICT,
+                detail=(
+                    f"Job '{analysis_id}' is still making progress (last update "
+                    f"{int(idle_for)}s ago) — stop it first, then resume"
+                ),
+            )
+
+    # --- What is left, from Postgres only ---------------------------------
+    rows = await _posts_for_selector(db, tenant_id, campaign_id, post_ids)
+    if not rows:
+        raise HTTPException(
+            status_code=status.HTTP_404_NOT_FOUND,
+            detail="No posts matched the job's selector — they may have been deleted",
+        )
+
+    all_ids = [r["id"] for r in rows]
+    done_ids = {
+        r[0]
+        for r in (
+            await db.execute(
+                text(
+                    "SELECT post_id FROM analysis_results "
+                    "WHERE tenant_id = :tid AND post_id = ANY(:ids) "
+                    "AND updated_at >= :since"
+                ),
+                {"tid": tenant_id, "ids": all_ids, "since": job_row["created_at"]},
+            )
+        ).all()
+    }
+    remaining = [r for r in rows if r["id"] not in done_ids]
+
+    if not remaining:
+        # Every post has a result from this job's lifetime; the row was simply
+        # never flipped because the assembler died before the last one landed.
+        await db.execute(
+            text(
+                "UPDATE jobs SET status = 'done', updated_at = NOW(), error = NULL "
+                "WHERE id = :id"
+            ),
+            {"id": analysis_id},
+        )
+        await db.commit()
+        log.info("analysis_resume_already_complete", analysis_id=analysis_id, total=len(all_ids))
+        return {
+            "analysis_id": analysis_id,
+            "resumed": False,
+            "status": "done",
+            "reason": "every post in the selector already has a result from this job",
+            "progress": {"total": len(all_ids), "completed": len(done_ids), "remaining": 0},
+        }
+
+    # --- Options: reuse the request's, re-resolve the backend --------------
+    # Stored so a resumed job asks for the same tasks the original did; the
+    # backend is re-resolved because the tenant may have been privacy-locked
+    # since (§13.5), and a stored 'groq' must not survive that.
+    options: dict[str, Any] = dict(job_row["options"] or {})
+    options["tenant_id"] = tenant_id
+    options["llm_backend"] = await resolve_llm_backend(db, redis, current_user, options)
+
+    # Lower the stop flag BEFORE enqueueing — the workers drop anything carrying
+    # it, so the order is the difference between a resume and a no-op.
+    if not await clear_cancelled(redis, analysis_id):
+        raise HTTPException(
+            status_code=status.HTTP_503_SERVICE_UNAVAILABLE,
+            detail="Could not reach Redis to clear the job's stop flag — not resumed",
+        )
+
+    # Rebuild the counters the power cut took with it. `completed` is seeded with
+    # the work already done, which is what makes the assembler finish the job on
+    # the last remaining post instead of on the first one (with no `total` it
+    # falls back to "first landing wins"), and what makes the dashboard resume
+    # the bar at 30/300 rather than 0/270.
+    try:
+        await redis.set(f"job:{analysis_id}:total", len(all_ids), ex=86_400)
+        await redis.set(f"job:{analysis_id}:completed", len(done_ids), ex=86_400)
+        # Old failures are being retried in `remaining`, so counting them again
+        # would push completed+failed past total and finish the job early.
+        await redis.delete(f"job:{analysis_id}:failed")
+    except Exception as exc:
+        log.warning("analysis_resume_counter_reset_failed", analysis_id=analysis_id, error=str(exc))
+
+    enqueued = await _enqueue_for_analysis(
+        redis, remaining, analysis_id=analysis_id, options=options, tenant_id=tenant_id
+    )
+    if enqueued == 0:
+        raise HTTPException(
+            status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,
+            detail="All remaining posts failed normalization",
+        )
+
+    await db.execute(
+        text(
+            "UPDATE jobs SET status = 'running', updated_at = NOW(), error = NULL "
+            "WHERE id = :id"
+        ),
+        {"id": analysis_id},
+    )
+    await db.commit()
+
+    log.info(
+        "analysis_resumed",
+        analysis_id=analysis_id,
+        previous_status=job_status,
+        total=len(all_ids),
+        already_done=len(done_ids),
+        re_enqueued=enqueued,
+    )
+    return {
+        "analysis_id": analysis_id,
+        "resumed": True,
+        "status": "running",
+        "previous_status": job_status,
+        "progress": {
+            "total": len(all_ids),
+            "completed": len(done_ids),
+            "remaining": enqueued,
+        },
+    }
+
+
+@router.delete(
+    "/{analysis_id}",
+    summary="Delete an analysis job record (stops it first if still running)",
+)
+async def delete_analysis(
+    analysis_id: str,
+    db: AsyncSession = Depends(get_db),
+    redis: aioredis.Redis = Depends(get_redis),
+    current_user: dict = Depends(get_current_user),
+) -> dict:
+    """Remove the job row for *analysis_id* plus its progress counters and trace.
+
+    A still-running job is stopped first — deleting the row without raising the
+    stop flag would leave the batch churning through the LLM against a job id
+    that no longer exists.
+
+    This deletes the JOB, not the analysis of the posts. ``analysis_results``
+    rows are keyed by post and campaign, not by job, and a post's latest result
+    is what every other tab reads — several jobs (and the original ingest) write
+    the same rows, so removing them here would silently blank posts that another
+    job analysed. Use ``DELETE /v1/posts/{post_id}`` to drop a post's data.
+    """
+    tenant_id = current_user.get("tenant_id", "default")
+    job_row = await _job_row_for_tenant(db, analysis_id, tenant_id)
+
+    job_status = job_row["status"]
+    was_running = job_status not in _TERMINAL_JOB_STATUSES
+    cancelled = False
+    if was_running:
+        cancelled = await mark_cancelled(redis, analysis_id, reason="job deleted")
+        if not cancelled:
+            raise HTTPException(
+                status_code=status.HTTP_503_SERVICE_UNAVAILABLE,
+                detail=(
+                    "Could not reach Redis to stop the running job — refusing to "
+                    "delete a job that would keep processing"
+                ),
+            )
+
+    result = await db.execute(
+        text("DELETE FROM jobs WHERE id = :id AND (tenant_id = :tid OR selector->>'tenant_id' = :tid)"),
+        {"id": analysis_id, "tid": tenant_id},
+    )
+    await db.commit()
+
+    # Progress counters and the Trace tab's replay buffer. The cancel flag is
+    # deliberately left behind to expire on its own TTL — it is the only thing
+    # still stopping this job's in-flight envelopes.
+    purged = await purge_job_keys(redis, analysis_id)
+
+    log.info(
+        "analysis_job_deleted",
+        analysis_id=analysis_id,
+        tenant_id=tenant_id,
+        previous_status=job_status,
+        stopped=cancelled,
+        redis_keys_purged=purged,
+    )
+    return {
+        "analysis_id": analysis_id,
+        "deleted": {"jobs": result.rowcount or 0, "redis_keys": purged},
+        "stopped": cancelled,
+        "previous_status": job_status,
+    }
 
 
 @router.get(
@@ -667,8 +1124,15 @@ def _result_to_html(res: dict) -> str:
     </div>
     """
 
-    # Comments
-    comments = (res.get("comment_analysis") or {}).get("comments", [])
+    # Comments — analysed ones (voted by models / stage2_selected / highest reactions) come first
+    raw_comments = (res.get("comment_analysis") or {}).get("comments", [])
+    comments = sorted(
+        raw_comments,
+        key=lambda c: (
+            0 if (c.get("label_voters", 0) > 0 or c.get("stage2_selected") is True or bool(c.get("parallel_labels"))) else 1,
+            -int(c.get("likes") or 0),
+        ),
+    )
     comments_html = ""
     for c in comments:
         c_text = _esc(c.get("text", c.get("comment_text", "")))
@@ -1103,7 +1567,7 @@ async def get_analysis(
                 await db.execute(
                     text(
                         "UPDATE jobs SET status = :s, updated_at = NOW() "
-                        "WHERE id = :id AND status NOT IN ('done', 'failed')"
+                        f"WHERE id = :id AND status NOT IN ({_TERMINAL_STATUS_SQL})"
                     ),
                     {"s": job_status, "id": analysis_id},
                 )
@@ -1236,6 +1700,15 @@ async def get_post_comments(
     if emotion != "all":
         filtered = [c for c in filtered if (c.get("emotion") or "neutral") == emotion]
 
+    # Priority sort: analysed comments (voted by models / stage2_selected / highest reactions) come first
+    filtered = sorted(
+        filtered,
+        key=lambda c: (
+            0 if (c.get("label_voters", 0) > 0 or c.get("stage2_selected") is True or bool(c.get("parallel_labels"))) else 1,
+            -int(c.get("likes") or 0),
+        ),
+    )
+
     page = filtered[offset : offset + limit]
 
     # ---- Aggregates over the FULL comment set (not just the page) ----------
@@ -1275,6 +1748,11 @@ async def get_post_comments(
         # How the labels were produced and how much the labellers agreed —
         # reported next to the counts, like coverage and provenance.
         "ensemble": ca.get("ensemble", {}),
+        # Which comments the router put in front of the models (top-N by reaction
+        # count). Surfaced on its own as well as inside `ensemble`, so a row
+        # written by a run whose comment lane failed still says how much of the
+        # thread was ever meant to be analysed.
+        "stage2_selection": ca.get("stage2_selection", {}),
         "target_stances": ca.get("target_stances", {}),
         "emotion_breakdown": ca.get("emotion_breakdown", {}),
         "method_breakdown": ca.get("method_breakdown", {}),
@@ -1292,28 +1770,61 @@ async def get_post_comments(
     }
 
 
+def _analysed_by_models(ca: dict) -> int | None:
+    """How many of a post's comments a Stage-2 model actually read.
+
+    NOT ``comment_analysis.analyzed`` — that is the number of comment rows Stage 1
+    stored, which equals the whole thread and so cannot say what the ensemble
+    covered. The honest count is ``ensemble.analysed`` (the set every voter read),
+    falling back to the router's ``stage2_selection.selected``.
+
+    Returns None when neither block exists (rows written before the ensemble
+    recorded itself) so callers can omit the number instead of substituting the
+    stored-row count, which would overstate coverage — the case this function
+    exists to prevent: 87 rows stored, 31 read, previously reported as 87.
+    """
+    ens = ca.get("ensemble") or {}
+    sel = ca.get("stage2_selection") or {}
+    for value in (ens.get("analysed"), sel.get("selected")):
+        if value is not None:
+            return int(value)
+    return None
+
+
 def _coverage_label(ca: dict, engagement: dict) -> str:
     """Human-readable comment-coverage string, computed server-side.
 
-    Mirrors what the dashboard used to build in JS: every stored comment is
-    classified, so "✓ all" means we analysed everything the upstream shipped;
-    the "% of N" tail is the honest fraction of the platform's reported total
-    that we ever received.
+    Distinguishes comments analysed by the model ensemble, comments stored in the DB,
+    and total comments reported on the upstream platform.
     """
-    analyzed = int(ca.get("analyzed") or 0)
-    stored = int((engagement or {}).get("stored_comments") or 0)
+    sel = ca.get("stage2_selection") or {}
+    ens = ca.get("ensemble") or {}
+    stored = int((engagement or {}).get("stored_comments") or ca.get("analyzed") or 0)
     total = int((engagement or {}).get("comment_count") or 0)
-    if not analyzed and not stored and not total:
+
+    sel_skipped = sel.get("skipped", 0)
+    analysed = _analysed_by_models(ca)
+
+    if not stored and not total:
         return "—"
-    full = analyzed >= stored if stored > 0 else True
-    head = ("✓ all " if full else "") + f"{analyzed} analyzed"
-    if total > 0 and total > analyzed:
-        head += f" · {round(analyzed / total * 100)}% of {total}"
-    elif total > 0 and analyzed > total:
-        # Storing more comments than the platform says exist is an upstream
-        # inconsistency. The old label just omitted the tail, which read as
-        # "we have everything" — say what actually happened instead.
-        head += f" · more than the {total} reported (upstream mismatch)"
+
+    # Did a model read every stored comment, or only some of them? Both a top-N
+    # cap and the dedup / min-words filters cut the set, and the second pair used
+    # to be invisible here: one post stored 87 rows, had 43 near-duplicates and 13
+    # textless/too-short, and reported "87 stored analyzed" for 31 comments read.
+    if analysed is not None and analysed < stored:
+        prefix = "top " if sel_skipped and sel_skipped > 0 else ""
+        head = f"{prefix}{analysed:,} of {stored:,} stored analyzed"
+    elif total > 0 and stored >= total:
+        head = f"✓ all {stored:,} analyzed (100%)"
+    else:
+        head = f"{stored:,} stored analyzed"
+
+    if total > 0 and total > stored:
+        head += f" · {round(stored / total * 100)}% of {total:,} total"
+    elif total > 0 and stored > total:
+        head += f" · more than the {total:,} reported (upstream mismatch)"
+
     return head
 
 
@@ -1328,6 +1839,10 @@ def _comment_analysis_summary(r: dict) -> dict:
     )
     ca.pop("comments", None)
     ca["coverage_label"] = _coverage_label(ca, r.get("engagement") or {})
+    # The list response is filtered by CommentAnalysisResult, which carries neither
+    # `ensemble` nor `stage2_selection` — so the count behind the label has to be
+    # exposed explicitly or the table can only ever show stored rows.
+    ca["analysed_by_models"] = _analysed_by_models(ca)
     return ca
 
 
@@ -1435,7 +1950,10 @@ async def _sse_generator(
                 event_type = payload.get("event", "progress")
                 yield f"event: {event_type}\ndata: {json.dumps(payload)}\n\n"
 
-                if event_type in ("done", "error"):
+                # "cancelled" terminates too — a stopped job publishes no
+                # further frames, so without it the client would sit on the
+                # stream until the 5-minute timeout.
+                if event_type in ("done", "error", "cancelled"):
                     break
             else:
                 # Keepalive comment so the client connection stays open

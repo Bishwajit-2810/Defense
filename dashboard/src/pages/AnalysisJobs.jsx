@@ -1,6 +1,47 @@
-import React, { useState, useEffect } from 'react';
-import { Play, FileText, CheckCircle2, Clock, AlertCircle, Download } from 'lucide-react';
+import React, { useState, useEffect, useRef } from 'react';
+import { Download, Square, Trash2, RotateCw } from 'lucide-react';
 import { apiCall, API_BASE, getAuthHeaders, getSseQueryAsync } from '../utils/api.js';
+
+// Wording for the shared confirm dialog. `dismiss` is per-action because a
+// button reading "Cancel" beside "Stop Job" is ambiguous — cancelling is also
+// the name of what Stop does. The stop and delete bodies state what
+// the backend actually guarantees — a stop cannot recall the posts already
+// inside a stage, and a delete removes the job record, not the posts' analyses.
+const CONFIRM_COPY = {
+  rerun: {
+    title: 'Confirm Re-run',
+    body: 'Re-analyses the same posts as a new job. The existing results are overwritten as the new ones land.',
+    confirm: 'Re-run Job',
+    dismiss: 'Cancel',
+    btnClass: 'bg-brand-500 hover:bg-brand-600',
+  },
+  stop: {
+    title: 'Stop this job?',
+    body: 'No further post is analysed. Posts already inside a pipeline stage finish and are saved, so progress may tick up once or twice more. The job is marked cancelled and can be re-run later.',
+    confirm: 'Stop Job',
+    dismiss: 'Keep Running',
+    btnClass: 'bg-amber-500 hover:bg-amber-600',
+  },
+  delete: {
+    title: 'Delete this job?',
+    body: 'Removes the job record, its progress counters and its live trace. If it is still running it is stopped first. The posts and their analysis results are kept — delete a post from the Posts tab to remove those.',
+    confirm: 'Delete Job',
+    dismiss: 'Keep Job',
+    btnClass: 'bg-rose-600 hover:bg-rose-700',
+  },
+};
+
+// Mirrors `_STALE_JOB_SECONDS` in routers/analysis.py. A job that stops writing
+// progress for this long is shown as stalled rather than running — after a power
+// cut the row keeps saying "running" forever, and that is the single most
+// misleading thing this table can display. The API applies the same threshold, so
+// a Resume offered on a stalled row is one the API will accept.
+const STALE_AFTER_MS = 5 * 60 * 1000;
+
+// The list endpoint returns `id`; the run endpoint returns `analysis_id` and
+// older rows have carried `job_id`. Read them through one helper so the stop and
+// delete calls can never address a different job than the row they sit in.
+const jobIdOf = (job) => job?.id || job?.job_id || job?.analysis_id || '';
 
 export default function AnalysisJobs() {
   const [jobs, setJobs] = useState([]);
@@ -9,16 +50,33 @@ export default function AnalysisJobs() {
   const [loading, setLoading] = useState(false);
   const [liveProgress, setLiveProgress] = useState(null);
   
-  // Modals state
-  const [confirmModal, setConfirmModal] = useState({ isOpen: false, job: null });
+  // Modals state. `action` is 'rerun' | 'stop' | 'delete' — one confirm dialog
+  // for all three, since they differ only in wording and the call they make.
+  const [confirmModal, setConfirmModal] = useState({ isOpen: false, job: null, action: 'rerun' });
   const [resultModal, setResultModal] = useState({ isOpen: false, data: null });
+  const [busyJob, setBusyJob] = useState(null);
+
+  // What the last stop/delete/resume did. Kept separate from `liveProgress`
+  // because that line belongs to the SSE stream and is rewritten by every frame
+  // — resuming a job subscribes to its stream immediately, which used to wipe
+  // the "30/300 already done, 270 re-queued" summary before it could be read.
+  const [notice, setNotice] = useState(null);
+
+  // Open EventSources by job id. Stopping a job has to close its stream here:
+  // the server sends one terminating `cancelled` frame and then goes quiet, and
+  // a stream left open would keep the row's "Track" state alive for 5 minutes.
+  const streamsRef = useRef({});
 
   useEffect(() => {
     fetchJobs();
     
     const handleAutoRefresh = () => fetchJobs();
     window.addEventListener('auto-refresh', handleAutoRefresh);
-    return () => window.removeEventListener('auto-refresh', handleAutoRefresh);
+    return () => {
+      window.removeEventListener('auto-refresh', handleAutoRefresh);
+      Object.values(streamsRef.current).forEach(es => { try { es.close(); } catch {} });
+      streamsRef.current = {};
+    };
   }, []);
 
   const fetchJobs = async () => {
@@ -40,7 +98,7 @@ export default function AnalysisJobs() {
         else if (data && Array.isArray(data.jobs)) jobsArr = data.jobs;
         else if (data && Array.isArray(data.results)) jobsArr = data.results;
         setJobs(jobsArr);
-      } catch(e) {}
+      } catch {}
     }
   };
 
@@ -73,17 +131,94 @@ export default function AnalysisJobs() {
     }
   };
 
-  const triggerRerunJob = (job) => {
-    setConfirmModal({ isOpen: true, job });
+  const askConfirm = (job, action) => {
+    setNotice(null);
+    setConfirmModal({ isOpen: true, job, action });
   };
 
-  const handleRerunJob = async () => {
-    const job = confirmModal.job;
-    setConfirmModal({ isOpen: false, job: null });
+  const closeStream = (jobId) => {
+    const es = streamsRef.current[jobId];
+    if (es) {
+      try { es.close(); } catch {}
+      delete streamsRef.current[jobId];
+    }
+  };
+
+  const handleStopJob = async (job) => {
+    const jid = jobIdOf(job);
+    setBusyJob(jid);
+    try {
+      const res = await apiCall(`/v1/analysis/${jid}/cancel`, { method: 'POST' });
+      closeStream(jid);
+      // Posts already inside a stage finish, so this is "no new work", not
+      // "everything halted this instant" — say so rather than implying a
+      // guarantee the pipeline cannot make.
+      setNotice({ kind: 'ok', text: `Job ${jid.split('-')[0]}... stopped — in-flight posts will finish, the rest are skipped.` });
+      setJobs(prev => prev.map(j => (jobIdOf(j) === jid ? { ...j, status: res.status || 'cancelled' } : j)));
+    } catch (err) {
+      setNotice({ kind: 'error', text: err.message });
+    } finally {
+      setBusyJob(null);
+      fetchJobs();
+    }
+  };
+
+  const handleResumeJob = async (job) => {
+    const jid = jobIdOf(job);
+    setBusyJob(jid);
+    setNotice({ kind: 'ok', text: `Resuming job ${jid.split('-')[0]}...` });
+    try {
+      const res = await apiCall(`/v1/analysis/${jid}/resume`, { method: 'POST' });
+      const p = res.progress || {};
+      if (res.resumed) {
+        // Report what it actually re-queued. "Resumed" alone would leave the
+        // operator unable to tell a 270-post continuation from a no-op.
+        setNotice({ kind: 'ok', text:
+          `Resumed — ${p.completed}/${p.total} already done, ${p.remaining} re-queued.` });
+        subscribeToJobProgress(jid);
+      } else {
+        setNotice({ kind: 'ok', text: `Nothing to resume — ${res.reason || 'the job is already complete'}.` });
+      }
+    } catch (err) {
+      setNotice({ kind: 'error', text: err.message });
+    } finally {
+      setBusyJob(null);
+      fetchJobs();
+    }
+  };
+
+  const handleDeleteJob = async (job) => {
+    const jid = jobIdOf(job);
+    setBusyJob(jid);
+    try {
+      const res = await apiCall(`/v1/analysis/${jid}`, { method: 'DELETE' });
+      closeStream(jid);
+      setJobs(prev => prev.filter(j => jobIdOf(j) !== jid));
+      setNotice({ kind: 'ok', text: res.stopped
+        ? `Job ${jid.split('-')[0]}... stopped and deleted. Post analyses are kept.`
+        : `Job ${jid.split('-')[0]}... deleted. Post analyses are kept.` });
+    } catch (err) {
+      setNotice({ kind: 'error', text: err.message });
+      fetchJobs();
+    } finally {
+      setBusyJob(null);
+    }
+  };
+
+  const handleConfirm = async () => {
+    const { job, action } = confirmModal;
+    setConfirmModal({ isOpen: false, job: null, action: 'rerun' });
+    if (!job) return;
+    if (action === 'stop') return handleStopJob(job);
+    if (action === 'delete') return handleDeleteJob(job);
+    return handleRerunJob(job);
+  };
+
+  const handleRerunJob = async (job) => {
     if (!job) return;
     
     setLoading(true);
-    setLiveProgress(`Re-running job ${job.id}...`);
+    setLiveProgress(`Re-running job ${jobIdOf(job)}...`);
     window.scrollTo({top: 0, behavior: 'smooth'});
     try {
       const body = {
@@ -149,7 +284,9 @@ export default function AnalysisJobs() {
   const subscribeToJobProgress = async (jobId) => {
     setLiveProgress(`Job ${jobId} tracking. Connecting to stream...`);
     const qs = await getSseQueryAsync();
+    closeStream(jobId);
     const es = new EventSource(`${API_BASE}/v1/analysis/${jobId}/stream${qs}`);
+    streamsRef.current[jobId] = es;
 
     const handleEvent = (e) => {
       try {
@@ -177,23 +314,31 @@ export default function AnalysisJobs() {
         } else if (e.type === 'done') {
           setLiveProgress(`Progress: 100% Job complete!`);
           fetchFinalResult(jobId);
+        } else if (e.type === 'cancelled') {
+          setLiveProgress(`Job stopped — ${data.completed || 0}/${data.total ?? '?'} posts had finished.`);
+          closeStream(jobId);
+          fetchJobs();
         } else if (e.type === 'error') {
           setLiveProgress(`Error: ${data.error || 'Unknown error occurred'}`);
         } else if (e.type === 'connected') {
           setLiveProgress(`Progress: 0% Connected. Waiting for progress...`);
         }
-      } catch (err) {}
+      } catch {}
     };
 
     es.addEventListener('progress', handleEvent);
     es.addEventListener('stage', handleEvent);
     es.addEventListener('done', handleEvent);
+    es.addEventListener('cancelled', handleEvent);
     es.addEventListener('error', handleEvent);
     es.addEventListener('connected', handleEvent);
 
     es.onerror = () => {
-      es.close();
-      pollStatus(jobId);
+      // Transport-level failure (not the `error` event above). This used to call
+      // a `pollStatus` that does not exist in this file, so a dropped stream
+      // threw a ReferenceError instead of falling back to anything.
+      closeStream(jobId);
+      fetchJobs();
     };
   };
 
@@ -273,6 +418,17 @@ export default function AnalysisJobs() {
           </div>
         </div>
         
+        {notice && (
+          <div className={`mt-4 p-3 rounded-lg text-sm flex items-start justify-between gap-3 border ${
+            notice.kind === 'error'
+              ? 'bg-rose-50 dark:bg-rose-900/10 border-rose-200 dark:border-rose-900/50 text-rose-700 dark:text-rose-400'
+              : 'bg-emerald-50 dark:bg-emerald-900/10 border-emerald-200 dark:border-emerald-900/50 text-emerald-700 dark:text-emerald-400'
+          }`}>
+            <span>{notice.text}</span>
+            <button onClick={() => setNotice(null)} className="opacity-60 hover:opacity-100 shrink-0" aria-label="Dismiss">✕</button>
+          </div>
+        )}
+
         {renderLiveProgress()}
       </div>
 
@@ -310,7 +466,20 @@ export default function AnalysisJobs() {
                   const completed = job.completed || 0;
                   const total = job.total || 0;
                   const isFinished = status === 'completed' || status === 'done';
+                  // Only a job that is actually still moving can be stopped or
+                  // tracked — a cancelled or failed one has nothing to stop.
+                  const isRunning = !isFinished && status !== 'failed' && status !== 'cancelled';
+                  // A job whose row says "running" but has written nothing for
+                  // five minutes is what a power cut leaves behind.
+                  const lastUpdate = job.updated_at ? Date.parse(job.updated_at) : NaN;
+                  const isStalled = isRunning && !Number.isNaN(lastUpdate)
+                    && (Date.now() - lastUpdate) > STALE_AFTER_MS;
+                  // Resume is offered on anything unfinished. A job that turns
+                  // out to be alive is refused by the API with a 409 that says
+                  // to stop it first, which is surfaced verbatim.
+                  const canResume = !isFinished;
                   const progress = total > 0 ? Math.round((completed / total) * 100) : (isFinished ? 100 : 0);
+                  const busy = busyJob === jid;
                   
                   return (
                     <tr key={jid} className="hover:bg-slate-50 dark:hover:bg-zinc-900/50 transition-colors">
@@ -331,10 +500,12 @@ export default function AnalysisJobs() {
                         <span className={`px-2 py-1 rounded-full text-xs font-medium ${
                           isFinished ? 'bg-emerald-100 text-emerald-700 dark:bg-emerald-900/30 dark:text-emerald-400' :
                           status === 'failed' ? 'bg-rose-100 text-rose-700 dark:bg-rose-900/30 dark:text-rose-400' :
+                          status === 'cancelled' ? 'bg-zinc-200 text-zinc-600 dark:bg-zinc-800 dark:text-zinc-400' :
+                          isStalled ? 'bg-orange-100 text-orange-700 dark:bg-orange-900/30 dark:text-orange-400' :
                           status === 'processing' || status === 'running' ? 'bg-amber-100 text-amber-700 dark:bg-amber-900/30 dark:text-amber-400' :
                           'bg-slate-100 text-slate-700 dark:bg-zinc-800 dark:text-zinc-300'
                         }`}>
-                          {status}
+                          {isStalled ? 'stalled' : status}
                         </span>
                       </td>
                       <td className="px-6 py-4 whitespace-nowrap text-sm">
@@ -345,15 +516,41 @@ export default function AnalysisJobs() {
                       </td>
                       <td className="px-6 py-4 whitespace-nowrap text-sm">
                         <div className="flex flex-col gap-2">
-                          {!isFinished && status !== 'failed' && (
+                          {isRunning && (
                             <button onClick={() => subscribeToJobProgress(jid)} className="text-brand-500 hover:text-brand-600 text-xs font-semibold text-left">Track</button>
+                          )}
+                          {isRunning && (
+                            <button
+                              onClick={() => askConfirm(job, 'stop')}
+                              disabled={busy}
+                              className="text-amber-600 dark:text-amber-500 hover:text-amber-700 dark:hover:text-amber-400 text-xs font-semibold text-left flex items-center gap-1 disabled:opacity-50"
+                            >
+                              <Square size={12} /> Stop
+                            </button>
+                          )}
+                          {canResume && (
+                            <button
+                              onClick={() => handleResumeJob(job)}
+                              disabled={busy}
+                              title="Re-queue only the posts this job never finished"
+                              className="text-emerald-600 dark:text-emerald-500 hover:text-emerald-700 dark:hover:text-emerald-400 text-xs font-semibold text-left flex items-center gap-1 disabled:opacity-50"
+                            >
+                              <RotateCw size={12} /> Resume
+                            </button>
                           )}
                           {isFinished && (
                             <button onClick={() => downloadJobReport(job.campaign_id)} className="text-brand-500 hover:text-brand-600 text-xs font-semibold text-left flex items-center gap-1">
                               <Download size={12} /> Download Report
                             </button>
                           )}
-                          <button onClick={() => triggerRerunJob(job)} className="text-slate-500 hover:text-brand-500 text-xs font-semibold text-left">Re-run</button>
+                          <button onClick={() => askConfirm(job, 'rerun')} className="text-slate-500 hover:text-brand-500 text-xs font-semibold text-left">Re-run</button>
+                          <button
+                            onClick={() => askConfirm(job, 'delete')}
+                            disabled={busy}
+                            className="text-rose-600 dark:text-rose-500 hover:text-rose-700 dark:hover:text-rose-400 text-xs font-semibold text-left flex items-center gap-1 disabled:opacity-50"
+                          >
+                            <Trash2 size={12} /> Delete
+                          </button>
                         </div>
                       </td>
                     </tr>
@@ -365,26 +562,29 @@ export default function AnalysisJobs() {
         </div>
       </div>
 
-      {/* Confirm Re-run Modal */}
+      {/* Confirm Re-run / Stop / Delete Modal */}
       {confirmModal.isOpen && (
         <div className="fixed inset-0 z-50 flex items-center justify-center bg-black/50 backdrop-blur-sm animate-in fade-in duration-200">
           <div className="bg-white dark:bg-zinc-900 border border-slate-200 dark:border-zinc-700 rounded-xl shadow-xl w-full max-w-md p-6">
-            <h3 className="text-lg font-bold mb-4">Confirm Re-run</h3>
-            <p className="text-slate-600 dark:text-zinc-400 mb-6">
-              Are you sure you want to re-run job <span className="font-mono text-brand-500">{confirmModal.job?.id?.split('-')[0]}...</span>?
+            <h3 className="text-lg font-bold mb-4">{CONFIRM_COPY[confirmModal.action].title}</h3>
+            <p className="text-slate-600 dark:text-zinc-400 mb-2">
+              Job <span className="font-mono text-brand-500">{jobIdOf(confirmModal.job).split('-')[0]}...</span>
+            </p>
+            <p className="text-slate-600 dark:text-zinc-400 mb-6 text-sm">
+              {CONFIRM_COPY[confirmModal.action].body}
             </p>
             <div className="flex justify-end gap-3">
               <button 
-                onClick={() => setConfirmModal({ isOpen: false, job: null })}
+                onClick={() => setConfirmModal({ isOpen: false, job: null, action: 'rerun' })}
                 className="px-4 py-2 bg-slate-100 hover:bg-slate-200 dark:bg-zinc-800 dark:hover:bg-zinc-700 rounded-lg text-sm font-medium transition-colors"
               >
-                Cancel
+                {CONFIRM_COPY[confirmModal.action].dismiss}
               </button>
               <button 
-                onClick={handleRerunJob}
-                className="px-4 py-2 bg-brand-500 hover:bg-brand-600 text-white rounded-lg text-sm font-medium transition-colors"
+                onClick={handleConfirm}
+                className={`px-4 py-2 text-white rounded-lg text-sm font-medium transition-colors ${CONFIRM_COPY[confirmModal.action].btnClass}`}
               >
-                Re-run Job
+                {CONFIRM_COPY[confirmModal.action].confirm}
               </button>
             </div>
           </div>

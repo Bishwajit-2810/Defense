@@ -18,7 +18,10 @@ export default defineConfig({
   },
   resolve: {
     alias: {
-      '@': path.resolve(__dirname, './src'),
+      // `import.meta.dirname` rather than `__dirname`: Vite 8 warns that
+      // `__dirname` is unsupported by the `configLoader: 'native'` it plans to
+      // default to, and that warning printed on every `npm test` run.
+      '@': path.resolve(import.meta.dirname, './src'),
     },
   },
 });

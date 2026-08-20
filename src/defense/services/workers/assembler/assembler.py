@@ -142,7 +142,15 @@ async def _update_job_status(
     status: str,
     error: str | None = None,
 ) -> None:
-    """Update the jobs table row for job_id with the given status."""
+    """Update the jobs table row for job_id with the given status.
+
+    A cancelled job is never re-opened. Stopping a job cannot recall the posts
+    already inside a stage, and those still land here and are persisted (their
+    LLM spend is already paid) — but if this UPDATE were unguarded, the last
+    in-flight post would write the row straight back to "running", or to "done"
+    once the counters happened to line up, and the Jobs tab would show a job the
+    operator stopped as one that completed normally.
+    """
     from sqlalchemy import text
 
     sql = text(
@@ -152,6 +160,7 @@ async def _update_job_status(
                updated_at = NOW(),
                error      = :error
         WHERE  id = :job_id
+          AND  status <> 'cancelled'
         """
     )
     try:

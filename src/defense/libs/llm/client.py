@@ -60,47 +60,45 @@ _ROLE_LOCAL_ENV: dict[str, str] = {
     "stage1": "STAGE1_LOCAL_MODEL",
     "stage2": "STAGE2_LOCAL_MODEL",
     "summary": "SUMMARY_LOCAL_MODEL",
-    "llm_a": "LLM_A_LOCAL_MODEL",
-    "llm_b": "LLM_B_LOCAL_MODEL",
-    "vlm":   "VLM_LOCAL_MODEL",
+    "agent":   "AGENT_LOCAL_MODEL",
+    "llm_a":   "LLM_A_LOCAL_MODEL",
+    "llm_b":   "LLM_B_LOCAL_MODEL",
+    "vlm":     "VLM_LOCAL_MODEL",
 }
 
 _ROLE_GROQ_ENV: dict[str, str] = {
     "stage1": "STAGE1_GROQ_MODEL",
     "stage2": "STAGE2_GROQ_MODEL",
     "summary": "SUMMARY_GROQ_MODEL",
-    "llm_a": "LLM_A_GROQ_MODEL",
-    "llm_b": "LLM_B_GROQ_MODEL",
-    "vlm":   "VLM_GROQ_MODEL",
+    "agent":   "AGENT_GROQ_MODEL",
+    "llm_a":   "LLM_A_GROQ_MODEL",
+    "llm_b":   "LLM_B_GROQ_MODEL",
+    "vlm":     "VLM_GROQ_MODEL",
 }
 
-# The default backend is `local` (LLM_BACKEND), so these Ollama model ids are the
-# ids actually used out of the box for Stage 1 and Stage 2 — gemma3:4b (fast) for
-# Stage 1, qwen2.5:7b (quality) for Stage 2. Override per role with the
-# *_LOCAL_MODEL env vars; any model from `ollama list` works.
+# The default backend is `local` (LLM_BACKEND):
+# - Stage 1 & Stage 2 share the same unified model (qwen2.5:7b)
+# - Agents use the dedicated agent model (AGENT_LOCAL_MODEL, default qwen2.5:7b)
+# - Multimodal vision uses VLM (qwen3-vl:4b)
 _ROLE_LOCAL_DEFAULT: dict[str, str] = {
-    "stage1": "gemma3:4b",
+    "stage1": "qwen2.5:7b",
     "stage2": "qwen2.5:7b",
-    # `summary` defaults to the same model as `stage2` so nothing changes until
-    # a bake-off picks a winner — see eval/bakeoff_summary.py, which scores the
-    # candidates in `ollama list` (qwen2.5:7b, gemma4:26b, gemma4:31b) on real
-    # Bangla posts. Point SUMMARY_LOCAL_MODEL at the winner and record the
-    # numbers; "we chose it because it scored X" is defence material in a way
-    # that "we chose it because it is bigger" is not.
     "summary": "qwen2.5:7b",
-    "llm_a": "qwen2.5:7b",
-    "llm_b": "qwen2.5:7b",
-    "vlm":   "qwen3-vl:4b",
+    "agent":   "llama3.1:8b",
+    "llm_a":   "qwen2.5:7b",
+    "llm_b":   "llama3.1:8b",
+    "vlm":     "qwen3-vl:4b",
 }
 
-# Only consulted when LLM_BACKEND=groq (opt-in); local/Ollama is the default.
+# Consulted when LLM_BACKEND=groq or during automatic fallback:
 _ROLE_GROQ_DEFAULT: dict[str, str] = {
-    "stage1": "llama-3.1-8b-instant",
+    "stage1": "llama-3.3-70b-versatile",
     "stage2": "llama-3.3-70b-versatile",
     "summary": "llama-3.3-70b-versatile",
-    "llm_a": "llama-3.1-8b-instant",
-    "llm_b": "llama-3.3-70b-versatile",
-    "vlm":   "meta-llama/llama-4-scout-17b-16e-instruct",
+    "agent":   "llama-3.3-70b-versatile",
+    "llm_a":   "llama-3.1-8b-instant",
+    "llm_b":   "llama-3.3-70b-versatile",
+    "vlm":     "meta-llama/llama-4-scout-17b-16e-instruct",
 }
 
 VALID_ROLES = frozenset(_ROLE_LOCAL_DEFAULT)

@@ -5,6 +5,7 @@ import hashlib
 import os
 import secrets
 from enum import Enum
+from typing import ClassVar
 
 from pydantic_settings import BaseSettings, SettingsConfigDict
 
@@ -137,20 +138,42 @@ class Settings(BaseSettings):
     # summary for every post. Leaving this true makes rule 3 fire on every
     # request and the gate stops gating.
     router_summary_routes: bool = False
+    #: How many comments per post Stage 2 analyses, ranked by reaction count
+    #: (``likes``) descending. The router picks them ONCE and marks them, so every
+    #: Stage-2 voter — the HF heads, the LLM stance pass, the dedup cache — reads
+    #: the same set and the UI's side-by-side comparison has no holes.
+    #:
+    #: **0 (the default) = no cap: every comment with text is analysed.** That is
+    #: the deliberate choice — a capped run leaves the tail of the thread with no
+    #: model verdict at all (Stage 1's keyword label does not vote), so
+    #: `sentiment_breakdown` fills up with `uncertain` and the post-level coverage
+    #: label stops matching the per-comment table.
+    #:
+    #: Set a positive value only as a speed/cost guard, and quote it when you do:
+    #: at 7 heads it is ~0.92 s/comment of CPU plus ceil(N/COMMENT_STANCE_BATCH)
+    #: LLM calls, so a 2,857-comment thread is ~44 min of classifier time and ~115
+    #: stance batches. `ensemble.not_analysed` reports what a cap dropped.
+    #:
+    #: Only comments with text ever compete: emoji-only reactions and bare links
+    #: get no model call, so a highly-liked ❤️ must not consume a slot — and with
+    #: no cap they are still the one group that ends up `uncertain`, because there
+    #: is nothing in them for a model to read.
+    router_comment_top_n: int = 0
+    #: Minimum word tokens for a comment to be eligible for Stage-2 analysis.
+    #: 0 = any comment with text; >2 (e.g. 3) = ignores short 1-2 word comments and pure emoji.
+    router_comment_min_words: int = 0
 
     # Stage 2
     llm_backend_key: str = RedisKeys.LLM_BACKEND.value
-    llm_backend: str = "local"
-    groq_api_key: str = ""
-    local_llm_base_url: str = "http://localhost:8000/v1"
+    # NOTE: llm_backend / groq_api_key / local_llm_base_url and the llm_a/llm_b/
+    # vlm model names used to be declared here AND again in the "Pipeline Model"
+    # block below, with different values (vLLM-style HF repo ids here, ollama
+    # tags there). A repeated field is not an error in pydantic — the LAST
+    # definition simply wins — so this block was dead text that read like
+    # configuration: editing `local_llm_base_url` here moved nothing, and the
+    # port it named (8000) was not the one in use (11434). Declared once now,
+    # in the block below.
 
-    llm_a_local_model: str = "Qwen/Qwen2.5-7B-Instruct"
-    llm_a_groq_model: str = "llama-3.1-8b-instant"
-    llm_b_local_model: str = "Qwen/Qwen2.5-32B-Instruct"
-    llm_b_groq_model: str = "llama-3.3-70b-versatile"
-    vlm_local_model: str = "Qwen/Qwen2.5-VL-7B-Instruct"
-    vlm_groq_model: str = "meta-llama/llama-4-scout-17b-16e-instruct"
-    
     stage2_batch_size: int = 10
     stage2_max_retries: int = 3
     
@@ -159,43 +182,144 @@ class Settings(BaseSettings):
     
     # Which comments get the context-aware LLM stance pass.
     #   "all"      — every comment that has text to read (the default). Gives
-    #                the UI three comparable verdicts (LLM / XLM-R / DistilBERT)
-    #                on every comment.
+    #                the UI the LLM's verdict beside all seven cheap heads on
+    #                every comment.
     #   "escalate" — only where the cheap voters disagree, have nothing to say,
-    #                or a watchlist entity is mentioned. Measured at ~20% of
-    #                comments on the corpus post, at the cost of an empty LLM
-    #                row on the rest.
+    #                or a watchlist entity is mentioned. The ~20% figure was
+    #                measured with TWO cheap voters; with seven, any single
+    #                dissenter escalates, so re-measure before assuming it still
+    #                saves anything.
     comment_llm_mode: str = "all"
-    comment_stance_max_per_post: int = 50
     # Identical text (after normalisation) reuses its twin's LLM verdict: the
     # prompt would be character-for-character the same. Set false to force a
     # separate call for every comment.
     comment_dedup_propagate: bool = True
 
-    # Stage 2 Parallel Classifiers — the two cheap voters in the ensemble.
-    # Both are skipped in MODEL_STUB_MODE (no weights are downloaded) and a
+    # Stage 2 Parallel Classifiers — the cheap voters in the ensemble.
+    # Skipped in MODEL_STUB_MODE unless the weights are already cached, and a
     # failed load is recorded once, never faked as a neutral verdict.
     stage2_classifiers_enabled: bool = True
-    # Where the two small classifiers run: "auto" tries the GPU and falls back
-    # to CPU, "cpu" skips the GPU entirely, "cuda" insists on it. The GPU is
+    # Where the small classifiers run: "auto" tries the GPU and falls back to
+    # CPU, "cpu" skips the GPU entirely, "cuda" insists on it. The GPU is
     # normally already hosting the LLM — on a 4 GB card serving qwen2.5:7b there
-    # is ~285 MB left, which fits one classifier and not two.
+    # is ~285 MB left, which fits one classifier and not seven. "cpu" is the
+    # right setting on this box; see .env.
     stage2_classifier_device: str = "auto"
+
+    # The roster, as (voter name, checkpoint) pairs. Every name here MUST also
+    # appear in ensemble.CHEAP_SOURCES or the vote is collected and then ignored
+    # by the escalation gate — tests/test_ensemble.py asserts that.
+    #
+    # A checkpoint earns a slot only if it is a *sentiment* head whose labels
+    # survive worker._map_sentiment_label. Four of the five original entries
+    # failed that bar and had never once voted: csebuetnlp/banglabert and
+    # sagorsarker/bangla-bert-base are base encoders (ElectraForPreTraining /
+    # BertForMaskedLM) — `pipeline("sentiment-analysis")` bolts a randomly
+    # initialised head on them and emits LABEL_0/LABEL_1, which maps to None —
+    # and l3cube-pune/bengali-sentiment-bert plus
+    # mrm8488/distilmbert-fine-tuned-bengali-sentiment do not exist on the Hub
+    # at all. A slot that cannot vote is worse than an empty one: it reads as
+    # coverage in the roster and contributes nothing to agreement.
+    #
+    # A slot also needs a tokenizer this environment can actually build. The
+    # obvious pick for slot 3, cardiffnlp/twitter-xlm-roberta-base-sentiment,
+    # ships only `sentencepiece.bpe.model` — no `tokenizer.json` — so
+    # transformers 5 tries to convert the slow tokenizer and raises
+    # "`tiktoken` is required". Its `-multilingual` sibling is the same model
+    # family with a fast tokenizer in the repo, and costs no new dependency.
+    #
+    # Measured on 300 real corpus comments (CPU, 16 cores), all seven loaded:
+    #
+    #   head                    pos  neg  neu  conf  agrees w/ majority  ms/comment
+    #   xlmr                    27%  43%  30%  0.54        52%              241
+    #   distilbert              54%  45%   0%  0.50        62%              207
+    #   twitter_xlmr            33%  34%  33%  0.67        56%              326
+    #   banglabert              29%  41%  30%  0.84        61%              282
+    #   bengali_sentiment_bert  31%  51%  18%  0.76        70%              277
+    #   mbert                   26%  51%  22%  0.36        55%              320
+    #   modernbert              81%  19%   1%  0.69        40%              860
+    #
+    # and what the roster does to the ensemble:
+    #
+    #   roster                       uncertain  unanimous  escalate%
+    #   2 (xlmr+distilbert)             49.7%      50.3%      49.7%
+    #   7 (all)                         50.7%       9.3%      90.7%
+    #   6 (drop modernbert)             32.0%      16.0%      84.0%
+    #   3 (banglabert, bengali, twitter) 5.0%      42.0%      58.0%
+    #
+    # Read those with two caveats. First, none of it is accuracy — the gold set
+    # is unlabelled, so this measures agreement, and seven heads agreeing can be
+    # seven heads wrong together. Second, `uncertain` falls with fewer voters
+    # partly by arithmetic: 2-of-3 clears DEFAULT_MIN_AGREEMENT, 4-of-7 does not.
+    #
+    # What survives both caveats is `modernbert`: 81% positive on a visibly
+    # mixed thread, agreeing with the room 40% of the time, for 47% of the
+    # roster's total CPU. Dropping it alone takes abstentions from 51% to 32%.
+    #
+    # ALL SEVEN STAY (decided 17 Aug 2026), so every comment gets all eight
+    # verdicts — the seven heads plus the LLM. Do not thin the roster to reduce
+    # abstentions: a comment eight models split on is genuinely contested, and
+    # removing the dissenter manufactures agreement rather than measuring it. The
+    # honest levers on that 51% are DEFAULT_MIN_AGREEMENT (`libs/ensemble.py` —
+    # 4-of-8 is a plurality the threshold currently rejects) and, eventually, a
+    # gold set that says which heads are actually right. `modernbert`'s skew is a
+    # reason to WEIGHT it, not to silence it.
+    #
+    # Setting a slot to "" still drops that voter — it is the switch for a
+    # deliberate, quoted experiment, not a default.
     stage2_classifier_1: str = "tabularisai/multilingual-sentiment-analysis"
     stage2_classifier_2: str = "lxyuan/distilbert-base-multilingual-cased-sentiments-student"
-    
+    stage2_classifier_3: str = "cardiffnlp/twitter-xlm-roberta-base-sentiment-multilingual"
+    stage2_classifier_4: str = "ADn-001/banglabert-sentnob-sentiment"
+    stage2_classifier_5: str = "ahs95/banglabert-sentiment-analysis"
+    stage2_classifier_6: str = "nlptown/bert-base-multilingual-uncased-sentiment"
+    stage2_classifier_7: str = "clapAI/modernBERT-base-multilingual-sentiment"
+
+    #: Voter name per slot. A ClassVar, so pydantic does not expose it as a
+    #: settable field: the names are the keys in `parallel_labels`, and renaming
+    #: one from the environment would silently orphan stored rows, the dashboard
+    #: column that reads them, and ensemble.CHEAP_SOURCES. The *checkpoint* in
+    #: each slot is configurable; which voter it answers as is not.
+    stage2_classifier_names: ClassVar[tuple[str, ...]] = (
+        "xlmr",                    # 1  DistilBERT-multilingual, 5-class
+        "distilbert",              # 2  DistilBERT-multilingual student, 3-class
+        "twitter_xlmr",            # 3  XLM-R trained on social media, 3-class
+        "banglabert",              # 4  BanglaBERT/Electra on SentNoB (Bangla social)
+        "bengali_sentiment_bert",  # 5  BanglaBERT/Electra, 5-class
+        "mbert",                   # 6  multilingual BERT, 1-5 stars
+        "modernbert",              # 7  ModernBERT-base multilingual, 3-class
+    )
+
+    @property
+    def stage2_classifier_roster(self) -> list[tuple[str, str]]:
+        """[(voter name, checkpoint)] for every slot that has a checkpoint."""
+        slots = [
+            self.stage2_classifier_1, self.stage2_classifier_2,
+            self.stage2_classifier_3, self.stage2_classifier_4,
+            self.stage2_classifier_5, self.stage2_classifier_6,
+            self.stage2_classifier_7,
+        ]
+        return [
+            (name, model.strip())
+            for name, model in zip(self.stage2_classifier_names, slots)
+            if (model or "").strip()
+        ]
+
+
     # Assembler
     assembler_batch_size: int = 50
     assembler_max_retries: int = 3
     assembler_flush_interval: int = 5
 
     # MCP
-    agents_service_url: str = "http://localhost:8001"
-    ingest_mcp_url: str = "http://ingest-mcp:8102"
-    retrieval_mcp_url: str = "http://retrieval-mcp:8101"
-    analytics_mcp_url: str = "http://analytics-mcp:8100"
-    analytics_mcp_stub: bool = True
-    
+    # agents_service_url and analytics_mcp_stub are declared further down (see
+    # the note in the Stage 2 block): the later definition is the one pydantic
+    # keeps, and these two read `http://localhost:8001` / `True` here while the
+    # values actually in force are `http://agents:8010` / `False`.
+    ingest_mcp_url: str = "http://localhost:8102"
+    retrieval_mcp_url: str = "http://localhost:8101"
+    analytics_mcp_url: str = "http://localhost:8110"
+
     # Misc
     log_level: str = "INFO"
     log_to_redis: bool = True
@@ -211,6 +335,30 @@ class Settings(BaseSettings):
     upstream_api_key: str = ""
     embedding_dim: int = 768
     embedding_model: str = "paraphrase-multilingual-mpnet-base-v2"
+    # Real embeddings WITHOUT the rest of the Stage-1 model suite.
+    #
+    # MODEL_STUB_MODE is one switch over seven models: sentiment, emotion,
+    # toxicity, CLIP/SigLIP, NER, KeyBERT and the sentence encoder. Retrieval
+    # needs exactly the last one, and the others land on a GPU that is normally
+    # already hosting the LLM — the stage2_classifier_device comment above puts
+    # the free VRAM on a 4 GB card at ~285 MB. Tying "make search meaningful" to
+    # "load the vision stack" made the first change cost the second.
+    #
+    # None = follow MODEL_STUB_MODE (so this is a no-op unless set). Setting it
+    # false also needs HF_OFFLINE=false, since HF offline policy follows
+    # MODEL_STUB_MODE too and would otherwise block the download.
+    embedding_stub_mode: bool | None = None
+    #: Device for the sentence encoder: "cpu", "cuda", "cuda:1", or "" to let
+    #: sentence-transformers choose (CUDA when present).
+    #:
+    #: Worth setting to "cpu" on this hardware. The GPU is a 4 GB card that
+    #: normally already hosts the LLM, so loading the encoder on CUDA fails with
+    #: `CUDA out of memory` depending on what ollama is doing — and the fallback
+    #: from a failed load is HASH vectors, i.e. retrieval silently degrades to
+    #: ranking noise, transiently. On CPU the same encoder costs 99 ms per query
+    #: and produces identical vectors. `_get_model` retries on CPU automatically;
+    #: this makes it the first choice rather than the recovery path.
+    embedding_device: str = ""
     llm_max_continuations: int = 2
     local_llm_api_key: str = "ollama"
     llm_backend: str = "local"
@@ -225,11 +373,30 @@ class Settings(BaseSettings):
     retrieval_mcp_stub: bool = False
 
     # Model overrides
-    stage1_local_model: str = "gemma3:4b"
+    # Pipeline Model (Stage 1 & Stage 2): Same unified model
+    stage1_local_model: str = "qwen2.5:7b"
     stage2_local_model: str = "qwen2.5:7b"
     summary_local_model: str = "qwen2.5:7b"
+
+    # Agent Model (Dedicated 3rd model for Agentic RAG & reasoning)
+    #
+    # `-16k` is a derived tag over plain llama3.1:8b that sets `num_ctx 16384`
+    # (config/Modelfile.llama31-16k). `ollama serve` defaults to a 4096-token
+    # window and silently DISCARDS anything longer, oldest messages first — so a
+    # large tool result pushed the system prompt and the operator's question out
+    # of context and the agent answered from the tail of a JSON payload. Measured
+    # on this machine: an 11k-token prompt evaluates 24 tokens on `llama3.1:8b`
+    # and all 11,045 on `llama3.1:8b-16k`.
+    #
+    # Setting OLLAMA_CONTEXT_LENGTH on the ollama service is the better fix — it
+    # covers the pipeline models too — but a PARAMETER in the model wins over it,
+    # so retag or drop the `-16k` suffix here if you go that route.
+    agent_local_model: str = "llama3.1:8b-16k"
+    agent_groq_model: str = "llama-3.3-70b-versatile"
+
+    # Backward-compatible role models
     llm_a_local_model: str = "qwen2.5:7b"
-    llm_b_local_model: str = "qwen2.5:7b"
+    llm_b_local_model: str = "llama3.1:8b"
     vlm_local_model: str = "qwen3-vl:4b"
 
     fasttext_lang_model: str = "/models/fasttext/lid.176.bin"
@@ -242,11 +409,12 @@ class Settings(BaseSettings):
     clip_model: str = "google/siglip-base-patch16-224"
     ner_model: str = "gliner"
 
-    stage1_groq_model: str = "llama-3.1-8b-instant"
+    # Groq Fallbacks for each tier
+    stage1_groq_model: str = "llama-3.3-70b-versatile"
     stage2_groq_model: str = "llama-3.3-70b-versatile"
     summary_groq_model: str = "llama-3.3-70b-versatile"
-    llm_a_groq_model: str = "llama-3.3-70b-versatile"
-    llm_b_groq_model: str = "llama-3.1-8b-instant"
+    llm_a_groq_model: str = "llama-3.1-8b-instant"
+    llm_b_groq_model: str = "llama-3.3-70b-versatile"
     vlm_groq_model: str = "meta-llama/llama-4-scout-17b-16e-instruct"
 
     stage1_llm: bool = True
@@ -319,6 +487,45 @@ class Settings(BaseSettings):
     signup_tenant_id: str = "default"
     report_cluster_sample_cap: int = 1500
     embedding_allow_stub: bool = True
+
+    # -- Retrieval (RAG_STATE_AND_ROADMAP §3.2 - §3.7) ----------------------
+    # Hybrid retrieval: run the pgvector kNN and a lexical scan, then fuse with
+    # reciprocal rank fusion. On this corpus (code-mixed Bangla / English /
+    # Banglish) the lexical arm carries exact entity names, transliterations and
+    # hashtags — precisely what a multilingual sentence encoder blurs. It is
+    # also the ONLY arm that means anything while MODEL_STUB_MODE=true.
+    retrieval_hybrid: bool = True
+    #: The 60 in `score(d) = Σ 1/(k + rank_i(d))`. Standard RRF constant.
+    retrieval_rrf_k: int = 60
+    #: Over-fetch factor per arm before fusion/reranking: ask for k * this,
+    #: return k. 4 puts a limit=10 request at 40 candidates, matching §3.4's
+    #: "retrieve 30-50, rerank down to 8".
+    retrieval_candidate_multiplier: int = 4
+    #: Cross-encoder reranking of the fused candidates. Off by default: it needs
+    #: the `ml` extra and costs a second model load, and it is pointless while
+    #: the first-stage ranking is hash noise.
+    retrieval_rerank: bool = False
+    retrieval_rerank_model: str = "BAAI/bge-reranker-v2-m3"
+    #: How many posts get_clusters may pull vectors for. Was a hardcoded 100,
+    #: which turned "corpus themes" into "themes of the 100 newest posts" with
+    #: nothing saying so (§3.6).
+    retrieval_cluster_scan_cap: int = 2000
+    #: Chunk long captions and give each piece its own vector (§3.5). A short
+    #: post is one chunk holding the whole caption, so this is a no-op below the
+    #: threshold — the cost is paid only where a single vector was averaging
+    #: several arguments together.
+    retrieval_chunks: bool = True
+    #: Prefer chunk vectors over the post-level vector in semantic_search. Split
+    #: from the write switch so the two can be measured independently: chunks can
+    #: be written and NOT searched, which is what a before/after eval needs.
+    retrieval_chunk_search: bool = True
+    #: Embed comment text as well as captions (§3.2). The signal in this corpus
+    #: lives in the threads; without this a question about what people are angry
+    #: about can only ever match caption text.
+    comment_embeddings_enabled: bool = True
+    #: Per-post ceiling on comments embedded, after near-duplicate grouping.
+    #: 0 disables the cap.
+    comment_embedding_max_per_post: int = 1000
 
     model_config = SettingsConfigDict(
         env_file=".env",

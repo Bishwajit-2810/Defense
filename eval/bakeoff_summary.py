@@ -55,7 +55,10 @@ if str(ROOT) not in sys.path:
 from libs.llm import LLMClient  # noqa: E402
 from services.workers.stage2_llm.prompts import build_summary_messages  # noqa: E402
 
-DEFAULT_CORPUS = ROOT / "posts_text_only.json"
+#: Full source corpus. This script summarises *captions*, so it filters to
+#: captioned posts itself (``_load_posts``) — pointing it at the pre-filtered
+#: subset was doing the same work twice, off a file that need not exist.
+DEFAULT_CORPUS = ROOT / "posts_with_details.json"
 DEFAULT_MODELS = ["qwen2.5:7b", "gemma4:26b", "gemma4:31b"]
 
 _BANGLA = re.compile(r"[ঀ-৿]")
@@ -90,6 +93,11 @@ def _load_posts(corpus: Path, n: int) -> list[dict]:
     if isinstance(data, dict):
         data = data.get("posts") or data.get("data") or []
     captioned = [p for p in data if (p.get("caption") or "").strip()]
+    if len(captioned) < len(data):
+        # Reading off the full source now, so the caption filter happens here.
+        # Print it: a silently shrinking pool reads as "summarised everything".
+        print(f"  ! skipped {len(data) - len(captioned)} null-caption post(s) "
+              f"— nothing to summarise", file=sys.stderr)
     # Longest captions first: truncation and fidelity differences show up on
     # real prose, not on one-line posts.
     captioned.sort(key=lambda p: len(p.get("caption") or ""), reverse=True)

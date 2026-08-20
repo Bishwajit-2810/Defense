@@ -1,24 +1,52 @@
-import React, { useState, useEffect } from 'react';
+import React, { useState, useEffect, useMemo, useRef, useCallback } from 'react';
+import { Search as SearchIcon, X, Copy, Check } from 'lucide-react';
 import { apiCall, API_BASE, getAuthHeaders } from '../utils/api.js';
+import { commentScrape, scrapeTooltip } from '../utils/coverage';
 import { formatAlertReason } from '../utils/sentiment.js';
 import PostModal from '../components/PostModal';
+
+// Every field an operator might paste or type. `post_id` and `platform_post_id`
+// are first because that is what the table shows and what gets copied out of a
+// ticket; the text fields make the same box work as a content search, so there is
+// one input rather than a filter per field.
+const SEARCHABLE = (post) => [
+  post.post_id,
+  post.result?.platform_post_id ?? post.platform_post_id,
+  post.result?.url ?? post.url,
+  post.campaign_id,
+  post.platform,
+  post.post_summary,
+  post.post_text,
+  post.language,
+  post.overall_sentiment,
+  ...(post.topics || []),
+  ...(post.keywords || []),
+];
+
+const matchesQuery = (post, needle) =>
+  SEARCHABLE(post).some(v => v && String(v).toLowerCase().includes(needle));
 
 export default function Posts() {
   const [posts, setPosts] = useState([]);
   const [loading, setLoading] = useState(false);
   const [campaignId, setCampaignId] = useState('');
+  const [query, setQuery] = useState('');
+  // Posts the loaded page does not contain, fetched from /v1/search. The table
+  // holds the latest 100; an id from an older post is not in it, and a filter
+  // over what happens to be loaded would report "not found" for a post that
+  // exists — which is the failure this page had.
+  const [serverHits, setServerHits] = useState(null);
+  const [searching, setSearching] = useState(false);
+  const [copied, setCopied] = useState(null);
+  const searchSeq = useRef(0);
   const [wantSummary, setWantSummary] = useState(true);
   const [selectedPost, setSelectedPost] = useState(null);
 
-  useEffect(() => {
-    fetchPosts();
-    
-    const handleAutoRefresh = () => fetchPosts();
-    window.addEventListener('auto-refresh', handleAutoRefresh);
-    return () => window.removeEventListener('auto-refresh', handleAutoRefresh);
-  }, []);
-
-  const fetchPosts = async () => {
+  // useCallback so the two effects below can name it as a dependency. Without
+  // it the identity changes every render, so listing it would refetch in a loop
+  // and omitting it is a lint warning that hides a real class of stale-closure
+  // bug — a fetch that captured an old `campaignId`.
+  const fetchPosts = useCallback(async () => {
     try {
       let url = '/v1/analysis/latest?limit=100&include=results';
       if (campaignId) url += '&campaign_id=' + encodeURIComponent(campaignId);
@@ -27,8 +55,67 @@ export default function Posts() {
     } catch (err) {
       console.error(err);
     }
-  };
+  }, [campaignId]);
   
+  useEffect(() => {
+    const handleAutoRefresh = () => fetchPosts();
+    window.addEventListener('auto-refresh', handleAutoRefresh);
+    return () => window.removeEventListener('auto-refresh', handleAutoRefresh);
+  }, [fetchPosts]);
+
+  // The campaign box used to change state and nothing else: it only took effect
+  // when you also pressed Refresh, so it read as a filter that did not work.
+  // Debounced so typing an id is not one request per keystroke.
+  useEffect(() => {
+    const t = setTimeout(fetchPosts, campaignId ? 350 : 0);
+    return () => clearTimeout(t);
+  }, [fetchPosts, campaignId]);
+
+  // Two tiers, in this order:
+  //   1. filter the rows already on screen — instant, no request;
+  //   2. only if that finds nothing, ask the server, which searches the whole
+  //      corpus and (since the id fix) answers an identifier exactly.
+  // The second tier is what makes an id search trustworthy: "no match here" and
+  // "no such post" are different answers and the page now distinguishes them.
+  const filtered = useMemo(() => {
+    const needle = query.trim().toLowerCase();
+    if (!needle) return posts;
+    return posts.filter(p => matchesQuery(p, needle));
+  }, [posts, query]);
+
+  useEffect(() => {
+    const needle = query.trim();
+    setServerHits(null);
+    if (needle.length < 3 || filtered.length > 0) return;
+
+    const seq = ++searchSeq.current;
+    const t = setTimeout(async () => {
+      setSearching(true);
+      try {
+        const data = await apiCall(`/v1/search?q=${encodeURIComponent(needle)}&limit=50`);
+        if (seq !== searchSeq.current) return;  // a newer query has taken over
+        setServerHits({
+          rows: (data.results || []).map(r => ({ ...(r.result || {}), ...r })),
+          matchType: data.match_type,
+          idLookupMissed: Boolean(data.id_lookup_missed),
+        });
+      } catch (err) {
+        if (seq === searchSeq.current) setServerHits({ rows: [], error: err.message });
+      } finally {
+        if (seq === searchSeq.current) setSearching(false);
+      }
+    }, 400);
+    return () => clearTimeout(t);
+  }, [query, filtered.length]);
+
+  const copyId = async (id) => {
+    try {
+      await navigator.clipboard.writeText(id);
+      setCopied(id);
+      setTimeout(() => setCopied(c => (c === id ? null : c)), 1200);
+    } catch { /* clipboard blocked — the full id is in the title tooltip */ }
+  };
+
   const downloadZip = async () => {
     try {
       const res = await fetch(`${API_BASE}/v1/analysis/export?only_warnings=false`, {
@@ -120,6 +207,11 @@ export default function Posts() {
     );
   };
 
+  // What the table renders: the local filter, or the server's answer when the
+  // local filter came up empty.
+  const fromServer = Boolean(query.trim() && filtered.length === 0 && serverHits?.rows?.length);
+  const rows = fromServer ? serverHits.rows : filtered;
+
   return (
     <div className="space-y-6 animate-in fade-in slide-in-from-bottom-4 duration-500">
       <div>
@@ -173,9 +265,32 @@ export default function Posts() {
         <div className="p-4 border-b border-slate-200 dark:border-zinc-800 bg-slate-50 dark:bg-[#121214] flex justify-between items-center flex-wrap gap-4">
           <div>
             <h3 className="font-semibold">Analysis Results</h3>
-            <p className="text-xs text-slate-500">{posts.length} results loaded</p>
+            <p className="text-xs text-slate-500">
+              {query.trim()
+                ? `${rows.length} of ${posts.length} loaded${fromServer ? ' · from server search' : ''}`
+                : `${posts.length} results loaded`}
+            </p>
           </div>
-          <div className="flex gap-2 items-center">
+          <div className="flex gap-2 items-center flex-wrap">
+            <div className="relative">
+              <SearchIcon className="absolute left-2.5 top-1/2 -translate-y-1/2 w-4 h-4 text-slate-400 pointer-events-none" />
+              <input
+                type="text"
+                placeholder="Search posts — id, platform id, caption, topic…"
+                value={query}
+                onChange={e => setQuery(e.target.value)}
+                className="pl-8 pr-8 py-1.5 text-sm bg-white dark:bg-zinc-900 border border-slate-200 dark:border-zinc-700 rounded-lg w-80"
+              />
+              {query && (
+                <button
+                  onClick={() => setQuery('')}
+                  aria-label="Clear search"
+                  className="absolute right-2 top-1/2 -translate-y-1/2 text-slate-400 hover:text-slate-600 dark:hover:text-slate-200"
+                >
+                  <X className="w-4 h-4" />
+                </button>
+              )}
+            </div>
             <input 
               type="text" 
               placeholder="Filter: campaign id" 
@@ -189,6 +304,16 @@ export default function Posts() {
           </div>
         </div>
         
+        {fromServer && (
+          <div className="px-4 py-2 bg-brand-50 dark:bg-brand-900/10 border-b border-brand-200 dark:border-brand-900/40 text-xs text-brand-700 dark:text-brand-400">
+            {serverHits.matchType === 'exact_id'
+              ? <>Exact identifier match from the full corpus — this <strong>is</strong> the post you asked for.</>
+              : serverHits.matchType === 'id_prefix'
+                ? <>Identifier prefix match from the full corpus ({serverHits.rows.length}).</>
+                : <>Not on this page — {serverHits.rows.length} match(es) found in the full corpus by {serverHits.matchType || 'keyword'} search.</>}
+          </div>
+        )}
+
         <div className="overflow-x-auto">
           <table className="w-full text-left text-sm whitespace-nowrap">
             <thead className="bg-slate-50 dark:bg-[#121214] text-slate-500 dark:text-zinc-400">
@@ -200,18 +325,31 @@ export default function Posts() {
                 <th className="px-4 py-3 font-medium">Sentiment</th>
                 <th className="px-4 py-3 font-medium">Toxicity</th>
                 <th className="px-4 py-3 font-medium">Summary</th>
-                <th className="px-4 py-3 font-medium">Comment Coverage</th>
+                <th className="px-4 py-3 font-medium" title="Comments a Stage-2 model read, over the rows the scraper delivered, over the total the platform reports.">Comments <span className="font-normal text-slate-400">analysed / scraped / platform</span></th>
                 <th className="px-4 py-3 font-medium">Created At</th>
                 <th className="px-4 py-3 font-medium text-right">Actions</th>
               </tr>
             </thead>
             <tbody className="divide-y divide-slate-200 dark:divide-zinc-800">
-              {posts.length === 0 ? (
-                <tr><td colSpan="10" className="px-4 py-8 text-center text-slate-500">No results found. Upload posts to get started.</td></tr>
-              ) : posts.map((post, i) => {
+              {rows.length === 0 ? (
+                <tr><td colSpan="10" className="px-4 py-8 text-center text-slate-500">
+                  {/* Three different situations, three different answers. They
+                      used to be one line reading "No results found. Upload posts
+                      to get started." — which is wrong advice for a search that
+                      simply matched nothing, and actively misleading for a post
+                      id that does not exist. */}
+                  {searching ? 'Searching the full corpus…'
+                    : !query.trim() ? 'No results found. Upload posts to get started.'
+                    : serverHits?.error ? `Search failed: ${serverHits.error}`
+                    : serverHits?.idLookupMissed
+                      ? <>No post has the id <span className="font-mono">{query.trim()}</span> — checked the whole corpus, not just this page.</>
+                      : <>Nothing matches <span className="font-mono">{query.trim()}</span>. Searched this page and the full corpus (id, platform id, URL, campaign, caption, summary, topics, keywords).</>}
+                </td></tr>
+              ) : rows.map((post, i) => {
                 const sentiment = post.overall_sentiment || 'neutral';
                 const toxScore = typeof post.toxicity_score === 'number' ? post.toxicity_score : null;
                 const coverage = (post.comment_analysis && post.comment_analysis.coverage_label) || '—';
+                const scrape = commentScrape(post);
                 const dateStr = post.created_at ? new Date(post.created_at).toLocaleString() : '—';
                 let langStr = post.language || '—';
                 if (post.language_mix && post.language_mix.length > 1) {
@@ -222,9 +360,24 @@ export default function Posts() {
                 return (
                   <tr key={post.post_id || i} className={`hover:bg-slate-50 dark:hover:bg-zinc-900/50 cursor-pointer transition-colors ${post.watchlist_alert ? 'bg-rose-50/30 dark:bg-rose-900/10' : ''}`} onClick={() => setSelectedPost(post)}>
                     <td className="px-4 py-3">{i + 1}</td>
+                    {/* The cell shows 8 of ~25 characters, which is why an id
+                        search had to work on a prefix — and why the full value
+                        needs to be reachable without opening the row. */}
                     <td className="px-4 py-3 font-mono text-xs">
                       {post.watchlist_alert && <span title={formatAlertReason(post.watchlist_alert_reason) || 'Watchlist alert'} className="mr-2 text-rose-500">⚠️</span>}
-                      {String(post.post_id || '').slice(0,8)}...
+                      <span title={post.post_id || ''}>{String(post.post_id || '').slice(0,8)}...</span>
+                      {post.post_id && (
+                        <button
+                          onClick={(e) => { e.stopPropagation(); copyId(post.post_id); }}
+                          title={`Copy ${post.post_id}`}
+                          aria-label="Copy post id"
+                          className="ml-1.5 align-middle text-slate-400 hover:text-brand-500 transition-colors"
+                        >
+                          {copied === post.post_id
+                            ? <Check className="w-3.5 h-3.5 text-emerald-500" />
+                            : <Copy className="w-3.5 h-3.5" />}
+                        </button>
+                      )}
                     </td>
                     <td className="px-4 py-3">{post.platform || '—'}</td>
                     <td className="px-4 py-3">{langStr}</td>
@@ -239,7 +392,27 @@ export default function Posts() {
                     </td>
                     <td className="px-4 py-3">{toxScore !== null ? renderToxicityBar(toxScore) : '—'}</td>
                     <td className="px-4 py-3 max-w-[200px] truncate" title={summary}>{summary}</td>
-                    <td className="px-4 py-3">{coverage}</td>
+                    <td className="px-4 py-3 whitespace-nowrap" title={`${scrapeTooltip(scrape, post.platform)}\n\n${coverage}`}>
+                      {/* Numbers only. The scrape-state tag lives on the post
+                          detail, not in a 50-row list where it repeats on almost
+                          every line and says nothing the three numbers don't; the
+                          cell tooltip still carries the full explanation. */}
+                      {scrape ? (
+                        <div>
+                          {/* Analysed first: it is the only one of the three that
+                              says what the models covered. Omitted, rather than
+                              filled in with the stored count, when unknown. */}
+                          {scrape.analysed !== null && (
+                            <span className={scrape.analysed < scrape.stored ? 'font-semibold text-amber-600 dark:text-amber-500' : 'font-semibold'}>
+                              {scrape.analysed.toLocaleString()}
+                              <span className="text-slate-400 dark:text-zinc-500 font-normal"> / </span>
+                            </span>
+                          )}
+                          <span className="font-medium">{scrape.stored.toLocaleString()}</span>
+                          <span className="text-slate-400 dark:text-zinc-500"> / {scrape.total ? scrape.total.toLocaleString() : '?'}</span>
+                        </div>
+                      ) : '—'}
+                    </td>
                     <td className="px-4 py-3 text-xs">{dateStr}</td>
                     <td className="px-4 py-3 text-right">
                       <button 

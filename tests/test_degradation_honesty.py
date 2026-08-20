@@ -14,8 +14,13 @@ instances of patterns this document already catalogues:
      (provenance recording the code path that *was intended* rather than the one
      that ran), one layer over.
 
-`torch`/`transformers` are genuinely absent here, so these tests run against the
-real failure — which is the right place to test it.
+These tests run against the real failure rather than a mocked one: the fixture
+forces real mode with HF offline, so any model whose weights are not in the local
+cache genuinely fails to load. They were written when `torch`/`transformers` were
+absent from the venv entirely; with the `ml` extra installed most weights are
+still uncached, so the failure being exercised is the same one — see
+`test_no_model_getter_raises_when_weights_are_unavailable` for the one assertion
+that had to stop conflating "degraded" with "returned None".
 """
 
 import sys
@@ -51,8 +56,22 @@ def test_missing_lang_detector_returns_none_rather_than_raising(real_mode):
     assert real_mode.get_lang_detector() is None
 
 
-def test_every_model_getter_returns_none_when_unavailable(real_mode):
-    """Consistency is the point: no getter may be the one that raises."""
+def test_no_model_getter_raises_when_weights_are_unavailable(real_mode):
+    """Consistency is the point: no getter may be the one that raises.
+
+    This asserted ``is None`` for every getter while `torch`/`transformers` were
+    absent from the venv, which made "degraded" and "returned None" the same
+    observation. With the `ml` extra installed they come apart:
+    ``get_keyword_model`` now succeeds, because KeyBERT's default backend
+    (all-MiniLM-L6-v2) happens to be in the local HF cache and so loads even
+    under HF_HUB_OFFLINE.
+
+    That does not weaken the property under test. The property was never
+    "returns None" — it was "a model this environment cannot load degrades
+    instead of killing the post", and `get_lang_detector` was the single getter
+    that used to raise. Asserting None would now be asserting which weights the
+    developer happens to have cached, which is not a fact about this code.
+    """
     getters = [
         real_mode.get_lang_detector,
         real_mode.get_emotion_pipeline,
@@ -64,7 +83,14 @@ def test_every_model_getter_returns_none_when_unavailable(real_mode):
         real_mode.get_embedding_model,
     ]
     for getter in getters:
-        assert getter() is None, f"{getter.__name__} did not degrade"
+        try:
+            getter()
+        except Exception as exc:  # noqa: BLE001 — the whole point is "never raises"
+            pytest.fail(f"{getter.__name__} raised {type(exc).__name__}: {exc}")
+
+    # This one is asserted strictly: no sentiment weights are cached under any
+    # configuration here, so an object coming back would mean the loader reached
+    # the network despite HF_HUB_OFFLINE.
     assert real_mode.get_sentiment_model("cardiffnlp/twitter-xlm-roberta-base-sentiment") is None
 
 
@@ -103,14 +129,33 @@ def test_degraded_components_starts_empty(real_mode):
 
 
 def test_degraded_components_records_each_failure(real_mode):
+    """Every component that failed to load is named — and only those.
+
+    `embedding` used to be asserted here too, because no weights were installed
+    and every getter failed. Now that the encoder loads from the local cache it
+    is genuinely NOT degraded, so asserting it would be asserting a broken
+    environment.
+
+    Which makes the second half of this test possible for the first time: with a
+    mix of loadable and unloadable models, the list can be checked for what it
+    OMITS. A `degraded_components` that named everything would have passed the
+    original assertions just as well — that is §5.2's defect (provenance
+    recording the intended path rather than the executed one) pointing the other
+    way, and nothing here could previously have caught it.
+    """
     real_mode.get_lang_detector()
     real_mode.get_emotion_pipeline()
-    real_mode.get_embedding_model()
+    embedding = real_mode.get_embedding_model()
 
     degraded = real_mode.degraded_components()
     assert "language" in degraded
     assert "emotion" in degraded
-    assert "embedding" in degraded
+    if embedding is None:
+        assert "embedding" in degraded
+    else:
+        assert "embedding" not in degraded, (
+            "the embedding model loaded, so it must not be reported as degraded"
+        )
 
 
 @pytest.mark.asyncio

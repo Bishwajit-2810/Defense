@@ -56,7 +56,10 @@ the embedded comments → thread breakdown + themes.
 >   absent image term no longer consumes its 0.4 weight and shrink a genuine text
 >   signal 40% toward neutral;
 > - OCR is off by default (`STAGE1_OCR_SENTIMENT=false`) and the working corpus
->   is `posts_text_only.json` (43 captioned posts).
+>   the working corpus is `posts_with_details.json` (all 50 posts) — the 7
+>   null-caption posts stay in, because the missing image bytes (not a filtered
+>   corpus) are what keep the OCR branch cold, and their 1,307 comments analyse
+>   normally.
 >
 > Post sentiment is therefore a **text** measurement today. Step 5 is the claim
 > that carries the most weight, and it is real: every non-emoji comment is
@@ -140,17 +143,19 @@ between them at any time without redeploying.
         │  lang detect · NER · summarization (gemma) · text features         │
         └─────────────────────────────────┬──────────────────────────────────┘
                                           │ writes features + summary
-                                ┌─────────▼─────────┐
-                                │ Router / Triage   │  emoji filter &
-                                │ (spam filter,     │  parallel dispatch
-                                │  dispatch)        │
-                                └─────┬─────────────┘
+                                ┌─────────▼─────────────┐
+                                │ Router / Triage       │  post-level gate +
+                                │ (confidence gate,     │  comment selection
+                                │  comment selection)   │  (all with text, or top-N)
+                                └─────┬─────────────────┘
                                       │
                               ┌───────▼───────────────────────────┐
                               │ STAGE 2 — Parallel Execution      │
-                              │ 1. LLM (Target/Watchlist alerts)  │
-                              │ 2. XLM-R Classifier               │
-                              │ 3. DistilBERT Classifier          │
+                              │ Lane A: post summary / type /      │
+                              │         insight (gated)            │
+                              │ Lane B: comment ensemble over the  │
+                              │   router's set — 7 cheap heads +   │
+                              │   LLM stance pass + dedup cache    │
                               └───────┬───────────────────────────┘
                               └─────────────┤
                                 ┌───────────▼───────────┐
@@ -169,7 +174,9 @@ between them at any time without redeploying.
 
 The **Router/Triage** between Stage 1 and Stage 2 is the heart of the cost
 strategy — see §5. All backend services are **Python + FastAPI**; the web dashboard
-is **plain HTML/CSS/JS**. Above the per-post pipeline sits a selective **agentic
+is **React 19 + Vite + Tailwind** (`dashboard/`; the vanilla HTML/CSS/JS build
+this document originally specified is preserved at `dashboard_legacy/`). Above
+the per-post pipeline sits a selective **agentic
 insight layer** — AI agents that reach data through **MCP servers** for analyst
 Q&A, grounded reports, and targeted deep-dives (never per post) — see §11.
 
@@ -197,6 +204,35 @@ Q&A, grounded reports, and targeted deep-dives (never per post) — see §11.
 3. **Enqueue.** A `job` row is created in PostgreSQL (`status=queued`). One
    message per post is produced to the bus, partitioned by `post_id` hash so a
    post's ordering is stable and load spreads evenly.
+
+   > **Implementation note — stopping and resuming a job.** The consequence of
+   > this step is that a job has no process to control: it is N messages spread
+   > across the stage streams, each picked up by whichever replica is free, and a
+   > message cannot be recalled once the bus has accepted it. So the two controls
+   > the operator needs are built the only way this shape allows.
+   >
+   > **Stop is cooperative.** One Redis flag (`job:{id}:cancelled`,
+   > `src/defense/libs/jobs.py`) is checked by ingestion, Stage 1, the router and
+   > Stage 2 as each picks a message up; a flagged message is ACKed and dropped
+   > instead of processed. Because the check sits at the head of every stage, a stop costs at
+   > most the one post already in flight *per stage* rather than the remainder of
+   > the batch. Posts already inside a stage finish and are persisted — their
+   > model spend is paid either way — so `cancelled` has to be a **terminal**
+   > status that both the assembler's status write and the stale-row
+   > reconciliation in `GET /v1/analysis/{id}` refuse to overwrite, or the last
+   > landing post would silently reopen the job.
+   >
+   > **Resume is derived from Postgres, not from the queue.** A host that loses
+   > power leaves the row reading `running`, the Redis counters gone and the
+   > in-flight messages lost — nothing in the system marks that job as dead. So
+   > `POST /v1/analysis/{id}/resume` recomputes the remainder from the selector
+   > plus the `analysis_results` rows written at or after the job's `created_at`,
+   > re-enqueues only those posts under the same job id, and rebuilds the counters
+   > with `completed` seeded at what is already done. The seeding is what lets the
+   > assembler finish the job on its last post instead of its first. `jobs.options`
+   > is persisted for the same reason: a job resumed without the options it was
+   > started with would finish half-summarised. See
+   > [api_design.md](api_design.md) §3a.
 4. **Stage 1 — Fast NLP + vision (parallel).** Worker pulls a batch
    (micro-batching) and runs the small-model suite. **Multimodal, post first, then
    comments** (see [data_contract.md](data_contract.md) §4):
@@ -241,6 +277,19 @@ Q&A, grounded reports, and targeted deep-dives (never per post) — see §11.
      compact, token-minimized prompt (post + a representative/clustered subset of
      comments, truncated). This selectivity is what keeps the service fast and
      cheap.
+   - **Which comments Stage 2 analyses**, independently of the post-level gate:
+     by default **every comment with text** (`ROUTER_COMMENT_TOP_N=0`), or the N
+     most-reacted ones when a positive cap is set. The selection is made once,
+     here, and marked on the comments (`stage2_selected`), so every Stage-2 voter
+     reads the same set —
+     the seven cheap classifier heads, the near-duplicate cache and the LLM
+     stance pass. A cap living inside the stance pass instead (the older
+     `COMMENT_STANCE_MAX_PER_POST`) bought the tokens back but still ran seven
+     models over the whole thread, and left the LLM column of the per-comment
+     comparison empty on comments every cheap head had voted on. Comments below
+     the cut are kept, persisted and reported (`ensemble.not_analysed`) — but with
+     no model verdict, so they read `uncertain` at zero voters rather than
+     borrowing Stage 1's keyword label. Nothing is dropped from the payload.
 6. **Stage 2 — LLM / VLM (selective).** The Stage-2 worker produces summaries,
    insights, and refined labels through two **logical roles** — **LLM-A** (fast
    7B/8B) for per-post refinement and short summaries, **LLM-B** (large 14B/32B)
@@ -255,6 +304,26 @@ Q&A, grounded reports, and targeted deep-dives (never per post) — see §11.
    model id. Both speak an OpenAI-compatible API, so the worker code is
    backend-agnostic; switching is a config/flag change, not a redeploy. Responses
    are cached by `(backend, model, task, content_hash)` in Redis so repeats are free.
+   **Lane B — the comment ensemble (the other half of the same worker).** Not
+   gated by the confidence rules: it runs for every post, over the router's
+   selected comments, and is where most of the pipeline's per-comment signal comes
+   from. **Eight labellers per comment**, combined by `libs/ensemble.combine()`:
+   **seven small sentiment heads** batched on CPU (`xlmr`, `distilbert`,
+   `twitter_xlmr`, `banglabert`, `bengali_sentiment_bert`, `mbert`, `modernbert` —
+   checkpoints in `STAGE2_CLASSIFIER_1..7`), and the **LLM stance pass**, the only
+   labeller that sees the post and therefore judges stance *toward* it. Each
+   verdict is kept separately in `parallel_labels`, so the dashboard can show all
+   eight side by side on one comment. **Only a model may label a comment:** Stage
+   1's emoji + keyword rule does not vote (removed 17 Aug 2026), because it answers
+   on every comment — mostly with the deterministic hash stub — and a voter that
+   can never abstain makes the agreement figures unfalsifiable. What the ensemble is **not** is nine independent
+   readings — five of the seven heads are multilingual encoders trained on
+   overlapping data, so a 7-0 vote is weaker evidence than seven unrelated models
+   would be. A voter that fails to load or returns an off-taxonomy label
+   **abstains**; it is never counted as a neutral vote, and `label_voters` reports
+   how many actually spoke. Zero voters is reported as `uncertain`, not neutral.
+   `libs/comment_groups.py` labels one representative per exact-duplicate group
+   and propagates the verdict, which is a cache rather than an approximation.
 7. **Assemble + validate.** The Result Assembler merges Stage 1 + Stage 2 into
    the canonical JSON (see §6), validates against the JSON Schema, and sets
    `confidence` = aggregate.
@@ -278,11 +347,11 @@ Q&A, grounded reports, and targeted deep-dives (never per post) — see §11.
 | **Auth Service**                 | API keys, JWT issue/verify, RBAC, per-tenant quotas                                                                                                                                        | FastAPI + PostgreSQL + Redis                                                               | stateless replicas  |
 | **Ingestion Service**            | Validate, normalize, dedup, create job, enqueue                                                                                                                                            | FastAPI (async)                                                                            | stateless replicas  |
 | **Stage-1 NLP + Vision Workers** | Run small-model suite (text) **and the visual model on image posts** (`image_sentiment` + image description), micro-batched, emit features + confidence                                    | Python (Ray/Celery consumer) + Triton/ONNX/CTranslate2; SigLIP/CLIP + light VLM for vision | GPU/CPU worker pool |
-| **Router/Triage**                | Apply confidence gates + task flags; decide LLM/VLM routing                                                                                                                                | lightweight Python service or in-worker rule module                                        | stateless           |
-| **Stage-2 LLM/VLM Workers**      | Selective summarization (text **and image-grounded via a VLM**) / insight / report / hard cases                                                                                            | Thin worker → local vLLM (LLM-A+LLM-B + a VLM) **or** Groq API (text + vision model)       | GPU pool, stateless |
+| **Router/Triage**                | Apply confidence gates + task flags; decide LLM/VLM routing; **select the top-N comments by reaction count** that every Stage-2 voter will read                                            | lightweight Python service or in-worker rule module                                        | stateless           |
+| **Stage-2 LLM/VLM Workers**      | Two lanes, run concurrently: **Lane A** selective summarization (text **and image-grounded via a VLM**) / post type / insight, gated; **Lane B** the per-comment ensemble — 7 batched sentiment heads + the context-aware LLM stance pass + dedup propagation, ungated | Thin worker → local vLLM (LLM-A+LLM-B + a VLM) **or** Groq API (text + vision model); the 7 heads are `transformers` pipelines on CPU (`STAGE2_CLASSIFIER_DEVICE`) | GPU pool, stateless |
 | **Result Assembler**             | Merge, JSON-schema validate, compute aggregate confidence                                                                                                                                  | Python consumer                                                                            | stateless replicas  |
 | **Reporting/Query Service**      | Read APIs, report generation, exports                                                                                                                                                      | FastAPI + ClickHouse + PostgreSQL                                                          | stateless replicas  |
-| **Agent Orchestrator**           | Runs the **selective AI agents** (insight/analyst, coverage deep-dive, alerting) — corpus/report tier only, never per-post (§11)                                                           | FastAPI + agent loop → pluggable LLM-B/VLM backend + MCP tools                             | stateless replicas  |
+| **Agent Orchestrator**           | Runs the **selective AI agents** — nine of them (§11) — corpus/report tier only, never per-post                                                           | FastAPI + agent loop → the dedicated `agent` LLM role + MCP tools                             | stateless replicas  |
 | **MCP Servers**                  | Standardized tool/resource interfaces the agents call: `analytics-mcp` (ClickHouse/Postgres), `retrieval-mcp` (Postgres + pgvector + fetch), `ingest-mcp` (trigger upstream pull / fetch more comments) | FastAPI + MCP SDK (stdio/HTTP)                                                             | stateless replicas  |
 | **User Management**              | Tenants, users, roles, billing/usage metering                                                                                                                                              | FastAPI + PostgreSQL                                                                       | stateless replicas  |
 
@@ -321,11 +390,25 @@ at runtime per the routing rules in §5.
 > Read the rate as **a measure of Stage-1 quality**: a Stage 1 that types a post
 > confidently bypasses Stage 2, so the rate *falls as Stage 1 improves*. Same
 > code, two Stage-1 engines, two rates.
+>
+> **The gate is only half the cost story.** 85–96% of LLM calls are
+> comment-level, and comment labelling is not gated by it (Stage 1 labels every
+> comment; Lane B runs for every post). The bound on comment volume is
+> `ROUTER_COMMENT_TOP_N` — see the next list — and quoting the routing rate alone
+> invites the wrong question. [cost_estimation.md](cost_estimation.md) §5.
 
 Levers that keep token usage and cost low:
 
 - **Confidence gating.** Only uncertain posts reach the LLM. Tune thresholds per
   task from a labeled validation set.
+- **Top-N comment selection (the biggest per-post lever).** The router hands
+  Stage 2 only the N most-reacted comments with text, bounding Stage-2 comment cost
+  at `ceil(N / COMMENT_STANCE_BATCH)` LLM calls however large the thread. It caps
+  every voter at once, which matters: a cap on the LLM alone still runs seven models
+  over the whole thread and leaves the per-comment comparison with an empty LLM
+  column. **It ships at `0` — the whole thread — so this lever is available, not
+  applied.** Reach for it when a run is too slow; the cost of leaving it off is
+  ~0.92 s/comment of classifier CPU plus one stance batch per 25 comments.
 - **Exact + near-duplicate caching.** Social feeds are highly repetitive
   (reshares, copypasta, viral captions). Hash + embedding dedup avoids reanalysis.
   Reuse is **post-level only**: a caption match is not a thread match, so the
@@ -550,7 +633,7 @@ created_at`) is preserved as a subset of this richer object (`sentiment` →
 | Orchestration  | **Kubernetes** (prod), **Docker Compose** (MVP)                                                          | Autoscaling + HA vs simplicity                                                                                                                                                  |
 | Autoscaling    | **KEDA** (scale on queue depth) + HPA                                                                    | Workers track backlog, not just CPU                                                                                                                                             |
 | Observability  | **Prometheus + Grafana + Loki + OpenTelemetry + Jaeger**                                                 | Metrics, logs, traces — see [infrastructure.md](infrastructure.md)                                                                                                              |
-| Frontend       | **Plain HTML + CSS + JavaScript** (vanilla, no framework)                                                | Simple static dashboard served from a CDN/static host; calls the read APIs directly; no build step or framework runtime                                                         |
+| Frontend       | **React 19 + Vite + Tailwind** (`dashboard/`)                                                            | Shipped UI: chart.js charts, SSE live trace, per-comment labeller comparison. Calls the read APIs directly. The vanilla no-build dashboard this row originally specified is kept at `dashboard_legacy/` |
 
 Rationale for each data-layer pick and the alternatives rejected is in
 [possible_architecture.md](possible_architecture.md).
@@ -736,22 +819,38 @@ own DB, never into upstream.
 
 ### AI agents (selective, corpus/report tier)
 
-Each agent is an LLM loop on the **pluggable backend** — **LLM-B** (Qwen/Llama,
-`local` vLLM ⇄ `groq`); both support tool/function calling, which MCP builds on. A
-**VLM** step is used when an answer needs the images.
+Each agent is an LLM loop on the dedicated **`agent`** role (`AGENT_LOCAL_MODEL`,
+default `llama3.1:8b-16k`, ⇄ `AGENT_GROQ_MODEL`, default
+`llama-3.3-70b-versatile`); both support tool/function calling, which MCP builds
+on. A **VLM** step is used when an answer needs the images. The roster is **nine**
+agents, defined in [`registry.py`](src/defense/services/agents/registry.py) — that
+file is the source of truth for tools and budgets, and `GET /v1/agents/types`
+serves it live:
 
-- **Insight / Analyst agent** — answers questions ("what are people saying about X
-  this week?") and generates **trend / brand / political reports** by planning
+- **Insight / Analyst agent** (budget 10) — answers questions ("what are people
+  saying about X this week?") by planning
   `trend_query → semantic_search → get_thread → synthesize → cite`. This replaces
   single-shot RAG generation ([models.md](models.md) §5) with a tool-using loop, and
   every claim is grounded in retrieved posts/comments.
-- **Coverage deep-dive agent** — fires when a post's `comment_analysis.coverage` is
-  low (`storedCommentRows ≪ commentCount`) or a post is flagged viral; calls
+- **Coverage deep-dive agent** (5) — fires when a post's `comment_analysis.coverage`
+  is low (`storedCommentRows ≪ commentCount`) or a post is flagged viral; calls
   `ingest-mcp.fetch_more_comments`, re-runs the comment pass, and escalates a richer
   thread analysis. This is the agentic way to spend effort only where it matters.
-- **Alerting / monitoring agent** (scheduled) — watches reaction-mix spikes
-  (`reaction_breakdown`), sentiment shifts, and viral signals via `analytics-mcp`,
-  investigates, and raises alerts/digests.
+- **Alerting / monitoring agent** (8, scheduled) — checks two thresholds
+  **separately**: negative sentiment >50% in a period, and avg toxicity >0.6. Its
+  prompt names which tool serves which, because `sentiment_over_time` has no
+  toxicity field and `trend_query` returns `avg_toxicity` on every row — and a run
+  that read neither still delivered a confident toxicity verdict.
+- **Stance agent** (12) — target-dependent stance across the operator watchlist,
+  the system's most novel signal made interactive.
+- **Comparator** (15) — cross-campaign and cross-period comparison.
+- **Toxicity agent** (14) — harm patterns; `search_comments` lets it find a
+  harassment pattern directly instead of walking `top_posts → get_thread`.
+- **Narrative agent** (12) — theme discovery over embedding clusters.
+- **Quality agent** (8) — coverage, ensemble agreement and vector provenance: the
+  agent that answers "how reliable is this?".
+- **Reporter** (15) — drafts the grounded **trend / brand / political report** end
+  to end.
 
 ### Guardrails (so agents don't blow the cost model)
 
@@ -761,9 +860,24 @@ Each agent is an LLM loop on the **pluggable backend** — **LLM-B** (Qwen/Llama
   `(agent, inputs, backend, model)`; repeated questions are free.
 - **Grounded & auditable.** Reports cite the posts/comments retrieved; each run
   records the backend, model, tools called, and token usage (ties into `/v1/usage`).
+- **A result cannot eat the context window.** Tool results are serialised with
+  `ensure_ascii=False` (the escaping alone was half the token bill on a Bengali
+  corpus) and capped at 6,000 characters, dropping **whole rows** with a note
+  saying what was withheld. Citations are read off what the model was *shown*.
+- **A repeat is not dispatched.** A byte-identical call is answered from the first
+  result with the untried tools named; after two, the tools are withdrawn — a model
+  repeating itself has stopped gathering evidence.
+- **A run is only `completed` if it answered something.** Code output, payload
+  narration, self-narration and the empty-template shape each get one
+  markdown-synthesis retry and then fail the run. An answer that denies retrieving
+  post-level data in a run that retrieved it is contradicted in writing, and
+  ungrounded ids and quotes are appended as a warning block rather than dropped.
 - **Backend-agnostic & policy-bound.** Agents honor the same `local`⇄`groq` policy
   as Stage 2 — privacy-locked tenants keep agent calls on `local` so retrieved
   content never egresses (§9).
 
-This layer is **not required for the MVP** (the core pipeline ships first); it lands
-with the reporting/insight phase — see [plan.md](plan.md).
+This layer was **not required for the MVP** (the core pipeline shipped first) — see
+[plan.md](plan.md), which is the dated plan record. It has since landed in full:
+nine agents, the MCP tool servers, and the hardening above. What it still lacks is
+a *measurement* — the agent answers are unmeasured for accuracy, which is the
+`🟡 Works, unmeasured` in [FEATURES.md](FEATURES.md) §9.

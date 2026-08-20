@@ -26,11 +26,13 @@ from .rules import (
     read_overall_confidence,
     read_photo_count,
     read_text_length,
+    select_comments_for_stage2,
     should_use_llm,
 )
 from defense.libs import streams
 from defense.libs.common.logging import setup_logging
 from defense.libs.dlq import record_failure
+from defense.libs.jobs import is_cancelled
 from defense.libs.progress import publish_stage
 
 setup_logging("router")
@@ -101,6 +103,14 @@ async def _process_message(
     # Route on the stage-1 result; the rest of the envelope is passed through.
     stage1_result: dict = payload.get("stage1_result", {})
     options: dict = payload.get("options", {})
+    job_id = payload.get("job_id")
+
+    # Stop check (libs/jobs.py). A post that got past Stage 1 before the flag
+    # went up is dropped here rather than handed to Stage 2, which is where the
+    # LLM spend lives. The caller ACKs on return, so this just stops the work.
+    if await is_cancelled(redis, job_id):
+        logger.info("router_skipped_cancelled_job", job_id=job_id, post_id=post_id)
+        return
 
     # NOTE: the router does not touch comment text. It used to strip emoji,
     # rewrite URLs to the literal word "link" and re-label every emoji comment
@@ -112,7 +122,6 @@ async def _process_message(
     # Normalisation now happens in Stage 1, next to the classifier that reads it,
     # and it adds a field (`text_norm`) rather than overwriting the original.
     use_llm, reasons = should_use_llm(stage1_result, options)
-    job_id = payload.get("job_id")
 
     # Log the inputs the six rules actually read, not just the verdict — via the
     # same readers the rules use, so this can never report a field the gate did
@@ -163,6 +172,14 @@ async def _process_message(
     task_flags["post_level_routed"] = bool(use_llm)
     payload["task_flags"] = task_flags
 
+    # Which comments Stage 2 analyses — top-N by reaction count, chosen ONCE
+    # here so every Stage-2 voter reads the same set (rules.py). Marks the
+    # comments in `stage1_result` in place; the ones outside the cut stay in the
+    # payload with their Stage-1 label, so nothing is dropped from persistence.
+    selection = select_comments_for_stage2(stage1_result, options)
+    if selection:
+        logger.info("router_comment_selection", post_id=post_id, **selection)
+
     await redis.xadd(STAGE2_QUEUE, {"data": json.dumps(payload)})
     if use_llm:
         await redis.incr(STAT_LLM)
@@ -187,6 +204,8 @@ async def _process_message(
             # cannot read "no post-level tasks" as "Stage 2 was skipped".
             "post_level_tasks": bool(use_llm),
             "comment_analysis": True,
+            # …and how much of the thread that comment analysis covers.
+            "comment_selection": selection,
         },
         log=logger,
     )

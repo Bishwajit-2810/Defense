@@ -48,8 +48,28 @@ dependencies = [
 ]
 
 [project.optional-dependencies]
+# Real EMBEDDINGS only — the retrieval half of `ml`.
+#
+# Separate because it is independently useful: clustering (get_clusters, and the
+# per-cluster LLM summaries reports.py calls the cost lever) has no lexical
+# fallback the way search does, so hash vectors make it group posts at random.
+# Hybrid retrieval fixed search without real embeddings; nothing fixes clustering
+# without them. This extra buys that without loading CLIP, NER, KeyBERT and the
+# emotion/toxicity pipelines onto a GPU that is usually already hosting the LLM.
+#
+# Pairs with EMBEDDING_STUB_MODE=false, which turns on real embeddings WITHOUT
+# turning on the rest of the Stage-1 model suite the way MODEL_STUB_MODE does.
+# Install with: uv sync --extra embeddings
+embeddings = [
+    "sentence-transformers>=3.0.0",
+]
 # Real NLP/vision models — only needed with MODEL_STUB_MODE=false (needs a GPU
 # for reasonable throughput). Install with: uv sync --extra ml
+#
+# Requires Python <= 3.12, which is why .python-version pins 3.12: fasttext-wheel
+# 0.9.2 publishes no cp313 wheel and its bundled C++ no longer compiles (`args.cc`
+# fails on an out-of-scope declaration), so on 3.13 this extra cannot be built at
+# all. Nothing else here is version-constrained.
 ml = [
     "sentence-transformers>=3.0.0",
     "fasttext-wheel>=0.9.2",

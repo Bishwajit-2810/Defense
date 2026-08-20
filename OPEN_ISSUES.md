@@ -3,7 +3,71 @@
 > **Superseded in part.** A fourth pass (12–13 August 2026) found eleven more, two of them
 > regressions of items fixed here: the routing gate (below) and issue 4 (report cluster
 > summaries computed, paid for and discarded). It also found that the contract guards this
-> pass left behind had _all_ stopped running. See **[AUDIT_PASS7.md](AUDIT_PASS7.md)**.
+> pass left behind had _all_ stopped running. See **[AUDIT_PASS7.md](AUDIT_PASS7.md)**,
+> then [AUDIT_PASS8.md](AUDIT_PASS8.md) and [AUDIT_PASS9.md](AUDIT_PASS9.md)
+> (14 August — multi-tenant data isolation across Postgres, ClickHouse, the routers,
+> the worker envelopes and the retrieval MCP).
+>
+> **Two later changes touch items in this file (17 August 2026), neither of them a
+> regression:**
+>
+> - **The Stage-2 comment set is chosen by the router**, not by the stance pass:
+>   `ROUTER_COMMENT_TOP_N` (default **0 = every comment with text**) is applied once
+>   and *every* voter reads that set. The cap this file discusses
+>   (`COMMENT_STANCE_MAX_PER_POST`) also stays at 0 — a positive value gives the LLM
+>   fewer comments than the seven cheap heads got, which is the hole the
+>   router-side selection exists to close. If a positive cap is set for speed, the
+>   comments below the cut are kept, persisted, and reported as
+>   `ensemble.not_analysed` with `uncertain` labels.
+> - **Stage 1's label is no longer a voter, and `_seed_heuristic_vote` is gone.**
+>   It was dead code for a while (defined, unit-tested, never called); it was
+>   briefly wired up for the comments the router left out; it is now deleted and
+>   `heuristic` is out of `ensemble.CHEAP_SOURCES`. **Only a model may label a
+>   comment.** The rule is that a voter which answers on every comment — and whose
+>   answers are 71.3% deterministic stub or emoji rule (§6.2) — can never abstain,
+>   which makes `abstained` / `unread` / `single_voter` unfalsifiable. **Consequence
+>   to watch:** every comment outside the router's top-N now reports `uncertain` at
+>   zero voters, so on a thread much larger than `ROUTER_COMMENT_TOP_N` the
+>   post-level `sentiment_breakdown` is mostly `uncertain`. That is accurate, and it
+>   is a reporting change worth knowing before showing a chart.
+>
+> **Three more (18–20 August 2026), none of them a regression of anything here:**
+>
+> - **`COMMENT_EMBEDDING_MAX_PER_POST` went 1000 → 0.** This was a *third* cap,
+>   quieter than either discussed above, because it truncates the **vector index**
+>   rather than the analysis: the comments past it were still stored and still
+>   labelled, so nothing in `ensemble.not_analysed` or the label provenance showed
+>   a gap — only `comment_vector_coverage` dipped, and it read as an encoder
+>   shortfall. It accounted for exactly the corpus's 10,272-vs-8,415 shortfall:
+>   1,857 comments, 18% of the corpus, unreachable by `search_comments` and
+>   `get_clusters`. Now uncapped, so all five coverage knobs sit at 0.
+> - **The agent layer was hardened against eight live failures**, all of which
+>   appeared *after* real retrieval landed — the stub never returned payloads large
+>   enough to trigger them. The root cause of most: `ollama serve` defaults to a
+>   4,096-token window and silently discards the overflow oldest-message-first,
+>   which is the system prompt and then the operator's question. Runs were recorded
+>   `completed` while briefing the operator on the agent's own tool-argument errors.
+>   Fixed with a 16k model tag, unescaped serialisation, a 6,000-char result cap,
+>   a question restated each round, repeat-call refusal, and four non-answer guards.
+>   Write-up: [RAG_STATE_AND_ROADMAP.md](RAG_STATE_AND_ROADMAP.md) §6 Section 9.
+> - **Analysis jobs can be stopped, resumed and deleted** (20 Aug):
+>   `POST /v1/analysis/{id}/cancel`, `POST /{id}/resume`, `DELETE /{id}`. Two
+>   consequences touch things this file discusses. **`cancelled` is a fourth
+>   terminal job status**, which the stale-row reconciliation in
+>   `GET /v1/analysis/{id}` (the fix for §9.7 / issue 7 here) and the assembler's
+>   status write both now refuse to overwrite — otherwise the last in-flight post
+>   of a stopped job reopens it. And **`jobs.options` is now actually written for
+>   analysis runs**: it was persisted as a literal `{}`, so the request's
+>   `want_summary` / task list was discarded at enqueue time, which a resume has
+>   to reproduce. That is a *different* `jobs.options` gap from issue 4's — the
+>   report path's `embedding_clusters` still lives only in that column, and this
+>   change does not touch it.
+>
+> **One path note.** Every `dashboard/app.js` reference below resolves to
+> [`dashboard_legacy/app.js`](dashboard_legacy/app.js): the shipped dashboard is
+> now React 19 + Vite + Tailwind under `dashboard/`, and the vanilla build these
+> findings were made against was moved, not deleted. The findings stand as
+> written against that file.
 
 **Found:** 5 August 2026, fresh-eyes audit of the whole tree (the third such pass).
 **Status: ALL TEN ARE FIXED** and regression-tested, 5 August 2026.
@@ -1043,7 +1107,7 @@ then call the new anomaly check with the same inputs and assert it flags it.
 
 ### 17a — Schema validator crashes on mixed-type path sorting
 
-[validator.py:48](src/defense/libs/schemas/validator.py#L48) `_collect_errors` sorts
+[validator.py:48](src/defense/contracts/schemas/validator.py#L48) `_collect_errors` sorts
 validation errors by `key=lambda e: list(e.absolute_path)`. JSON Schema paths
 contain both strings (object keys) and integers (array indices). Python 3 raises
 `TypeError: '<' not supported between instances of 'int' and 'str'` when

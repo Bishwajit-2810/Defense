@@ -36,6 +36,7 @@ from sqlalchemy import text
 from defense.libs.common.config import get_settings
 from defense.libs import streams
 from defense.libs.common import content_hash
+from defense.libs.jobs import is_cancelled
 from defense.libs.dlq import record_failure
 from defense.libs.embeddings import embed_text, to_pgvector_literal
 from defense.libs.progress import publish_stage
@@ -530,6 +531,16 @@ async def _process_message(
         raw = raw["post"]
 
     post_id: str = raw.get("id", "<unknown>")
+
+    # Stop check (libs/jobs.py). The same flag Stage 1, the router and Stage 2
+    # read — checked here too so a stop on an upload job takes effect before the
+    # post is upserted and enqueued, rather than one stage later. Without it the
+    # button still worked (Stage 1 drops what this pushes) but a stopped job kept
+    # writing posts, which is not what "stop" reads as on the Jobs tab.
+    if await is_cancelled(redis, job_id):
+        await redis.xack(stream_name, CONSUMER_GROUP, message_id)
+        log.info("ingestion.skipped_cancelled_job", job_id=job_id, post_id=post_id)
+        return
 
     # One line per ingestion step below, so a post that never reaches Stage 1 can
     # be pinned to the step that stopped it (dedup, normalization, near-dup reuse)

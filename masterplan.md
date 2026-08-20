@@ -19,6 +19,22 @@
 > **comment-dominated** (85–96% of LLM calls), so the routing gate is no longer
 > the dominant lever.
 >
+> Three more, as of 17 August 2026:
+>
+> - **The router makes a second decision this document does not describe:** which
+>   comments Stage 2 analyses. It defaults to **every comment with text**
+>   (`ROUTER_COMMENT_TOP_N=0`); a positive value keeps only the top-N by reaction
+>   count and is the knob that bounds the comment bill, since that bill — not the
+>   confidence gate — is 85–96% of LLM calls.
+> - **Comment sentiment is an eight-labeller ensemble**, not the two classifiers
+>   the Stage-2 box below shows: seven small sentiment heads
+>   (`STAGE2_CLASSIFIER_1..7`) + the LLM stance pass, combined by
+>   `libs/ensemble.py`, with abstention rather than fabricated neutrals. **Only a
+>   model may label a comment** — Stage 1's emoji/keyword rule does not vote, so a
+>   comment no model read reports `uncertain`, not a keyword verdict.
+> - **The dashboard is React 19 + Vite + Tailwind** (`dashboard/`). The vanilla
+>   HTML/CSS/JS build this document specifies is preserved at `dashboard_legacy/`.
+>
 > Four more, from the sixth audit pass (§13) — each one a place where this
 > document describes a mechanism that exists but did not reach its consumer:
 >
@@ -224,9 +240,11 @@ object per thread, reporting comment **coverage** since only a sample is shipped
                                       │
                               ┌───────▼───────────────────────────┐
                               │ STAGE 2 — Parallel Execution      │
-                              │ 1. LLM (Target/Watchlist alerts)  │
-                              │ 2. XLM-R Classifier               │
-                              │ 3. DistilBERT Classifier          │
+                              │ Lane A: summary / post-type /      │
+                              │         insight (gated)            │
+                              │ Lane B: comment ensemble — 7 cheap │
+                              │   heads + LLM stance + dedup cache │
+                              │   over the router's top-N comments │
                               └───────┬───────────────────────────┘
                               └─────────────┤
                                 ┌───────────▼───────────┐
@@ -330,7 +348,7 @@ strategy — see §7.
 | **Stage-2 LLM/VLM Workers**      | Selective summarization (text **and image-grounded via a VLM**) / insight / report / hard cases                                                                                       | Thin worker → local vLLM (LLM-A+LLM-B + VLM) **or** Groq API (text + vision) | GPU pool, stateless |
 | **Result Assembler**             | Merge, JSON-schema validate, compute aggregate confidence                                                                                                                             | Python consumer                                                              | stateless replicas  |
 | **Reporting/Query Service**      | Read APIs, report generation, exports                                                                                                                                                 | FastAPI + ClickHouse + PostgreSQL                                            | stateless replicas  |
-| **Agent Orchestrator**           | Selective **AI agents** (insight/analyst, coverage deep-dive, alerting) — corpus/report tier only, never per-post (§14.6)                                                             | FastAPI + agent loop → LLM-B/VLM backend + MCP tools                         | stateless replicas  |
+| **Agent Orchestrator**           | Selective **AI agents** — nine of them (§14.6) — corpus/report tier only, never per-post                                                             | FastAPI + agent loop → the dedicated `agent` LLM role + MCP tools                         | stateless replicas  |
 | **MCP Servers**                  | Standardized tools for the agents: `analytics-mcp` (ClickHouse/Postgres), `retrieval-mcp` (pgvector), `ingest-mcp` (upstream pull / more comments)                                    | FastAPI + MCP SDK (internal)                                                 | stateless replicas  |
 | **User Management**              | Tenants, users, roles, billing/usage metering                                                                                                                                         | FastAPI + PostgreSQL                                                         | stateless replicas  |
 
@@ -565,7 +583,7 @@ created_at`) is preserved as a subset of the above richer object.
 | Orchestration  | **Kubernetes** (prod), **Docker Compose** (MVP)                                                | Autoscaling + HA vs simplicity                                                                                                                          |
 | Autoscaling    | **KEDA** (scale on queue depth) + HPA                                                          | Workers track backlog, not just CPU                                                                                                                     |
 | Observability  | **Prometheus + Grafana + Loki + OpenTelemetry + Jaeger**                                       | Metrics, logs, traces                                                                                                                                   |
-| Frontend       | **Plain HTML + CSS + JavaScript** (vanilla, no framework)                                      | Simple static dashboard served from a CDN/static host; calls the read APIs directly; no build step or framework runtime                                 |
+| Frontend       | **React 19 + Vite + Tailwind** (`dashboard/`)                                                  | Shipped UI: charts (chart.js), live SSE trace, per-comment labeller comparison. The vanilla no-build dashboard this row originally specified is kept at `dashboard_legacy/` |
 
 ---
 
@@ -977,21 +995,31 @@ Q&A, grounded reports, targeted deep-dives. **Agents never run per post.**
   (trigger an upstream post-with-details pull / fetch more comments to raise coverage).
   One consistent tool interface, same auth/tenant scoping; read-mostly (`ingest-mcp`
   writes only into our own DB, never upstream).
-- **AI agents** (LLM-B on the pluggable `local`⇄`groq` backend — Qwen/Llama both do
-  tool calling; a **VLM** step when images matter):
-  - **Insight/Analyst agent** — `trend_query → semantic_search → get_thread →
-synthesize → cite`; generates reports and answers `POST /v1/agents/query`,
-    replacing single-shot RAG with a grounded tool-using loop.
-  - **Coverage deep-dive agent** — when `comment_analysis.coverage` is low or a post
-    is flagged viral, calls `ingest-mcp.fetch_more_comments`, re-runs the comment
-    pass, escalates.
-  - **Alerting agent** (scheduled) — watches `reaction_breakdown` spikes / sentiment
-    shifts / viral signals and raises alerts.
+- **AI agents** — **nine**, on the dedicated `agent` role over the pluggable
+  `local`⇄`groq` backend (`llama3.1:8b-16k` / `llama-3.3-70b-versatile`, both do
+  tool calling; a **VLM** step when images matter). Tools and budgets live in
+  [`registry.py`](src/defense/services/agents/registry.py) and are served live by
+  `GET /v1/agents/types`:
+  - **Insight/Analyst agent** (budget 10) — `trend_query → semantic_search →
+    get_thread → synthesize → cite`; answers `POST /v1/agents/query`, replacing
+    single-shot RAG with a grounded tool-using loop.
+  - **Coverage deep-dive agent** (5) — when `comment_analysis.coverage` is low or a
+    post is flagged viral, calls `ingest-mcp.fetch_more_comments`, re-runs the
+    comment pass, escalates.
+  - **Alerting agent** (8, scheduled) — checks negative sentiment >50% and avg
+    toxicity >0.6 as two separate verdicts, each required to quote its figure.
+  - **Stance** (12), **Comparator** (15), **Toxicity** (14), **Narrative** (12),
+    **Quality** (8) and **Reporter** (15) — see
+    [architecture.md](architecture.md) §11 for what each is for.
 - **Guardrails:** invoked by request/schedule/router escalation (not per post);
   per-run tool-call + token budgets; cached by `(agent, inputs, backend, model)`;
   grounded + cited + auditable (records backend/model/tools/tokens → `/v1/usage`);
-  privacy-locked tenants keep agent calls on `local`. Not required for the MVP —
-  lands with the reporting/insight phase (§20).
+  privacy-locked tenants keep agent calls on `local`. Tool results are capped at
+  6,000 characters and serialised unescaped so one result cannot displace the
+  system prompt; byte-identical repeats are refused; and a run only reports
+  `completed` if the answer answers something. Was not required for the MVP —
+  landed with the reporting/insight phase (§20), and is now built in full but
+  still **unmeasured** for answer accuracy.
 
 ---
 
@@ -1528,6 +1556,29 @@ transparency feature tied to the hybrid design.
 Real-time alternative: `GET /v1/analysis/{id}/stream` (SSE) pushes per-post results
 as they complete, for live dashboards.
 
+### 17.3a Job control — stop, resume, delete
+
+`POST /v1/analysis/{id}/cancel` · `POST /v1/analysis/{id}/resume` ·
+`DELETE /v1/analysis/{id}`. Full request/response shapes and the reasoning are in
+[api_design.md](api_design.md) §3a; the three things that matter at plan level:
+
+- **Stopping is cooperative, because a job is not a process.** It is N envelopes
+  across the stage streams, so there is nothing to kill. One Redis flag
+  (`job:{id}:cancelled`) is checked by ingestion, Stage 1, the router and Stage 2
+  as each picks a message up, which bounds the cost of a stop at one post per stage
+  rather than the rest of the batch. `cancelled` is a **terminal** job status:
+  neither the assembler nor the §17.3 counter reconciliation may overwrite it.
+- **Resume re-enqueues only what an interrupted job never finished**, derived
+  from Postgres alone — the selector for the full set, and an `analysis_results`
+  row written at or after the job's `created_at` for what is done — because the
+  Redis progress counters do not survive the power cut that makes resume
+  necessary. The counters are rebuilt with `completed` seeded, so progress
+  continues at 30/300 rather than restarting, and the job still finishes on its
+  last post. Refused while the job is still writing progress.
+- **Delete removes the job, not the analysis.** `analysis_results` is keyed by
+  post, written by several jobs and by ingest, and is what every read path uses;
+  `DELETE /v1/posts/{id}` is the endpoint that removes a post's data.
+
 ### 17.4 Reporting — `GET /v1/reports`
 
 List and fetch generated reports (trends, brand mentions, political analysis,
@@ -1973,7 +2024,8 @@ Goal: prove the hybrid pipeline and output quality end-to-end, cheaply.
   auth (API key + JWT).
 - **Web dashboard (v1) — plain HTML/CSS/JS** (vanilla, no framework): job status,
   results table, per-post sentiment + comment breakdown + reaction chart, static
-  files calling the read APIs.
+  files calling the read APIs. *Shipped as React 19 + Vite + Tailwind instead
+  (`dashboard/`); the vanilla build described here is at `dashboard_legacy/`.*
 - **Monitoring:** Prometheus + Grafana + Loki; track LLM-routing rate + cache hits.
 
 **Exit criteria:** process 1,000-post batches reliably; measured LLM slice in single

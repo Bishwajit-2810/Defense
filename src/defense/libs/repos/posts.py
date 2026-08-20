@@ -5,7 +5,13 @@ from sqlalchemy.ext.asyncio import AsyncSession
 from sqlalchemy import select, update
 from sqlalchemy.dialects.postgresql import insert
 
-from defense.libs.models.posts import Post, Comment, AnalysisResult
+from defense.libs.models.posts import (
+    Post,
+    Comment,
+    AnalysisResult,
+    CommentEmbedding,
+    PostChunk,
+)
 
 log = structlog.get_logger(__name__)
 
@@ -115,16 +121,24 @@ class PostRepository:
         return result.scalar_one_or_none()
 
     async def upsert_analysis(
-        self, 
-        post_id: str, 
-        campaign_id: Optional[str], 
-        result_json: Dict[str, Any], 
-        embedding: List[float], 
-        embedding_is_stub: bool, 
+        self,
+        post_id: str,
+        campaign_id: Optional[str],
+        result_json: Dict[str, Any],
+        embedding: List[float],
+        embedding_is_stub: bool,
         schema_version: str,
-        tenant_id: str = "default"
+        tenant_id: str = "default",
+        embedding_model: Optional[str] = None,
+        embedding_dim: Optional[int] = None,
     ):
-        """Upsert an AnalysisResult."""
+        """Upsert an AnalysisResult.
+
+        ``embedding_model`` / ``embedding_dim`` record which vector space the
+        row's embedding lives in. Change EMBEDDING_MODEL without them and old
+        rows stay in the old space — still comparable by cosine distance,
+        silently meaningless, with no way to tell which is which.
+        """
         analysis_dict = {
             "post_id": post_id,
             "campaign_id": campaign_id,
@@ -132,6 +146,8 @@ class PostRepository:
             "result": result_json,
             "embedding": embedding,
             "embedding_is_stub": embedding_is_stub,
+            "embedding_model": embedding_model,
+            "embedding_dim": embedding_dim if embedding_dim is not None else len(embedding or []),
             "schema_version": schema_version,
             "updated_at": datetime.now(timezone.utc)
         }
@@ -155,4 +171,53 @@ class PostRepository:
         await self._session.execute(post_update)
 
         await self._session.commit()
+
+    async def replace_post_chunks(self, post_id: str, rows: List[Dict[str, Any]]) -> int:
+        """Replace a post's chunks wholesale.
+
+        Delete-then-insert rather than upsert, because re-analysing an edited
+        caption can produce FEWER chunks than before: an upsert keyed
+        (post_id, chunk_idx) would leave the surplus tail rows behind, still
+        indexed, still matching queries, describing text the post no longer
+        contains.
+
+        Does NOT commit. The caller owns the transaction boundary because it
+        wraps this in a SAVEPOINT (``session.begin_nested()``): a ``commit()``
+        here would release that savepoint, and the isolation it exists to
+        provide — an enrichment failure that cannot roll back the analysis row —
+        would be gone. See the note above ``_log_enrichment_failure`` in the
+        assembler's persistence module.
+        """
+        await self._session.execute(
+            PostChunk.__table__.delete().where(PostChunk.post_id == post_id)
+        )
+        if rows:
+            await self._session.execute(insert(PostChunk).values(rows))
+        return len(rows)
+
+    async def upsert_comment_embeddings(self, rows: List[Dict[str, Any]]) -> int:
+        """Upsert per-comment vectors, keyed (post_id, comment_id).
+
+        Re-analysing a post REPLACES its comment vectors rather than
+        accumulating them: the conflict target is the same pair the
+        ``comments`` table is unique on, so a second pass with a different
+        embedding model overwrites the old space instead of leaving two
+        generations of vector in one HNSW index.
+
+        Does not commit, for the same reason ``replace_post_chunks`` does not.
+        """
+        if not rows:
+            return 0
+
+        stmt = insert(CommentEmbedding).values(rows)
+        update_dict = {
+            c.name: c
+            for c in stmt.excluded
+            if c.name not in ("post_id", "comment_id", "created_at")
+        }
+        stmt = stmt.on_conflict_do_update(
+            index_elements=["post_id", "comment_id"], set_=update_dict
+        )
+        await self._session.execute(stmt)
+        return len(rows)
 

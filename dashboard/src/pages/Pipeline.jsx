@@ -1,6 +1,14 @@
 import React, { useState, useEffect, useRef } from 'react';
-import { Database, Brain, Cpu, MessageSquare, Save, Activity, ChevronRight, Terminal, CheckCircle2 } from 'lucide-react';
+import { Activity, ChevronRight, Terminal, CheckCircle2 } from 'lucide-react';
 import { API_BASE, apiCall, getSseQueryAsync } from '../utils/api.js';
+
+// The Redis log sink strips ANSI before storing, but `run_all.py` tees worker
+// stdout through the same buffer, so a colourised line can still arrive. Matching
+// ESC by its escape is the point of this regex, hence the rule exemption; a
+// \u001b escape trips the same rule, so a disable is the only way to say
+// "intentional".
+// oxlint-disable-next-line no-control-regex
+const stripAnsi = (str) => (typeof str === 'string' ? str.replace(/\x1b\[[0-9;]*[a-zA-Z]/g, '') : str);
 
 export default function Pipeline() {
   const [logs, setLogs] = useState([]);
@@ -21,8 +29,11 @@ export default function Pipeline() {
     es.addEventListener('log', (e) => {
       try {
         const parsed = JSON.parse(e.data);
+        if (parsed && parsed.message) {
+          parsed.message = stripAnsi(parsed.message);
+        }
         setLogs(prev => [...prev.slice(-99), parsed]);
-      } catch (err) {}
+      } catch {}
     });
     
     logStreamRef.current = es;
@@ -40,7 +51,7 @@ export default function Pipeline() {
       try {
         setPipelineStats(JSON.parse(e.data));
         setLiveStatus('live');
-      } catch (err) {}
+      } catch {}
     });
     
     es.addEventListener('error', () => {
@@ -61,7 +72,7 @@ export default function Pipeline() {
         const stats = await apiCall('/v1/pipeline/stats');
         setPipelineStats(stats);
         setLiveStatus('polling');
-      } catch (e) {
+      } catch {
         setLiveStatus('offline');
       }
     };
@@ -207,7 +218,7 @@ export default function Pipeline() {
                       if (!t) return '';
                       const d = new Date(typeof t === 'number' && t < 1e12 ? t * 1000 : t);
                       return d.toISOString().split('T')[1].replace('Z', '');
-                    } catch (e) {
+                    } catch {
                       return '';
                     }
                   })()}

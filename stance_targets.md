@@ -264,7 +264,61 @@ Reuse the existing lane rather than adding one:
   calls, so this feature is **free** against the cost model in
   [PROJECT_ASSESSMENT.md](PROJECT_ASSESSMENT.md) §6.8. Worth saying out loud: it
   adds a capability without adding a lane.
+- **…which also means it inherits that call's reach.** The Stage-2 comment pass
+  covers whatever the router selected — by default every comment with text
+  (`ROUTER_COMMENT_TOP_N=0`), so the LLM-scored target stances cover the whole
+  thread. Set a positive cap for speed and they cover only that slice, while the
+  Stage-1 deterministic verdict still covers every comment; the rollup then mixes
+  the two, and `method: "llm"` per entry is the field to check before describing a
+  per-target number as LLM-judged.
 - **The deterministic scorer fills in** for bypassed posts and stub-mode runs.
+
+### 6.1 The agent-facing surface — and why an unknown `target_id` raises
+
+Two retrieval-MCP tools expose the rollup: `stance_by_target` (distribution per
+entity) and `stance_over_time` (one row per period × entity). Both take an
+optional `target_id`, and the `stance` agent reaches them.
+
+That id used to be applied as a plain equality filter against whatever string the
+model passed, which made **two very different situations look identical**:
+
+```
+stance_over_time(target_id="primary_political_figures")  ->  []
+```
+
+was briefed to the operator as *"no stance data exists for the primary political
+figures"* — while the one entity actually on the watchlist had stance rows in
+seven posts the whole time. The model cannot guess an id (this file is
+gitignored; it never sees it) and it has no tool that lists one, so it invents
+one — and an invented id is indistinguishable from a quiet corpus.
+
+So the roster is the authority. An id that is not on the watchlist now **raises**,
+the way a placeholder `campaign_id` does, and the error names every valid id:
+
+```
+target_id 'primary_political_figures' is not on the watchlist, so no stance was
+ever scored for it. The watchlist tracks exactly: <id> (<display>), … Pass one of
+those ids, or omit target_id to get every tracked target. Do not report this as
+an absence of data in the corpus.
+```
+
+The runner turns that into a tool result the model reads, so the correction costs
+one turn out of the budget rather than the whole run. Three details that follow
+from §3.1:
+
+- **Aliases resolve too** — id, display name, or any alias, including the Bangla
+  and Banglish spellings, because those are what the retrieved comments contain
+  and therefore what the model has in front of it when it picks an argument.
+- **Comma-separated ids are split, not rejected.** It is the shape a model reaches
+  for when the question names a group of people; every part still has to resolve.
+- **A *tracked* target with no rows still returns empty.** That is a real answer —
+  nobody mentioned them, or the aliases need work (`unmatched_targets` in
+  [`stance_targets.py`](src/defense/libs/stance_targets.py) is the signal for the
+  second) — and it is the answer the tool docstrings promise.
+
+If the watchlist file cannot be read at all, the filter falls back to the old
+unvalidated behaviour and logs `target_id_unvalidated` rather than taking the
+stance tools down with a bad config file.
 
 ---
 
@@ -276,7 +330,8 @@ thing**, not a scorecard.
 Two metrics, and they must be reported separately because they fail differently:
 
 1. **Mention detection** — precision and recall of the matcher, on comments
-   sampled from `posts_text_only.json`. This is where the alias work is proved
+   sampled from `posts_with_details.json` (all 50 posts — comment text does not
+   depend on the parent post carrying a caption). This is where the alias work is proved
    or disproved, and it is the number that matters most. **Recall is the one to
    watch**: a missed alias is invisible, an over-match is obvious.
 2. **Stance agreement** — of the correctly-matched mentions, how often the stance

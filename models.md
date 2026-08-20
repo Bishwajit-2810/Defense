@@ -34,8 +34,9 @@ prior** we cross-check against.
 > reachable in any runnable configuration** — the image term has never
 > contributed a non-zero value ([PROJECT_ASSESSMENT.md](PROJECT_ASSESSMENT.md)
 > §5.2). OCR is consequently off by default (`STAGE1_OCR_SENTIMENT=false`), the
-> working corpus is `posts_text_only.json` (43 captioned posts), and post
-> sentiment is a **text** measurement. The vision rows below are kept because
+> working corpus is `posts_with_details.json` (all 50 posts — post-level
+> sentiment on the 7 null-caption posts rests on reactions and comments alone),
+> and post sentiment is a **text** measurement. The vision rows below are kept because
 > the code path is retained and the models are the right ones — they are
 > labelled ⚠ so nothing here reads as a measured capability.
 
@@ -128,12 +129,27 @@ with its own model id so the stages and tasks run on **different models**:
 | `stage1` | `STAGE1_LOCAL_MODEL` / `STAGE1_GROQ_MODEL` | `gemma3:4b` / `llama-3.1-8b-instant` | **Stage-1 Fast NLP** — sentiment/emotion/topic/intent/toxicity/NER/keywords over caption + comments (`STAGE1_LLM=true`) |
 | `stage2` | `STAGE2_LOCAL_MODEL` / `STAGE2_GROQ_MODEL` | `qwen2.5:7b` / `llama-3.3-70b-versatile` | **Stage-2 classification** — post-type, insight, context-aware comment stance |
 | `summary` | `SUMMARY_LOCAL_MODEL` / `SUMMARY_GROQ_MODEL` | `qwen2.5:7b` / `llama-3.3-70b-versatile` | **Stage-2 summarization** — post summary and comment summary |
+| `agent` | `AGENT_LOCAL_MODEL` / `AGENT_GROQ_MODEL` | `llama3.1:8b-16k` / `llama-3.3-70b-versatile` | **All nine MCP agents** ([`registry.py`](src/defense/services/agents/registry.py)). The only role doing multi-turn tool use, so it wants solid native function calling — llama rather than qwen — and the **`-16k` suffix is load-bearing**: see the note below. |
+| `vlm` | `VLM_LOCAL_MODEL` / `VLM_GROQ_MODEL` | `qwen3-vl:4b` / — | **Image-grounded summaries.** *Substitutes for* the `summary` role rather than adding a call. If the image bytes do not resolve, the result is tagged `post_summary_source: "llm"`, not `"vlm"`. |
 
 `stage1` is the LLM realization of the small-model suite in §1 (a small fast model
-carries the high-volume per-post + per-comment NLP). `llm_a` / `llm_b` remain the
-architectural fast / quality roles for the agents + report layer (§5), and the VLM
-role is unchanged. On local Ollama all of these can be time-sliced on one GPU; on
+carries the high-volume per-post + per-comment NLP). `llm_a` / `llm_b` remain as the
+architectural fast / quality roles and are still what `reports.py` asks for, but the
+**agents no longer use them** — they resolve through the dedicated `agent` role above. On local Ollama all of these can be time-sliced on one GPU; on
 Groq they are just distinct model IDs.
+
+**Why the agent model carries a `-16k` tag.** `ollama serve` runs with no
+`OLLAMA_CONTEXT_LENGTH` here, so it defaults to a **4,096-token** window and
+*silently discards* anything longer — oldest messages first, which is the system
+prompt and then the operator's question. It reports only what it evaluated, so
+nothing in the response says this happened. `llama3.1:8b-16k` is a derived tag
+([`config/Modelfile.llama31-16k`](config/Modelfile.llama31-16k)) setting
+`num_ctx 16384`; llama3.1 itself supports 131,072, and 16k is what this machine
+evaluates quickly (~960 tok/s prompt eval, ~2 GB of KV cache). Measured: an
+11k-token prompt evaluates **24** tokens on `llama3.1:8b` and all **11,045** on
+`llama3.1:8b-16k`. Setting `OLLAMA_CONTEXT_LENGTH` on the service is the better
+fix because it covers the pipeline models too — but a `PARAMETER` inside a model
+wins over it, so retag or drop the suffix if you go that route.
 
 **Why `summary` is separate from `stage2`.** The two Stage-2 jobs have opposite
 requirements: classification picks from a **fixed vocabulary** and wants a cheap,
@@ -144,6 +160,64 @@ needs it, **once per post**, rather than on every classification call (which,
 since comment stance runs per batch, would multiply straight through the
 comment lane). `summary` defaults to the same model as `stage2`, so nothing
 changes until you point it elsewhere.
+
+### The Stage-2 comment ensemble — seven small heads beside the LLM
+
+Comment sentiment is not decided by one model. Every comment in the router's
+analysis set collects up to **eight** verdicts in `parallel_labels`, and
+`libs/ensemble.combine()` reduces them to one label plus an agreement figure. The
+LLM is one voter of eight — the only one that sees the post, and therefore the only
+one judging *stance toward it* rather than the comment's own tone.
+
+| Slot (env) | Voter name | Checkpoint | Note |
+| --- | --- | --- | --- |
+| `STAGE2_CLASSIFIER_1` | `xlmr` | `tabularisai/multilingual-sentiment-analysis` | DistilBERT-multilingual, 5-class |
+| `STAGE2_CLASSIFIER_2` | `distilbert` | `lxyuan/distilbert-base-multilingual-cased-sentiments-student` | 3-class student |
+| `STAGE2_CLASSIFIER_3` | `twitter_xlmr` | `cardiffnlp/twitter-xlm-roberta-base-sentiment-multilingual` | XLM-R trained on social media |
+| `STAGE2_CLASSIFIER_4` | `banglabert` | `ADn-001/banglabert-sentnob-sentiment` | BanglaBERT/Electra on SentNoB — Bangla social text |
+| `STAGE2_CLASSIFIER_5` | `bengali_sentiment_bert` | `ahs95/banglabert-sentiment-analysis` | BanglaBERT/Electra, 5-class |
+| `STAGE2_CLASSIFIER_6` | `mbert` | `nlptown/bert-base-multilingual-uncased-sentiment` | multilingual BERT, 1–5 stars |
+| `STAGE2_CLASSIFIER_7` | `modernbert` | `clapAI/modernBERT-base-multilingual-sentiment` | ModernBERT-base multilingual |
+| — | `llm` | the `stage2` role above | context-aware stance, per batch |
+
+**Stage 1's emoji + lexicon rule is deliberately absent from that table.** It used
+to vote as `heuristic`; it was removed on 17 Aug 2026 and **only a model may label
+a comment** now. Two reasons: it is a keyword rule, and in the shipped
+configuration most of its verdicts are the deterministic hash `stub` — reproducible
+and not sentiment (measured: 11 of 12 comments on a real Bangla thread) — and a
+free voter that answers on *every* comment can never abstain, which made
+`abstained` / `unread` / `single_voter` unable to report a run where no model
+loaded. The consequence is intended and visible: a comment no model read is
+`uncertain` with `label_voters: 0`, and its cheap Stage-1 path is still disclosed
+in `method` / `provenance`.
+
+Four things about this roster are worth knowing before changing it — each is a
+trap this project already walked into:
+
+- **Seven heads are not seven independent readings.** Five of them are
+  multilingual encoders trained on overlapping data, so their agreement is
+  correlated: a 7-0 vote is weaker evidence than seven unrelated models would be.
+  Report `unanimous_share` next to `single_voter_share`, never alone.
+- **A checkpoint earns a slot only if it can vote.** It must be a *sentiment* head
+  whose labels survive `worker._map_sentiment_label`. Base encoders
+  (`ElectraForPreTraining`, `BertForMaskedLM`) load fine, get a randomly
+  initialised head bolted on by `pipeline("sentiment-analysis")`, and emit
+  `LABEL_0`/`LABEL_1` — which maps to nothing. **Four of the roster's original five
+  Bangla entries were that, or did not exist on the Hub at all**, and voted zero
+  times while reading as coverage in the roster.
+- **It also needs a tokenizer this environment can build.** The obvious pick for
+  slot 3, `cardiffnlp/twitter-xlm-roberta-base-sentiment`, ships only
+  `sentencepiece.bpe.model` and no `tokenizer.json`, so transformers 5 raises
+  "`tiktoken` is required". The `-multilingual` sibling is the same family with a
+  fast tokenizer and costs no new dependency.
+- **Where they run.** `STAGE2_CLASSIFIER_DEVICE=cpu` when the GPU is serving the
+  LLM: a 4 GB card hosting `qwen2.5:7b` has ~285 MB free, which fits one head, not
+  seven. Batched CPU inference is the intended configuration, not a fallback.
+
+Fetch and verify the roster with `deploy/prefetch_classifiers.py` — it downloads
+into the local HF cache (`MODEL_STUB_MODE=true` means *download nothing*, so an
+unprefetched box silently runs LLM-only) and then runs each head on a Bangla /
+English / Banglish probe, so "downloaded" is never mistaken for "voting".
 
 **Pick the summary model by measurement, not reputation:**
 
@@ -288,10 +362,11 @@ backend.
 
 ### Delivered as an agentic loop over MCP tools
 
-In practice RAG here is driven by the **Insight/Analyst agent**
-([architecture.md](architecture.md) §11), not a single retrieve→generate call. The
-agent runs on **LLM-B** (Qwen/Llama — both support tool/function calling, which MCP
-builds on) and plans over **MCP tools**: `retrieval-mcp.semantic_search` /
+In practice RAG here is driven by the **agent layer** — nine agents, of which
+`analyst` is the general-purpose one ([architecture.md](architecture.md) §11) — not
+a single retrieve→generate call. They run on the dedicated **`agent` role**
+(`llama3.1:8b-16k` locally, `llama-3.3-70b-versatile` on Groq; both support
+tool/function calling, which MCP builds on) and plan over **MCP tools**: `retrieval-mcp.semantic_search` /
 `get_thread` (Postgres + pgvector) for grounding, `analytics-mcp.trend_query` /
 `reaction_mix` (ClickHouse) for the numbers, and a **VLM** step when an answer needs
 the images. This keeps reports **grounded and cited**, lets the agent decide _how

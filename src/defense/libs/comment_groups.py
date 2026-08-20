@@ -34,8 +34,8 @@ _DIGITS = re.compile(r"\d+")
 def normalize(text: str) -> str:
     """A comparison key for near-duplicate detection.
 
-    Case-folded, NFKC-normalised, stripped of punctuation, symbols (which
-    includes emoji), and digits, with whitespace collapsed. Two comments sharing
+    Case-folded, NFKC-normalised, stripped of punctuation and symbols (which
+    includes emoji), with whitespace collapsed. Two comments sharing
     a key are the same written opinion as far as a sentiment model is concerned.
 
     Returns "" for anything with no textual content left — those are never
@@ -46,7 +46,6 @@ def normalize(text: str) -> str:
         return ""
     s = unicodedata.normalize("NFKC", text).casefold()
     s = "".join(ch for ch in s if unicodedata.category(ch)[0] not in _STRIP_CATEGORIES)
-    s = _DIGITS.sub(" ", s)
     return _WS.sub(" ", s).strip()
 
 

@@ -1,0 +1,10 @@
+# llama3.1:8b with an explicit context window.
+#
+# `ollama serve` runs with no OLLAMA_CONTEXT_LENGTH here, so it defaults to 4096
+# tokens and SILENTLY discards any prompt over that, oldest messages first — the
+# system prompt and the operator's question go first. llama3.1 itself supports
+# 131072 (llama.context_length); 16384 is what this machine can evaluate quickly
+# (~960 tok/s prompt eval, ~2GB of KV cache) and comfortably holds the system
+# prompt, the question, a capped tool result and a couple of tool rounds.
+FROM llama3.1:8b
+PARAMETER num_ctx 16384

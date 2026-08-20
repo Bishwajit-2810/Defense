@@ -65,16 +65,16 @@ async def predict_all(rows: list[dict]) -> dict[str, dict[str, str]]:
         res = await classify_comment(row["text"], registry)
         out["heuristic"][row["comment_id"]] = res.get("sentiment") or "neutral"
 
-    # 2. The two cheap HF heads, when weights are actually present.
+    # 2. The cheap HF heads, when weights are actually present. Driven by the
+    #    configured roster, not a hardcoded pair: scoring two of the seven
+    #    voters and calling the result "the ensemble" measures a system that is
+    #    not the one in production.
     try:
         from defense.services.workers.stage2_llm.worker import _run_hf_classifier
         from defense.libs.common.config import get_settings
 
         config = get_settings()
-        for name, model_id in (
-            ("xlmr", config.stage2_classifier_1),
-            ("distilbert", config.stage2_classifier_2),
-        ):
+        for name, model_id in config.stage2_classifier_roster:
             probe = [
                 {"text": r["text"], "text_norm": r.get("text_norm"), "kind": r["kind"]}
                 for r in rows

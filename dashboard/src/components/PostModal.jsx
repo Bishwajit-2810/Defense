@@ -1,11 +1,45 @@
-import React, { useRef, useState, useEffect } from 'react';
-import { X, Download, Heart, MessageCircle, Share2, ThumbsUp, ThumbsDown, Minus, ChevronLeft, ChevronRight } from 'lucide-react';
+import React, { useRef, useState, useEffect, useCallback } from 'react';
+import { X, Download, Heart, MessageCircle, Share2, ChevronLeft, ChevronRight, AlertCircle } from 'lucide-react';
 import { Chart as ChartJS, ArcElement, Tooltip, Legend, CategoryScale, LinearScale, BarElement, Title } from 'chart.js';
-import { Doughnut, Bar } from 'react-chartjs-2';
+import { Bar } from 'react-chartjs-2';
 import { apiCall } from '../utils/api';
 import { formatAlertReason } from '../utils/sentiment';
+import { commentScrape, SCRAPE_TAG, scrapeTooltip } from '../utils/coverage';
 
 ChartJS.register(ArcElement, Tooltip, Legend, CategoryScale, LinearScale, BarElement, Title);
+
+// Every labeller the ensemble can hear from, in the order they are worth
+// reading: the one that saw the post first, then the seven cheap heads.
+// Must stay in sync with Settings.stage2_classifier_names + ensemble.CHEAP_SOURCES
+// — a voter missing here runs, costs its forward pass, and is invisible.
+//
+// Stage 1's emoji + lexicon rule ('heuristic') is deliberately NOT here: it stopped
+// voting on 17 Aug 2026, because a keyword rule — largely the deterministic hash
+// stub in the shipped configuration — is not a model reading the comment. Its
+// label still shows up in the row's `method` chip and in `provenance`; it is no
+// longer presented as one of the verdicts.
+const LABELLERS = [
+  ['LLM', 'llm', 'context-aware stance pass — the only one that read the post'],
+  ['XLM-R', 'xlmr', 'tabularisai/multilingual-sentiment-analysis'],
+  ['DistilBERT', 'distilbert', 'lxyuan/distilbert-base-multilingual-cased-sentiments-student'],
+  ['Twitter XLM-R', 'twitter_xlmr', 'cardiffnlp/twitter-xlm-roberta-base-sentiment-multilingual'],
+  ['BanglaBERT', 'banglabert', 'ADn-001/banglabert-sentnob-sentiment'],
+  ['Bangla 5-cls', 'bengali_sentiment_bert', 'ahs95/banglabert-sentiment-analysis'],
+  ['mBERT', 'mbert', 'nlptown/bert-base-multilingual-uncased-sentiment'],
+  ['ModernBERT', 'modernbert', 'clapAI/modernBERT-base-multilingual-sentiment'],
+];
+
+// The router's TEXTLESS_KINDS (rules.py): comments with nothing for a model to
+// read. They come back `sentiment: "uncertain"`, which is true but misleading in
+// the stance column — "uncertain" is the ensemble abstaining after reading, and
+// these were never readable. A 👍👍 row showing amber `UNCERTAIN` next to eight
+// "—" voters invites the reader to count it as a failed label instead of a
+// comment that carries a reaction and no text.
+const TEXTLESS_BADGE = {
+  emoji: { label: 'emoji', title: 'Emoji-only comment — no words for a model to read, so no stance is claimed. Its emotion (E:) comes from Stage 1\u2019s emoji rule, which is not one of the eight voters.' },
+  link: { label: 'link only', title: 'The comment is a bare link — no text for a model to read, so no stance is claimed.' },
+  filtered: { label: 'filtered', title: 'The comment was filtered upstream (no readable text), so no stance is claimed.' },
+};
 
 export default function PostModal({ post, onClose }) {
   const modalRef = useRef(null);
@@ -17,19 +51,22 @@ export default function PostModal({ post, onClose }) {
   const [commentFilter, setCommentFilter] = useState('all');
   const [commentOffset, setCommentOffset] = useState(0);
   const limit = 100;
+  // One source for the id both the loader and its effect key on.
+  const postId = post?.post_id;
 
-  useEffect(() => {
-    if (post?.post_id) {
-      loadComments(0, 'all');
-    }
-  }, [post?.post_id]);
-
-  const loadComments = async (offset, sentiment) => {
+  // Declared above the effect that depends on it, and keyed on the post id
+  // rather than on `post`: a parent refetch hands this component a new object
+  // with the same id on every poll, and re-requesting up to 2,000 comment rows
+  // each time is the cost of getting that wrong. Identity therefore changes
+  // exactly when the post does — which is also what makes it safe to name in the
+  // dependency array below instead of suppressing the warning.
+  const loadComments = useCallback(async (offset, sentiment) => {
+    if (!postId) return;
     setCommentsLoading(true);
     setCommentsError(null);
     try {
       const qs = `?limit=${limit}&offset=${offset}&sentiment=${encodeURIComponent(sentiment)}`;
-      const data = await apiCall(`/v1/analysis/post/${encodeURIComponent(post.post_id)}/comments${qs}`);
+      const data = await apiCall(`/v1/analysis/post/${encodeURIComponent(postId)}/comments${qs}`);
       setCommentsData(data);
       setCommentOffset(offset);
       setCommentFilter(sentiment);
@@ -38,7 +75,13 @@ export default function PostModal({ post, onClose }) {
     } finally {
       setCommentsLoading(false);
     }
-  };
+  }, [postId]);
+
+  useEffect(() => {
+    if (postId) {
+      loadComments(0, 'all');
+    }
+  }, [postId, loadComments]);
 
   const handleFilterChange = (f) => loadComments(0, f);
   const handlePage = (delta) => loadComments(Math.max(0, commentOffset + delta * limit), commentFilter);
@@ -62,7 +105,7 @@ export default function PostModal({ post, onClose }) {
         img.style.height = liveCanvas[i].style.height || liveCanvas[i].offsetHeight + 'px';
         img.style.display = 'block';
         clonedCanvas[i].parentNode.replaceChild(img, clonedCanvas[i]);
-      } catch (e) {}
+      } catch {}
     }
 
     const headStyles = Array.from(document.head.querySelectorAll('style, link[rel="stylesheet"]'))
@@ -151,6 +194,12 @@ export default function PostModal({ post, onClose }) {
     </div>
   );
 
+  // Which comments the router put in front of the models — top-N by reaction
+  // count (ROUTER_COMMENT_TOP_N). Read by the ensemble bar AND the per-comment
+  // rows, so both explain an empty labeller cell the same way.
+  const commentSelection =
+    commentsData?.ensemble?.selection || commentsData?.stage2_selection || {};
+
   // Charts
   const emoScores = post.emotion?.scores || {};
   const emotionData = {
@@ -170,6 +219,8 @@ export default function PostModal({ post, onClose }) {
   };
 
   const reactions = post.reaction_breakdown || {};
+  const scrape = commentScrape(post);
+
   const reactionData = {
     labels: Object.keys(reactions),
     datasets: [{
@@ -197,6 +248,7 @@ export default function PostModal({ post, onClose }) {
     const topLiked = (commentsData.top_liked || []).filter(c => (c.likes || 0) > 0).slice(0, 4);
 
     const ens = commentsData.ensemble || {};
+    const sel = commentSelection;
     return (
       <>
       {/* How these labels were produced, and what the agreement bought. Shown
@@ -217,6 +269,22 @@ export default function PostModal({ post, onClose }) {
               {ens.llm_labelled ?? 0}/{ens.comments} ({Math.round((ens.llm_share || 0) * 100)}%)
             </span>
           </span>
+          {/* The router analyses the top-N comments by reaction count, and every
+              model reads that same set. Shown next to LLM coverage because the
+              two are read together: 100/2857 is not a failed stance pass, it is
+              a cap — and the share OF THE SELECTION is the number that says
+              whether the pass succeeded. */}
+          {ens.not_analysed > 0 && (
+            <span className="text-slate-500"
+                  title={`ROUTER_COMMENT_TOP_N=${sel.limit ?? '?'} — the ${sel.selected ?? 0} most-reacted comments with text were analysed by every model (cutoff: ${sel.cutoff_likes ?? 0} reactions). The other ${ens.not_analysed} keep their Stage-1 label. Set ROUTER_COMMENT_TOP_N=0 to analyse the whole thread.`}>
+              analysed: <span className="font-medium text-slate-700 dark:text-slate-300">
+                top {ens.analysed}/{ens.comments} by reactions
+              </span>
+              <span className="ml-1 text-indigo-600 dark:text-indigo-400">
+                ({Math.round((ens.llm_share_analysed || 0) * 100)}% LLM of those)
+              </span>
+            </span>
+          )}
           <span className="text-slate-500">abstained: <span className="font-medium text-amber-600 dark:text-amber-500">{ens.abstained || 0}</span></span>
           {ens.deduplicated > 0 && (
             <span className="text-slate-500" title="Identical text after normalisation — the twin's verdict was reused rather than re-asked.">
@@ -321,11 +389,27 @@ export default function PostModal({ post, onClose }) {
               {post.emotion?.primary && <span className="chip text-purple-700 bg-purple-50 border-purple-200 dark:bg-purple-900/30 dark:border-purple-800 dark:text-purple-400">emotion {post.emotion.primary}</span>}
               {post.toxicity_score !== undefined && <span className="chip bg-slate-100 border-slate-200 text-slate-700 dark:bg-zinc-800 dark:border-zinc-700 dark:text-zinc-300">toxicity {pct(post.toxicity_score)}</span>}
               {post.hate_speech_score !== undefined && <span className="chip bg-slate-100 border-slate-200 text-slate-700 dark:bg-zinc-800 dark:border-zinc-700 dark:text-zinc-300">hate {pct(post.hate_speech_score)}</span>}
+              {/* Scrape depth, not analysis depth. Without this the header's
+                  comment number reads as a coverage claim it cannot support. */}
+              {scrape && (
+                <span className={`chip ${SCRAPE_TAG[scrape.state].cls}`} title={SCRAPE_TAG[scrape.state].title(scrape)}>
+                  {SCRAPE_TAG[scrape.state].text(scrape)}
+                </span>
+              )}
             </div>
             {post.engagement && (
               <div className="flex gap-4 text-sm font-medium border-l border-slate-200 dark:border-zinc-800 pl-4 bg-slate-50 dark:bg-zinc-900/50 p-2 rounded-lg">
                 <div className="flex items-center gap-1.5 text-rose-500"><Heart size={16} /> {formatNumber(post.engagement.reactions || post.engagement.total_reactions || 0)}</div>
-                <div className="flex items-center gap-1.5 text-blue-500"><MessageCircle size={16} /> {formatNumber(post.engagement.comment_count || 0)}</div>
+                <div className="flex items-center gap-1.5 text-blue-500" title={scrapeTooltip(scrape, post.platform)}>
+                  <MessageCircle size={16} />
+                  {scrape
+                    ? <span>
+                        {scrape.analysed !== null && <>{formatNumber(scrape.analysed)}<span className="text-slate-400 dark:text-zinc-500 font-normal"> / </span></>}
+                        {formatNumber(scrape.stored)}
+                        <span className="text-slate-400 dark:text-zinc-500 font-normal"> / {scrape.total ? formatNumber(scrape.total) : '?'}</span>
+                      </span>
+                    : formatNumber(post.engagement.comment_count || 0)}
+                </div>
                 <div className="flex items-center gap-1.5 text-emerald-500"><Share2 size={16} /> {formatNumber(post.engagement.share_count || 0)}</div>
               </div>
             )}
@@ -487,23 +571,34 @@ export default function PostModal({ post, onClose }) {
                         <div key={c.id || i} className="p-3 md:p-4 flex flex-col md:flex-row md:items-start gap-3 md:gap-4 hover:bg-slate-50 dark:hover:bg-zinc-900 transition-colors">
                           <div className="w-32 shrink-0 flex flex-col gap-1.5">
                             <div className="flex items-center mb-1">
-                              <span className={`px-2 py-1 rounded text-[10px] font-bold uppercase tracking-wider ${getSentimentColor(c.sentiment || 'neutral')}`}>
-                                {c.sentiment || 'neutral'}
-                              </span>
+                              {/* Only when no model read it: if a voter did label a
+                                  textless row, that verdict is the thing to show. */}
+                              {TEXTLESS_BADGE[c.kind] && c.label_voters === 0 ? (
+                                <span className="px-2 py-1 rounded text-[10px] font-bold uppercase tracking-wider text-sky-700 bg-sky-50 border border-sky-200 dark:bg-sky-950/40 dark:text-sky-300 dark:border-sky-900"
+                                      title={TEXTLESS_BADGE[c.kind].title}>
+                                  {TEXTLESS_BADGE[c.kind].label}
+                                </span>
+                              ) : (
+                                <span className={`px-2 py-1 rounded text-[10px] font-bold uppercase tracking-wider ${getSentimentColor(c.sentiment || 'neutral')}`}>
+                                  {c.sentiment || 'neutral'}
+                                </span>
+                              )}
                             </div>
-                            {/* All three labellers, ALWAYS rendered. A source
+                            {/* All eight labellers, ALWAYS rendered. A source
                                 that did not vote shows "—" rather than
                                 vanishing: an absent row and a neutral verdict
-                                must not look the same. */}
-                            {[['LLM', 'llm'], ['XLM-R', 'xlmr'], ['DistilBERT', 'distilbert']].map(([label, key]) => {
+                                must not look the same. Rendering only the
+                                three that happened to be loaded is how five
+                                dead heads sat in the roster unnoticed. */}
+                            {LABELLERS.map(([label, key, what]) => {
                               const v = (c.parallel_labels || {})[key];
                               return (
                                 <div key={key}
-                                     title={v ? `${label}: ${v.sentiment}` : `${label} did not label this comment (${c.escalation_reason || 'not run'})`}
-                                     className="flex justify-between items-center bg-slate-50 dark:bg-zinc-900/50 px-2 py-1 rounded border border-slate-100 dark:border-zinc-800">
-                                  <span className="text-[9px] font-bold text-slate-500">{label}</span>
-                                  <span className={`text-[10px] font-bold uppercase tracking-wider ${v ? getSentimentColor(v.sentiment) : 'text-slate-400'}`}>
-                                    {v ? v.sentiment : '—'}
+                                     title={v ? `${label}: ${v.sentiment}\n${what}` : `${label} did not label this comment (${c.escalation_reason || 'not run'})\n${what}`}
+                                     className="flex justify-between items-center gap-1 bg-slate-50 dark:bg-zinc-900/50 px-2 py-0.5 rounded border border-slate-100 dark:border-zinc-800">
+                                  <span className="text-[9px] font-bold text-slate-500 truncate">{label}</span>
+                                  <span className={`text-[10px] font-bold uppercase tracking-wider shrink-0 ${v ? getSentimentColor(v.sentiment) : 'text-slate-400'}`}>
+                                    {v ? (v.sentiment || '').slice(0, 3) : '—'}
                                   </span>
                                 </div>
                               );
@@ -512,6 +607,29 @@ export default function PostModal({ post, onClose }) {
                           <div className="flex-1 text-sm text-slate-800 dark:text-slate-200">{c.text || c.comment_text}</div>
                           <div className="w-full md:w-auto shrink-0 flex flex-wrap items-center gap-4 text-xs font-medium text-slate-500 dark:text-zinc-400 bg-slate-50 dark:bg-zinc-900 px-3 py-1.5 rounded-lg border border-slate-100 dark:border-zinc-800/50">
                             {c.emotion && <span className="flex items-center gap-1"><span className="text-slate-400 text-[10px] uppercase">E:</span> {c.emotion}</span>}
+                            {/* Not in the router's top-N by reactions, or filtered duplicate/short — so no model
+                                read it — the row reports `uncertain`, not a label.
+                                Said on the row, because "no model was asked" and
+                                "the models could not agree" both end up looking
+                                like an unlabelled comment otherwise. */}
+                            {c.stage2_selected === false && (
+                              <span className={`text-[9px] uppercase tracking-wider rounded px-1.5 py-0.5 border ${
+                                c.stage2_skip_reason === 'duplicate' 
+                                  ? 'text-purple-600 bg-purple-50 border-purple-200 dark:bg-purple-950/30 dark:text-purple-400 dark:border-purple-800' 
+                                  : c.stage2_skip_reason === 'below_min_words' 
+                                  ? 'text-amber-600 bg-amber-50 border-amber-200 dark:bg-amber-950/30 dark:text-amber-400 dark:border-amber-800' 
+                                  : 'text-slate-400 border-slate-200 dark:border-zinc-700'
+                              }`}
+                              title={
+                                c.stage2_skip_reason === 'duplicate' 
+                                  ? 'Filtered as duplicate/repeat comment in router. Representative comment is analysed instead.'
+                                  : c.stage2_skip_reason === 'below_min_words'
+                                  ? 'Filtered: comment contains fewer than 3 words.'
+                                  : `Outside the top ${commentSelection.limit ?? '?'} comments by reaction count (cutoff ${commentSelection.cutoff_likes ?? 0}).`
+                              }>
+                                {c.stage2_skip_reason === 'duplicate' ? 'duplicate' : (c.stage2_skip_reason === 'below_min_words' ? '<3 words' : 'not selected')}
+                              </span>
+                            )}
                             {/* No score for a comment nobody read. `label_voters:
                                 0` carries `sentiment_score: 0.0`, and "Score:
                                 0.00" beside it reads as a measured neutral —
@@ -529,7 +647,7 @@ export default function PostModal({ post, onClose }) {
                                 as one the labellers fought over. */}
                             {c.label_voters === 0 ? (
                               <span className="flex items-center gap-1 text-amber-600 dark:text-amber-500"
-                                    title="No labeller read this comment: Stage 1 fell back to the hash stub (which does not vote), no classifier was available, and no LLM verdict returned. Nothing is claimed about it.">
+                                    title="No model read this comment — so nothing is claimed about it. Usual causes: the router did not select it, it has no text, every classifier was unavailable, or no LLM verdict returned. Stage 1&#39;s emoji/keyword label is not a voter.">
                                 <span className="text-slate-400 text-[10px] uppercase">Agree:</span>
                                 <span className="text-[9px] uppercase">not read</span>
                               </span>

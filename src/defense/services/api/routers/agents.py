@@ -10,7 +10,14 @@ import structlog
 from fastapi import APIRouter, Depends, HTTPException, Query, status
 from pydantic import BaseModel
 
-from defense.services.api.deps import get_current_user, rate_limit
+from sqlalchemy.ext.asyncio import AsyncSession
+
+from defense.services.api.deps import (
+    check_llm_backend_policy,
+    get_current_user,
+    get_db,
+    rate_limit,
+)
 
 log = structlog.get_logger(__name__)
 
@@ -48,6 +55,12 @@ class AgentQueryRequest(BaseModel):
     stream: bool = False
     """When True the agents service should stream partial results."""
 
+    llm_backend: str | None = None
+    """Per-request backend override ("local"/"groq"), subject to tenant policy."""
+
+    history: list[dict[str, str]] | None = None
+    """Prior conversation turns, oldest first, for multi-turn (chat) callers."""
+
 
 # ---------------------------------------------------------------------------
 # POST /v1/agents/query
@@ -63,12 +76,18 @@ class AgentQueryRequest(BaseModel):
 async def query_agent(
     request: AgentQueryRequest,
     user: dict = Depends(get_current_user),
+    db: AsyncSession = Depends(get_db),
 ) -> Any:
     """POST /v1/agents/query — proxy to the agents service.
 
     Returns 202 Accepted with ``run_id`` for async execution, or 200 with a
     full result if the agents service responds within 30 s.
     """
+    # A privacy-locked tenant may not reach Groq by any route. The chat and
+    # analysis endpoints have always enforced that; this proxy did not, so an
+    # agent run was a way around the lock.
+    await check_llm_backend_policy(db, user, {"llm_backend": request.llm_backend})
+
     # Translate the public API shape to the agents-service contract:
     # query → question, agent_type → agent (extras the service doesn't know are dropped).
     payload = request.model_dump(exclude_none=True)
@@ -107,13 +126,53 @@ async def query_agent(
 
 
 # ---------------------------------------------------------------------------
-# GET /v1/agents
+# ---------------------------------------------------------------------------
+# GET /v1/agents/types
+# ---------------------------------------------------------------------------
+
+
+@router.get(
+    "/types",
+    summary="List available agent types and their descriptions",
+)
+async def list_agent_types(
+    user: dict = Depends(get_current_user),
+) -> Any:
+    """GET /v1/agents/types — list all available agent personas and capabilities."""
+    from defense.services.agents.registry import AGENT_REGISTRY
+
+    async with httpx.AsyncClient(timeout=10.0) as client:
+        try:
+            resp = await client.get(f"{AGENTS_URL}/v1/agents/types")
+            if resp.status_code == 200:
+                return resp.json()
+        except Exception:
+            pass  # Fallback to local registry if agents service is remote or offline
+
+    return [
+        {
+            "name": a.name,
+            "description": a.description,
+            "tools": a.tools,
+            "llm_role": a.llm_role,
+            "max_tool_calls": a.max_tool_calls,
+        }
+        for a in AGENT_REGISTRY.values()
+    ]
+
+
+# ---------------------------------------------------------------------------
+# GET /v1/agents & GET /v1/agents/runs
 # ---------------------------------------------------------------------------
 
 
 @router.get(
     "",
     summary="List recent agent runs",
+)
+@router.get(
+    "/runs",
+    summary="List recent agent runs (alias)",
 )
 async def list_agent_runs(
     limit: int = Query(20, ge=1, le=200, description="Maximum number of runs to return"),
@@ -179,3 +238,58 @@ async def get_agent_run(
             )
 
         return resp.json()
+
+
+# ---------------------------------------------------------------------------
+# DELETE /v1/agents (+ /runs alias) & DELETE /v1/agents/{run_id}
+#
+# Order matters: FastAPI matches in registration order, so the literal "/runs"
+# path must be declared BEFORE "/{run_id}" or the clear-all alias is swallowed by
+# the single-run route and quietly deletes a run whose id is "runs".
+# ---------------------------------------------------------------------------
+
+
+@router.delete(
+    "",
+    summary="Clear all agent run history",
+)
+@router.delete(
+    "/runs",
+    summary="Clear all agent run history (alias)",
+)
+async def clear_all_agent_runs(
+    user: dict = Depends(get_current_user),
+) -> Any:
+    """DELETE /v1/agents — clear all agent run history."""
+    async with httpx.AsyncClient(timeout=10.0) as client:
+        try:
+            resp = await client.delete(f"{AGENTS_URL}/v1/agents")
+            return resp.json()
+        except Exception as exc:
+            log.error("agents_proxy_error", endpoint="clear_all_runs", error=str(exc))
+            raise HTTPException(
+                status_code=status.HTTP_502_BAD_GATEWAY,
+                detail="Agents service unavailable",
+            ) from exc
+
+
+@router.delete(
+    "/{run_id}",
+    summary="Delete a single agent run",
+)
+async def delete_agent_run(
+    run_id: str,
+    user: dict = Depends(get_current_user),
+) -> Any:
+    """DELETE /v1/agents/{run_id} — delete a single agent run."""
+    async with httpx.AsyncClient(timeout=10.0) as client:
+        try:
+            resp = await client.delete(f"{AGENTS_URL}/v1/agents/{run_id}")
+            return resp.json()
+        except Exception as exc:
+            log.error("agents_proxy_error", endpoint="delete_run", run_id=run_id, error=str(exc))
+            raise HTTPException(
+                status_code=status.HTTP_502_BAD_GATEWAY,
+                detail="Agents service unavailable",
+            ) from exc
+

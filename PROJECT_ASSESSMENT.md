@@ -5,6 +5,55 @@ Bangla / English / Banglish)
 **Assessed:** 2 August 2026, branch `testing` (working tree, 14 commits)
 **Revised:** 3 August 2026 — three passes:
 
+> ## Where this document stands — 20 August 2026
+>
+> **Read this first.** Everything below is a dated record of passes 1–6 (2–5
+> August). Three later audits live in their own files —
+> [AUDIT_PASS7.md](AUDIT_PASS7.md) (12–13 Aug, eleven findings including two
+> regressions of items closed here), [AUDIT_PASS8.md](AUDIT_PASS8.md) (14 Aug) and
+> [AUDIT_PASS9.md](AUDIT_PASS9.md) (14 Aug, multi-tenant data isolation) — and
+> [OPEN_ISSUES.md](OPEN_ISSUES.md) is the actionable form of the latest one.
+>
+> Current repository: **175 Python files (53,019 LOC) under `src/`, `tests/` and
+> `eval/`; 1,373 tests across 67 files in `tests/`.** (The method is named because
+> the previous figure could not be reproduced without it — a repo-wide count is
+> 199 files / 54,615 LOC, the difference being 24 loose scripts at the root and
+> `deploy/`.)
+>
+> Seven things below are now out of date. In each case the *reasoning* still holds
+> and only the numbers or the mechanism moved:
+>
+> | Claim below | Current state |
+> | --- | --- |
+> | "the two cheap classifiers (XLM-R + DistilBERT)" | **Seven** heads (`STAGE2_CLASSIFIER_1..7`), so a comment collects up to **eight** verdicts with the LLM. Stage 1's own label is **not** among them: the `heuristic` voter was removed on 17 Aug 2026 because it answers on every comment — and §6.2 measured that **71.3%** of those answers are the deterministic stub or the emoji rule — which made abstention unreportable. A comment no model read is now `uncertain` at zero voters. Four of the roster's original Bangla entries were base encoders or absent from the Hub and had voted **zero** times while reading as coverage; `stage2_cheap_voters` now logs `voted` vs `declared` at WARNING. Note the honest caveat: five of the seven are multilingual encoders on overlapping data, so their agreement is **correlated** — a 7-0 vote is not seven independent readings. |
+> | "every non-emoji comment reaches the Stage-2 LLM; both caps default to 0" | **Still true, and now three caps at 0.** The router gained `ROUTER_COMMENT_TOP_N` on 17 Aug — the set it selects is read by *every* Stage-2 voter, closing the hole where `COMMENT_STANCE_MAX_PER_POST` capped the LLM alone while seven heads ran over the whole thread — and it ships at **0 = every comment with text**. Setting it to 100 would fix Stage-2 comment cost at 4 LLM calls per post regardless of thread size; coverage was chosen over that instead. Cost of the choice, measured: ~0.92 s/comment of classifier CPU (~44 min on a 2,857-comment post) plus one stance batch per 25 comments. |
+> | "the dashboard JS" / "plain HTML/CSS/JS" | The shipped dashboard is **React 19 + Vite + Tailwind** (`dashboard/`), eleven tabs; the vanilla build audited in passes 4–5 is preserved at `dashboard_legacy/`. **Every `dashboard/app.js` path and line citation below resolves to [`dashboard_legacy/app.js`](dashboard_legacy/app.js)** — the findings were real against that file and the links are left as written rather than rewritten. |
+> | "working corpus is `posts_text_only.json` (43 captioned posts)" (§9.3, §5.2, §9.9 and the roadmap row) | **The corpus is `posts_with_details.json` — all 50 posts, 10,272 comments**, the same file the ingestion path uploads. The caption filter was right about *post* text and wrong as a corpus-wide filter: the 7 null-caption `PHOTO` posts carry **1,307 comments (12.7%)** that analyse like any other, so eval was measuring a population the running system never processes and under-counting the comment lane — now the dominant cost. `eval/` scripts default to the full file and each reports what it skips; `eval/make_text_corpus.py` still writes the 43-post subset for reproducing numbers measured under the old frame. `eval/gold/comments_gold_300.json` was rebuilt on the full frame (still **0 adjudicated**, so no labels were lost). |
+> | "three agents (`analyst`, `coverage`, `alerting`)" | **Nine.** `stance`, `comparator`, `toxicity`, `narrative`, `quality` and `reporter` shipped from the AGENTIC_RAG_NOVELTY §3 proposal list. They run on a dedicated **`agent`** LLM role, not `llm_b`, defaulting to **`llama3.1:8b-16k`** — a derived tag setting `num_ctx 16384`, because `ollama serve`'s 4,096-token default *silently discarded* the system prompt and the operator's question on any large tool result. Measured: an 11k-token prompt evaluates **24** tokens on `llama3.1:8b` and all **11,045** on the `-16k` tag. The runner also caps tool results at 6,000 chars (serialised `ensure_ascii=False` — the `\uXXXX` escaping of Bengali was *half* the token bill), refuses byte-identical repeat calls, and fails a run whose "answer" is code, payload narration, self-narration, or an empty template. Eight live failures, each with a regression test: [RAG_STATE_AND_ROADMAP.md](RAG_STATE_AND_ROADMAP.md) §6 Section 9. |
+> | "`COMMENT_EMBEDDING_MAX_PER_POST=1000`" | **Now `0` — uncapped** (18 Aug). Disclosure came first (`posts_over_comment_cap` / `comments_dropped_by_cap` on `coverage_stats`), but an honestly-disclosed 82% index is still an 82% index, and the 1,857 hidden comments were the tail of the single most-discussed thread in the corpus. Every knob that can drop a comment is now 0. |
+> | §7.2 "zero gold labels" — **the decisive gap** | **Still open, and still decisive.** The harness now exists (`eval/build_gold_set.py`, `eval/score_gold.py`, and `eval/gold/comments_gold_300.json` with 300 stratified rows) but **0 rows are adjudicated**, by design — labels seeded from a model in this repo would measure agreement with itself. There is still **no measured accuracy** for any labeller. |
+>
+> One addition rather than a correction (20 Aug): **analysis jobs can now be
+> stopped, resumed and deleted** — `POST /v1/analysis/{id}/cancel`,
+> `POST /{id}/resume`, `DELETE /{id}`, reasoned through in
+> [api_design.md](api_design.md) §3a and [architecture.md](architecture.md) §3
+> step 3. It refines two things recorded below rather than contradicting them:
+> `cancelled` joins `done`/`failed` as a terminal status, so the counter
+> reconciliation that closed §9.7 can no longer revive a job the operator stopped;
+> and `jobs.options` is now persisted for analysis runs, where it had been written
+> as a literal `{}` — a separate hole from §13.1's, which is about the report
+> path's `embedding_clusters` living only in that column, and is untouched.
+>
+> How to run any of it is now one document — **[testing.md](testing.md)** — which
+> also records what a green suite does *not* prove, §7.2 below being the headline:
+> 1,370 passing tests are correctness and contract tests, and there is still no
+> measured accuracy for any labeller.
+>
+> One structural note for anyone re-running the audits: the JSON contracts moved
+> from `src/defense/libs/schemas/` to **`src/defense/contracts/schemas/`**.
+>
+> ---
+>
 > ## Implementation status — 4 August 2026
 >
 > The **P0 list (§9.1–§9.7) and the comment-path rebuild (§9 P0′ A–G) are
@@ -1648,7 +1697,7 @@ is common. It returns `refined_topics`, `intents` and a one-line `insight`.
 
 `assembler/builder.build_canonical_result` read `topics` and `intents` from
 `stage1_result` **only**, and never read `insight` at all; `insight` was also
-absent from `src/defense/libs/schemas/output_schema.json` and from
+absent from `src/defense/contracts/schemas/output_schema.json` and from
 `AnalysisResultResponse`. So the task's entire output was thrown away before it
 reached the API, Postgres, ClickHouse, MinIO or the dashboard. Reproduction, on
 the pre-fix builder:

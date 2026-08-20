@@ -33,12 +33,18 @@ What ends up running:
 
 - **Docker** (with `compose`)
 - **[uv](https://docs.astral.sh/uv/)** — `curl -LsSf https://astral.sh/uv/install.sh | sh`
-- **[Ollama](https://ollama.com/)** with the three models pulled — Stage 1 and
-  Stage 2 run on **different** models:
+- **[Ollama](https://ollama.com/)** with four models pulled — the pipeline stages
+  and the agents run on **different** models:
 
   ```bash
-  # one line, ~7 GB total — Stage-1 NLP, Stage-2 text, and the VLM
-  ollama pull gemma3:4b && ollama pull qwen2.5:7b && ollama pull qwen3-vl:4b
+  # ~12 GB total — Stage-1 NLP, Stage-2 text, the VLM, and the agents
+  ollama pull gemma3:4b && ollama pull qwen2.5:7b && ollama pull qwen3-vl:4b \
+    && ollama pull llama3.1:8b
+
+  # Then derive the 16k-context tag the agents actually ask for. There is no
+  # preflight for it, so without this every agent call comes back as Ollama's
+  # `model "llama3.1:8b-16k" not found`.
+  ollama create llama3.1:8b-16k -f config/Modelfile.llama31-16k
   ```
 
   | Model | Used for |
@@ -46,6 +52,30 @@ What ends up running:
   | `gemma3:4b` | Stage-1 Fast NLP — sentiment / emotion / topics + every comment |
   | `qwen2.5:7b` | Stage-2 — summary, insight, comment stance; also the Chat tab |
   | `qwen3-vl:4b` | VLM — image-grounded summaries (unexercised: no image bytes are reachable) |
+  | `llama3.1:8b-16k` | All nine MCP agents (`AGENT_LOCAL_MODEL`) |
+
+  **Why the derived tag.** `ollama serve` runs with no `OLLAMA_CONTEXT_LENGTH`, so
+  it defaults to a **4,096-token** window and *silently discards* a longer prompt,
+  oldest message first — which is the system prompt and then your question. One
+  `semantic_search` result is bigger than that, so plain `llama3.1:8b` answers
+  agent questions from the tail of a JSON payload and reports success.
+  [`config/Modelfile.llama31-16k`](config/Modelfile.llama31-16k) sets
+  `num_ctx 16384`. Setting `OLLAMA_CONTEXT_LENGTH=16384` on the ollama service
+  instead is fine — it covers the pipeline models too — but then set
+  `AGENT_LOCAL_MODEL=llama3.1:8b` so it stops looking for the derived tag.
+
+- **(Optional) the seven small sentiment heads** — the cheap half of the Stage-2
+  comment ensemble, ~3 GB of HF checkpoints on CPU. Everything runs without them
+  (the ensemble degrades to the LLM alone and says so), so this is a second-run
+  step, not a prerequisite:
+
+  ```bash
+  uv run python deploy/prefetch_classifiers.py     # downloads, then proves each head votes
+  ```
+
+  Until you do, the Stage-2 log says `stage2_cheap_voters voted=0 declared=7` and
+  the per-comment table in the dashboard shows `—` in those seven columns. That is
+  the honest rendering of a head that never ran — not a bug.
 
 Repo assumed at `/home/bk/code/defense`.
 
@@ -165,8 +195,19 @@ Open **<http://127.0.0.1:8080>** in your browser.
 submit. (Dev mode accepts any key.) The tabs:
 
 - **Overview** — usage/cost counters + corpus charts
-- **Posts** — the ingested posts
-- **Analysis Jobs** — submit / track analysis runs
+- **Posts** — the ingested posts, searchable by **post id / platform id / URL /
+  campaign** or by caption, summary, topic and keyword. An id search checks the
+  whole corpus, not just the rows on screen, so "no post has that id" and "not on
+  this page" are different answers; the id cell has a copy button because it shows
+  only the first 8 characters
+- **Analysis Jobs** — submit / track analysis runs, and control them:
+  **Stop** (no further post is analysed; the ones already inside a stage finish,
+  so the counter may tick up once or twice more), **Resume** (re-queues *only*
+  the posts an interrupted job never finished — this is what to press after a
+  power cut, and it continues at 30/300 rather than re-paying for the first 30),
+  **Re-run**, and **Delete** (removes the job record; the posts and their
+  analysis results are kept). A job that has written no progress for five minutes
+  is badged **stalled** rather than left reading "running" forever
 - **Reports** — generate & read reports (headline metrics, topic clusters, **and
   embedding clusters with one LLM summary per cluster**)
 - **Search** — semantic + keyword search over the analyzed posts
@@ -215,7 +256,7 @@ curl -s -X POST http://127.0.0.1:8001/v1/agents/query \
   | python -m json.tool
 ```
 
-`agent_type` is one of `analyst`, `coverage`, `alerting`.
+`agent_type` is one of `analyst`, `coverage`, `alerting`, `stance`, `comparator`, `toxicity`, `narrative`, `quality`, `reporter` — `GET /v1/agents/types` returns the live list.
 
 ---
 
@@ -280,6 +321,21 @@ block). Full reference in [run.md](run.md).
 
 ---
 
+## 5b. Run the tests
+
+```bash
+uv run pytest -q                            # backend, ~50 s, needs nothing running
+cd dashboard && npm test -- --run           # dashboard unit tests
+cd dashboard && npm run test:e2e            # headless browser
+```
+
+Safe to run while the stack is up: a plain `pytest` cannot touch your datastores
+or your log view — both are opt-in, and one of the opt-ins wipes Redis/Postgres/
+ClickHouse. Details, targeted invocations and the gated groups:
+**[testing.md](testing.md)**.
+
+---
+
 ## 6. If something's off
 
 - **A service didn't come up** → read its log: `/tmp/<name>.log`
@@ -297,8 +353,12 @@ block). Full reference in [run.md](run.md).
   your browser cached an old `app.js`. **Hard-refresh** (Ctrl-Shift-R). The dashboard
   targets `http://127.0.0.1:8001` by default; confirm `curl http://127.0.0.1:8001/v1/health` works.
 - **Want to start clean** → `uv run run_all.py --reset` (wipes Postgres + Redis, reloads posts).
-- **Ollama missing/empty** → `ollama pull gemma3:4b qwen2.5:7b qwen3-vl:4b`;
+- **Ollama missing/empty** → `ollama pull gemma3:4b qwen2.5:7b qwen3-vl:4b llama3.1:8b`;
   Stage-1 NLP (gemma3:4b) and Stage-2 (qwen2.5:7b) both need it.
+- **`model "llama3.1:8b-16k" not found`** → the derived tag was never created:
+  `ollama create llama3.1:8b-16k -f config/Modelfile.llama31-16k`.
+- **An agent answers something you did not ask** → the context window truncated
+  your question. Check you are on `llama3.1:8b-16k`, not plain `llama3.1:8b`.
 
 Full troubleshooting + every knob is in **[run.md](run.md)**.
 
@@ -385,7 +445,7 @@ npm run dev -- --port 8080      # open http://127.0.0.1:8080
 ```
 
 The dashboard targets the dev API on `http://127.0.0.1:8001` by default
-(configured in `dashboard/src/config.js` or via `.env`).
+(`API_BASE` in [`dashboard/src/utils/api.js`](dashboard/src/utils/api.js)).
 
 **Stop (manual):**
 

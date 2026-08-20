@@ -35,6 +35,14 @@ _OPTIONS: dict[str, dict] = {
     "xlmr": {
         "label": "XLM-R (multilingual, social)",
         "env": "SENTIMENT_MODEL",
+        # NOTE: this repo ships `sentencepiece.bpe.model` and no `tokenizer.json`,
+        # so under transformers 5 the load fails with "`tiktoken` is required to
+        # read a `tiktoken` file" unless tiktoken/sentencepiece is installed —
+        # neither is a dependency here. Dormant while MODEL_STUB_MODE=true (the
+        # weights are never loaded); it bites the moment stub mode is turned off.
+        # `cardiffnlp/twitter-xlm-roberta-base-sentiment-multilingual` is the
+        # same model family WITH a fast tokenizer, which is why Stage 2's
+        # `twitter_xlmr` slot uses that one (see config.stage2_classifier_3).
         "hf_default": "cardiffnlp/twitter-xlm-roberta-base-sentiment",
         "languages": ["en", "banglish", "bn"],  # general fallback for any bucket
     },

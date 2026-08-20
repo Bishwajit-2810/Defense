@@ -5,6 +5,13 @@
 -- canonical result in analysis_results.embedding.
 CREATE EXTENSION IF NOT EXISTS vector;
 
+-- pg_trgm — backs the lexical arm of hybrid retrieval. The corpus is code-mixed
+-- Bangla / English / Banglish, where exact entity names, transliterations and
+-- hashtags are what a multilingual sentence encoder blurs and what a lexical
+-- match nails. Trigrams rather than a stemmed tsvector because Postgres ships
+-- no Bengali text-search configuration; 'simple' + trigram is honest about that.
+CREATE EXTENSION IF NOT EXISTS pg_trgm;
+
 -- Tenant Isolation Migrations & Backfill Policy
 -- Existing rows in posts, analysis_results, and jobs are backfilled to 'default' tenant.
 -- Future rows acquire tenant_id explicitly from current_user / job envelope.
@@ -44,6 +51,14 @@ CREATE TABLE IF NOT EXISTS analysis_results (
     -- arbitrary neighbours, and the row is otherwise indistinguishable from a
     -- real one — so search and report paths must be able to disclose it.
     embedding_is_stub BOOLEAN DEFAULT FALSE,
+    -- Which model produced `embedding`, and at what width. Change EMBEDDING_MODEL
+    -- without these and old rows stay in the OLD vector space: still comparable
+    -- by cosine distance, silently meaningless, with nothing to detect it by —
+    -- `fit_dim()` will even truncate or pad a mismatched model into the column
+    -- with a single warning. 'stub:sha256' is the sentinel for a hash vector,
+    -- which is a different fact from "unknown" (NULL).
+    embedding_model VARCHAR,
+    embedding_dim   INTEGER,
     schema_version  VARCHAR,
     created_at      TIMESTAMPTZ DEFAULT NOW(),
     updated_at      TIMESTAMPTZ DEFAULT NOW(),
@@ -62,6 +77,90 @@ CREATE TABLE IF NOT EXISTS comments (
     sentiment   VARCHAR,                     -- null at ingestion; NLP fills later
     created_at  TIMESTAMPTZ,
     UNIQUE (post_id, comment_id)
+);
+
+-- Per-comment vectors.
+--
+-- The single biggest structural gap this schema used to have: one vector per
+-- post, built from the CAPTION, while the signal in this corpus lives in the
+-- comment threads. "Where are people angry about fuel prices?" could only ever
+-- match caption text — the anger was in rows carrying no vector at all.
+--
+-- Separate table rather than a column on `comments` for three reasons: comments
+-- are ingested before anything is embedded, so the vector's lifecycle is not the
+-- row's; near-duplicates point at a representative instead of storing their own
+-- copy (`represented_by`); and an HNSW index over a table that also serves
+-- `get_thread` reads would pay for the index on every ingestion write.
+CREATE TABLE IF NOT EXISTS comment_embeddings (
+    comment_id        VARCHAR NOT NULL,
+    post_id           VARCHAR NOT NULL REFERENCES posts(id) ON DELETE CASCADE,
+    campaign_id       VARCHAR,
+    tenant_id         VARCHAR NOT NULL DEFAULT 'default',
+    embedding         vector(768),
+    embedding_is_stub BOOLEAN DEFAULT FALSE,
+    embedding_model   VARCHAR,
+    embedding_dim     INTEGER,
+    -- Set when this comment was NOT embedded in its own right: it normalises to
+    -- the same text as another comment under the same post, so it shares that
+    -- one's vector. Recorded rather than implied, for the same reason
+    -- `label_source: "propagated"` is recorded on a copied sentiment label.
+    represented_by    VARCHAR,
+    created_at        TIMESTAMPTZ DEFAULT NOW(),
+    PRIMARY KEY (post_id, comment_id)
+);
+
+-- Chunk vectors.
+--
+-- One vector per post averages a long caption into mush: a 5,463-character post
+-- argues three things and gets the centroid of all three, close to none of them.
+-- A chunk gets its own vector and its own citable span.
+--
+-- Every post has at least one row here — a short caption is a single chunk whose
+-- text is the whole caption, so its vector is identical to the post-level one.
+-- That matters: chunk retrieval never needs a fallback path for short posts, and
+-- "no chunk matched" always means the post did not match, never that it was
+-- never chunked.
+CREATE TABLE IF NOT EXISTS post_chunks (
+    post_id           VARCHAR NOT NULL REFERENCES posts(id) ON DELETE CASCADE,
+    chunk_idx         INTEGER NOT NULL,
+    campaign_id       VARCHAR,
+    tenant_id         VARCHAR NOT NULL DEFAULT 'default',
+    text              TEXT NOT NULL,
+    char_start        INTEGER,
+    embedding         vector(768),
+    embedding_is_stub BOOLEAN DEFAULT FALSE,
+    embedding_model   VARCHAR,
+    embedding_dim     INTEGER,
+    created_at        TIMESTAMPTZ DEFAULT NOW(),
+    PRIMARY KEY (post_id, chunk_idx)
+);
+
+-- Persisted cluster centroids and their LLM-written labels.
+--
+-- Two problems, one table. `get_clusters` recomputes k-means on every call, so
+-- "the themes" are re-derived — and can silently change — between one report and
+-- the next, which makes "is this narrative growing?" unanswerable. And the
+-- narrative agent's prompt asks for a cluster NAME that the tool has never
+-- returned, so the agent invents one every run; the prompt is patched to ask for
+-- `representative_summary` instead, but a real label is the actual fix.
+--
+-- `centroid` is what makes a label survive recomputation: a fresh cluster is
+-- matched to a stored one by cosine distance between centroids rather than by
+-- cluster_id, which k-means assigns arbitrarily on each run.
+CREATE TABLE IF NOT EXISTS cluster_labels (
+    id            BIGSERIAL PRIMARY KEY,
+    campaign_id   VARCHAR,
+    tenant_id     VARCHAR NOT NULL DEFAULT 'default',
+    label         VARCHAR NOT NULL,
+    centroid      vector(768) NOT NULL,
+    size          INTEGER,
+    -- Which model wrote the label, and over which vector space the centroid
+    -- lives. A centroid from a different embedding model is not comparable to
+    -- this one, so matching must be able to exclude it.
+    labeled_by      VARCHAR,
+    embedding_model VARCHAR,
+    created_at    TIMESTAMPTZ DEFAULT NOW(),
+    updated_at    TIMESTAMPTZ DEFAULT NOW()
 );
 
 CREATE TABLE IF NOT EXISTS jobs (
@@ -129,10 +228,41 @@ CREATE TABLE IF NOT EXISTS users (
     created_at    TIMESTAMPTZ DEFAULT NOW()
 );
 
+-- Chat history. A conversation belongs to one operator in one tenant; both are
+-- carried on the row so a query can never accidentally cross either boundary.
+CREATE TABLE IF NOT EXISTS chat_conversations (
+    id         VARCHAR PRIMARY KEY,
+    tenant_id  VARCHAR NOT NULL DEFAULT 'default',
+    username   VARCHAR NOT NULL,
+    title      VARCHAR NOT NULL DEFAULT 'New chat',
+    created_at TIMESTAMPTZ DEFAULT NOW(),
+    updated_at TIMESTAMPTZ DEFAULT NOW()
+);
+
+-- One row per turn. `meta` holds the provenance of an assistant turn — which
+-- agent answered, which MCP servers and tools it called, citations. Reopening a
+-- conversation without it would show the answers and lose the evidence, which
+-- is the half that makes an intelligence briefing checkable.
+CREATE TABLE IF NOT EXISTS chat_messages (
+    id              BIGSERIAL PRIMARY KEY,
+    conversation_id VARCHAR NOT NULL REFERENCES chat_conversations (id) ON DELETE CASCADE,
+    role            VARCHAR NOT NULL,        -- 'user' | 'assistant'
+    content         TEXT NOT NULL,
+    meta            JSONB,
+    created_at      TIMESTAMPTZ DEFAULT NOW()
+);
+
+CREATE INDEX IF NOT EXISTS idx_chat_conv_owner
+    ON chat_conversations (tenant_id, username, updated_at DESC);
+CREATE INDEX IF NOT EXISTS idx_chat_msg_conversation
+    ON chat_messages (conversation_id, id);
+
 -- Idempotent schema updates for existing deployments
 ALTER TABLE posts ADD COLUMN IF NOT EXISTS tenant_id VARCHAR NOT NULL DEFAULT 'default';
 ALTER TABLE analysis_results ADD COLUMN IF NOT EXISTS tenant_id VARCHAR NOT NULL DEFAULT 'default';
 ALTER TABLE analysis_results ADD COLUMN IF NOT EXISTS embedding_is_stub BOOLEAN DEFAULT FALSE;
+ALTER TABLE analysis_results ADD COLUMN IF NOT EXISTS embedding_model VARCHAR;
+ALTER TABLE analysis_results ADD COLUMN IF NOT EXISTS embedding_dim INTEGER;
 ALTER TABLE jobs ADD COLUMN IF NOT EXISTS tenant_id VARCHAR NOT NULL DEFAULT 'default';
 
 -- Indexes
@@ -149,4 +279,44 @@ CREATE INDEX IF NOT EXISTS idx_jobs_tenant_id         ON jobs (tenant_id);
 -- Approximate nearest-neighbour index for cosine similarity (pgvector / semantic search).
 CREATE INDEX IF NOT EXISTS idx_analysis_embedding_hnsw
     ON analysis_results USING hnsw (embedding vector_cosine_ops);
+
+-- ---------------------------------------------------------------------------
+-- Hybrid retrieval: the lexical arm (RAG_STATE_AND_ROADMAP §3.3)
+-- ---------------------------------------------------------------------------
+-- `to_tsvector(regconfig, text)` is IMMUTABLE in its two-argument form, so this
+-- can be an expression index; the one-argument form is only STABLE and cannot.
+-- 'simple' is deliberate, not a placeholder: it does no stemming and no
+-- stop-wording, which is the correct behaviour for a corpus Postgres has no
+-- language configuration for.
+CREATE INDEX IF NOT EXISTS idx_analysis_fts_simple
+    ON analysis_results
+ USING gin (to_tsvector('simple',
+            coalesce(result->>'post_summary', '') || ' ' ||
+            coalesce(result->>'post_text', '')));
+
+-- Trigram index for substring/typo matching on the caption — the arm that
+-- catches a transliterated name spelled three different ways.
+CREATE INDEX IF NOT EXISTS idx_analysis_post_text_trgm
+    ON analysis_results
+ USING gin ((result->>'post_text') gin_trgm_ops);
+
+-- Comment vectors: HNSW for kNN, plus the scoping columns every query filters on.
+CREATE INDEX IF NOT EXISTS idx_comment_emb_hnsw
+    ON comment_embeddings USING hnsw (embedding vector_cosine_ops);
+CREATE INDEX IF NOT EXISTS idx_comment_emb_tenant   ON comment_embeddings (tenant_id);
+CREATE INDEX IF NOT EXISTS idx_comment_emb_campaign ON comment_embeddings (campaign_id);
+CREATE INDEX IF NOT EXISTS idx_comment_emb_post     ON comment_embeddings (post_id);
+-- Comment text lives in `comments`, so the lexical arm of comment search reads
+-- from there.
+CREATE INDEX IF NOT EXISTS idx_comments_text_trgm
+    ON comments USING gin (text gin_trgm_ops);
+
+-- Chunk vectors: same treatment as the other two vector tables.
+CREATE INDEX IF NOT EXISTS idx_post_chunks_hnsw
+    ON post_chunks USING hnsw (embedding vector_cosine_ops);
+CREATE INDEX IF NOT EXISTS idx_post_chunks_tenant   ON post_chunks (tenant_id);
+CREATE INDEX IF NOT EXISTS idx_post_chunks_campaign ON post_chunks (campaign_id);
+
+CREATE INDEX IF NOT EXISTS idx_cluster_labels_scope
+    ON cluster_labels (tenant_id, campaign_id);
 

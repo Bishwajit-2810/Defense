@@ -25,7 +25,7 @@ export async function getSseQueryAsync(extra) {
     if (res && res.ticket) {
       return `?ticket=${encodeURIComponent(res.ticket)}${suffix}`;
     }
-  } catch (err) {}
+  } catch {}
   
   const token = localStorage.getItem('auth_token');
   const apiKey = localStorage.getItem('api_key');
@@ -102,7 +102,7 @@ export async function login(username, password, apiKeyInput) {
     try {
       const data = await res.json();
       msg = data.detail || data.error?.message || msg;
-    } catch (e) {}
+    } catch {}
     throw new Error(msg);
   }
   
@@ -123,7 +123,7 @@ export async function signup(username, password) {
     try {
       const data = await res.json();
       msg = data.detail || data.error?.message || msg;
-    } catch (e) {}
+    } catch {}
     throw new Error(msg);
   }
 

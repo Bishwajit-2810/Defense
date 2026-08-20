@@ -36,7 +36,7 @@ export default function Reports() {
         else if (data && Array.isArray(data.reports)) reportsArr = data.reports;
         else if (data && Array.isArray(data.results)) reportsArr = data.results;
         setReports(reportsArr);
-      } catch (e) {}
+      } catch {}
     }
   };
 

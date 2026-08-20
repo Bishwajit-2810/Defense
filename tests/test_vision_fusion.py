@@ -85,15 +85,21 @@ async def test_stub_mode_is_labelled_stub(monkeypatch):
 
 
 def test_endpoint_without_scheme_gets_one(monkeypatch):
-    """`.env` shipped MINIO_ENDPOINT=minio:9000 — httpx raised before fetching."""
-    monkeypatch.setenv("MINIO_ENDPOINT", "minio:9000")
-    monkeypatch.setenv("MINIO_BUCKET", "defense")
+    """`.env` shipped MINIO_ENDPOINT=minio:9000 — httpx raised before fetching.
+
+    The endpoint is patched on the settings object, not in the environment:
+    `_resolve_image_url` reads `config`, which is built once at import, so
+    `setenv` here would leave the assertion reading whatever the developer's
+    `.env` happens to say rather than what this test set.
+    """
+    monkeypatch.setattr(vision.config, "minio_endpoint", "minio:9000")
+    monkeypatch.setattr(vision.config, "minio_bucket", "defense")
     url = vision._resolve_image_url("posts/c/p/abc.jpg")
     assert url == "http://minio:9000/defense/posts/c/p/abc.jpg"
 
 
 def test_absolute_url_is_left_alone(monkeypatch):
-    monkeypatch.setenv("MINIO_ENDPOINT", "http://minio:9000")
+    monkeypatch.setattr(vision.config, "minio_endpoint", "http://minio:9000")
     assert (
         vision._resolve_image_url("https://cdn.example/x.jpg")
         == "https://cdn.example/x.jpg"

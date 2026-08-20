@@ -43,6 +43,7 @@ from defense.libs.ensemble import (  # noqa: E402
 )
 from defense.libs.llm import LLMClient  # noqa: E402
 from defense.libs.llm.usage import LANE_COMMENT, LANE_POST, track_usage  # noqa: E402
+from defense.libs.jobs import is_cancelled  # noqa: E402
 from defense.libs.progress import publish_stage  # noqa: E402
 
 from .cache import get_cached, set_cached  # noqa: E402
@@ -74,10 +75,14 @@ _STANCE_ENABLED = config.comment_stance
 _STANCE_ROLE = config.comment_stance_role
 _STANCE_BATCH = config.comment_stance_batch
 _STANCE_MAX_TEXT = 140
-# 0 = no cap: EVERY non-emoji comment on a routed post gets the context-aware
+# 0 = no cap: every comment in the router's analysis set gets the context-aware
 # stance pass (§6.3). This used to default to 40, so Stage 2 re-labelled only
 # the 40 most-liked comments per post while `sentiment_breakdown` mixed those
 # with Stage-1 heuristic labels and could not say which was which.
+#
+# It is no longer the per-post volume lever — ROUTER_COMMENT_TOP_N is, and it
+# applies to EVERY voter rather than to the LLM alone. Leave this at 0 unless you
+# specifically want the LLM to see fewer comments than the cheap heads did.
 #
 # Note the reach question §6.3 step 4 raises and answers here: Stage-1 comment
 # labelling runs for EVERY post, but this Stage-2 stance pass only runs for
@@ -95,14 +100,15 @@ _STANCE_BATCH_RETRIES = max(0, config.comment_stance_batch_retries)
 
 # Summarize all comments across a post (Insight / Topic discovery)
 _COMMENT_SUMMARY_ENABLED = config.comment_summary
-#: The two cheap multilingual heads that vote alongside the heuristic and the
-#: LLM. Off turns the ensemble back into "Stage-1 heuristic + LLM" without
-#: changing any other behaviour — the merge simply sees fewer voters.
+#: The seven cheap multilingual heads that vote alongside the LLM
+#: (STAGE2_CLASSIFIER_1..7). Off leaves the LLM as the ONLY labeller — Stage 1's
+#: keyword label does not vote — so every comment the LLM misses reports
+#: `uncertain` at zero voters. That is a real, and visible, degradation.
 _CLASSIFIERS_ENABLED = config.stage2_classifiers_enabled
 #: Keep textless comments (emoji reactions, bare links) out of LLM batches.
 _FILTER_EMOJI_ONLY = config.filter_emoji_only
 #: "all" (default) — every comment with text gets an LLM verdict, so the UI can
-#: show LLM / XLM-R / DistilBERT side by side on the same comment.
+#: show the LLM beside all seven cheap heads on the same comment.
 #: "escalate" — only where the cheap voters disagree. See _comment_lane.
 _COMMENT_LLM_MODE = (config.comment_llm_mode or "all").strip().lower()
 #: Let an identical (post-normalisation) comment reuse its twin's LLM verdict.
@@ -683,6 +689,13 @@ def _is_cached(model_id: str) -> bool:
     is what lets MODEL_STUB_MODE mean "download nothing" while still using
     weights the machine already has.
 
+    "Cached" means the WEIGHTS are present, not merely `config.json`. An
+    interrupted prefetch routinely leaves a repo with its config and tokenizer
+    and no checkpoint; counting that as cached passes the gate here and then
+    fails inside `pipeline(...)` — under `HF_HUB_OFFLINE=1` (which run_all.py
+    sets) as an obscure connection error rather than the accurate
+    "weights were never fetched".
+
     Fails OPEN (returns True) if the cache API is unavailable: a wrong "yes"
     costs a download, a wrong "no" silently removes a labeller.
     """
@@ -691,7 +704,13 @@ def _is_cached(model_id: str) -> bool:
     except Exception:
         return True
     try:
-        for filename in ("config.json", "model.safetensors", "pytorch_model.bin"):
+        # Sharded checkpoints have no single-file name, so their index counts.
+        for filename in (
+            "model.safetensors",
+            "pytorch_model.bin",
+            "model.safetensors.index.json",
+            "pytorch_model.bin.index.json",
+        ):
             hit = try_to_load_from_cache(repo_id=model_id, filename=filename)
             if isinstance(hit, str):
                 return True
@@ -719,15 +738,16 @@ def _get_pipeline(name: str, model_id: str):
 
     **Falls back to CPU when the GPU is full.** The GPU is normally already
     hosting the LLM: on a 4 GB card serving qwen2.5:7b there is ~285 MB left,
-    the first classifier takes it and the second dies with CUDA OOM. These are
-    ~135M-parameter encoders — CPU is perfectly serviceable for them, and a
-    working third opinion beats an absent one. `STAGE2_CLASSIFIER_DEVICE=cpu`
+    the first classifier takes it and the rest die with CUDA OOM. These are
+    ~135-280M-parameter encoders — CPU is perfectly serviceable for them, and a
+    working extra opinion beats an absent one. `STAGE2_CLASSIFIER_DEVICE=cpu`
     skips the GPU attempt entirely, which is the right setting when the card is
-    dedicated to the LLM.
+    dedicated to the LLM — and with seven heads in the roster it is also the
+    only setting that does not pay six failed CUDA loads per process.
 
-    Construction is serialised: both classifiers load concurrently from the
-    executor, and letting them race for the last few hundred MB of VRAM is how
-    a fallback that works in isolation still loses one of the two.
+    Construction is serialised: the roster loads concurrently from the executor,
+    and letting seven heads race for the last few hundred MB of VRAM is how a
+    fallback that works in isolation still loses most of them.
     """
     if name in _PIPELINE_FAILED:
         return None
@@ -1032,39 +1052,27 @@ async def _run_llm_comment_labeling(
     return labeled
 
 
-#: Stage-1 methods that represent an actual reading of the comment. `stub` is
-#: the deterministic hash fallback used when no model could be loaded — the
-#: schema's own words are "it is reproducible, and it is not sentiment" — and
-#: `failed` is the absence of a label. Neither may vote: a hash of the text
-#: dressed up as an opinion is exactly the fabricated-neutral problem in
-#: another costume, and on a real Bangla thread it is the MAJORITY of Stage-1
-#: labels (measured: 11 of 12 comments), so it would dominate the ensemble.
-_VOTING_STAGE1_METHODS = frozenset({"fast", "emoji", "model", "llm", "link"})
-
-
-def _seed_heuristic_vote(comment: dict) -> None:
-    """Make Stage 1's own label a first-class voter — when it is a real one.
-
-    Stage 1 labelled every comment (emoji/lexicon, a small model, or its own LLM
-    pass). That verdict used to be the comment's `sentiment` and nothing else —
-    invisible to the ensemble, then silently overwritten by an aggregate built
-    from a different source. It votes now, under the name of whatever produced
-    it, unless that was the hash stub.
-    """
-    label = comment.get("sentiment")
-    if label not in ("positive", "negative", "neutral"):
-        return
-    method = comment.get("method") or "fast"
-    if method not in _VOTING_STAGE1_METHODS:
-        return
-    comment.setdefault("parallel_labels", {}).setdefault(
-        "heuristic",
-        {
-            "sentiment": label,
-            "sentiment_score": comment.get("sentiment_score", 0.0),
-            "via": method,
-        },
-    )
+#: STAGE 1'S OWN LABEL IS NOT A VOTER (17 Aug 2026).
+#:
+#: There used to be a `_seed_heuristic_vote()` here that copied Stage 1's
+#: `sentiment` into `parallel_labels["heuristic"]` so it counted alongside the
+#: models. It is gone, and `"heuristic"` is gone from `ensemble.CHEAP_SOURCES`:
+#: only a model may label a comment. Two reasons, both load-bearing:
+#:
+#:   * Stage 1's label is an emoji + keyword rule, and in the shipped
+#:     configuration a large share of its verdicts are the deterministic hash
+#:     `stub` — reproducible, and not sentiment. On a real Bangla thread the stub
+#:     was the MAJORITY of Stage-1 labels (measured: 11 of 12 comments), so it
+#:     would have dominated every aggregate it entered.
+#:   * A free voter that answers on every comment makes `label_voters` and
+#:     `unanimous_share` unfalsifiable: nothing can ever abstain, so the numbers
+#:     cannot report the run where no model loaded.
+#:
+#: The consequence is intended: a comment no model read is `uncertain` with
+#: `label_voters: 0` — including every comment outside the router's top-N set,
+#: whose Stage-1 label stays visible in `method` / `provenance` but is not
+#: presented as a verdict. Do not reintroduce a seeded vote to make the
+#: abstentions look smaller.
 
 
 def _merge_ensemble(
@@ -1094,6 +1102,13 @@ def _merge_ensemble(
     reaction_only = 0
 
     for c in comments:
+        if c.get("stage2_selected") is False:
+            # Named with the same field every other "why is this cell empty?"
+            # answer uses, so the per-comment UI says "below_top_n" rather than
+            # falling back to its "not run" default — which reads as a failure.
+            # No model read this comment, so it gets no verdict below: `uncertain`
+            # at zero voters, which is the honest reading of "not selected".
+            c["escalation_reason"] = c.get("stage2_skip_reason") or "below_top_n"
         labels = c.get("parallel_labels") or {}
         verdict = combine(labels)
         verdicts.append(verdict)
@@ -1120,21 +1135,24 @@ def _merge_ensemble(
             else:
                 c["method"] = "propagated"
         else:
-            # NOBODY read this comment. Stage 1 fell back to the hash stub (or
-            # produced nothing), the classifiers were unavailable, and no LLM
-            # verdict came back. Leaving Stage 1's label in place here is what
-            # let the stub keep the last word after issue 13 stopped it voting:
-            # `_seed_heuristic_vote` correctly declined the vote, but the hash
-            # label still became the comment's `sentiment` and was counted in
+            # NO MODEL read this comment. It is textless, or the router did not
+            # select it, or every classifier was unavailable and no LLM verdict
+            # came back. Since Stage 1's keyword/stub label no longer votes, this
+            # branch is the normal outcome for the unselected tail of a thread —
+            # not an error path.
+            #
+            # Leaving Stage 1's label in place here is what let the hash stub keep
+            # the last word for a while: it was refused a *vote*, but its label
+            # still became the comment's `sentiment` and was counted in
             # `sentiment_breakdown` as a measurement, while `ensemble.abstained`
             # simultaneously reported that every comment had abstained. Two
-            # contradicting aggregates in one payload — the same defect the
+            # contradicting aggregates in one payload — the defect the
             # single-writer merge exists to prevent.
             #
             # An unread comment is `uncertain`, which is exactly what that label
             # is for. `method` is left alone so `provenance` still reports which
-            # cheap path ran, and `label_voters: 0` tells the UI why no label is
-            # claimed.
+            # cheap Stage-1 path ran, and `label_voters: 0` tells the UI why no
+            # label is claimed.
             c["sentiment"] = UNCERTAIN
             c["sentiment_score"] = 0.0
             c["label_agreement"] = 0.0
@@ -1181,6 +1199,16 @@ def _merge_ensemble(
     llm_labelled = sum(
         1 for c in comments if (c.get("parallel_labels") or {}).get(LLM_SOURCE)
     )
+    # What the router put in front of the models, and how big the thread was.
+    # `llm_share` is against the WHOLE thread and `llm_share_analysed` against
+    # the selection: 100 of 2,857 is 3.5% coverage of the post and 100% of what
+    # was selected, and only reporting both keeps either from being read as the
+    # other.
+    selection = ca.get("stage2_selection") or {}
+    analysed = int(selection.get("selected") or 0) or sum(
+        1 for c in comments if c.get("stage2_selected") is not False
+    )
+
     summary = agreement_summary(verdicts)
     summary.update({
         "escalated": escalated,
@@ -1188,6 +1216,10 @@ def _merge_ensemble(
         "escalation_reasons": dict(escalation_reasons),
         "llm_labelled": llm_labelled,
         "llm_share": round(llm_labelled / len(comments), 4) if comments else 0.0,
+        "selection": dict(selection),
+        "analysed": analysed,
+        "not_analysed": int(selection.get("skipped") or 0),
+        "llm_share_analysed": round(llm_labelled / analysed, 4) if analysed else 0.0,
         "capped_out": escalation_reasons.get("capped_by_max_per_post", 0),
         "mode": _COMMENT_LLM_MODE,
         "deduplicated": dedup_stats.get("duplicates", 0),
@@ -1360,9 +1392,17 @@ async def _process_message(
         except Exception as exc:
             log.warning("llm_backend_override_read_failed", error=str(exc))
 
+    job_id = payload.get("job_id")
+
+    # Stop check (libs/jobs.py) — last one, and the one that saves the most: a
+    # single post here is the post-level summary plus the whole per-comment
+    # ensemble. The caller ACKs on return.
+    if await is_cancelled(redis, job_id):
+        log.info("stage2_skipped_cancelled_job", job_id=job_id, post_id=post_id)
+        return
+
     log.info("stage2_processing", task_flags=task_flags, backend_override=backend_override)
 
-    job_id = payload.get("job_id")
     await publish_stage(
         redis, "stage2", "running",
         job_id=job_id, post_id=post_id,
@@ -1524,6 +1564,32 @@ async def _process_message(
         if not comments:
             return out
 
+        # The analysis set, chosen by the ROUTER (router/rules.py). At the shipped
+        # ROUTER_COMMENT_TOP_N=0 that is every comment with text; a positive value
+        # narrows it to the top-N by reaction count.
+        # Every voter below reads this same list — the cheap HF heads, the
+        # near-duplicate cache and the LLM stance pass — so the UI's per-comment
+        # comparison is either fully populated for a comment or absent for it,
+        # never a partial row. The cap used to live in the stance pass alone,
+        # which is exactly how the LLM column came to be empty on comments the
+        # seven cheap heads had all voted on.
+        #
+        # Unmarked comments are IN the pool: `stage2_selected` is only ever set
+        # False by the router, so an older payload (or a run with the cap off)
+        # behaves as it always did.
+        selection = ca.get("stage2_selection") or {}
+        pool = [c for c in comments if c.get("stage2_selected") is not False]
+        if selection:
+            log.info(
+                "stage2_comment_pool",
+                pool=len(pool),
+                total=len(comments),
+                **{k: selection[k] for k in ("limit", "eligible", "skipped", "cutoff_likes")
+                   if k in selection},
+            )
+        if not pool:
+            return out
+
         # What the LLM judges each comment AGAINST. Stage 1's summary first —
         # a comment's stance is toward what the post SAID, and the summary is
         # the readable form of that. Falls back to the post's own content
@@ -1542,22 +1608,27 @@ async def _process_message(
             # ---- cheap voters: 7 ML heads over the whole thread --------
             voters_used: list[str] = []
             if _CLASSIFIERS_ENABLED:
-                classifier_specs = [
-                    ("xlmr", config.stage2_classifier_1),
-                    ("distilbert", config.stage2_classifier_2),
-                    ("banglabert", "csebuetnlp/banglabert"),
-                    ("banglabert_base", "sagorsarker/bangla-bert-base"),
-                    ("bengali_sentiment_bert", "l3cube-pune/bengali-sentiment-bert"),
-                    ("twitter_xlmr", "cardiffnlp/twitter-xlm-roberta-base-sentiment"),
-                    ("distilmbert_bengali", "mrm8488/distilmbert-fine-tuned-bengali-sentiment"),
-                ]
+                classifier_specs = config.stage2_classifier_roster
                 counts = await asyncio.gather(
-                    *(_run_hf_classifier(comments, name, model_id) for name, model_id in classifier_specs)
+                    *(_run_hf_classifier(pool, name, model_id) for name, model_id in classifier_specs)
                 )
+                silent: list[str] = []
                 for (name, _), n in zip(classifier_specs, counts):
-                    if n:
-                        voters_used.append(name)
-                log.info("stage2_cheap_voters", voters=voters_used)
+                    (voters_used if n else silent).append(name)
+                # Declared-but-silent is the failure this roster already had for
+                # months: five heads listed, none of them able to vote, and
+                # nothing above DEBUG saying so. Log the gap, not just the wins,
+                # and log it as a WARNING — a post labelled by 2 of 7 voters is
+                # a degraded run, and `agreement` computed over the survivors
+                # cannot tell you that by itself.
+                log.log(
+                    logging.WARNING if silent else logging.INFO,
+                    "stage2_cheap_voters",
+                    voters=voters_used,
+                    declared=len(classifier_specs),
+                    voted=len(voters_used),
+                    silent=silent,
+                )
 
             # ---- near-duplicate grouping: label one, propagate to the rest --
             # Grouping is EXACT match after normalisation, so a duplicate's
@@ -1566,9 +1637,13 @@ async def _process_message(
             # construction. It is a cache, not an approximation — but it is
             # still switchable, because "every comment got its own call" is
             # sometimes the claim being made.
+            # Grouped over `pool`, so every index below indexes POOL, not
+            # `comments`. Grouping the whole thread instead would let a
+            # representative outside the analysis set "propagate" a verdict it
+            # was never given.
             if _DEDUP_PROPAGATE:
                 groups, dedup_stats = comment_groups.group_indices(
-                    [(c.get("text_norm") or c.get("text") or "") for c in comments]
+                    [(c.get("text_norm") or c.get("text") or "") for c in pool]
                 )
             else:
                 groups, dedup_stats = {}, {"duplicates": 0, "duplicate_share": 0.0}
@@ -1586,7 +1661,12 @@ async def _process_message(
             #                the cost of an empty LLM row on the other 80%.
             escalation_reasons: dict[str, int] = {}
             selected: list[dict] = []
-            for idx, c in enumerate(comments):
+            # Comments the router left out of the analysis set are recorded as a
+            # reason like any other, so `escalation_reasons` still sums to the
+            # whole thread and the UI can name why a row has no verdict.
+            if selection.get("skipped"):
+                escalation_reasons["below_top_n"] = selection["skipped"]
+            for idx, c in enumerate(pool):
                 if idx in member_of:
                     # A near-duplicate: its representative pays for both.
                     escalation_reasons["near_duplicate"] = (
@@ -1614,12 +1694,13 @@ async def _process_message(
                 if escalate:
                     selected.append(c)
 
-            # COMMENT_STANCE_MAX_PER_POST caps the premium pass at the top-N
-            # most-engaged comments so one 2,857-comment thread cannot stall the
-            # worker for minutes. Applied HERE, not inside the labeller, so the
-            # comments it drops are recorded as dropped: with the cap set and
-            # COMMENT_LLM_MODE="all", "every comment gets an LLM verdict" is
-            # true only up to N, and the UI has to be able to say so.
+            # A SECOND, tighter cap on the LLM alone, applied inside the router's
+            # already-selected set. Normally 0 (off): ROUTER_COMMENT_TOP_N is the
+            # lever that keeps one 2,857-comment thread from stalling the worker,
+            # and unlike this one it caps every voter rather than just the LLM —
+            # so it cannot reintroduce the hole this cap used to leave in the
+            # per-comment comparison. Applied HERE, not inside the labeller, so
+            # the comments it drops are recorded as dropped.
             capped_out = 0
             if 0 < _STANCE_MAX_PER_POST < len(selected):
                 selected.sort(key=lambda c: int(c.get("likes") or 0), reverse=True)
@@ -1659,12 +1740,12 @@ async def _process_message(
 
             # ---- propagate the representative's verdict to its duplicates ---
             for rep_idx, members in groups.items():
-                rep = comments[rep_idx]
+                rep = pool[rep_idx]
                 rep_llm = (rep.get("parallel_labels") or {}).get(LLM_SOURCE)
                 if not rep_llm:
                     continue
                 for m in members:
-                    dup = comments[m]
+                    dup = pool[m]
                     dup.setdefault("parallel_labels", {})[LLM_SOURCE] = dict(rep_llm)
                     dup["label_source"] = "propagated"
                     dup["propagated_from"] = rep.get("id") or ""
@@ -1690,7 +1771,11 @@ async def _process_message(
             log.info(
                 "stage2_comment_ensemble",
                 labeled=n_labeled,
+                # Three numbers, not one: the thread, what the router selected,
+                # and what the LLM actually voted on.
                 total=len(comments),
+                analysed=summary.get("analysed"),
+                not_analysed=summary.get("not_analysed"),
                 escalated=summary.get("escalated"),
                 escalated_share=summary.get("escalated_share"),
                 unanimous_share=summary.get("unanimous_share"),
