@@ -22,6 +22,7 @@ from defense.services.api.routers.agents import router as agents_router
 from defense.services.api.routers.logs import router as logs_router
 from defense.services.api.routers.usage import router as usage_router
 from defense.services.api.routers.events import router as events_router
+from defense.services.api.routers.system import router as system_router
 
 # ---------------------------------------------------------------------------
 # Logging — everything funnels into loguru (see libs/common/logging.py)
@@ -100,11 +101,11 @@ Instrumentator().instrument(app).expose(app, endpoint="/metrics")
 # dashboard polls/tails them continuously and every such request would show up
 # in the very view the user is reading — drowning the pipeline lines that matter.
 # /metrics is excluded for the same reason (Prometheus scrapes on a timer).
-_LOG_EXEMPT_PREFIXES = ("/v1/logs", "/metrics", "/docs", "/redoc", "/openapi.json", "/favicon")
+_LOG_EXEMPT_PREFIXES = ("/v1/logs", "/v1/system/stream", "/metrics", "/docs", "/redoc", "/openapi.json", "/favicon")
 
 # Health checks are logged at DEBUG rather than INFO: useful when chasing a
 # readiness problem, noise otherwise.
-_LOG_QUIET_PREFIXES = ("/health", "/v1/health")
+_LOG_QUIET_PREFIXES = ("/health", "/v1/health", "/v1/system/health")
 
 
 @app.middleware("http")
@@ -191,6 +192,7 @@ app.include_router(agents_router)
 app.include_router(usage_router)
 app.include_router(logs_router)
 app.include_router(events_router)
+app.include_router(system_router)
 
 # ---------------------------------------------------------------------------
 # Lifecycle events

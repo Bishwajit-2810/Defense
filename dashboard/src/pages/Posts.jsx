@@ -325,7 +325,7 @@ export default function Posts() {
                 <th className="px-4 py-3 font-medium">Sentiment</th>
                 <th className="px-4 py-3 font-medium">Toxicity</th>
                 <th className="px-4 py-3 font-medium">Summary</th>
-                <th className="px-4 py-3 font-medium" title="Comments a Stage-2 model read, over the rows the scraper delivered, over the total the platform reports.">Comments <span className="font-normal text-slate-400">analysed / scraped / platform</span></th>
+                <th className="px-4 py-3 font-medium" title="Comments (analysed / scraped / platform total): Comments read by Stage-2 models / rows delivered by scraper / total reported by platform">Comments</th>
                 <th className="px-4 py-3 font-medium">Created At</th>
                 <th className="px-4 py-3 font-medium text-right">Actions</th>
               </tr>

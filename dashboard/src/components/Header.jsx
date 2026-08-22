@@ -1,8 +1,8 @@
 import React, { useState, useEffect } from 'react';
-import { Moon, Sun, Shield } from 'lucide-react';
+import { Moon, Sun, Shield, Activity } from 'lucide-react';
 import { apiCall } from '../utils/api';
 
-export default function Header({ authStatus, onLogout }) {
+export default function Header({ authStatus, onLogout, onOpenSystemMonitor }) {
   const [isDark, setIsDark] = useState(
     document.documentElement.classList.contains('dark')
   );
@@ -50,16 +50,26 @@ export default function Header({ authStatus, onLogout }) {
         </div>
       </div>
 
-      <div className="flex items-center gap-4">
+      <div className="flex items-center gap-2 sm:gap-3 md:gap-4">
+        {/* System Monitor Trigger Button */}
+        <button
+          onClick={onOpenSystemMonitor}
+          className="flex items-center gap-2 px-3 py-1.5 rounded-lg text-xs font-semibold bg-brand-500/10 hover:bg-brand-500/20 text-brand-600 dark:text-brand-400 border border-brand-500/20 shadow-sm transition-all duration-150"
+          title="Open Backend System Monitor (Alt+M)"
+          aria-label="Open Backend System Monitor"
+        >
+          <Activity size={14} className="animate-pulse text-brand-500" />
+          <span className="hidden sm:inline">System Monitor</span>
+        </button>
 
         {llmConfig && llmConfig.backend && (
-          <button className="px-3 py-1 rounded-full text-xs font-semibold bg-indigo-500/10 text-indigo-600 dark:text-indigo-400 border border-indigo-500/20 hover:bg-indigo-500/20 transition-colors" title="LLM Backend">
+          <button className="hidden lg:inline-flex px-3 py-1 rounded-full text-xs font-semibold bg-indigo-500/10 text-indigo-600 dark:text-indigo-400 border border-indigo-500/20 hover:bg-indigo-500/20 transition-colors" title="LLM Backend">
             LLM: {getLlmLabel(llmConfig.backend)}
           </button>
         )}
         
         {nlpConfig && nlpConfig.sentiment_model && (
-          <button className="px-3 py-1 rounded-full text-xs font-semibold bg-emerald-500/10 text-emerald-600 dark:text-emerald-400 border border-emerald-500/20 hover:bg-emerald-500/20 transition-colors" title="NLP Backend">
+          <button className="hidden lg:inline-flex px-3 py-1 rounded-full text-xs font-semibold bg-emerald-500/10 text-emerald-600 dark:text-emerald-400 border border-emerald-500/20 hover:bg-emerald-500/20 transition-colors" title="NLP Backend">
             NLP: {nlpConfig.sentiment_model}
           </button>
         )}
@@ -72,7 +82,7 @@ export default function Header({ authStatus, onLogout }) {
           {isDark ? <Sun size={20} /> : <Moon size={20} />}
         </button>
 
-        <div className="px-3 py-1 rounded-full text-xs font-semibold bg-brand-500/10 text-brand-600 dark:text-brand-400 border border-brand-500/20">
+        <div className="hidden sm:inline-flex px-3 py-1 rounded-full text-xs font-semibold bg-brand-500/10 text-brand-600 dark:text-brand-400 border border-brand-500/20">
           Authenticated
         </div>
 
