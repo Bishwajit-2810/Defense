@@ -2,6 +2,7 @@ import React, { useState, useEffect } from 'react';
 import Header from './components/Header';
 import NavTabs from './components/NavTabs';
 import SystemMonitorDrawer from './components/SystemMonitorDrawer';
+import SystemMetricsChip from './components/SystemMetricsChip';
 import Overview from './pages/Overview';
 import Posts from './pages/Posts';
 import AnalysisJobs from './pages/AnalysisJobs';
@@ -56,7 +57,7 @@ function App() {
   }
 
   return (
-    <div className="min-h-screen bg-slate-50 dark:bg-black text-slate-900 dark:text-slate-50 flex flex-col font-sans transition-colors duration-200">
+    <div className="min-h-screen bg-slate-50 dark:bg-black text-slate-900 dark:text-slate-50 flex flex-col font-sans transition-colors duration-200 relative">
       <Header 
         authStatus={authStatus} 
         onLogout={handleLogout}
@@ -82,6 +83,12 @@ function App() {
           </div>
         </main>
       </div>
+
+      {/* Vertical Right-Side Popped System Metrics Chip (CPU, GPU, RAM) */}
+      <SystemMetricsChip
+        orientation="vertical"
+        onOpen={() => setIsSystemMonitorOpen(true)}
+      />
 
       <div className="h-8 border-t border-slate-200 dark:border-zinc-800 bg-slate-100 dark:bg-[#121214] text-xs flex items-center px-4 gap-4 text-slate-500 dark:text-zinc-400">
         <button

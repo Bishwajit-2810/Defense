@@ -50,12 +50,12 @@ export default function Header({ authStatus, onLogout, onOpenSystemMonitor }) {
         </div>
       </div>
 
-      <div className="flex items-center gap-3 md:gap-4">
+      <div className="flex items-center gap-2 sm:gap-3 md:gap-4">
         {/* System Monitor Trigger Button */}
         <button
           onClick={onOpenSystemMonitor}
           className="flex items-center gap-2 px-3 py-1.5 rounded-lg text-xs font-semibold bg-brand-500/10 hover:bg-brand-500/20 text-brand-600 dark:text-brand-400 border border-brand-500/20 shadow-sm transition-all duration-150"
-          title="Open Backend System Monitor"
+          title="Open Backend System Monitor (Alt+M)"
           aria-label="Open Backend System Monitor"
         >
           <Activity size={14} className="animate-pulse text-brand-500" />
