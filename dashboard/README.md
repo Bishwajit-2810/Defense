@@ -7,6 +7,11 @@ computed here that the pipeline could not also report. The writes it does make
 are the deliberate ones: starting, stopping, resuming and deleting analysis jobs,
 generating a report, and the runtime config toggles.
 
+> **Comprehensive documentation:** See [DASHBOARD_UI.md](../DASHBOARD_UI.md) for
+> all 11 tabs, component architecture, SSE streaming, and authentication flow.
+> See [SYSTEM_MONITOR.md](../SYSTEM_MONITOR.md) for the hardware telemetry drawer
+> and observability stack.
+
 This replaced the vanilla HTML/CSS/JS dashboard the design docs specify; that one
 is preserved at [`../dashboard_legacy/`](../dashboard_legacy/). Where a design doc
 still says "plain HTML/CSS/JS, no build step", this directory is the current

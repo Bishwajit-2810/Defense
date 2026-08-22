@@ -56,6 +56,13 @@ layer. It consolidates the whole design — overview, architecture, alternatives
 models, infrastructure, cost, API, worked examples, deployment, and the phased
 roadmap — into one source of truth.
 
+> **Focused docs that supersede sections below:** For the dashboard UI, read
+> [DASHBOARD_UI.md](DASHBOARD_UI.md). For monitoring and observability, read
+> [SYSTEM_MONITOR.md](SYSTEM_MONITOR.md). For agents, read
+> [AGENTS.md](AGENTS.md). For MCP servers, read
+> [MCP_SERVERS.md](MCP_SERVERS.md). These focused docs are authoritative where
+> they diverge from the consolidated text below.
+
 ---
 
 ## Table of contents

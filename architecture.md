@@ -807,11 +807,14 @@ small FastAPI services exposing typed tools over MCP (stdio/HTTP), so the agent
 (and any future LLM client) gets one consistent tool interface instead of bespoke
 glue:
 
-| MCP server      | Tools it exposes                                                                 | Backed by                      |
-| --------------- | -------------------------------------------------------------------------------- | ------------------------------ |
-| `analytics-mcp` | `trend_query`, `sentiment_over_time`, `top_posts`, `reaction_mix`, point lookups | ClickHouse + PostgreSQL        |
-| `retrieval-mcp` | `semantic_search`, `get_post`, `get_thread`, `representative_comments`           | Postgres + pgvector            |
-| `ingest-mcp`    | `pull_campaign`, `fetch_more_comments` (raise coverage), `refresh_post`          | upstream post-with-details API |
+| MCP server      | Tools it exposes                                                                                                                                  | Backed by                      |
+| --------------- | ------------------------------------------------------------------------------------------------------------------------------------------------- | ------------------------------ |
+| `analytics-mcp` (`:8110`) | `trend_query`, `sentiment_over_time`, `top_posts`, `reaction_mix`, `watchlist_timeline`, `agreement_stats`                             | ClickHouse + PostgreSQL        |
+| `retrieval-mcp` (`:8101`) | `semantic_search`, `search_comments`, `get_post`, `get_thread`, `representative_comments`, `get_clusters`, `stance_by_target`, `stance_over_time`, `coverage_stats` | Postgres + pgvector |
+| `ingest-mcp`    (`:8102`) | `pull_campaign`, `fetch_more_comments` (raise coverage), `refresh_post`                                                                | Redis → upstream API           |
+
+> **Full tool schemas, parameters, and return types:** [MCP_SERVERS.md](MCP_SERVERS.md).
+> **Full agent profiles, runner architecture, and hardening:** [AGENTS.md](AGENTS.md).
 
 MCP servers are **read-mostly** and respect the same auth/tenant scoping as the
 read APIs; `ingest-mcp` is the only one that triggers (idempotent) writes into our
