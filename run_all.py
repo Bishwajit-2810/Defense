@@ -3,6 +3,8 @@
 
 Run it with uv (recommended):
 
+    uv run run_all.py --with-agents --reset
+    uv run run_all.py --with-agents --no-load       
     uv run run_all.py                 # core pipeline + dashboard, load the 50 posts
     uv run run_all.py --with-agents   # also start the agents + 3 MCP servers
     uv run run_all.py --reset         # wipe prior data, then load the 50 posts fresh
@@ -17,8 +19,9 @@ It brings up the Docker datastores, waits for them, initialises ClickHouse,
 checks Ollama, launches the 5 workers + API, serves the dashboard, and (by
 default) pushes the 50 sample posts. Press Ctrl-C to stop everything it started.
 
-Equivalent manual steps live in easy_run.md / run.md.
+Equivalent manual steps live in docs/easy_run.md / docs/run.md.
 """
+
 from __future__ import annotations
 
 import argparse
@@ -745,7 +748,7 @@ def banner(with_agents: bool, dash_port: int | None, manual_load: bool = False) 
         if dash_port:
             print("       – UI:  Dashboard → Posts tab → drop  posts_with_details.json  onto the upload box")
         print(f"       – API: POST http://127.0.0.1:{API_PORT}/v1/posts/upload  with body {{\"posts\": [...]}}")
-        print("              (ready-to-run command in easy_run.md §D; or re-run without --manual-load to auto-load)")
+        print("              (ready-to-run command in docs/easy_run.md §D; or re-run without --manual-load to auto-load)")
     if _STREAM:
         flt = f" (filtered: '{_LOG_FILTER}')" if _LOG_FILTER else ""
         print(f"   • Logs       →  streaming live below{flt}  +  /tmp/<service>.log")

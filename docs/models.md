@@ -1,7 +1,7 @@
 # AI Model Selection, RAG & Fine-Tuning
 
 Model recommendations per task, the Bangla/Banglish/English fine-tuning strategy,
-and the RAG evaluation for the smart layer in [what.txt](what.txt). All small-model
+and the RAG evaluation for the smart layer in [what.txt](../what.txt). All small-model
 choices favor open-source, GPU-efficient models with genuine Bangla support and
 run **self-hosted**. The Stage-2 LLM runs behind a **pluggable backend with two
 interchangeable providers — `local` (self-hosted vLLM) and `groq` (Groq Cloud
@@ -129,7 +129,7 @@ with its own model id so the stages and tasks run on **different models**:
 | `stage1` | `STAGE1_LOCAL_MODEL` / `STAGE1_GROQ_MODEL` | `gemma3:4b` / `llama-3.1-8b-instant` | **Stage-1 Fast NLP** — sentiment/emotion/topic/intent/toxicity/NER/keywords over caption + comments (`STAGE1_LLM=true`) |
 | `stage2` | `STAGE2_LOCAL_MODEL` / `STAGE2_GROQ_MODEL` | `qwen2.5:7b` / `llama-3.3-70b-versatile` | **Stage-2 classification** — post-type, insight, context-aware comment stance |
 | `summary` | `SUMMARY_LOCAL_MODEL` / `SUMMARY_GROQ_MODEL` | `qwen2.5:7b` / `llama-3.3-70b-versatile` | **Stage-2 summarization** — post summary and comment summary |
-| `agent` | `AGENT_LOCAL_MODEL` / `AGENT_GROQ_MODEL` | `llama3.1:8b-16k` / `llama-3.3-70b-versatile` | **All nine MCP agents** ([`registry.py`](src/defense/services/agents/registry.py)). The only role doing multi-turn tool use, so it wants solid native function calling — llama rather than qwen — and the **`-16k` suffix is load-bearing**: see the note below. |
+| `agent` | `AGENT_LOCAL_MODEL` / `AGENT_GROQ_MODEL` | `llama3.1:8b-16k` / `llama-3.3-70b-versatile` | **All nine MCP agents** ([`registry.py`](../src/defense/services/agents/registry.py)). The only role doing multi-turn tool use, so it wants solid native function calling — llama rather than qwen — and the **`-16k` suffix is load-bearing**: see the note below. |
 | `vlm` | `VLM_LOCAL_MODEL` / `VLM_GROQ_MODEL` | `qwen3-vl:4b` / — | **Image-grounded summaries.** *Substitutes for* the `summary` role rather than adding a call. If the image bytes do not resolve, the result is tagged `post_summary_source: "llm"`, not `"vlm"`. |
 
 `stage1` is the LLM realization of the small-model suite in §1 (a small fast model
@@ -143,7 +143,7 @@ Groq they are just distinct model IDs.
 *silently discards* anything longer — oldest messages first, which is the system
 prompt and then the operator's question. It reports only what it evaluated, so
 nothing in the response says this happened. `llama3.1:8b-16k` is a derived tag
-([`config/Modelfile.llama31-16k`](config/Modelfile.llama31-16k)) setting
+([`config/Modelfile.llama31-16k`](../config/Modelfile.llama31-16k)) setting
 `num_ctx 16384`; llama3.1 itself supports 131,072, and 16k is what this machine
 evaluates quickly (~960 tok/s prompt eval, ~2 GB of KV cache). Measured: an
 11k-token prompt evaluates **24** tokens on `llama3.1:8b` and all **11,045** on

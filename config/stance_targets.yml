@@ -1,7 +1,7 @@
 # ---------------------------------------------------------------------------
 # WATCHLIST — STATED BIAS MODEL, NOT A MEASUREMENT
 # ---------------------------------------------------------------------------
-# See stance_targets.md §2. The CONTENTS of this file are an editorial choice by
+# See docs/stance_targets.md §2. The CONTENTS of this file are an editorial choice by
 # the operator: declaring an entity "favored" encodes a political stance into the
 # labels. That is legitimate for a monitoring product and indefensible presented
 # as neutral sentiment analysis, so:

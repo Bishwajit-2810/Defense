@@ -7,7 +7,7 @@
 > item-by-item state and [FEATURES.md](FEATURES.md) for what each capability
 > actually does.
 
-Phased plan to build the smart layer from [what.txt](what.txt) from MVP (1k) →
+Phased plan to build the smart layer from [what.txt](../what.txt) from MVP (1k) →
 Production (10k) → Enterprise (100k), plus best practices for processing 10,000+
 posts efficiently. Read alongside [architecture.md](architecture.md).
 
@@ -18,7 +18,7 @@ posts efficiently. Read alongside [architecture.md](architecture.md).
 - Repo + monorepo layout (services, workers, infra, models, dashboard).
 - Lock the **input contract** ([data_contract.md](data_contract.md)): the upstream
   **post-with-details** schema (real sample in
-  [posts_with_details.json](posts_with_details.json)) — post with embedded
+  [posts_with_details.json](../posts_with_details.json)) — post with embedded
   `comments[]`, `engagement`, `reactionBreakdown`, and `sampleShares` — the pull +
   own-DB integration (no write-back), platform-from-URL, and the recompute-with-baseline
   sentiment policy. Lock the **canonical output JSON schema**

@@ -104,7 +104,7 @@ that sits on top of that platform and:
 - **pulls** the post-with-details payload into its **own separate database** —
   read-only consumer, no write-back (full input contract:
   [data_contract.md](data_contract.md), real sample
-  [posts_with_details.json](posts_with_details.json)). The **comment thread is
+  [posts_with_details.json](../posts_with_details.json)). The **comment thread is
   embedded**, so no separate fetch/join is needed.
 - decides _per item_ how much intelligence each one needs (cheap NLP models vs. an
   LLM — this routing is the "smart" part), and
@@ -1005,7 +1005,7 @@ Q&A, grounded reports, targeted deep-dives. **Agents never run per post.**
 - **AI agents** — **nine**, on the dedicated `agent` role over the pluggable
   `local`⇄`groq` backend (`llama3.1:8b-16k` / `llama-3.3-70b-versatile`, both do
   tool calling; a **VLM** step when images matter). Tools and budgets live in
-  [`registry.py`](src/defense/services/agents/registry.py) and are served live by
+  [`registry.py`](../src/defense/services/agents/registry.py) and are served live by
   `GET /v1/agents/types`:
   - **Insight/Analyst agent** (budget 10) — `trend_query → semantic_search →
     get_thread → synthesize → cite`; answers `POST /v1/agents/query`, replacing
@@ -1680,7 +1680,7 @@ upstream error where possible.
 ## 18. Worked examples
 
 Real records from the upstream **post-with-details** payload (verbatim from
-[posts_with_details.json](posts_with_details.json)) run through the smart layer.
+[posts_with_details.json](../posts_with_details.json)) run through the smart layer.
 Analysis is **multimodal and full-thread**: text `text_sentiment` + visual
 `image_sentiment` (we also OCR the image), fused and cross-checked against
 `reaction_breakdown`; `post_summary` grounded on caption + OCR + image; and **our**
@@ -1967,7 +1967,7 @@ Phased build from MVP (1k) → Production (10k) → Enterprise (100k).
 - Repo + monorepo layout (services, workers, infra, models, dashboard).
 - Lock the **input contract** ([data_contract.md](data_contract.md)): the upstream
   **post-with-details** schema (real sample
-  [posts_with_details.json](posts_with_details.json)) — post with embedded
+  [posts_with_details.json](../posts_with_details.json)) — post with embedded
   `comments[]`, `engagement`, `reactionBreakdown`, `sampleShares` — the pull +
   own-DB integration (no write-back), platform-from-URL, and recompute-with-baseline
   sentiment. Lock the **canonical output JSON schema** (§8) and a shared JSON Schema

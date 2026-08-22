@@ -53,7 +53,7 @@ graph TB
 ### Current Agent Inventory
 
 All nine are registered in
-[`registry.py`](src/defense/services/agents/registry.py), which is the source of
+[`registry.py`](../src/defense/services/agents/registry.py), which is the source of
 truth for tools and budgets — the six below the rule were the §3 proposals and
 have all shipped.
 
@@ -526,7 +526,7 @@ examiner sees the entire flow in one artifact.
 | 🟢 P2 | **Toxicity Agent** | Low | 0 (minor enhancement) | Content moderation application angle |
 
 All six are implemented and registered in
-[`registry.py`](src/defense/services/agents/registry.py).
+[`registry.py`](../src/defense/services/agents/registry.py).
 
 > [!NOTE]
 > **The §3 code blocks are the original proposals, kept as the design record.**

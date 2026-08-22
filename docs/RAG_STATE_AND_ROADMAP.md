@@ -137,13 +137,13 @@ returns fields out of it.
 ### Two facts about that vector that shape everything downstream
 
 **(a) It is built from the post caption only.**
-[`worker.py:372`](src/defense/services/workers/stage1_nlp/worker.py#L372) calls
+[`worker.py:372`](../src/defense/services/workers/stage1_nlp/worker.py#L372) calls
 `analyze_text(caption, ...)`, and the embedding falls out of that call
-([`text_analyzer.py:871`](src/defense/services/workers/stage1_nlp/text_analyzer.py#L871)).
+([`text_analyzer.py:871`](../src/defense/services/workers/stage1_nlp/text_analyzer.py#L871)).
 The only alternative source is OCR text, behind `_OCR_SENTIMENT`, for
 null-caption image posts.
 
-**Comments are never embedded.** The [`comments`](deploy/init-db.sql#L55) table has
+**Comments are never embedded.** The [`comments`](../deploy/init-db.sql#L55) table has
 `text`, `author`, `likes`, `sentiment` — and no vector column. The per-comment
 ensemble labels every comment, but none of that text is retrievable by meaning.
 
@@ -166,15 +166,15 @@ ensemble labels every comment, but none of that text is retrievable by meaning.
 
 **(b) In the default configuration the vector is not semantic.**
 `.env` sets `MODEL_STUB_MODE=true`, so
-[`embeddings.py:62`](src/defense/libs/embeddings.py#L62) returns a SHA-256-seeded
+[`embeddings.py:62`](../src/defense/libs/embeddings.py#L62) returns a SHA-256-seeded
 random unit vector — correct dimension, correct HNSW index, arbitrary
 neighbours. `EMBEDDING_ALLOW_STUB` defaults to `true`
-([`config.py:329`](src/defense/libs/common/config.py#L329)), so persistence
+([`config.py:329`](../src/defense/libs/common/config.py#L329)), so persistence
 writes them without complaint.
 
 The plumbing that carries this fact is good: `embedding_is_stub` is produced at
 the one layer that knows
-([`_embed_with_provenance`](src/defense/services/workers/stage1_nlp/text_analyzer.py#L535)),
+([`_embed_with_provenance`](../src/defense/services/workers/stage1_nlp/text_analyzer.py#L535)),
 carried through the assembler, stored on the row, and surfaced by
 `GET /v1/search` and `get_clusters`. **It is not surfaced by the retrieval-mcp
 `semantic_search` tool** — see §4.1.
@@ -208,7 +208,7 @@ graph LR
 ### The retrieval surface
 
 `retrieval-mcp` (:8101) exposed **8 tools**
-([`server.py`](src/defense/mcp_servers/retrieval_mcp/server.py)) — now 9, with
+([`server.py`](../src/defense/mcp_servers/retrieval_mcp/server.py)) — now 9, with
 `search_comments` added by §3.2:
 
 | Tool | Backing | Notes |
@@ -225,7 +225,7 @@ graph LR
 
 ### The retrieval algorithm
 
-One statement — [`server.py:188`](src/defense/mcp_servers/retrieval_mcp/server.py#L188):
+One statement — [`server.py:188`](../src/defense/mcp_servers/retrieval_mcp/server.py#L188):
 
 ```sql
 SELECT post_id, campaign_id, overall_sentiment, post_summary,
@@ -248,16 +248,16 @@ filter**. Retrieval quality is entirely whatever the raw kNN returns.
 ### Keyword vs semantic are mutually exclusive
 
 `GET /v1/search?semantic=true|false`
-([`search.py:56`](src/defense/services/api/routers/search.py#L56)) branches into
+([`search.py:56`](../src/defense/services/api/routers/search.py#L56)) branches into
 *either* a JSONB `LIKE` scan *or* a pgvector search. There is no fusion, and
 `semantic_search` (the tool the agents actually use) has no lexical mode at all.
 
 ### Clustering as the LLM cost lever
 
-[`get_clusters`](src/defense/mcp_servers/retrieval_mcp/server.py#L1315) pulls
+[`get_clusters`](../src/defense/mcp_servers/retrieval_mcp/server.py#L1315) pulls
 vectors, runs seeded k-means (or HDBSCAN), and returns one representative post
 per cluster so the report summarises a handful of slices instead of N posts
-([`clustering.py`](src/defense/libs/clustering.py)).
+([`clustering.py`](../src/defense/libs/clustering.py)).
 
 ---
 
@@ -297,7 +297,7 @@ CREATE TABLE comment_embeddings (
 ```
 
 Batch-encode per post — one `model.encode(list_of_texts)` call per thread, not
-one per comment. Reuse [`comment_groups.py`](src/defense/libs/comment_groups.py)
+one per comment. Reuse [`comment_groups.py`](../src/defense/libs/comment_groups.py)
 to skip near-duplicates: embed the representative, point the duplicates at it.
 
 ### 3.3 Hybrid retrieval with rank fusion
@@ -327,7 +327,7 @@ precision and citation granularity.
 
 ### 3.6 Fix two silent truncations
 
-- [`get_clusters`](src/defense/mcp_servers/retrieval_mcp/server.py#L1315) hardcodes
+- [`get_clusters`](../src/defense/mcp_servers/retrieval_mcp/server.py#L1315) hardcodes
   `LIMIT 100 ORDER BY created_at DESC`. "Corpus themes" is really "themes of the
   100 newest posts, in at most 8 buckets" — and it reads as corpus-wide.
 - `semantic_search` accepts no date window, even though `_date_filter` already
@@ -374,9 +374,9 @@ are not — and one requires a change to the runner's fabrication guards, not ju
 to prompts.**
 
 The agent layer is
-[`registry.py`](src/defense/services/agents/registry.py) (nine agents, each with
+[`registry.py`](../src/defense/services/agents/registry.py) (nine agents, each with
 a fixed `tools` allowlist and a `max_tool_calls` budget) driven by
-[`runner.py`](src/defense/services/agents/runner.py) (OpenAI tool-call loop,
+[`runner.py`](../src/defense/services/agents/runner.py) (OpenAI tool-call loop,
 plus citation/quote verification).
 
 ### 5.1 Per-change impact
@@ -399,7 +399,7 @@ plus citation/quote verification).
 `semantic_search_over_stub_vectors`. `get_clusters` returns `is_stub` per
 cluster. **The retrieval-mcp `semantic_search` tool returns neither** — its
 result dict is `post_id`, `score`, `campaign_id`, `overall_sentiment`,
-`post_summary` ([`server.py:206`](src/defense/mcp_servers/retrieval_mcp/server.py#L206)).
+`post_summary` ([`server.py:206`](../src/defense/mcp_servers/retrieval_mcp/server.py#L206)).
 
 So an agent that says *"the most semantically similar posts are…"* is asserting
 something it has no way to check, and in the default configuration that
@@ -420,7 +420,7 @@ comments by walking `top_posts` → `get_thread`, i.e. it can find toxic *posts*
 and then read their threads, but cannot search for a harassment pattern
 directly. Also `analyst`, `stance`, and `narrative`.
 
-**A runner change.** [`_extract_post_ids`](src/defense/services/agents/runner.py#L475)
+**A runner change.** [`_extract_post_ids`](../src/defense/services/agents/runner.py#L475)
 and the citation verifier are built around post ids. Comment-level results
 introduce `comment_id`s that the verifier does not recognise, so a fabricated
 comment citation would pass unchallenged while a real one might be flagged. The
@@ -432,7 +432,7 @@ checks.
 search encourages more, narrower calls; watch for agents truncating mid-analysis.
 *Shipped values (20 Aug 2026):* `coverage` 5, `alerting` 8, `quality` 8, `analyst`
 10, `stance` 12, `narrative` 12, `toxicity` 14, `comparator` 15, `reporter` 15 —
-[`registry.py`](src/defense/services/agents/registry.py) is the source of truth.
+[`registry.py`](../src/defense/services/agents/registry.py) is the source of truth.
 `alerting` went 5 → 8 after a live run hit the cap and returned
 `[Budget cap of 5 tool calls reached]` **as the briefing**, having answered
 nothing; the runner now also refuses to dispatch a byte-identical repeat, which
@@ -786,15 +786,15 @@ That held right up until the retrieval got good: real embeddings over a Bengali
 corpus return **large** results, and every failure below is the agent layer
 meeting a payload the stub never produced. All are live-observed, not reasoned
 about, and each has a regression test
-([`test_agent_context_window.py`](tests/test_agent_context_window.py),
-[`test_agent_placeholder_post_ids.py`](tests/test_agent_placeholder_post_ids.py)).
+([`test_agent_context_window.py`](../tests/test_agent_context_window.py),
+[`test_agent_placeholder_post_ids.py`](../tests/test_agent_placeholder_post_ids.py)).
 
 1. **The context window was 4,096 tokens and nothing said so.** `ollama serve`
    defaults to `num_ctx 4096` and *silently discards* a longer prompt, oldest
    message first, reporting only what it evaluated. The oldest messages are the
    system prompt and the operator's question. Measured: an 11k-token prompt
    evaluates **24** tokens on `llama3.1:8b` and all **11,045** on a derived
-   `llama3.1:8b-16k` tag ([`config/Modelfile.llama31-16k`](config/Modelfile.llama31-16k)),
+   `llama3.1:8b-16k` tag ([`config/Modelfile.llama31-16k`](../config/Modelfile.llama31-16k)),
    which is now the `AGENT_LOCAL_MODEL` default.
 
 2. **Half the token bill was `\uXXXX` escaping.** `json.dumps` defaults to

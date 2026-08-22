@@ -1,7 +1,7 @@
 # Worked Examples — Real Post-with-Details → Output JSON
 
 Real records from the upstream **post-with-details** payload (verbatim from
-[posts_with_details.json](posts_with_details.json)) run through the smart layer,
+[posts_with_details.json](../posts_with_details.json)) run through the smart layer,
 showing the exact input and the structured JSON the service returns. These match
 the canonical schema in [architecture.md](architecture.md) §6, the input contract
 in [data_contract.md](data_contract.md), and the API in [api_design.md](api_design.md).

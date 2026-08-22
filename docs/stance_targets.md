@@ -36,7 +36,7 @@ scores positive.
 
 **What existed before this:** nothing like it. Sentiment was document-level, and
 the Stage-2 stance prompt judged stance *toward the post*
-([prompts.py](src/defense/services/workers/stage2_llm/prompts.py)) — never toward a named
+([prompts.py](../src/defense/services/workers/stage2_llm/prompts.py)) — never toward a named
 entity. The system could tell you a comment was angry. It could not tell you
 **who it was angry at**, which for political monitoring is the entire question.
 That is what this adds.
@@ -200,7 +200,7 @@ it is what makes a wrong verdict debuggable in a demo.
 
 **(b) Deterministic fallback** — alias proximity plus polarity cues, using the
 existing emoji and lexicon tables in
-[comment_analyzer.py](src/defense/services/workers/stage1_nlp/comment_analyzer.py). Cruder,
+[comment_analyzer.py](../src/defense/services/workers/stage1_nlp/comment_analyzer.py). Cruder,
 but it runs in stub mode and in CI. **Without it, the offline suite cannot cover
 this feature at all**, which for a capstone means the one novel component is also
 the one with no tests.
@@ -313,7 +313,7 @@ from §3.1:
   for when the question names a group of people; every part still has to resolve.
 - **A *tracked* target with no rows still returns empty.** That is a real answer —
   nobody mentioned them, or the aliases need work (`unmatched_targets` in
-  [`stance_targets.py`](src/defense/libs/stance_targets.py) is the signal for the
+  [`stance_targets.py`](../src/defense/libs/stance_targets.py) is the signal for the
   second) — and it is the answer the tool docstrings promise.
 
 If the watchlist file cannot be read at all, the filter falls back to the old
@@ -356,7 +356,7 @@ Sampling notes:
 them.
 
 The need is one config file, one prompt slot, and one parser. This repository
-already has all three: [prompts.py](src/defense/services/workers/stage2_llm/prompts.py),
+already has all three: [prompts.py](../src/defense/services/workers/stage2_llm/prompts.py),
 `_safe_json_parse`, and the role-based `LLMClient`. LangChain would add a large
 dependency tree and a second prompt-templating system, and — the deciding factor
 — **it would not run in the offline stub path** that the entire test suite and

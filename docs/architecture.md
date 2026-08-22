@@ -826,7 +826,7 @@ Each agent is an LLM loop on the dedicated **`agent`** role (`AGENT_LOCAL_MODEL`
 default `llama3.1:8b-16k`, ⇄ `AGENT_GROQ_MODEL`, default
 `llama-3.3-70b-versatile`); both support tool/function calling, which MCP builds
 on. A **VLM** step is used when an answer needs the images. The roster is **nine**
-agents, defined in [`registry.py`](src/defense/services/agents/registry.py) — that
+agents, defined in [`registry.py`](../src/defense/services/agents/registry.py) — that
 file is the source of truth for tools and budgets, and `GET /v1/agents/types`
 serves it live:
 

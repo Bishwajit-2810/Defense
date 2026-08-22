@@ -1,6 +1,6 @@
 # Infrastructure — GPU Sizing, Monitoring, Caching, Scaling
 
-Infrastructure and scaling for the smart layer from [what.txt](what.txt): GPU
+Infrastructure and scaling for the smart layer from [what.txt](../what.txt): GPU
 sizing, the monitoring stack, caching, and how it scales from 1k → 100k threads
 per batch. Cost figures live in [cost_estimation.md](cost_estimation.md).
 

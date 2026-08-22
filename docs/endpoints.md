@@ -5,7 +5,7 @@ system** (post summary, sentiment, topics, toxicity, comment analysis — the
 full canonical result) and for **testing every API endpoint with curl**.
 
 The canonical schema lives in
-[src/defense/contracts/schemas/output_schema.json](src/defense/contracts/schemas/output_schema.json); the field
+[src/defense/contracts/schemas/output_schema.json](../src/defense/contracts/schemas/output_schema.json); the field
 meanings are specified in [data_contract.md](data_contract.md) §4. This file
 shows what actually comes over the wire and how to reshape it.
 
@@ -182,7 +182,7 @@ Field-level rules worth knowing when consuming this JSON:
 | `comment_analysis.comments[].label_voters` / `label_sources` | How many labellers actually voted, and which. Quote them with `label_agreement`: `1.0` over one voter is a single opinion, not a consensus. `label_voters: 0` ⇒ `sentiment: "uncertain"`, and *nothing* about that comment is claimed. |
 | `comment_analysis.ensemble.llm_share` vs `llm_share_analysed` | Against the **whole thread** vs against the **router's selection**. 100 of 2,857 is 3.4% of the post and 100% of what was selected; both are needed or one gets read as the other. |
 | `language_method` | `fasttext` \| `script_heuristic` \| `stub`. fastText is optional; without it the pipeline degrades to script detection rather than failing the post. |
-| `processing.llm_used` | Only routed posts ([router rules](src/defense/services/workers/router/rules.py)) carry Stage-2 latency/cost. Note this is **not** the whole cost lever any more: comment labelling runs for every post and is 85–96% of LLM calls (PROJECT_ASSESSMENT §6.8). |
+| `processing.llm_used` | Only routed posts ([router rules](../src/defense/services/workers/router/rules.py)) carry Stage-2 latency/cost. Note this is **not** the whole cost lever any more: comment labelling runs for every post and is 85–96% of LLM calls (PROJECT_ASSESSMENT §6.8). |
 
 ---
 

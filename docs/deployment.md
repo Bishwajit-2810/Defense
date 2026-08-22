@@ -1,6 +1,6 @@
 # Deployment — Docker Compose vs Kubernetes, and the K8s Plan
 
-How the smart layer from [what.txt](what.txt) is deployed: the MVP shape, the
+How the smart layer from [what.txt](../what.txt) is deployed: the MVP shape, the
 production shape, and the full Kubernetes plan that delivers the "proper scaling"
 the owner asked for.
 

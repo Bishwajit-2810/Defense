@@ -2,7 +2,7 @@
 
 **Authoritative description of the real input the smart layer consumes**, how it
 integrates with the existing platform, and how every upstream field maps into our
-analysis. The real source of truth is **[posts_with_details.json](posts_with_details.json)**
+analysis. The real source of truth is **[posts_with_details.json](../posts_with_details.json)**
 (50 posts with their comments embedded). This supersedes any earlier sketched
 schema (`{post_id, platform, text, author}`) and the earlier **two-endpoint
 (separate Post API + Comment API)** model — the upstream now returns a **single
@@ -60,7 +60,7 @@ comments — §4.)
 ## 1. Post-with-details — real schema
 
 The endpoint returns a **JSON array of post objects**. Every field below is present
-on all 50 records of [posts_with_details.json](posts_with_details.json). Types and
+on all 50 records of [posts_with_details.json](../posts_with_details.json). Types and
 example values are from that sample.
 
 | Field               | Type             | Example / range                             | Meaning & how we use it                                                                                        |
@@ -227,7 +227,7 @@ The upstream stores one coarse post `sentiment` (and `viralPotential`); comment
    > configuration: the 69 `photoUrls` are relative object-storage keys and the
    > objects are not in MinIO. The image term therefore contributes nothing
    > today, and OCR is off by default (`STAGE1_OCR_SENTIMENT=false`). The
-   > working corpus is [posts_with_details.json](posts_with_details.json) — all
+   > working corpus is [posts_with_details.json](../posts_with_details.json) — all
    > 50 posts, as uploaded. The 7 `null`-caption `PHOTO` posts yield no *post*
    > text with no image and no OCR, but their 1,307 comments are unaffected, so
    > they are kept in the corpus and the emptiness is reported per post rather

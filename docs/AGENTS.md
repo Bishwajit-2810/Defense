@@ -3,11 +3,11 @@
 ## 1. Overview
 The Defense platform includes a selective, corpus-tier agentic insight layer. 9 specialized AI agents autonomously query the corpus through MCP (Model Context Protocol) servers, producing grounded analytical intelligence. The agent layer sits ABOVE the per-post pipeline — agents are never invoked per-post; they operate at the corpus/campaign level.
 
-- **Agent orchestrator:** [runner.py](src/defense/services/agents/runner.py) (~108KB)
-- **Agent definitions:** [registry.py](src/defense/services/agents/registry.py)
-- **MCP client:** [mcp_client.py](src/defense/services/agents/mcp_client.py)
-- **Run persistence:** [store.py](src/defense/services/agents/store.py)
-- **API routes:** [main.py](src/defense/services/agents/main.py)
+- **Agent orchestrator:** [runner.py](../src/defense/services/agents/runner.py) (~108KB)
+- **Agent definitions:** [registry.py](../src/defense/services/agents/registry.py)
+- **MCP client:** [mcp_client.py](../src/defense/services/agents/mcp_client.py)
+- **Run persistence:** [store.py](../src/defense/services/agents/store.py)
+- **API routes:** [main.py](../src/defense/services/agents/main.py)
 - **LLM Role:** `agent` (dedicated, default model: `llama3.1:8b-16k`)
 
 ## 2. Agent Registry

@@ -59,7 +59,7 @@ What ends up running:
   oldest message first — which is the system prompt and then your question. One
   `semantic_search` result is bigger than that, so plain `llama3.1:8b` answers
   agent questions from the tail of a JSON payload and reports success.
-  [`config/Modelfile.llama31-16k`](config/Modelfile.llama31-16k) sets
+  [`config/Modelfile.llama31-16k`](../config/Modelfile.llama31-16k) sets
   `num_ctx 16384`. Setting `OLLAMA_CONTEXT_LENGTH=16384` on the ollama service
   instead is fine — it covers the pipeline models too — but then set
   `AGENT_LOCAL_MODEL=llama3.1:8b` so it stops looking for the derived tag.
@@ -445,7 +445,7 @@ npm run dev -- --port 8080      # open http://127.0.0.1:8080
 ```
 
 The dashboard targets the dev API on `http://127.0.0.1:8001` by default
-(`API_BASE` in [`dashboard/src/utils/api.js`](dashboard/src/utils/api.js)).
+(`API_BASE` in [`dashboard/src/utils/api.js`](../dashboard/src/utils/api.js)).
 
 **Stop (manual):**
 

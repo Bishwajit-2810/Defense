@@ -4,11 +4,12 @@
 
 ```bash
 uv run run_all.py --with-agents --reset
+uv run run_all.py --with-agents --no-load
 ```
 
 Datastores in Docker, everything else on your host; dashboard on
 **<http://127.0.0.1:8080>**, API on :8001. Needs Docker, [uv](https://docs.astral.sh/uv/)
-and Ollama with three models pulled — see [easy_run.md](easy_run.md) §1.
+and Ollama with three models pulled — see [easy_run.md](docs/easy_run.md) §1.
 
 ---
 
@@ -36,27 +37,27 @@ threads per batch.
 > excluded corpus-wide: the caption filter now lives in the one script that
 > summarises captions. `python -m eval.make_text_corpus` still writes the
 > 43-post subset for reproducing pre-existing numbers.
-> See [data_contract.md](data_contract.md) §4 and
-> [PROJECT_ASSESSMENT.md](PROJECT_ASSESSMENT.md) §5.2.
+> See [data_contract.md](docs/data_contract.md) §4 and
+> [PROJECT_ASSESSMENT.md](docs/PROJECT_ASSESSMENT.md) §5.2.
 
 > **Input contract:** the real upstream **post-with-details** schema (embedded
 > comments + engagement + reactions + shares), the integration model (pull + our
 > own DB, no write-back), platform detection, and field mapping are documented in
-> [data_contract.md](data_contract.md) — the source of truth, with a real sample
+> [data_contract.md](docs/data_contract.md) — the source of truth, with a real sample
 > in [posts_with_details.json](posts_with_details.json).
 
 Platform is derived from each post's URL host (Facebook in the current sample;
 others supported). The upstream's coarse **post** `sentiment`/`viralPotential` are
 kept as a **baseline** while the smart layer **recomputes** richer sentiment;
 **comment sentiment is empty upstream and OCR is no longer shipped — both are our
-job** (see [data_contract.md](data_contract.md) §4).
+job** (see [data_contract.md](docs/data_contract.md) §4).
 
 **First target (in order):** post **text sentiment** → _(image sentiment — a
 visual model on the photo, plus OCR — implemented but unexercised, see above)_ →
 fuse (cross-check the crowd `reactionBreakdown`) → a **post summary grounded on
 caption** → **per-comment sentiment** over the **embedded** comment thread
 (reported with coverage, since only a stored sample of comments ships). See
-[data_contract.md](data_contract.md) §4.
+[data_contract.md](docs/data_contract.md) §4.
 
 It is built around a **smart routing layer** ("thinking layer") that decides how
 much intelligence each unit of work needs. The claim is deliberately narrow and
@@ -87,7 +88,7 @@ Two things follow, and both are worth stating plainly:
   spend (55% → 30%) without shrinking the bill. What sets the bill is how many
   comments exist.
 
-See [PROJECT_ASSESSMENT.md](PROJECT_ASSESSMENT.md) §4.6 and §6.8.
+See [PROJECT_ASSESSMENT.md](docs/PROJECT_ASSESSMENT.md) §4.6 and §6.8.
 
 That LLM runs behind a **pluggable, runtime-switchable backend — `local`
 (self-hosted vLLM/Ollama) or `groq` (Groq Cloud API)** — so the operator can
@@ -109,16 +110,16 @@ decision. Above the per-post pipeline sits a selective
 reach data through **MCP servers** (`analytics` / `retrieval` / `ingest`) for
 analyst Q&A, watchlist stance, toxicity and narrative deep-dives, quality audits
 and grounded reports — **corpus-tier only, never per post**
-(see [architecture.md](architecture.md) §11).
+(see [architecture.md](docs/architecture.md) §11).
 
 This folder answers the system-design request described by the owner in
 [what.txt](what.txt) — an upstream platform scrapes 1,000+ real-time
 Bangla/English/Banglish posts **with their comments**; this smart layer pulls the
 **post-with-details** payload from that platform's REST API and returns structured
-JSON out. For the input contract see [data_contract.md](data_contract.md); for
-concrete input→output, see [examples.md](examples.md).
+JSON out. For the input contract see [data_contract.md](docs/data_contract.md); for
+concrete input→output, see [examples.md](docs/examples.md).
 
-> **Single-file master plan:** [masterplan.md](masterplan.md) consolidates every
+> **Single-file master plan:** [masterplan.md](docs/masterplan.md) consolidates every
 > document below into one self-contained read (overview, architecture,
 > alternatives, models, infrastructure, cost, API, examples, deployment, roadmap),
 > kept in sync with the per-topic docs. Use the focused docs for one subject;
@@ -128,32 +129,32 @@ concrete input→output, see [examples.md](examples.md).
 
 | Document                                             | What it covers                                                                                                                                                                    |
 | ---------------------------------------------------- | --------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- |
-| [FEATURES.md](FEATURES.md)                           | **Feature list** — every capability, what it does, and whether it is **measured**, works-but-unmeasured, **unexercised**, or planned. Start here for "what does this actually do?"     |
-| [masterplan.md](masterplan.md)                       | **Single-file master plan** — every document below consolidated into one self-contained read                                                                                      |
-| [data_contract.md](data_contract.md)                 | **Upstream input contract** — real post-with-details schema (embedded comments + engagement + reactions + shares), integration (pull + own DB), platform detection, field mapping |
-| [architecture.md](architecture.md)                   | Recommended high- and low-level architecture, the hybrid NLP→LLM pipeline, data flow, service breakdown, security                                                                 |
-| [possible_architecture.md](possible_architecture.md) | Alternatives considered and tradeoffs (queues, databases, deployment, service mesh)                                                                                               |
-| [models.md](models.md)                               | AI/NLP model selection per task, Bangla/Banglish support, RAG evaluation, fine-tuning strategy                                                                                    |
-| [infrastructure.md](infrastructure.md)               | GPU sizing, monitoring stack, caching, scaling                                                                                                                                    |
-| [cost_estimation.md](cost_estimation.md)             | Monthly cost estimates for MVP / Production / Enterprise                                                                                                                          |
-| [api_design.md](api_design.md)                       | REST API contracts: ingest the post-with-details payload, get structured JSON                                                                                                     |
-| [endpoints.md](endpoints.md)                         | Hands-on: the output JSON (annotated example) + curl commands to test every endpoint and reshape the JSON                                                                         |
-| [examples.md](examples.md)                           | Real Facebook posts from [posts_with_details.json](posts_with_details.json), with embedded comments analyzed → full output JSON                                                   |
-| [deployment.md](deployment.md)                       | Docker Compose vs Kubernetes, full K8s deployment plan                                                                                                                            |
-| [evaluation.md](evaluation.md)                       | **Evaluation plan** — how we score each task, the summary, the agents, and system properties; gold sets, gates, drift                                                             |
-| [plan.md](plan.md)                                   | Phased implementation roadmap and milestones                                                                                                                                      |
-| [HOWTO.md](HOWTO.md)                                 | **Build guide for coding agents** — golden rules, ordered tasks with definition-of-done, repo layout; how to actually implement this design                                       |
-| [stance_targets.md](stance_targets.md)               | **Watchlist-driven target stance** — the project's novelty item: per-entity stance over a configurable, alias-aware watchlist for code-mixed Bangla/Banglish. **Built**; watchlist contents and validation outstanding.  |
-| [PROJECT_ASSESSMENT.md](PROJECT_ASSESSMENT.md)       | **Capstone / paper readiness review** — six independent audit passes, every finding with its evidence class (measured / probed / read), what was fixed, and what is still open       |
-| [run.md](run.md) · [easy_run.md](easy_run.md)        | Running it: the one-command quickstart, then the deep reference (every env var, scaling, troubleshooting)                                                                            |
-| [testing.md](testing.md)                             | **Running the tests** — the three suites and their commands, what a plain `pytest` deliberately skips (including the one that would wipe your datastores), and what a green run does *not* prove |
-| [env.example.md](env.example.md)                     | **Every environment variable**, with its default and what happens if you change it — including the dead keys kept only because older docs mention them                               |
-| [AGENTIC_RAG_NOVELTY.md](AGENTIC_RAG_NOVELTY.md)     | The agentic-RAG layer as a research contribution: what is novel, what is assembly, and which claims are measured                                                                     |
-| [RAG_STATE_AND_ROADMAP.md](RAG_STATE_AND_ROADMAP.md) | Current state of retrieval + the agents, per-agent behaviour, and what is still missing to call it RAG rather than SQL-with-an-LLM-on-top                                            |
-| [DASHBOARD_UI.md](DASHBOARD_UI.md)                   | **Dashboard UI** — React 19 + Vite + Tailwind architecture, all 11 tabs in depth, component hierarchy, SSE real-time streams, authentication flow, build & development                |
-| [SYSTEM_MONITOR.md](SYSTEM_MONITOR.md)               | **System Monitor & Observability** — hardware telemetry (CPU/GPU/RAM), pipeline monitoring, structured logging (Loki), metrics (Prometheus/Grafana), tracing (OpenTelemetry/Jaeger)     |
-| [AGENTS.md](AGENTS.md)                               | **Agents & Runner** — all 9 agent profiles, multi-turn tool execution engine, prompt injection hardening, citation verification, budget enforcement, chat routing                       |
-| [MCP_SERVERS.md](MCP_SERVERS.md)                     | **MCP Servers** — analytics-mcp (ClickHouse), retrieval-mcp (pgvector), ingest-mcp (Redis) — all 18 tools, schemas, stub modes, agent-to-tool mapping, deployment                      |
+| [FEATURES.md](docs/FEATURES.md)                           | **Feature list** — every capability, what it does, and whether it is **measured**, works-but-unmeasured, **unexercised**, or planned. Start here for "what does this actually do?"     |
+| [masterplan.md](docs/masterplan.md)                       | **Single-file master plan** — every document below consolidated into one self-contained read                                                                                      |
+| [data_contract.md](docs/data_contract.md)                 | **Upstream input contract** — real post-with-details schema (embedded comments + engagement + reactions + shares), integration (pull + own DB), platform detection, field mapping |
+| [architecture.md](docs/architecture.md)                   | Recommended high- and low-level architecture, the hybrid NLP→LLM pipeline, data flow, service breakdown, security                                                                 |
+| [possible_architecture.md](docs/possible_architecture.md) | Alternatives considered and tradeoffs (queues, databases, deployment, service mesh)                                                                                               |
+| [models.md](docs/models.md)                               | AI/NLP model selection per task, Bangla/Banglish support, RAG evaluation, fine-tuning strategy                                                                                    |
+| [infrastructure.md](docs/infrastructure.md)               | GPU sizing, monitoring stack, caching, scaling                                                                                                                                    |
+| [cost_estimation.md](docs/cost_estimation.md)             | Monthly cost estimates for MVP / Production / Enterprise                                                                                                                          |
+| [api_design.md](docs/api_design.md)                       | REST API contracts: ingest the post-with-details payload, get structured JSON                                                                                                     |
+| [endpoints.md](docs/endpoints.md)                         | Hands-on: the output JSON (annotated example) + curl commands to test every endpoint and reshape the JSON                                                                         |
+| [examples.md](docs/examples.md)                           | Real Facebook posts from [posts_with_details.json](posts_with_details.json), with embedded comments analyzed → full output JSON                                                   |
+| [deployment.md](docs/deployment.md)                       | Docker Compose vs Kubernetes, full K8s deployment plan                                                                                                                            |
+| [evaluation.md](docs/evaluation.md)                       | **Evaluation plan** — how we score each task, the summary, the agents, and system properties; gold sets, gates, drift                                                             |
+| [plan.md](docs/plan.md)                                   | Phased implementation roadmap and milestones                                                                                                                                      |
+| [HOWTO.md](docs/HOWTO.md)                                 | **Build guide for coding agents** — golden rules, ordered tasks with definition-of-done, repo layout; how to actually implement this design                                       |
+| [stance_targets.md](docs/stance_targets.md)               | **Watchlist-driven target stance** — the project's novelty item: per-entity stance over a configurable, alias-aware watchlist for code-mixed Bangla/Banglish. **Built**; watchlist contents and validation outstanding.  |
+| [PROJECT_ASSESSMENT.md](docs/PROJECT_ASSESSMENT.md)       | **Capstone / paper readiness review** — six independent audit passes, every finding with its evidence class (measured / probed / read), what was fixed, and what is still open       |
+| [run.md](docs/run.md) · [easy_run.md](docs/easy_run.md)        | Running it: the one-command quickstart, then the deep reference (every env var, scaling, troubleshooting)                                                                            |
+| [testing.md](docs/testing.md)                             | **Running the tests** — the three suites and their commands, what a plain `pytest` deliberately skips (including the one that would wipe your datastores), and what a green run does *not* prove |
+| [env.example.md](docs/env.example.md)                     | **Every environment variable**, with its default and what happens if you change it — including the dead keys kept only because older docs mention them                               |
+| [AGENTIC_RAG_NOVELTY.md](docs/AGENTIC_RAG_NOVELTY.md)     | The agentic-RAG layer as a research contribution: what is novel, what is assembly, and which claims are measured                                                                     |
+| [RAG_STATE_AND_ROADMAP.md](docs/RAG_STATE_AND_ROADMAP.md) | Current state of retrieval + the agents, per-agent behaviour, and what is still missing to call it RAG rather than SQL-with-an-LLM-on-top                                            |
+| [DASHBOARD_UI.md](docs/DASHBOARD_UI.md)                   | **Dashboard UI** — React 19 + Vite + Tailwind architecture, all 11 tabs in depth, component hierarchy, SSE real-time streams, authentication flow, build & development                |
+| [SYSTEM_MONITOR.md](docs/SYSTEM_MONITOR.md)               | **System Monitor & Observability** — hardware telemetry (CPU/GPU/RAM), pipeline monitoring, structured logging (Loki), metrics (Prometheus/Grafana), tracing (OpenTelemetry/Jaeger)     |
+| [AGENTS.md](docs/AGENTS.md)                               | **Agents & Runner** — all 9 agent profiles, multi-turn tool execution engine, prompt injection hardening, citation verification, budget enforcement, chat routing                       |
+| [MCP_SERVERS.md](docs/MCP_SERVERS.md)                     | **MCP Servers** — analytics-mcp (ClickHouse), retrieval-mcp (pgvector), ingest-mcp (Redis) — all 18 tools, schemas, stub modes, agent-to-tool mapping, deployment                      |
 | [dashboard/README.md](dashboard/README.md)           | The React dashboard: dev server, build, tests                                                                                                                                       |
 
 Background: the original system-design request has been reconciled with
@@ -161,12 +162,12 @@ Background: the original system-design request has been reconciled with
 (`social_media_llm_architecture_prompt.md` was removed in commit `e9fba98`; the
 link is dropped rather than left dangling.)
 
-**What it does, feature by feature:** [FEATURES.md](FEATURES.md) — with each
+**What it does, feature by feature:** [FEATURES.md](docs/FEATURES.md) — with each
 capability marked measured / unmeasured / unexercised / planned, so nothing on a
 slide is stated more strongly than the evidence supports.
 
 **Current implementation status** is in
-[PROJECT_ASSESSMENT.md](PROJECT_ASSESSMENT.md) — read its status header first.
+[PROJECT_ASSESSMENT.md](docs/PROJECT_ASSESSMENT.md) — read its status header first.
 The design documents in the table above describe the *intended* system; where
 the two disagree, the assessment is what actually runs. Claims that are
 implemented-but-unexercised (the image modality) or measured-and-different-from-
@@ -177,8 +178,8 @@ target (the routing rate) are flagged inline in each document.
 - **Unit of analysis = post + its comment thread.** The upstream returns a post
   **with its comments embedded** (a stored sample of the total). The service
   analyzes the whole thread and emits
-  one JSON object per thread (see [architecture.md](architecture.md) §6,
-  [data_contract.md](data_contract.md)). Processing order: **post sentiment first,
+  one JSON object per thread (see [architecture.md](docs/architecture.md) §6,
+  [data_contract.md](docs/data_contract.md)). Processing order: **post sentiment first,
   then comments**.
 - **Hybrid analysis pipeline.** Cheap, fast NLP models (fastText, transformer
   classifiers, spaCy/GLiNER) run over the post and every comment. An LLM is invoked
@@ -259,4 +260,4 @@ target (the routing rate) are flagged inline in each document.
 - **Deployment:** Docker Compose for MVP, Kubernetes (with KEDA autoscaling on
   queue depth) for Production and beyond.
 
-Read [architecture.md](architecture.md) first.
+Read [architecture.md](docs/architecture.md) first.

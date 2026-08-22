@@ -1,10 +1,10 @@
 # Environment Reference
 
-Companion to [`.env.example`](.env.example) — what every key does, which code reads it,
+Companion to [`.env.example`](../.env.example) — what every key does, which code reads it,
 and what changes if you touch it. Sections match the numbered blocks in the file.
 
 Settings are loaded by `Settings` in
-[`src/defense/libs/common/config.py`](src/defense/libs/common/config.py) (pydantic-settings,
+[`src/defense/libs/common/config.py`](../src/defense/libs/common/config.py) (pydantic-settings,
 case-insensitive, `extra="ignore"`). **`extra="ignore"` means a misspelled key is silently
 dropped, not rejected** — if a setting appears to have no effect, check the spelling first.
 
@@ -17,11 +17,11 @@ dropped, not rejected** — if a setting appears to have no effect, check the sp
 | `DATABASE_URL` | Postgres. Holds posts, analysis results, users — **and** the pgvector embeddings in `analysis_results.embedding`. There is no separate vector-store URL; RAG search shares this connection. Converted to `postgresql+asyncpg://` at runtime by `get_async_database_url()`. |
 | `REDIS_URL` | Three jobs at once: the inter-stage work queues (Redis Streams — `ingestion:queue` → `nlp:stage1:queue` → `router:queue` → `llm:stage2:queue` → `assembler:queue`), the LLM response cache, and the live log/trace buffer when `LOG_TO_REDIS` is on. |
 | `CLICKHOUSE_URL` | Analytics store the dashboard charts read from. |
-| `MINIO_ENDPOINT` | S3-compatible object store for post images. **Must include the scheme.** boto3's `endpoint_url` needs a full URL ([`assembler/__main__.py:96`](src/defense/services/workers/assembler/__main__.py#L96)), and the image-URL builder logs a warning and patches in `http://` if you omit it ([`vision_analyzer.py:84`](src/defense/services/workers/stage1_nlp/vision_analyzer.py#L84)). |
+| `MINIO_ENDPOINT` | S3-compatible object store for post images. **Must include the scheme.** boto3's `endpoint_url` needs a full URL ([`assembler/__main__.py:96`](../src/defense/services/workers/assembler/__main__.py#L96)), and the image-URL builder logs a warning and patches in `http://` if you omit it ([`vision_analyzer.py:84`](../src/defense/services/workers/stage1_nlp/vision_analyzer.py#L84)). |
 | `MINIO_ACCESS_KEY` / `MINIO_SECRET_KEY` / `MINIO_BUCKET` | Credentials and bucket. The bucket is created on assembler start-up if missing. |
 
 **Hostnames:** `.env.example` ships the Docker service names (`postgres`, `redis`,
-`clickhouse`, `minio`) to match [`deploy/docker-compose.yml`](deploy/docker-compose.yml).
+`clickhouse`, `minio`) to match [`deploy/docker-compose.yml`](../deploy/docker-compose.yml).
 Swap them for `localhost` when you run the services directly on the host.
 
 ---
@@ -36,7 +36,7 @@ Swap them for `localhost` when you run the services directly on the host.
 | `GROQ_API_KEY` | Used when `LLM_BACKEND=groq` **and** on automatic failover. |
 
 **Failover is automatic and one-directional.** If a Groq call fails, the client retries the
-same request on the local backend ([`client.py:370`](src/defense/libs/llm/client.py#L370)).
+same request on the local backend ([`client.py:370`](../src/defense/libs/llm/client.py#L370)).
 Each backend also sits behind a circuit breaker (`LLM_CB_FAILURE_THRESHOLD`,
 `LLM_CB_COOLDOWN_SECONDS`) so a flapping backend is taken out of rotation instead of being
 hammered. This is why the `_GROQ_` model keys matter even when you run fully local.
@@ -46,18 +46,18 @@ hammered. This is why the `_GROQ_` model keys matter even when you run fully loc
 ## 3. Models
 
 There are **seven roles**. A role is a *job*, not a stage — the mapping lives at
-[`client.py:59-77`](src/defense/libs/llm/client.py#L59-L77). Every role has a `_LOCAL_` and a
+[`client.py:59-77`](../src/defense/libs/llm/client.py#L59-L77). Every role has a `_LOCAL_` and a
 `_GROQ_` variant naming the same job on each backend.
 
 | Role | Env keys | Who calls it | What it does |
 |---|---|---|---|
-| `stage1` | `STAGE1_LOCAL_MODEL`<br>`STAGE1_GROQ_MODEL` | [`text_analyzer.py:854`](src/defense/services/workers/stage1_nlp/text_analyzer.py#L854), [`worker.py:470`](src/defense/services/workers/stage1_nlp/worker.py#L470), [`comment_analyzer.py:547`](src/defense/services/workers/stage1_nlp/comment_analyzer.py#L547) | The high-volume classifier. One JSON call returns 12 fields per post: `language, sentiment, sentiment_score, emotion, topics, intents, post_type, post_type_confidence, toxicity_score, hate_speech_score, entities, keywords`. Also per-comment labelling — but only when `STAGE1_LLM_COMMENTS=true`. |
-| `stage2` | `STAGE2_LOCAL_MODEL`<br>`STAGE2_GROQ_MODEL` | [`worker.py:1509`](src/defense/services/workers/stage2_llm/worker.py#L1509) (post-type), [`:1533`](src/defense/services/workers/stage2_llm/worker.py#L1533) (insight), [`:960`](src/defense/services/workers/stage2_llm/worker.py#L960) (comment stance) | Post-type, insight, and context-aware comment stance. Every one picks from a fixed vocabulary, so it wants a constrained model, not a creative one. |
-| `summary` | `SUMMARY_LOCAL_MODEL`<br>`SUMMARY_GROQ_MODEL` | [`stage1_nlp/worker.py:451`](src/defense/services/workers/stage1_nlp/worker.py#L451), [`stage2_llm/worker.py:1319`](src/defense/services/workers/stage2_llm/worker.py#L1319) | All prose. **Note this is the model Stage 1 uses for its post summary** — the summary does *not* run on the `stage1` model. Also covers the Stage-2 comment-thread summary, and the Stage-2 post summary on the fallback path. |
-| `agent` | `AGENT_LOCAL_MODEL`<br>`AGENT_GROQ_MODEL` | [`runner.py:2241`](src/defense/services/agents/runner.py#L2241) (`role=agent_def.llm_role`) | All 9 MCP agents in [`registry.py`](src/defense/services/agents/registry.py). The only role doing multi-turn tool use, so it needs solid native function calling — hence llama rather than qwen. The default is **`llama3.1:8b-16k`**, not plain `llama3.1:8b`: a derived tag ([`config/Modelfile.llama31-16k`](config/Modelfile.llama31-16k)) that sets `num_ctx 16384`, because `ollama serve` otherwise runs a 4096-token window and *silently discards* the overflow oldest-message-first — i.e. the system prompt and the operator's question. Measured on this machine: an 11k-token prompt evaluates 24 tokens on `llama3.1:8b` and all 11,045 on `llama3.1:8b-16k`. `OLLAMA_CONTEXT_LENGTH` on the ollama service is the better fix (it covers the pipeline models too), but a `PARAMETER` in the model wins over it — retag or drop the suffix if you go that route. |
-| `llm_b` | `LLM_B_LOCAL_MODEL`<br>`LLM_B_GROQ_MODEL` | [`reports.py:323`](src/defense/services/api/routers/reports.py#L323), [`:501`](src/defense/services/api/routers/reports.py#L501) | The report-generation layer. |
+| `stage1` | `STAGE1_LOCAL_MODEL`<br>`STAGE1_GROQ_MODEL` | [`text_analyzer.py:854`](../src/defense/services/workers/stage1_nlp/text_analyzer.py#L854), [`worker.py:470`](../src/defense/services/workers/stage1_nlp/worker.py#L470), [`comment_analyzer.py:547`](../src/defense/services/workers/stage1_nlp/comment_analyzer.py#L547) | The high-volume classifier. One JSON call returns 12 fields per post: `language, sentiment, sentiment_score, emotion, topics, intents, post_type, post_type_confidence, toxicity_score, hate_speech_score, entities, keywords`. Also per-comment labelling — but only when `STAGE1_LLM_COMMENTS=true`. |
+| `stage2` | `STAGE2_LOCAL_MODEL`<br>`STAGE2_GROQ_MODEL` | [`worker.py:1509`](../src/defense/services/workers/stage2_llm/worker.py#L1509) (post-type), [`:1533`](../src/defense/services/workers/stage2_llm/worker.py#L1533) (insight), [`:960`](../src/defense/services/workers/stage2_llm/worker.py#L960) (comment stance) | Post-type, insight, and context-aware comment stance. Every one picks from a fixed vocabulary, so it wants a constrained model, not a creative one. |
+| `summary` | `SUMMARY_LOCAL_MODEL`<br>`SUMMARY_GROQ_MODEL` | [`stage1_nlp/worker.py:451`](../src/defense/services/workers/stage1_nlp/worker.py#L451), [`stage2_llm/worker.py:1319`](../src/defense/services/workers/stage2_llm/worker.py#L1319) | All prose. **Note this is the model Stage 1 uses for its post summary** — the summary does *not* run on the `stage1` model. Also covers the Stage-2 comment-thread summary, and the Stage-2 post summary on the fallback path. |
+| `agent` | `AGENT_LOCAL_MODEL`<br>`AGENT_GROQ_MODEL` | [`runner.py:2241`](../src/defense/services/agents/runner.py#L2241) (`role=agent_def.llm_role`) | All 9 MCP agents in [`registry.py`](../src/defense/services/agents/registry.py). The only role doing multi-turn tool use, so it needs solid native function calling — hence llama rather than qwen. The default is **`llama3.1:8b-16k`**, not plain `llama3.1:8b`: a derived tag ([`config/Modelfile.llama31-16k`](../config/Modelfile.llama31-16k)) that sets `num_ctx 16384`, because `ollama serve` otherwise runs a 4096-token window and *silently discards* the overflow oldest-message-first — i.e. the system prompt and the operator's question. Measured on this machine: an 11k-token prompt evaluates 24 tokens on `llama3.1:8b` and all 11,045 on `llama3.1:8b-16k`. `OLLAMA_CONTEXT_LENGTH` on the ollama service is the better fix (it covers the pipeline models too), but a `PARAMETER` in the model wins over it — retag or drop the suffix if you go that route. |
+| `llm_b` | `LLM_B_LOCAL_MODEL`<br>`LLM_B_GROQ_MODEL` | [`reports.py:323`](../src/defense/services/api/routers/reports.py#L323), [`:501`](../src/defense/services/api/routers/reports.py#L501) | The report-generation layer. |
 | `llm_a` | `LLM_A_LOCAL_MODEL`<br>`LLM_A_GROQ_MODEL` | *nothing* | **Dead.** No `role="llm_a"` call site exists in `src/`. Kept only for backward compatibility; safe to delete. |
-| `vlm` | `VLM_LOCAL_MODEL`<br>`VLM_GROQ_MODEL` | [`worker.py:1439`](src/defense/services/workers/stage2_llm/worker.py#L1439) | Image posts. It **substitutes for** the `summary` role rather than adding a call: `role = "vlm" if (has_photos and vlm_enabled) else summary`. If the image bytes don't resolve, the result is tagged `post_summary_source: "llm"` instead of `"vlm"`. |
+| `vlm` | `VLM_LOCAL_MODEL`<br>`VLM_GROQ_MODEL` | [`worker.py:1439`](../src/defense/services/workers/stage2_llm/worker.py#L1439) | Image posts. It **substitutes for** the `summary` role rather than adding a call: `role = "vlm" if (has_photos and vlm_enabled) else summary`. If the image bytes don't resolve, the result is tagged `post_summary_source: "llm"` instead of `"vlm"`. |
 
 ### Why the models are split this way
 
@@ -77,13 +77,13 @@ There are **seven roles**. A role is a *job*, not a stage — the mapping lives 
 
 The two live `stage1` calls both use `response_format={"type":"json_object"}`. A 4B model
 under grammar-constrained decoding is the likeliest to return a well-formed but empty `{}`,
-which parses fine and says nothing. [`_is_degenerate_json`](src/defense/libs/llm/client.py#L107)
+which parses fine and says nothing. [`_is_degenerate_json`](../src/defense/libs/llm/client.py#L107)
 catches this and retries unconstrained; if that also fails, Stage 1 falls back to the
 deterministic stub for all 12 fields. Watch for `llm_json_mode_degenerate_retrying_unconstrained`
 with `role=stage1` in the logs.
 
 Also note `post_type` is computed **twice** in Stage 1 — once inside the 12-field blob and
-again as a separate call at [`worker.py:470`](src/defense/services/workers/stage1_nlp/worker.py#L470).
+again as a separate call at [`worker.py:470`](../src/defense/services/workers/stage1_nlp/worker.py#L470).
 Harmless, but it is a duplicate round-trip per post if you are counting cost.
 
 ---
@@ -92,11 +92,11 @@ Harmless, but it is a duplicate round-trip per post if you are counting cost.
 
 | Key | What it does |
 |---|---|
-| `EMBEDDING_DIM` | Vector width, read by [`embeddings.py:33`](src/defense/libs/embeddings.py#L33). **Must match the pgvector column width in the database** — changing it without a migration breaks inserts. |
+| `EMBEDDING_DIM` | Vector width, read by [`embeddings.py:33`](../src/defense/libs/embeddings.py#L33). **Must match the pgvector column width in the database** — changing it without a migration breaks inserts. |
 | `EMBEDDING_MODEL` | SentenceTransformer checkpoint. `paraphrase-multilingual-mpnet-base-v2` is 768-dim and covers Bangla, English, and romanized Banglish. This never goes through the LLM client. |
 | `MODEL_STUB_MODE` | `true` = no heavy ML weights are downloaded or loaded. Embeddings come from a deterministic stub, and the seven Stage-2 HF classifiers are skipped. It also drives the Hugging Face offline policy: `apply_hf_offline_policy()` sets `HF_HUB_OFFLINE`/`TRANSFORMERS_OFFLINE` so nothing reaches the network. Override that link with `HF_OFFLINE`. |
 | `EMBEDDING_STUB_MODE` | Overrides `MODEL_STUB_MODE` **for the sentence encoder alone**, in either direction — real vectors without loading the classifiers, or hash vectors while they stay on. `EMBEDDING_ALLOW_STUB=false` (the default) makes the encoder *refuse* rather than silently degrade to `stub:sha256`. |
-| `COMMENT_EMBEDDINGS_ENABLED` | `true` = the assembler embeds comment text, not just captions. The signal in this corpus lives in the threads. Backfill existing rows with [`deploy/backfill_embeddings.py`](deploy/backfill_embeddings.py). |
+| `COMMENT_EMBEDDINGS_ENABLED` | `true` = the assembler embeds comment text, not just captions. The signal in this corpus lives in the threads. Backfill existing rows with [`deploy/backfill_embeddings.py`](../deploy/backfill_embeddings.py). |
 | `COMMENT_EMBEDDING_MAX_PER_POST` | Per-post ceiling on comment **vectors** after near-duplicate grouping. **`0` (the default) disables the cap**, matching `ROUTER_COMMENT_TOP_N=0` in §5. A positive value here is *quieter* than a Stage-2 cap: the comments past it are still stored and still labelled, but they have **no vector**, so `search_comments` and `get_clusters` cannot reach them and the only symptom is an unexplained dip in `comment_vector_coverage` (`coverage_stats` derives the corpus-wide figure from this number). The old default of `1000` hid the tail of the one 2,857-comment thread — **1,857 comments, 18% of the corpus, invisible to comment search**. |
 | `RETRIEVAL_HYBRID` / `RETRIEVAL_RRF_K` / `RETRIEVAL_CANDIDATE_MULTIPLIER` | Hybrid retrieval: run the vector and keyword arms together and fuse by reciprocal rank (`k=60`), pulling `4×` the requested rows as candidates. On by default. |
 | `RETRIEVAL_CHUNKS` / `RETRIEVAL_CHUNK_SEARCH` | Write and search `post_chunks` — the Bangla-aware splitter for long captions and threads. On by default. |
@@ -127,7 +127,7 @@ report who actually voted.
 | `COMMENT_SUMMARY_MAX_TOKENS` | Ceiling for the comment-thread summary (640). |
 | `INSIGHT_MAX_TOKENS` | Ceiling for the Stage-2 insight (768). |
 | `LLM_MAX_CONTINUATIONS` | A reply cut off at its ceiling is auto-continued this many times, then flagged and **never cached**. This exists because Bangla costs far more tokens per character than English, so one fixed ceiling truncates Bangla while sparing English. The continuation prompt is deliberately language-neutral so the model doesn't switch language mid-summary. |
-| `COMMENT_LAUGH_SENTIMENT` | How 🤣😂😆😹 are scored: `negative` \| `positive` \| `neutral`. Emoji-only comments are kept as crowd signal but never sent to an LLM. On this corpus laughing emoji read as mockery, hence `negative`. An unrecognised value falls back to `negative` ([`comment_analyzer.py:119-123`](src/defense/services/workers/stage1_nlp/comment_analyzer.py#L119-L123)). |
+| `COMMENT_LAUGH_SENTIMENT` | How 🤣😂😆😹 are scored: `negative` \| `positive` \| `neutral`. Emoji-only comments are kept as crowd signal but never sent to an LLM. On this corpus laughing emoji read as mockery, hence `negative`. An unrecognised value falls back to `negative` ([`comment_analyzer.py:119-123`](../src/defense/services/workers/stage1_nlp/comment_analyzer.py#L119-L123)). |
 | `STAGE1_OCR_SENTIMENT` | Runs sentiment over OCR text for null-caption image posts. Off — no `photoUrl` in the current corpus resolves, so it would yield nothing. |
 
 **Full coverage is the shipped configuration, and it is five knobs, not one.**
@@ -166,7 +166,7 @@ empty is *not* the same as off if `APP_ENV` is still `dev`.
 | Key | What it does |
 |---|---|
 | `LOG_LEVEL` | Standard level. Companion settings `LOG_TO_REDIS`, `LOG_REDIS_MAX`, `LOG_REDIS_TTL` control the live dashboard log buffer. `LOG_TO_REDIS` defaults **on**, and the buffer it writes (`logs:recent` / `logs:live`) is the one the Logs tab reads — so any process using `setup_logging` publishes into the operator's log view. `tests/conftest.py` forces it to `0` for the whole session: a bare `pytest` used to file the agent suites' deliberately fabricated fixtures (`post_id='1234567890abcdef'`, a table of "#12345 Economic Growth") into that view as real agent runs. Set `LOG_TO_REDIS=1` to opt a test run back in. |
-| `PUBLIC_BASE_URL` | The externally-reachable API base. The agents service uses it to build links in generated output ([`agents/main.py:449`](src/defense/services/agents/main.py#L449)) — if it is wrong, links point somewhere unreachable while everything else still works. |
+| `PUBLIC_BASE_URL` | The externally-reachable API base. The agents service uses it to build links in generated output ([`agents/main.py:449`](../src/defense/services/agents/main.py#L449)) — if it is wrong, links point somewhere unreachable while everything else still works. |
 | `AGENTS_SERVICE_URL` | Where the API reaches the agents service. `docker-compose.yml` overrides this to `http://agents:8010` for containers, so the value here is the one used for direct host runs. |
 | `ANALYTICS_MCP_PORT` / `RETRIEVAL_MCP_PORT` / `INGEST_MCP_PORT` | Listen ports for the three MCP servers (8100 / 8101 / 8102). |
 | `ANALYTICS_MCP_STUB` | `true` = the analytics MCP serves canned results instead of querying ClickHouse. Useful for a first run without the full stack; misleading if you forget it is on. |
@@ -178,7 +178,7 @@ empty is *not* the same as off if `APP_ENV` is still `dev`.
 
 | Key | What it does |
 |---|---|
-| `UPSTREAM_API_URL` | Source of posts. Ingestion pulls `<url>/posts-with-details` ([`ingestion/service.py:424`](src/defense/services/ingestion/service.py#L424)); an empty value disables upstream pulls entirely. |
+| `UPSTREAM_API_URL` | Source of posts. Ingestion pulls `<url>/posts-with-details` ([`ingestion/service.py:424`](../src/defense/services/ingestion/service.py#L424)); an empty value disables upstream pulls entirely. |
 | `UPSTREAM_API_KEY` | Sent as `Authorization: Bearer <key>` when set. |
 
 ---
@@ -202,7 +202,7 @@ They are documented so the corpus a number was measured on is never a guess.
 
 | Key | Default | What it does |
 |---|---|---|
-| `CORPUS` | `posts_with_details.json` | The corpus every eval script reads — the **same file the ingestion path uploads** (50 posts, 10,272 comments). Read by [`measure_routing_rate.py`](eval/measure_routing_rate.py); [`sweep_threshold.py`](eval/sweep_threshold.py) and [`build_gold_set.py`](eval/build_gold_set.py) take the same default via `--corpus`. |
+| `CORPUS` | `posts_with_details.json` | The corpus every eval script reads — the **same file the ingestion path uploads** (50 posts, 10,272 comments). Read by [`measure_routing_rate.py`](../eval/measure_routing_rate.py); [`sweep_threshold.py`](../eval/sweep_threshold.py) and [`build_gold_set.py`](../eval/build_gold_set.py) take the same default via `--corpus`. |
 | `MAX_COMMENTS` | `0` | Comments analysed per post; `0` = all of them, the shipped configuration. No routing rule reads a comment field, so this moves the comment-lane cost estimate and the runtime, **not** the routing rate. Set it low (e.g. `3`) with `STAGE1_LLM=true` to get a routing rate in minutes instead of hours. |
 | `OUT` | *(unset)* | Write the per-post rows as JSON here as well as printing them. |
 

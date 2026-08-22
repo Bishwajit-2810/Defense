@@ -7,7 +7,7 @@ The other docs say _what/why_; this says _what to do next_.
 - **Design source of truth:** [architecture.md](architecture.md) (esp. §6 output
   schema, §3 data flow, §5 routing, §11 agents/MCP).
 - **Input contract:** [data_contract.md](data_contract.md) + real sample
-  [posts_with_details.json](posts_with_details.json).
+  [posts_with_details.json](../posts_with_details.json).
 - **Models:** [models.md](models.md). **Roadmap:** [plan.md](plan.md).
   **API:** [api_design.md](api_design.md). **Eval:** [evaluation.md](evaluation.md).
   **Deploy:** [deployment.md](deployment.md). **Consolidated:** [masterplan.md](masterplan.md).
@@ -268,7 +268,7 @@ Scale + reliability ([plan.md](plan.md) Phase 2), then the agents.
     upstream pull / fetch more comments — writes only to OUR db).
   - **Agent orchestrator** (FastAPI, CPU-only) running on the dedicated `agent`
     LLM role — **nine** agents, all defined in
-    [`registry.py`](src/defense/services/agents/registry.py):
+    [`registry.py`](../src/defense/services/agents/registry.py):
     **Insight/Analyst** (`POST /v1/agents/query`),
     **Coverage deep-dive** (low `coverage`/viral → `fetch_more_comments`),
     **Alerting** (scheduled, on reaction/sentiment/toxicity thresholds),
