@@ -13,7 +13,7 @@
 /* ============================================================
    Config & globals
    ============================================================ */
-var API_BASE = window.API_BASE || 'http://127.0.0.1:8001';  // dev API (run.md / easy_run.md); override via window.API_BASE
+var API_BASE = window.API_BASE || 'http://127.0.0.1:8001';  // dev API (docs/run.md / docs/easy_run.md); override via window.API_BASE
 var AUTO_REFRESH_MS = 15000;
 var authToken = localStorage.getItem('auth_token');
 var apiKey    = localStorage.getItem('api_key') || '';
@@ -1465,7 +1465,7 @@ function renderEmotionChart(canvas, emotionBreakdown) {
  * Every id is scoped by `prefix` so the modal and any number of expanded rows
  * can coexist. Static parts render from the cached result `r`; the analytics /
  * per-comment list are filled by mountCommentInsights's fetch. */
-/** Per-entity stance rollup from the watchlist (stance_targets.md).
+/** Per-entity stance rollup from the watchlist (docs/stance_targets.md).
  *
  * Rendered as its own block, deliberately apart from the sentiment donut: the
  * two answer different questions ("is this comment angry?" vs "who is it angry
@@ -1616,7 +1616,7 @@ function commentInsightsHtml(prefix, r) {
   // The novelty item. A SEPARATE measurement from the sentiment donut above: a
   // comment can be positive in tone while opposing a listed entity, so these are
   // never merged. Absent entirely when no watchlist is configured or nothing
-  // was mentioned. See stance_targets.md.
+  // was mentioned. See docs/stance_targets.md.
   html += targetStanceHtml(ca.target_stances);
 
   if (ca.themes && ca.themes.length > 0) {
@@ -2547,7 +2547,7 @@ async function viewReport(reportId) {
     }
 
     // ---- Embedding clusters ----
-    // The LLM cost lever (architecture.md §5): one LLM-B call per cluster rather
+    // The LLM cost lever (docs/architecture.md §5): one LLM-B call per cluster rather
     // than one per post. These were computed and paid for on every grounded
     // report but never reached any response — ReportResponse did not declare the
     // field, so the response model stripped it (§13.1). The "Topic Clusters"
@@ -4183,7 +4183,7 @@ async function sendChatMessage() {
    ============================================================ */
 
 // Layers in pipeline order, with the stream each one reads from. Mirrors
-// STAGES in libs/progress.py and the chain in architecture.md §3.
+// STAGES in libs/progress.py and the chain in docs/architecture.md §3.
 var TRACE_LAYERS = [
   { key: 'ingest',    label: 'Ingestion',      queue: 'ingestion:queue',  note: 'normalize · OCR · dedup · enqueue' },
   { key: 'stage1',    label: 'Stage 1 · NLP',  queue: 'nlp:stage1:queue', note: 'text · vision · fuse · comments' },

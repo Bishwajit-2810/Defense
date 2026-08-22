@@ -71,7 +71,10 @@ def _strip_line_comments(block: str) -> str:
 
 def _first_result_object(doc_name: str, fence: str) -> dict:
     """Parse the first fenced JSON(C) block of `doc_name` as a result object."""
-    text = (_REPO / doc_name).read_text(encoding="utf-8")
+    path = _REPO / "docs" / doc_name
+    if not path.exists():
+        path = _REPO / doc_name
+    text = path.read_text(encoding="utf-8")
     assert fence in text, f"{doc_name} no longer has a ```{fence} block"
     block = text.split(fence, 1)[1].split("```", 1)[0]
     cleaned = _strip_line_comments(block)

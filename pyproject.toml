@@ -9,8 +9,8 @@ description = "Smart Layer — social-media analysis pipeline (ingest → NLP �
 requires-python = ">=3.11"
 
 # Core runtime — everything needed for the default, verified stub-mode run
-# (Mode A in run.md): API + 5 workers + assembler + agents + MCP servers.
-# No GPU / ML weights required. See run.md §1.
+# (Mode A in docs/run.md): API + 5 workers + assembler + agents + MCP servers.
+# No GPU / ML weights required. See docs/run.md §1.
 dependencies = [
     "fastapi>=0.115.0",
     "starlette>=0.40,<0.51",                      # FastAPI 0.128 needs starlette<0.51
