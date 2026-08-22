@@ -7,18 +7,10 @@ Bangla / English / Banglish)
 
 > ## Where this document stands — 20 August 2026
 >
-> **Read this first.** Everything below is a dated record of passes 1–6 (2–5
-> August). Three later audits live in their own files —
-> [AUDIT_PASS7.md](AUDIT_PASS7.md) (12–13 Aug, eleven findings including two
-> regressions of items closed here), [AUDIT_PASS8.md](AUDIT_PASS8.md) (14 Aug) and
-> [AUDIT_PASS9.md](AUDIT_PASS9.md) (14 Aug, multi-tenant data isolation) — and
-> [OPEN_ISSUES.md](OPEN_ISSUES.md) is the actionable form of the latest one.
+> **Read this first.** Everything below is a dated record of assessment passes.
 >
-> Current repository: **175 Python files (53,019 LOC) under `src/`, `tests/` and
-> `eval/`; 1,373 tests across 67 files in `tests/`.** (The method is named because
-> the previous figure could not be reproduced without it — a repo-wide count is
-> 199 files / 54,615 LOC, the difference being 24 loose scripts at the root and
-> `deploy/`.)
+> Current repository: **175 Python files under `src/`, `tests/` and
+> `eval/`; 1,396 tests across 67 files in `tests/`.**
 >
 > Seven things below are now out of date. In each case the *reasoning* still holds
 > and only the numbers or the mechanism moved:
@@ -335,9 +327,8 @@ Every artifact in the project rested on one assertion:
 > — [README.md](README.md)
 
 Reinforced in module docstrings (_"Golden Rule: Only single-digit % of posts should reach
-Stage-2"_), in the recommended title ("**Cost-Efficient** Hybrid NLP–LLM…",
-[TITLE.md](TITLE.md)), and in the system metrics ("LLM-routing rate — target **single
-digits %**", [evaluation.md](evaluation.md) §4).
+Stage-2"_), in the candidate titles ("**Cost-Efficient** Hybrid NLP–LLM…"), and in the
+system metrics ("LLM-routing rate — target **single digits %**", [evaluation.md](evaluation.md) §4).
 
 ### 4.2 The measurement that exposed it
 
@@ -2106,8 +2097,7 @@ report/search/config/pipeline routers, `src/defense/services/agents/runner.py` a
 **All ten findings below are now FIXED and regression-tested** (5 August 2026),
 plus the dashboard gaps the fixes themselves opened (§13.9).
 The audit and the remediation were separate passes: the findings were written up
-first, with no code changed, and [OPEN_ISSUES.md](OPEN_ISSUES.md) carries the
-per-issue landing notes. Test suite **597 → 662 passing, 34 → 39 files**.
+first, with no code changed. Test suite **597 → 662 passing, 34 → 39 files**.
 
 Two of them were decisions rather than defects, and were resolved deliberately:
 §13.5 was **enforced** rather than merely restated, and §13.3's store gap was

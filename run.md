@@ -528,7 +528,7 @@ cd dashboard && npm run test:e2e                   # browser   → 4 passed (chr
 Two groups are opt-in and skipped by default. One of them, `RUN_DESTRUCTIVE_E2E=1`,
 runs `run_all.py --reset` — **it FLUSHALLs Redis and truncates Postgres and
 ClickHouse**, i.e. it destroys the stack this document just told you to build. It
-is gated for exactly that reason (AUDIT_PASS8 §2). testing.md §4 has the rest.
+is gated for exactly that reason. testing.md §4 has the rest.
 
 ---
 

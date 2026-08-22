@@ -93,7 +93,7 @@ is equivalent if the venv is already synced.
 
 | Setting | Why it exists |
 | --- | --- |
-| `testpaths = ["tests"]` | The repo root holds ~24 loose debug scripts named `test_*.py` / `check_*.py` (`test_httpx.py`, `check_binop.py`, …). They collect **zero** tests and are not part of any suite; this keeps them out. |
+| `testpaths = ["tests"]` | Specifies the test directories to discover tests from. |
 | `pythonpath = [".", "src", "src/defense"]` | The workers use bare imports (`from libs.… import`) because each is launched with its own package root, while the installed package is `defense.…`. Tests import **both** spellings, so both roots must be importable or a whole class of contract test silently stops collecting. |
 
 And `tests/conftest.py` forces the environment the suite assumes:
@@ -155,12 +155,7 @@ Playwright starts the Vite dev server itself (`webServer` in
 whatever is running rather than a stale bundle. Chromium only; the other browser
 projects are commented out.
 
-> **`tests/example.spec.ts` is the unmodified Playwright scaffold** — two of the
-> four tests navigate to `https://playwright.dev/` and click a link there. They
-> need the public internet and they test Playwright's own docs site, not this
-> dashboard. So a green e2e run currently overstates coverage by half: the real
-> tests are the two in `dashboard.spec.ts` (page title, login screen). Worth
-> deleting the scaffold.
+> E2E browser tests are located in `dashboard/tests/dashboard.spec.ts` (page title, login screen).
 
 ## 4. The opt-in groups — what a plain run deliberately skips
 
@@ -175,7 +170,7 @@ RUN_DESTRUCTIVE_E2E=1 uv run pytest tests/test_pipeline_e2e.py -q
 **This wipes your datastores.** It runs `run_all.py --reset`, which FLUSHALLs
 Redis and truncates Postgres and ClickHouse, and it needs the full Docker +
 Ollama stack. It is gated because a plain `pytest` used to destroy the
-developer's live dev environment (AUDIT_PASS8 §2) — and it was 85% of the
+developer's live dev environment — and it was 85% of the
 suite's wall clock. Only run it against a stack you are willing to lose.
 
 ### 4.2 Live router — `DEFENSE_LIVE_ROUTER=1`
