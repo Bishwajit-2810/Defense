@@ -1,12 +1,19 @@
 # AI Model Selection, RAG & Fine-Tuning
 
 Model recommendations per task, the Bangla/Banglish/English fine-tuning strategy,
-and the RAG evaluation for the smart layer in [what.txt](../what.txt). All small-model
+and the RAG evaluation for the smart layer in [architecture.md](architecture.md). All small-model
 choices favor open-source, GPU-efficient models with genuine Bangla support and
 run **self-hosted**. The Stage-2 LLM runs behind a **pluggable backend with two
 interchangeable providers — `local` (self-hosted vLLM) and `groq` (Groq Cloud
 API) — switchable at runtime** (see §2). Default is `local` (no per-token bill, no
 data egress); `groq` is an opt-in switch for fastest inference and zero GPU ops.
+
+> **Implementation companions:** the role→model resolution, backend switching and
+> per-role cost counters are [LLM_BACKENDS.md](LLM_BACKENDS.md); what Stage 1 does
+> with these models is [STAGE1_NLP.md](STAGE1_NLP.md); what Stage 2 does with them,
+> including the seven-head comment ensemble, is [STAGE2_LLM.md](STAGE2_LLM.md);
+> retrieval quality is measured in [SEARCH.md](SEARCH.md).
+
 
 The guiding rule from [architecture.md](architecture.md): **small models do the
 bulk work; the LLM is selective.** So the table below is mostly _small_ models,
@@ -265,19 +272,31 @@ notes (Groq).
 
 ## 3. Model serving architecture
 
-```text
-   NLP fleet (Stage 1)                  LLM roles (Stage 2) — pluggable backend
- ┌───────────────────────┐          ┌──────────────────────────────────────────┐
- │ Triton / ONNX Runtime │          │  Stage-2 worker (OpenAI-compatible client) │
- │  + CTranslate2        │          │      picks role LLM-A / LLM-B by task      │
- │  dynamic batching     │          └───────────────┬────────────────┬───────────┘
- │  many small models    │            LLM_BACKEND=local│        =groq │
- └──────────┬────────────┘          ┌─────────────────▼──┐   ┌───────▼──────────┐
-            │ gRPC/HTTP             │ vLLM (our GPUs):    │   │ Groq Cloud API   │
-   Stage-1 worker pulls batch       │  LLM-A 7B/8B fast   │   │ OpenAI-compatible│
-   from queue, calls Triton         │  LLM-B 14B/32B qual │   │ Llama/Qwen on LPU│
-                                     │  quantized, paged KV│   │ per-token, no GPU│
-                                     └─────────────────────┘   └──────────────────┘
+```mermaid
+%%{init: {'theme':'base','themeVariables':{'fontFamily':'ui-sans-serif, system-ui, -apple-system, Roboto, Helvetica, Arial, sans-serif','fontSize':'14px','primaryColor':'#2f4468','primaryTextColor':'#eef2f8','primaryBorderColor':'#5b7bb5','secondaryColor':'#14564f','secondaryTextColor':'#eef2f8','secondaryBorderColor':'#2c9d8f','tertiaryColor':'#3d2f63','tertiaryTextColor':'#eef2f8','tertiaryBorderColor':'#8b6fd4','mainBkg':'#2f4468','nodeBorder':'#5b7bb5','nodeTextColor':'#eef2f8','lineColor':'#8fa1bd','textColor':'#eef2f8','titleColor':'#c9d6ea','clusterBkg':'#161e2e','clusterBorder':'#3f5573','edgeLabelBackground':'#1b2434','background':'transparent'}, 'flowchart':{'curve':'basis','padding':14,'nodeSpacing':45,'rankSpacing':55,'useMaxWidth':true}}}%%
+graph TD
+    subgraph stage1["NLP fleet — Stage 1"]
+        Triton["Triton / ONNX Runtime<br/>+ CTranslate2<br/><small>dynamic batching · INT8/FP16<br/>many small models share a GPU</small>"]
+        W1["Stage-1 worker<br/><small>pulls a batch from the queue,<br/>calls Triton over gRPC/HTTP</small>"]
+        W1 --> Triton
+    end
+
+    subgraph stage2["LLM roles — Stage 2, pluggable backend"]
+        W2["Stage-2 worker<br/><small>OpenAI-compatible client —<br/>picks the role per task</small>"]
+        Local["vLLM on our GPUs<br/><small>LLM-A 7B/8B fast · LLM-B 14B/32B quality<br/>quantized, paged KV</small>"]
+        Groq["Groq Cloud API<br/><small>OpenAI-compatible · Llama/Qwen on LPU<br/>per-token, no GPU ops</small>"]
+        W2 -- "LLM_BACKEND=local" --> Local
+        W2 -- "LLM_BACKEND=groq" --> Groq
+    end
+
+    class W1,W2 svc
+    class Triton tool
+    class Local,Groq entry
+    classDef entry fill:#3d2f63,stroke:#8b6fd4,stroke-width:1.5px,color:#eef2f8
+    classDef svc fill:#2f4468,stroke:#5b7bb5,stroke-width:1.5px,color:#eef2f8
+    classDef store fill:#14564f,stroke:#2c9d8f,stroke-width:1.5px,color:#eef2f8
+    classDef tool fill:#1b2434,stroke:#5b7bb5,stroke-width:1px,color:#c9d6ea
+    classDef obs fill:#5a3410,stroke:#c9772e,stroke-width:1.5px,color:#f6e6d5
 ```
 
 - **NLP models** → **Triton Inference Server** (or ONNX Runtime / CTranslate2)

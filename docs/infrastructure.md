@@ -1,8 +1,14 @@
 # Infrastructure — GPU Sizing, Monitoring, Caching, Scaling
 
-Infrastructure and scaling for the smart layer from [what.txt](../what.txt): GPU
+Infrastructure and scaling for the smart layer in [architecture.md](architecture.md): GPU
 sizing, the monitoring stack, caching, and how it scales from 1k → 100k threads
 per batch. Cost figures live in [cost_estimation.md](cost_estimation.md).
+
+> **Implementation companions:** the stream topology these autoscalers key on is
+> [PIPELINE.md](PIPELINE.md) §1; the stores the assembler writes are
+> [ASSEMBLER.md](ASSEMBLER.md) §3; the telemetry is
+> [SYSTEM_MONITOR.md](SYSTEM_MONITOR.md).
+
 
 ---
 
@@ -140,21 +146,32 @@ interruptions (just re-queue from Kafka).
 
 ## 3. Monitoring stack
 
-```text
-            ┌──────────────────────────────────────────────────────┐
-   services │ OpenTelemetry SDK in every service/worker             │
-   & workers│  emits: metrics, logs, traces                         │
-            └───────┬───────────────┬───────────────┬──────────────┘
-                    │ metrics       │ logs          │ traces
-              ┌─────▼─────┐   ┌─────▼─────┐   ┌──────▼──────┐
-              │ Prometheus│   │   Loki    │   │   Jaeger    │
-              │ (scrape/  │   │ (logs)    │   │ (traces)    │
-              │  remote-w)│   │           │   │             │
-              └─────┬─────┘   └─────┬─────┘   └──────┬──────┘
-                    └───────────────┼────────────────┘
-                              ┌─────▼─────┐
-                              │  Grafana  │  dashboards + alerts
-                              └───────────┘
+```mermaid
+%%{init: {'theme':'base','themeVariables':{'fontFamily':'ui-sans-serif, system-ui, -apple-system, Roboto, Helvetica, Arial, sans-serif','fontSize':'14px','primaryColor':'#2f4468','primaryTextColor':'#eef2f8','primaryBorderColor':'#5b7bb5','secondaryColor':'#14564f','secondaryTextColor':'#eef2f8','secondaryBorderColor':'#2c9d8f','tertiaryColor':'#3d2f63','tertiaryTextColor':'#eef2f8','tertiaryBorderColor':'#8b6fd4','mainBkg':'#2f4468','nodeBorder':'#5b7bb5','nodeTextColor':'#eef2f8','lineColor':'#8fa1bd','textColor':'#eef2f8','titleColor':'#c9d6ea','clusterBkg':'#161e2e','clusterBorder':'#3f5573','edgeLabelBackground':'#1b2434','background':'transparent'}, 'flowchart':{'curve':'basis','padding':14,'nodeSpacing':45,'rankSpacing':55,'useMaxWidth':true}}}%%
+graph TD
+    Src["Every service and worker<br/><small>OpenTelemetry SDK — emits metrics, logs, traces</small>"]
+
+    Prom["Prometheus<br/><small>scrape / remote-write</small>"]
+    Loki["Loki<br/><small>logs</small>"]
+    Jaeger["Jaeger<br/><small>traces</small>"]
+
+    Src -- "metrics" --> Prom
+    Src -- "logs" --> Loki
+    Src -- "traces" --> Jaeger
+
+    Graf["Grafana<br/><small>dashboards + alerts</small>"]
+    Prom --> Graf
+    Loki --> Graf
+    Jaeger --> Graf
+
+    class Src svc
+    class Prom,Loki,Jaeger obs
+    class Graf entry
+    classDef entry fill:#3d2f63,stroke:#8b6fd4,stroke-width:1.5px,color:#eef2f8
+    classDef svc fill:#2f4468,stroke:#5b7bb5,stroke-width:1.5px,color:#eef2f8
+    classDef store fill:#14564f,stroke:#2c9d8f,stroke-width:1.5px,color:#eef2f8
+    classDef tool fill:#1b2434,stroke:#5b7bb5,stroke-width:1px,color:#c9d6ea
+    classDef obs fill:#5a3410,stroke:#c9772e,stroke-width:1.5px,color:#f6e6d5
 ```
 
 - **Prometheus** — metrics: queue depth/lag, posts/sec per stage, GPU

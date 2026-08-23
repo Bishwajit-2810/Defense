@@ -763,10 +763,11 @@ A privacy guarantee that evaporates when the database hiccups is not a guarantee
 
 ## 3b. The rest of the surface — every `/v1` path
 
-The app serves **49 distinct `/v1` paths / 61 method+path pairs** (20 Aug 2026;
+The app serves **52 distinct `/v1` paths / 64 method+path pairs** (23 Aug 2026;
 `python -c "from defense.services.api.main import app; ..."` over `app.routes` is
-the check). §2–§3 cover the ones you drive by hand. These are the remainder — all
-real routes, most of them what the dashboard calls:
+the check — regexing the router files instead gives garbage, because prefixes are
+set at `include_router`). §2–§3 cover the ones you drive by hand. These are the
+remainder — all real routes, most of them what the dashboard calls:
 
 | Method | Path | What it is |
 | :--- | :--- | :--- |
@@ -787,6 +788,12 @@ real routes, most of them what the dashboard calls:
 | `GET` | `/v1/reports/export_latest/export` | Generate a **fresh** grounded mass-reaction report and stream it straight back — no id round-trip. |
 | `GET` | `/v1/logs/services` | Which services are present in the log buffer (populates the Logs tab's filter). Every entry read `service: "-"` until 21 Aug 2026: the Redis sink is a stdlib handler reading `record.service`, while `setup_logging` binds the name through structlog's contextvars, which never touch the stdlib record. |
 | `GET` | `/v1/logs/stream` | Tail server-side logs over SSE. Needs an SSE ticket, like every other stream — see §3. **Replays `backfill` lines (default 60) before tailing**, subscribing to `logs:live` *before* reading `logs:recent` so no line can fall between the two — which means the line straddling the join arrives twice by construction. A client must dedupe (ts + level + message) and must open exactly one stream per view; two open streams double every line *and* the backfill, which is precisely how the Logs tab came to look like the backend was doing everything twice. |
+| `GET` | `/v1/analysis/overview` | Corpus-level rollup the **Overview** tab reads — post/comment totals, sentiment mix, and `corpus_coverage` (the aggregate 3.75% figure, alongside the per-post number the rest of the API shows). |
+| `GET`&nbsp;/&nbsp;`PUT` | `/v1/config/nlp` | Read or force the Stage-1 sentiment model. `PUT` with no model **clears** the override and returns to auto-routing by detected language; the override is a Redis key, so a restart returns to the deployed default. Slots whose checkpoint is a bare encoder report as unavailable rather than silently falling back. |
+| `GET` | `/v1/logs` | Read the buffered log lines (the non-streaming companion to `/v1/logs/stream`). `DELETE /v1/logs` clears the buffer. |
+| `GET` | `/v1/system/stats` | Full host + stack telemetry snapshot: per-core CPU, GPU, RAM, disks and I/O, Docker containers, datastore health and connection counts, Ollama's loaded models, per-stream queue depths **and DLQ depths**, the agent registry, and LLM role resolution. Backs the System Monitor drawer — [SYSTEM_MONITOR.md](SYSTEM_MONITOR.md). |
+| `GET` | `/v1/system/health` | The cheap version: component up/down plus status, for a header chip or a probe. |
+| `GET` | `/v1/system/stream` | The same telemetry over SSE. Needs an SSE ticket. |
 
 Two of these are easy to get wrong from the outside:
 
@@ -812,3 +819,22 @@ The dashboard (<http://127.0.0.1:8080>) exercises all of the above visually.
 Overview (usage/corpus stats), Posts, Jobs (live SSE progress, plus stop /
 resume / re-run / delete per job), Reports, Search, Agents, Chat, Pipeline,
 Trace, Warnings, Logs.
+
+---
+
+## 5. Which document explains each endpoint group
+
+| Endpoints | Document |
+| --------- | -------- |
+| `/v1/posts/upload`, `/v1/ingest/sync`, `DELETE /v1/posts/{id}` | [INGESTION.md](INGESTION.md) |
+| `/v1/analysis/*` — run, stream, cancel, resume, delete | [JOBS.md](JOBS.md) |
+| `/v1/analysis/{id}` result shape | [ASSEMBLER.md](ASSEMBLER.md) · [architecture.md](architecture.md) §6 |
+| `/v1/search` | [SEARCH.md](SEARCH.md) |
+| `/v1/reports/*` | [REPORTS.md](REPORTS.md) |
+| `/v1/chat/*` | [CHAT.md](CHAT.md) |
+| `/v1/agents/*` | [AGENTS.md](AGENTS.md) |
+| `/v1/auth/*` | [AUTH.md](AUTH.md) |
+| `/v1/config/llm`, `/v1/usage` | [LLM_BACKENDS.md](LLM_BACKENDS.md) |
+| `/v1/config/nlp` | [STAGE1_NLP.md](STAGE1_NLP.md) |
+| `/v1/pipeline/*` | [PIPELINE.md](PIPELINE.md) |
+| `/v1/system/*`, `/v1/logs/*`, `/v1/health`, `/v1/ready` | [SYSTEM_MONITOR.md](SYSTEM_MONITOR.md) |

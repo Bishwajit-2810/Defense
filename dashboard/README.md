@@ -7,9 +7,9 @@ computed here that the pipeline could not also report. The writes it does make
 are the deliberate ones: starting, stopping, resuming and deleting analysis jobs,
 generating a report, and the runtime config toggles.
 
-> **Comprehensive documentation:** See [DASHBOARD_UI.md](../DASHBOARD_UI.md) for
+> **Comprehensive documentation:** See [DASHBOARD_UI.md](../docs/DASHBOARD_UI.md) for
 > all 11 tabs, component architecture, SSE streaming, and authentication flow.
-> See [SYSTEM_MONITOR.md](../SYSTEM_MONITOR.md) for the hardware telemetry drawer
+> See [SYSTEM_MONITOR.md](../docs/SYSTEM_MONITOR.md) for the hardware telemetry drawer
 > and observability stack.
 
 This replaced the vanilla HTML/CSS/JS dashboard the design docs specify; that one
@@ -38,23 +38,23 @@ npm run preview    # serve the built bundle
 The API base URL is a **hardcoded constant**, `API_BASE` in
 [`src/utils/api.js`](src/utils/api.js) (`http://127.0.0.1:8001`) — there is no Vite
 proxy and no env var. Point it elsewhere by editing that line; see
-[`../run.md`](../run.md) for the ports.
+[`../run.md`](../docs/run.md) for the ports.
 
 ## Tests
 
 ```bash
 npm test -- --run  # vitest + @testing-library/react (jsdom) — `npm test` alone WATCHES
 npm run test:e2e   # Playwright; starts/reuses the Vite dev server on :5173 itself
-npm run lint       # oxlint — must stay at "Found 0 warnings and 0 errors"
+npm run lint       # oxlint — silent with exit 0; ANY output is a failure
 npm run build      # not optional before pushing, but it does NOT resolve JSX identifiers
-                   # (six chunks by design — vite.config.js splits the vendor libs)
+                   # (5 JS chunks + 1 CSS by design — vite.config.js splits the vendor libs)
 ```
 
 Seven unit-test files (one per page for AnalysisJobs / Posts / Search / Logs,
 plus `App`, `MarkdownView`, `sentiment`) and two Playwright specs — of which
 `tests/example.spec.ts` is the untouched scaffold that visits playwright.dev, so
 half a green e2e run is not about this dashboard. The backend suite and the
-opt-in groups are in [`../testing.md`](../testing.md).
+opt-in groups are in [`../testing.md`](../docs/testing.md).
 
 ## What to keep in mind when editing
 

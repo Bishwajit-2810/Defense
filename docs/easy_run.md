@@ -301,16 +301,16 @@ block). Full reference in [run.md](run.md).
   when you flip `MODEL_STUB_MODE=false` to demo against a corpus analysed in stub
   mode. It was derived from the vector's *dimension* until §13.2 — and the stub
   is the same 768 dims as a real vector, so every row read as real.
-- **Near-duplicate reuse** (on by default): a post within cosine `NEAR_DUP_THRESHOLD`
-  (0.97) of an already-analyzed one reuses that result and skips Stage-1/2.
-  `NEAR_DUP_DEDUP=false` to disable. (In stub mode only *identical* captions match —
+- **Near-duplicate reuse** (**off by default** — `NEAR_DUP_DEDUP=true` to enable):
+  a post within cosine `NEAR_DUP_THRESHOLD` (**0.95**) of an already-analyzed one
+  reuses that result and skips Stage-1/2. (In stub mode only *identical* captions match —
   which, since identical text hashes to an identical vector, means cosine 1.0 and a
   guaranteed hit.) The result is **composed, not copied** (§13.3): identity,
   engagement and reactions come from the new post, only the post-level analysis is
   reused, the comment thread is reported unanalysed, and `processing.reused_from`
   records the source. It goes through the assembler, so all three stores are
-  written. Still set `NEAR_DUP_DEDUP=false` for a run whose per-post *latency*
-  numbers you intend to quote — a reused post does no stage work.
+  written. Keep it off (the default) for any run whose per-post *latency* numbers
+  you intend to quote — a reused post does no stage work.
 - **Dead-letter queues**: failed messages retry then land on `<stream>:dlq`
   (`STAGE1_MAX_RETRIES`, `ASSEMBLER_MAX_RETRIES`).
 - **Tracing (OpenTelemetry → Jaeger/Loki)**: `uv sync --extra obs`, then
@@ -454,3 +454,17 @@ pkill -f "[p]ython -m defense" ; pkill -f "[p]ython __main__.py"
 pkill -f "[u]vicorn"           ; pkill -f "vite"
 ( cd /home/bk/code/defense/deploy && docker compose down )   # add -v to wipe data
 ```
+
+---
+
+## Next, by subject
+
+Once it is running, the per-component documents explain what you are watching —
+each ends in a table saying which of its claims are measured:
+
+[PIPELINE.md](PIPELINE.md) · [ROUTER.md](ROUTER.md) (the routing rate you will see
+in the logs) · [STAGE2_LLM.md](STAGE2_LLM.md) (why a run is slow, and which knob
+bounds it) · [JOBS.md](JOBS.md) (stop and resume) ·
+[LLM_BACKENDS.md](LLM_BACKENDS.md) (the local ⇄ Groq toggle) ·
+[DASHBOARD_UI.md](DASHBOARD_UI.md) · [SYSTEM_MONITOR.md](SYSTEM_MONITOR.md) ·
+and [run.md](run.md) for the full reference.

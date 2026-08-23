@@ -44,6 +44,45 @@ Bangla / English / Banglish)
 > One structural note for anyone re-running the audits: the JSON contracts moved
 > from `src/defense/libs/schemas/` to **`src/defense/contracts/schemas/`**.
 >
+> ### Addendum — 23 August 2026 (documentation pass, no findings reopened)
+>
+> Current repository: **181 Python files, 55,965 lines**; **1,396 tests collected
+> across 67 files — 1,393 pass, 3 skipped** (the `e2e`/`destructive` markers).
+> Dashboard: 78 unit tests across 12 files, 2 Playwright specs. The API serves
+> **52 distinct `/v1` paths / 64 method+path pairs** (was 49/61 on 20 Aug; the
+> three additions are the System Monitor routes `/v1/system/{stats,health,stream}`).
+>
+> Four documentation corrections, each verified against the code rather than
+> against another document:
+>
+> | Was documented as | Code says |
+> | --- | --- |
+> | Near-duplicate reuse is **on** by default at cosine **0.97** | `Settings.near_dup_dedup` defaults to `"false"` and `near_dup_threshold` to **`0.95`**; nothing in `.env`/`.env.example` overrides either. §13.3's *reasoning* about composing rather than copying is untouched and still correct — but the path **ships disabled**, so anywhere dedup is treated as a load-bearing cost lever, it is available rather than applied ([INGESTION.md](INGESTION.md) §3). |
+> | The router dispatches to `llm:stage2:queue` **or** `assembler:queue` | It `XADD`s **every** post to `llm:stage2:queue`. The chain is linear; the gate sets `task_flags.post_level_routed` and governs *how much work* a post gets, not which stage it reaches. `router.py`'s own module docstring still describes the old two-way dispatch and its `ASSEMBLER_QUEUE` constant is unused on the dispatch path ([PIPELINE.md](PIPELINE.md) §1). |
+> | Comment selection = "top-N by reaction count, emoji excluded" | Three steps: eligibility (textless kinds **plus** a `ROUTER_COMMENT_MIN_WORDS` floor), **deduplication** of repeat comment texts to their most-liked occurrence (`duplicate_of`), then top-N. `stage2_selection` gained `eligible` / `duplicates` / `cutoff_likes` / `top_likes` ([ROUTER.md](ROUTER.md) §5). |
+> | `what.txt` is "the authoritative source" | It was **removed** from the repository in commit `036e013`. Seven documents still linked to it; the links are dropped, as `social_media_llm_architecture_prompt.md`'s were. The input contract lives in [data_contract.md](data_contract.md), the design in [architecture.md](architecture.md). |
+>
+> **§7.2 is unchanged and still decisive.** `eval/gold/comments_gold_300.json`
+> holds 300 stratified rows and **0 adjudicated labels** (`_meta.labelled: 0`,
+> re-verified 23 Aug). There is still no measured accuracy for any labeller.
+>
+> One thing that *is* now measured, and was not when this document was written:
+> **retrieval**. `eval/score_retrieval.py` over 32 known-item queries reports
+> recall@10 = **0.8750** for `hybrid`/`chunked` against **0.1875** for stub
+> vectors — lower bounds, on a set with no human relevance judgement
+> ([evaluation.md](evaluation.md) §8.4). "No measured accuracy anywhere" is no
+> longer the right phrasing; "no measured *labelling* accuracy" is.
+>
+> Finally, every component now has an implementation document ending in an
+> evidence-class table — [PIPELINE.md](PIPELINE.md), [INGESTION.md](INGESTION.md),
+> [STAGE1_NLP.md](STAGE1_NLP.md), [ROUTER.md](ROUTER.md),
+> [STAGE2_LLM.md](STAGE2_LLM.md), [ASSEMBLER.md](ASSEMBLER.md),
+> [JOBS.md](JOBS.md), [LLM_BACKENDS.md](LLM_BACKENDS.md), [SEARCH.md](SEARCH.md),
+> [CHAT.md](CHAT.md), [REPORTS.md](REPORTS.md), [AUTH.md](AUTH.md). Findings below
+> are **not** duplicated into them; where a finding shaped current behaviour, the
+> feature document states the behaviour and the reason, and this document remains
+> the record of how it was found.
+>
 > ---
 >
 > ## Implementation status — 4 August 2026

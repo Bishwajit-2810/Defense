@@ -46,7 +46,10 @@
 >   applies the lock, and stamps the decision into the envelope.
 > - **Near-duplicate reuse composes rather than copies**, and reuses post-level
 >   analysis only: the comment thread of a caption-matched post is its own and is
->   reported unanalysed.
+>   reported unanalysed. It also **ships disabled** (`NEAR_DUP_DEDUP=false`) at a
+>   `0.95` threshold, so wherever this document treats dedup as a load-bearing
+>   cost lever, that lever is available rather than applied
+>   ([INGESTION.md](INGESTION.md) §3).
 > - **Cluster summarization delivers output.** The per-cluster LLM calls this
 >   document describes as the cost lever were, until §13.1, computed and then
 >   stripped by the API's response model.
@@ -56,12 +59,29 @@ layer. It consolidates the whole design — overview, architecture, alternatives
 models, infrastructure, cost, API, worked examples, deployment, and the phased
 roadmap — into one source of truth.
 
-> **Focused docs that supersede sections below:** For the dashboard UI, read
-> [DASHBOARD_UI.md](DASHBOARD_UI.md). For monitoring and observability, read
-> [SYSTEM_MONITOR.md](SYSTEM_MONITOR.md). For agents, read
-> [AGENTS.md](AGENTS.md). For MCP servers, read
-> [MCP_SERVERS.md](MCP_SERVERS.md). These focused docs are authoritative where
-> they diverge from the consolidated text below.
+> **Focused docs that supersede sections below.** Every component now has an
+> implementation document that describes what the code does and ends in an
+> evidence-class table. **They are authoritative wherever they diverge from the
+> consolidated text below**, which is a design document.
+>
+> | Sections below | Read instead |
+> | -------------- | ------------ |
+> | §5 Data flow, §6 Service breakdown, §10 Reliability | [PIPELINE.md](PIPELINE.md) — the stream topology, the single envelope, cancellation, retry/DLQ, live progress |
+> | §5 step 1–2 (ingest, dedup) | [INGESTION.md](INGESTION.md) |
+> | §5 step 4 (Stage 1) | [STAGE1_NLP.md](STAGE1_NLP.md) |
+> | §7 The hybrid routing strategy | [ROUTER.md](ROUTER.md) — **the chain is linear; there is no bypass hop** |
+> | §5 step 5–6 (Stage 2) | [STAGE2_LLM.md](STAGE2_LLM.md) |
+> | §8 Canonical output JSON, storage fan-out | [ASSEMBLER.md](ASSEMBLER.md) |
+> | §17 API — job control | [JOBS.md](JOBS.md) |
+> | §14 model roles, backend switching, cost counters | [LLM_BACKENDS.md](LLM_BACKENDS.md) |
+> | §14 RAG / retrieval | [SEARCH.md](SEARCH.md) · [RAG_STATE_AND_ROADMAP.md](RAG_STATE_AND_ROADMAP.md) |
+> | §11 Security | [AUTH.md](AUTH.md) |
+> | §17 chat / reports endpoints | [CHAT.md](CHAT.md) · [REPORTS.md](REPORTS.md) |
+> | Agentic layer | [AGENTS.md](AGENTS.md) · [MCP_SERVERS.md](MCP_SERVERS.md) |
+> | Dashboard UI | [DASHBOARD_UI.md](DASHBOARD_UI.md) |
+> | §15 Monitoring and observability | [SYSTEM_MONITOR.md](SYSTEM_MONITOR.md) |
+> | Evidence classes for every claim | [FEATURES.md](FEATURES.md) · [evaluation.md](evaluation.md) |
+> | §9 Technology stack | [TECH_STACK.md](TECH_STACK.md) — installed versions, not recommendations |
 
 ---
 
@@ -208,63 +228,73 @@ object per thread, reporting comment **coverage** since only a sample is shipped
 
 ## 4. High-level architecture
 
-```text
-                          ┌─────────────────────────────┐
-   Clients                │  Web Dashboard (HTML/CSS/JS) │
- (dashboard, uploaders)   │  consumers / 3rd-party apps  │
-                          └───────────────┬─────────────┘
-                                          │ HTTPS
-                          ┌───────────────▼─────────────┐
-                          │   API Gateway + LB           │  NGINX / K8s Ingress
-                          │   (TLS, routing, rate limit) │
-                          └───────────────┬─────────────┘
-                                          │
-              ┌───────────────────────────┼───────────────────────────┐
-              │                           │                           │
-     ┌────────▼────────┐        ┌─────────▼─────────┐       ┌─────────▼────────┐
-     │  Auth Service   │        │ Ingestion Service │       │ Reporting / Query│
-     │ (JWT, FastAPI)  │        │ (FastAPI, dedup,  │       │ + Agent Orchestr.│  FastAPI
-     └─────────────────┘        │  enqueue)         │       │ (read + agents)  │
-                                └─────────┬─────────┘       └────────┬─────────┘
-                                          │ produce                  │ read / agent tools
-                                ┌─────────▼─────────┐       ┌─────────▼─────────────────┐
-                                │   Message Bus     │       │ Agentic layer: AI agents  │
-                                │ Kafka / Redis Str │       │ (LLM-B/VLM) + MCP servers │
-                                │  (partitioned)    │       │ analytics·retrieval·ingest│
-                                └─────────┬─────────┘       └─────────┬─────────────────┘
-                                          │ consume                  │ read
+```mermaid
+%%{init: {'theme':'base','themeVariables':{'fontFamily':'ui-sans-serif, system-ui, -apple-system, Roboto, Helvetica, Arial, sans-serif','fontSize':'14px','primaryColor':'#2f4468','primaryTextColor':'#eef2f8','primaryBorderColor':'#5b7bb5','secondaryColor':'#14564f','secondaryTextColor':'#eef2f8','secondaryBorderColor':'#2c9d8f','tertiaryColor':'#3d2f63','tertiaryTextColor':'#eef2f8','tertiaryBorderColor':'#8b6fd4','mainBkg':'#2f4468','nodeBorder':'#5b7bb5','nodeTextColor':'#eef2f8','lineColor':'#8fa1bd','textColor':'#eef2f8','titleColor':'#c9d6ea','clusterBkg':'#161e2e','clusterBorder':'#3f5573','edgeLabelBackground':'#1b2434','background':'transparent'}, 'flowchart':{'curve':'basis','padding':14,'nodeSpacing':45,'rankSpacing':55,'useMaxWidth':true}}}%%
+graph TD
+    subgraph clients["Clients"]
+        Dash["Web dashboard<br/><small>React 19 + Vite + Tailwind</small>"]
+        Consumers["Downstream consumers<br/><small>3rd-party apps</small>"]
+    end
 
+    GW["API gateway + LB<br/><small>NGINX / K8s Ingress — TLS, routing, rate limit</small>"]
+    Dash -- "HTTPS" --> GW
+    Consumers -- "HTTPS" --> GW
 
-        │  STAGE 1 — Heavy LLM worker (GPU/Ollama), horizontally scaled      │
-        │  lang detect · NER · summarization (gemma) · text features         │
-        └─────────────────────────────────┬──────────────────────────────────┘
-                                          │ writes features + summary
-                                ┌─────────▼─────────┐
-                                │ Router / Triage   │  emoji filter &
-                                │ (spam filter,     │  parallel dispatch
-                                │  dispatch)        │
-                                └─────┬─────────────┘
-                                      │
-                              ┌───────▼───────────────────────────┐
-                              │ STAGE 2 — Parallel Execution      │
-                              │ Lane A: summary / post-type /      │
-                              │         insight (gated)            │
-                              │ Lane B: comment ensemble — 7 cheap │
-                              │   heads + LLM stance + dedup cache │
-                              │   over the router's top-N comments │
-                              └───────┬───────────────────────────┘
-                              └─────────────┤
-                                ┌───────────▼───────────┐
-                                │  Result Assembler      │  builds final JSON
-                                │  + JSON schema validate│
-                                └───────────┬───────────┘
-                                            │ fan-out writes
-        ┌──────────────────┬────────────────┼────────────────┬───────────────┐
-   ┌────▼───────────┐   ┌──▼─────────┐      ┌▼────────────┐  ┌▼──────────┐
-   │PostgreSQL      │   │ ClickHouse │      │   Redis     │  │  Object   │
-   │ ops+jobs+vector│   │ analytics  │      │ cache/dedup │  │  storage  │
-   │ (pgvector)     │   └────────────┘      └─────────────┘  └───────────┘
-   └────────────────┘
+    subgraph api["FastAPI services"]
+        Auth["Auth<br/><small>JWT · API keys · SSE tickets</small>"]
+        Ingest["Ingestion<br/><small>validate · dedup · enqueue</small>"]
+        Report["Reporting / query<br/><small>read APIs · report generation</small>"]
+    end
+    GW --> Auth
+    GW --> Ingest
+    GW --> Report
+
+    Bus["Message bus<br/><small>Redis Streams (MVP) · Kafka (prod), partitioned</small>"]
+    Ingest -- "produce" --> Bus
+
+    subgraph pipeline["Per-post pipeline"]
+        S1["Stage 1 — cheap NLP + fast LLM<br/><small>language · sentiment · emotion · NER · toxicity<br/>summary (gemma3:4b when STAGE1_LLM=true)</small>"]
+        Router["Router / triage<br/><small>post-level gate + comment selection</small>"]
+        S2["Stage 2 — two lanes<br/><small>Lane A: summary / post_type / insight (gated)<br/>Lane B: comment ensemble — 7 heads + LLM stance</small>"]
+        Asm["Result assembler<br/><small>build canonical JSON + schema validate</small>"]
+    end
+
+    Bus -- "consume" --> S1
+    S1 -- "features + summary" --> Router
+    Router -- "every post; task_flags carry the gate" --> S2
+    S2 --> Asm
+
+    subgraph agentlayer["Agentic insight layer — corpus tier"]
+        Agents["9 AI agents<br/><small>agent LLM role</small>"]
+        MCP["MCP servers<br/><small>analytics · retrieval · ingest</small>"]
+    end
+    Report -- "agent runs" --> Agents
+    Agents --> MCP
+
+    subgraph stores["Storage, split by access pattern"]
+        PG[("PostgreSQL + pgvector<br/><small>ops · jobs · vectors</small>")]
+        CH[("ClickHouse<br/><small>analytics</small>")]
+        RD[("Redis<br/><small>cache · dedup · counters</small>")]
+        OS[("Object storage<br/><small>raw payloads · reports</small>")]
+    end
+
+    Asm -- "fan-out writes" --> PG
+    Asm --> CH
+    Asm --> OS
+    Asm --> RD
+    MCP -- "read" --> PG
+    MCP -- "read" --> CH
+    Report -- "read" --> PG
+
+    class Dash,Consumers entry
+    class GW,Auth,Ingest,Report,S1,Router,S2,Asm,Agents,MCP svc
+    class Bus tool
+    class PG,CH,RD,OS store
+    classDef entry fill:#3d2f63,stroke:#8b6fd4,stroke-width:1.5px,color:#eef2f8
+    classDef svc fill:#2f4468,stroke:#5b7bb5,stroke-width:1.5px,color:#eef2f8
+    classDef store fill:#14564f,stroke:#2c9d8f,stroke-width:1.5px,color:#eef2f8
+    classDef tool fill:#1b2434,stroke:#5b7bb5,stroke-width:1px,color:#c9d6ea
+    classDef obs fill:#5a3410,stroke:#c9772e,stroke-width:1.5px,color:#f6e6d5
 ```
 
 The **Router/Triage** between Stage 1 and Stage 2 is the heart of the cost
@@ -371,18 +401,39 @@ runtime per the routing rules in §7.
 
 ## 7. The hybrid routing strategy (core cost control)
 
-```text
-                     post features + confidences (from Stage 1)
-                                      │
-                          ┌───────────▼───────────┐
-                          │  Router decision tree  │
-                          └───────────┬───────────┘
-        ┌──────────────────────────────┼──────────────────────────────┐
-        │ all required fields           │ low confidence OR             │ LLM-only task
-        │ confident, no LLM task        │ ambiguous mixed-lang          │ requested
-        ▼                               ▼                               ▼
-   COMPLETE (no LLM)            LLM verify/refine               LLM generate
-   84% of posts (measured)     16% (measured)                  (summary/insight/report)
+```mermaid
+%%{init: {'theme':'base','themeVariables':{'fontFamily':'ui-sans-serif, system-ui, -apple-system, Roboto, Helvetica, Arial, sans-serif','fontSize':'14px','primaryColor':'#2f4468','primaryTextColor':'#eef2f8','primaryBorderColor':'#5b7bb5','secondaryColor':'#14564f','secondaryTextColor':'#eef2f8','secondaryBorderColor':'#2c9d8f','tertiaryColor':'#3d2f63','tertiaryTextColor':'#eef2f8','tertiaryBorderColor':'#8b6fd4','mainBkg':'#2f4468','nodeBorder':'#5b7bb5','nodeTextColor':'#eef2f8','lineColor':'#8fa1bd','textColor':'#eef2f8','titleColor':'#c9d6ea','clusterBkg':'#161e2e','clusterBorder':'#3f5573','edgeLabelBackground':'#1b2434','background':'transparent'}, 'flowchart':{'curve':'basis','padding':14,'nodeSpacing':45,'rankSpacing':55,'useMaxWidth':true}}}%%
+graph TD
+    In["Post features + confidences<br/><small>from Stage 1</small>"]
+    Gate{"Router decision<br/><small>six gates — any one fires</small>"}
+    In --> Gate
+
+    A["No post-level LLM work<br/><small>84% of posts (measured)</small>"]
+    B["Post-level tasks run<br/><small>16% (measured, gemma3:4b Stage 1)</small>"]
+
+    Gate -- "all required fields confident,<br/>no LLM-only task requested" --> A
+    Gate -- "low confidence · unknown post_type ·<br/>high toxicity · long code-mixed" --> B
+
+    Comments["Comment ensemble<br/><small>runs for EVERY post, gated or not</small>"]
+    A --> Comments
+    B --> Comments
+
+    Out["Stage 2 → assembler"]
+    Comments --> Out
+    B -- "summary · post_type · insight" --> Out
+
+    Note["The gate governs 30-55% of spend.<br/><small>85-96% of LLM calls are comment-level.</small>"]
+    Comments -.-> Note
+
+    class In entry
+    class Gate tool
+    class A,B,Comments,Out svc
+    class Note obs
+    classDef entry fill:#3d2f63,stroke:#8b6fd4,stroke-width:1.5px,color:#eef2f8
+    classDef svc fill:#2f4468,stroke:#5b7bb5,stroke-width:1.5px,color:#eef2f8
+    classDef store fill:#14564f,stroke:#2c9d8f,stroke-width:1.5px,color:#eef2f8
+    classDef tool fill:#1b2434,stroke:#5b7bb5,stroke-width:1px,color:#c9d6ea
+    classDef obs fill:#5a3410,stroke:#c9772e,stroke-width:1.5px,color:#f6e6d5
 ```
 
 _Measured on the 43-post working corpus with the shipped Stage-1 LLM; 26%/74%
@@ -921,19 +972,31 @@ a switch never routes their data to Groq.
 
 ### 14.3 Model serving architecture
 
-```text
-   NLP fleet (Stage 1)                  LLM roles (Stage 2) — pluggable backend
- ┌───────────────────────┐          ┌──────────────────────────────────────────┐
- │ Triton / ONNX Runtime │          │  Stage-2 worker (OpenAI-compatible client) │
- │  + CTranslate2        │          │      picks role LLM-A / LLM-B by task      │
- │  dynamic batching     │          └───────────────┬────────────────┬───────────┘
- │  many small models    │            LLM_BACKEND=local│        =groq │
- └──────────┬────────────┘          ┌─────────────────▼──┐   ┌───────▼──────────┐
-            │ gRPC/HTTP             │ vLLM (our GPUs):    │   │ Groq Cloud API   │
-   Stage-1 worker pulls batch       │  LLM-A 7B/8B fast   │   │ OpenAI-compatible│
-   from queue, calls Triton         │  LLM-B 14B/32B qual │   │ Llama/Qwen on LPU│
-                                     │  quantized, paged KV│   │ per-token, no GPU│
-                                     └─────────────────────┘   └──────────────────┘
+```mermaid
+%%{init: {'theme':'base','themeVariables':{'fontFamily':'ui-sans-serif, system-ui, -apple-system, Roboto, Helvetica, Arial, sans-serif','fontSize':'14px','primaryColor':'#2f4468','primaryTextColor':'#eef2f8','primaryBorderColor':'#5b7bb5','secondaryColor':'#14564f','secondaryTextColor':'#eef2f8','secondaryBorderColor':'#2c9d8f','tertiaryColor':'#3d2f63','tertiaryTextColor':'#eef2f8','tertiaryBorderColor':'#8b6fd4','mainBkg':'#2f4468','nodeBorder':'#5b7bb5','nodeTextColor':'#eef2f8','lineColor':'#8fa1bd','textColor':'#eef2f8','titleColor':'#c9d6ea','clusterBkg':'#161e2e','clusterBorder':'#3f5573','edgeLabelBackground':'#1b2434','background':'transparent'}, 'flowchart':{'curve':'basis','padding':14,'nodeSpacing':45,'rankSpacing':55,'useMaxWidth':true}}}%%
+graph TD
+    subgraph stage1["NLP fleet — Stage 1"]
+        Triton["Triton / ONNX Runtime<br/>+ CTranslate2<br/><small>dynamic batching · INT8/FP16<br/>many small models share a GPU</small>"]
+        W1["Stage-1 worker<br/><small>pulls a batch from the queue,<br/>calls Triton over gRPC/HTTP</small>"]
+        W1 --> Triton
+    end
+
+    subgraph stage2["LLM roles — Stage 2, pluggable backend"]
+        W2["Stage-2 worker<br/><small>OpenAI-compatible client —<br/>picks the role per task</small>"]
+        Local["vLLM on our GPUs<br/><small>LLM-A 7B/8B fast · LLM-B 14B/32B quality<br/>quantized, paged KV</small>"]
+        Groq["Groq Cloud API<br/><small>OpenAI-compatible · Llama/Qwen on LPU<br/>per-token, no GPU ops</small>"]
+        W2 -- "LLM_BACKEND=local" --> Local
+        W2 -- "LLM_BACKEND=groq" --> Groq
+    end
+
+    class W1,W2 svc
+    class Triton tool
+    class Local,Groq entry
+    classDef entry fill:#3d2f63,stroke:#8b6fd4,stroke-width:1.5px,color:#eef2f8
+    classDef svc fill:#2f4468,stroke:#5b7bb5,stroke-width:1.5px,color:#eef2f8
+    classDef store fill:#14564f,stroke:#2c9d8f,stroke-width:1.5px,color:#eef2f8
+    classDef tool fill:#1b2434,stroke:#5b7bb5,stroke-width:1px,color:#c9d6ea
+    classDef obs fill:#5a3410,stroke:#c9772e,stroke-width:1.5px,color:#f6e6d5
 ```
 
 - **NLP models** → **Triton Inference Server** (or ONNX Runtime / CTranslate2) with
@@ -1094,19 +1157,32 @@ interruptions (re-queue from Kafka).
 
 ### 15.3 Monitoring stack
 
-```text
-            ┌──────────────────────────────────────────────────────┐
-   services │ OpenTelemetry SDK in every service/worker             │
-   & workers│  emits: metrics, logs, traces                         │
-            └───────┬───────────────┬───────────────┬──────────────┘
-                    │ metrics       │ logs          │ traces
-              ┌─────▼─────┐   ┌─────▼─────┐   ┌──────▼──────┐
-              │ Prometheus│   │   Loki    │   │   Jaeger    │
-              └─────┬─────┘   └─────┬─────┘   └──────┬──────┘
-                    └───────────────┼────────────────┘
-                              ┌─────▼─────┐
-                              │  Grafana  │  dashboards + alerts
-                              └───────────┘
+```mermaid
+%%{init: {'theme':'base','themeVariables':{'fontFamily':'ui-sans-serif, system-ui, -apple-system, Roboto, Helvetica, Arial, sans-serif','fontSize':'14px','primaryColor':'#2f4468','primaryTextColor':'#eef2f8','primaryBorderColor':'#5b7bb5','secondaryColor':'#14564f','secondaryTextColor':'#eef2f8','secondaryBorderColor':'#2c9d8f','tertiaryColor':'#3d2f63','tertiaryTextColor':'#eef2f8','tertiaryBorderColor':'#8b6fd4','mainBkg':'#2f4468','nodeBorder':'#5b7bb5','nodeTextColor':'#eef2f8','lineColor':'#8fa1bd','textColor':'#eef2f8','titleColor':'#c9d6ea','clusterBkg':'#161e2e','clusterBorder':'#3f5573','edgeLabelBackground':'#1b2434','background':'transparent'}, 'flowchart':{'curve':'basis','padding':14,'nodeSpacing':45,'rankSpacing':55,'useMaxWidth':true}}}%%
+graph TD
+    Src["Every service and worker<br/><small>OpenTelemetry SDK — emits metrics, logs, traces</small>"]
+
+    Prom["Prometheus<br/><small>scrape / remote-write</small>"]
+    Loki["Loki<br/><small>logs</small>"]
+    Jaeger["Jaeger<br/><small>traces</small>"]
+
+    Src -- "metrics" --> Prom
+    Src -- "logs" --> Loki
+    Src -- "traces" --> Jaeger
+
+    Graf["Grafana<br/><small>dashboards + alerts</small>"]
+    Prom --> Graf
+    Loki --> Graf
+    Jaeger --> Graf
+
+    class Src svc
+    class Prom,Loki,Jaeger obs
+    class Graf entry
+    classDef entry fill:#3d2f63,stroke:#8b6fd4,stroke-width:1.5px,color:#eef2f8
+    classDef svc fill:#2f4468,stroke:#5b7bb5,stroke-width:1.5px,color:#eef2f8
+    classDef store fill:#14564f,stroke:#2c9d8f,stroke-width:1.5px,color:#eef2f8
+    classDef tool fill:#1b2434,stroke:#5b7bb5,stroke-width:1px,color:#c9d6ea
+    classDef obs fill:#5a3410,stroke:#c9772e,stroke-width:1.5px,color:#f6e6d5
 ```
 
 - **Prometheus** — queue depth/lag, posts/sec per stage, GPU utilization (DCGM
@@ -1832,22 +1908,64 @@ Enterprise.
 
 ### 19.2 MVP architecture (Docker Compose)
 
-Single host with one GPU. One `docker-compose.yml` brings up:
+Single host with one GPU. The **target** Compose shape is below; the checked-in
+`deploy/docker-compose.yml` differs (no `gateway`/NGINX, no `vllm`, different
+worker names — **19 services**) — see [deployment.md](deployment.md) §2b.
 
-```text
-services:
-  gateway        (NGINX)            → TLS, routing, rate limit
-  api            (FastAPI)          → auth + ingestion + reporting (combined for MVP)
-  worker-nlp     (Python)           → Stage-1 text suite + vision (image sentiment, OCR, GPU)
-  worker-llm     (Python)           → Stage-2 worker (text LLM + VLM); LLM_BACKEND=local|groq
-  vllm           (vLLM, optional)   → local backend only: LLM-A (+LLM-B) + VLM on GPU
-  agent-orch     (FastAPI)          → AI agents (insight/deep-dive/alerting) → LLM-B + MCP [Phase 2]
-  mcp-servers    (FastAPI + MCP)    → analytics-mcp · retrieval-mcp · ingest-mcp (internal) [Phase 2]
-  redis          (cache/queue)      → Redis Streams = bus + cache + dedup
-  postgres       (ops + jobs + vectors) → pgvector/pgvector:pg16 image; analysis_results.embedding vector(768)
-  clickhouse     (analytics)
-  minio          (object storage)
-  prometheus + grafana + loki       → monitoring
+```mermaid
+%%{init: {'theme':'base','themeVariables':{'fontFamily':'ui-sans-serif, system-ui, -apple-system, Roboto, Helvetica, Arial, sans-serif','fontSize':'14px','primaryColor':'#2f4468','primaryTextColor':'#eef2f8','primaryBorderColor':'#5b7bb5','secondaryColor':'#14564f','secondaryTextColor':'#eef2f8','secondaryBorderColor':'#2c9d8f','tertiaryColor':'#3d2f63','tertiaryTextColor':'#eef2f8','tertiaryBorderColor':'#8b6fd4','mainBkg':'#2f4468','nodeBorder':'#5b7bb5','nodeTextColor':'#eef2f8','lineColor':'#8fa1bd','textColor':'#eef2f8','titleColor':'#c9d6ea','clusterBkg':'#161e2e','clusterBorder':'#3f5573','edgeLabelBackground':'#1b2434','background':'transparent'}, 'flowchart':{'curve':'basis','padding':14,'nodeSpacing':45,'rankSpacing':55,'useMaxWidth':true}}}%%
+graph TD
+    subgraph edge["Edge"]
+        GW["gateway<br/><small>NGINX — TLS, routing, rate limit</small>"]
+    end
+
+    subgraph app["Application"]
+        API["api<br/><small>FastAPI — auth + ingestion + reporting,<br/>combined for the MVP</small>"]
+        WN["worker-nlp<br/><small>Stage-1 text suite + vision (GPU)</small>"]
+        WL["worker-llm<br/><small>Stage-2 text LLM + VLM<br/>LLM_BACKEND=local|groq</small>"]
+        VLLM["vllm<br/><small>optional, local backend only:<br/>LLM-A (+LLM-B) + VLM on GPU</small>"]
+    end
+
+    subgraph phase2["Phase 2"]
+        AO["agent-orch<br/><small>FastAPI — AI agents</small>"]
+        MCPS["mcp-servers<br/><small>analytics · retrieval · ingest</small>"]
+    end
+
+    subgraph data["Data"]
+        RD[("redis<br/><small>Streams = bus + cache + dedup</small>")]
+        PG[("postgres<br/><small>ops + jobs + vectors via pgvector</small>")]
+        CH[("clickhouse<br/><small>analytics</small>")]
+        MO[("minio<br/><small>object storage</small>")]
+    end
+
+    subgraph mon["Monitoring"]
+        PGF["prometheus + grafana + loki"]
+    end
+
+    GW --> API
+    API --> RD
+    RD --> WN
+    WN --> RD
+    RD --> WL
+    WL --> VLLM
+    WL --> PG
+    WL --> CH
+    WL --> MO
+    API --> AO
+    AO --> MCPS
+    MCPS --> PG
+    MCPS --> CH
+
+    class GW entry
+    class API,WN,WL,AO,MCPS svc
+    class VLLM entry
+    class RD,PG,CH,MO store
+    class PGF obs
+    classDef entry fill:#3d2f63,stroke:#8b6fd4,stroke-width:1.5px,color:#eef2f8
+    classDef svc fill:#2f4468,stroke:#5b7bb5,stroke-width:1.5px,color:#eef2f8
+    classDef store fill:#14564f,stroke:#2c9d8f,stroke-width:1.5px,color:#eef2f8
+    classDef tool fill:#1b2434,stroke:#5b7bb5,stroke-width:1px,color:#c9d6ea
+    classDef obs fill:#5a3410,stroke:#c9772e,stroke-width:1.5px,color:#f6e6d5
 ```
 
 - Queue = **Redis Streams** (no separate Kafka yet).
@@ -1862,42 +1980,65 @@ services:
 
 ### 19.3 Production architecture (Kubernetes)
 
-```text
-            Internet
-               │ TLS
-        ┌──────▼───────┐
-        │  Ingress     │  NGINX ingress controller (+ optional Linkerd mesh)
-        │  Controller  │
-        └──────┬───────┘
-   ┌───────────┼───────────────────────────┐
-   │           │                           │
-┌──▼───┐  ┌────▼─────┐  ┌──────────┐  ┌────▼──────┐
-│auth  │  │ingestion │  │reporting │  │user-mgmt  │   Deployments (HPA on CPU/RPS)
-│(pods)│  │ (pods)   │  │ (pods)   │  │ (pods)    │
-└──────┘  └────┬─────┘  └────┬─────┘  └───────────┘
-               │ produce      │ read
-          ┌────▼──────────────▼────┐
-          │   Kafka (StatefulSet/   │  partitioned topics: ingest, llm, dlq
-          │   operator, 3 brokers)  │
-          └────┬───────────────┬────┘
-        consume│               │consume
-   ┌───────────▼──┐      ┌─────▼─────────┐
-   │ nlp-workers  │      │ llm-workers   │   Deployments on GPU node pools
-   │ (GPU pool A) │      │ (GPU pool B)  │   KEDA scales on Kafka lag
-   │ KEDA-scaled  │      │ KEDA-scaled   │
-   └──────┬───────┘      └─────┬─────────┘
-          │ Triton svc          │ vLLM svc
-   ┌──────▼───────┐      ┌──────▼────────────────────┐
-   │ triton (GPU) │      │ Stage-2 backend:          │   LLM_BACKEND switch:
-   └──────────────┘      │  vllm A+B (GPU)  ⇄  Groq  │   local (in-cluster GPU)
-                         │                    (API)  │   or groq (egress HTTPS)
-                         └───────────────────────────┘
-          │ writes (assembler Deployment) │
-   ┌──────▼────────────────┬──────────┬──────────────┬───────────┐
-   │ postgres + pgvector    │clickhouse│              │ minio/S3  │  StatefulSets / managed
-   │ (HA, replica; vectors) │(cluster) │              │           │
-   └────────────────────────┴──────────┴──────────────┴───────────┘
-        observability namespace: prometheus, grafana, loki, jaeger, otel-collector
+```mermaid
+%%{init: {'theme':'base','themeVariables':{'fontFamily':'ui-sans-serif, system-ui, -apple-system, Roboto, Helvetica, Arial, sans-serif','fontSize':'14px','primaryColor':'#2f4468','primaryTextColor':'#eef2f8','primaryBorderColor':'#5b7bb5','secondaryColor':'#14564f','secondaryTextColor':'#eef2f8','secondaryBorderColor':'#2c9d8f','tertiaryColor':'#3d2f63','tertiaryTextColor':'#eef2f8','tertiaryBorderColor':'#8b6fd4','mainBkg':'#2f4468','nodeBorder':'#5b7bb5','nodeTextColor':'#eef2f8','lineColor':'#8fa1bd','textColor':'#eef2f8','titleColor':'#c9d6ea','clusterBkg':'#161e2e','clusterBorder':'#3f5573','edgeLabelBackground':'#1b2434','background':'transparent'}, 'flowchart':{'curve':'basis','padding':14,'nodeSpacing':45,'rankSpacing':55,'useMaxWidth':true}}}%%
+graph TD
+    Net["Internet"]
+    Ing["Ingress controller<br/><small>NGINX (+ optional Linkerd mesh)</small>"]
+    Net -- "TLS" --> Ing
+
+    subgraph deploys["Deployments — HPA on CPU/RPS"]
+        A1["auth"]
+        A2["ingestion"]
+        A3["reporting"]
+        A4["user-mgmt"]
+    end
+    Ing --> A1
+    Ing --> A2
+    Ing --> A3
+    Ing --> A4
+
+    Kafka["Kafka<br/><small>StatefulSet / operator, 3 brokers<br/>topics: ingest · llm · dlq</small>"]
+    A2 -- "produce" --> Kafka
+    A3 -- "read" --> Kafka
+
+    subgraph gpupools["GPU node pools — KEDA scales on Kafka lag"]
+        NLPW["nlp-workers<br/><small>GPU pool A</small>"]
+        LLMW["llm-workers<br/><small>GPU pool B</small>"]
+    end
+    Kafka -- "consume" --> NLPW
+    Kafka -- "consume" --> LLMW
+
+    TritonSvc["triton service<br/><small>GPU</small>"]
+    Backend["Stage-2 backend<br/><small>vLLM A+B in-cluster GPU ⇄ Groq API<br/>LLM_BACKEND switch: local or egress HTTPS</small>"]
+    NLPW --> TritonSvc
+    LLMW --> Backend
+
+    Asm["assembler<br/><small>Deployment</small>"]
+    LLMW --> Asm
+
+    subgraph data["StatefulSets / managed"]
+        PG[("postgres + pgvector<br/><small>HA, replica, vectors</small>")]
+        CH[("clickhouse<br/><small>cluster</small>")]
+        S3[("minio / S3")]
+    end
+    Asm -- "writes" --> PG
+    Asm --> CH
+    Asm --> S3
+
+    Obs["observability namespace<br/><small>prometheus · grafana · loki · jaeger · otel-collector</small>"]
+
+    class Net entry
+    class Ing,A1,A2,A3,A4,NLPW,LLMW,Asm svc
+    class Kafka,TritonSvc tool
+    class Backend entry
+    class PG,CH,S3 store
+    class Obs obs
+    classDef entry fill:#3d2f63,stroke:#8b6fd4,stroke-width:1.5px,color:#eef2f8
+    classDef svc fill:#2f4468,stroke:#5b7bb5,stroke-width:1.5px,color:#eef2f8
+    classDef store fill:#14564f,stroke:#2c9d8f,stroke-width:1.5px,color:#eef2f8
+    classDef tool fill:#1b2434,stroke:#5b7bb5,stroke-width:1px,color:#c9d6ea
+    classDef obs fill:#5a3410,stroke:#c9772e,stroke-width:1.5px,color:#f6e6d5
 ```
 
 ### 19.4 Kubernetes deployment plan

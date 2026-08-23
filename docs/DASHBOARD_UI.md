@@ -22,39 +22,52 @@ The Defense dashboard is a modern Single Page Application (SPA) built with perfo
 ## 2. Component Hierarchy
 
 ```mermaid
+%%{init: {'theme':'base','themeVariables':{'fontFamily':'ui-sans-serif, system-ui, -apple-system, Roboto, Helvetica, Arial, sans-serif','fontSize':'14px','primaryColor':'#2f4468','primaryTextColor':'#eef2f8','primaryBorderColor':'#5b7bb5','secondaryColor':'#14564f','secondaryTextColor':'#eef2f8','secondaryBorderColor':'#2c9d8f','tertiaryColor':'#3d2f63','tertiaryTextColor':'#eef2f8','tertiaryBorderColor':'#8b6fd4','mainBkg':'#2f4468','nodeBorder':'#5b7bb5','nodeTextColor':'#eef2f8','lineColor':'#8fa1bd','textColor':'#eef2f8','titleColor':'#c9d6ea','clusterBkg':'#161e2e','clusterBorder':'#3f5573','edgeLabelBackground':'#1b2434','background':'transparent'}, 'flowchart':{'curve':'basis','padding':14,'nodeSpacing':45,'rankSpacing':55,'useMaxWidth':true}}}%%
 graph TD
-    App[App.jsx] --> Header
+    App["App.jsx<br/><small>activeTab state · auth gate</small>"]
+    Welcome["Welcome.jsx<br/><small>login / signup</small>"]
+    Header["Header<br/><small>LLM + NLP backend pills</small>"]
+    NavTabs["NavTabs<br/><small>the tab list of record</small>"]
+
+    App --> Welcome
+    App --> Header
     App --> NavTabs
-    
-    %% Tab Pages
-    App --> Overview[Overview Page]
-    App --> Posts[Posts Page]
-    App --> AnalysisJobs[Analysis Jobs Page]
-    App --> Reports[Reports Page]
-    App --> Search[Search Page]
-    App --> Agents[Agents Page]
-    App --> Chat[Chat Page]
-    App --> Pipeline[Pipeline Page]
-    App --> Trace[Trace Page]
-    App --> Warnings[Warnings Page]
-    App --> Logs[Logs Page]
-    
-    %% Shared UI Elements
-    App --> SystemMetricsChip
-    App --> SystemMonitorDrawer
-    
-    %% Common Components used across pages
-    Posts --> PostModal
-    Trace --> PostModal
-    Warnings --> PostModal
-    
-    Chat --> MarkdownView
-    Agents --> MarkdownView
-    
-    %% Hooks and Utils
-    App -.-> Hook[useSystemMetrics Hook]
-    App -.-> API[api.js]
-    App -.-> Utils[coverage.js / sentiment.js]
+
+    Pages["11 tab pages<br/><small>Overview · Posts · Analysis Jobs · Reports · Search<br/>Agents · Chat · Pipeline · Trace · Warnings · Logs</small>"]
+    NavTabs -- "activeTab" --> Pages
+
+    subgraph shared["Shared components"]
+        PostModal["PostModal<br/><small>Posts · Trace · Warnings</small>"]
+        MarkdownView["MarkdownView<br/><small>Chat · Agents</small>"]
+        SystemMetricsChip["SystemMetricsChip"]
+        SystemMonitorDrawer["SystemMonitorDrawer"]
+    end
+
+    Pages --> PostModal
+    Pages --> MarkdownView
+    Header --> SystemMetricsChip
+    SystemMetricsChip --> SystemMonitorDrawer
+
+    subgraph libs["Hooks and utils"]
+        Hook["useSystemMetrics"]
+        API["utils/api.js<br/><small>hardcoded API_BASE</small>"]
+        Utils["coverage.js · sentiment.js"]
+    end
+
+    SystemMetricsChip -.-> Hook
+    Pages -.-> API
+    Pages -.-> Utils
+
+    classDef entry fill:#3d2f63,stroke:#8b6fd4,stroke-width:1.5px,color:#eef2f8
+    classDef svc fill:#2f4468,stroke:#5b7bb5,stroke-width:1.5px,color:#eef2f8
+    classDef store fill:#14564f,stroke:#2c9d8f,stroke-width:1.5px,color:#eef2f8
+    classDef tool fill:#1b2434,stroke:#5b7bb5,stroke-width:1px,color:#c9d6ea
+    classDef obs fill:#5a3410,stroke:#c9772e,stroke-width:1.5px,color:#f6e6d5
+
+    class App,Welcome entry
+    class Header,NavTabs,Pages svc
+    class PostModal,MarkdownView,SystemMetricsChip,SystemMonitorDrawer tool
+    class Hook,API,Utils tool
 ```
 
 ## 3. Authentication Flow
@@ -220,19 +233,46 @@ Custom markdown rendering engine.
 ## 6. State Management & Real-Time Architecture
 
 ```mermaid
+%%{init: {'theme':'base','themeVariables':{'fontFamily':'ui-sans-serif, system-ui, -apple-system, Roboto, Helvetica, Arial, sans-serif','fontSize':'14px','primaryColor':'#2f4468','primaryTextColor':'#eef2f8','primaryBorderColor':'#5b7bb5','secondaryColor':'#14564f','secondaryTextColor':'#eef2f8','secondaryBorderColor':'#2c9d8f','tertiaryColor':'#3d2f63','tertiaryTextColor':'#eef2f8','tertiaryBorderColor':'#8b6fd4','mainBkg':'#2f4468','nodeBorder':'#5b7bb5','nodeTextColor':'#eef2f8','lineColor':'#8fa1bd','textColor':'#eef2f8','titleColor':'#c9d6ea','clusterBkg':'#161e2e','clusterBorder':'#3f5573','edgeLabelBackground':'#1b2434','background':'transparent'}, 'flowchart':{'curve':'basis','padding':14,'nodeSpacing':45,'rankSpacing':55,'useMaxWidth':true}}}%%
 graph LR
-    Client[Client Dashboard<br/>React 19]
-    
-    %% SSE Connections
-    SystemMonitor[SystemMonitor] -- "SSE /v1/system/stream" --> Client
-    AnalysisJobs[Analysis Jobs] -- "SSE /v1/analysis/{id}/stream" --> Client
-    Pipeline[Pipeline] -- "SSE /v1/pipeline/stream<br/>SSE /v1/logs/stream" --> Client
-    Chat[Chat] -- "ReadableStream /v1/chat/stream" --> Client
-    Logs[Logs] -- "SSE /v1/logs/stream" --> Client
-    Trace[Trace] -- "SSE /v1/analysis/{id}/stream" --> Client
-    
-    %% Global Events
-    GlobalRefresh[15s auto-refresh event] -.-> Client
+    subgraph api["FastAPI — streaming endpoints"]
+        S1["GET /v1/system/stream"]
+        S2["GET /v1/analysis/{id}/stream"]
+        S3["GET /v1/pipeline/stream"]
+        S4["GET /v1/logs/stream"]
+        S5["POST /v1/chat/stream"]
+    end
+
+    Ticket["POST /v1/auth/sse-ticket<br/><small>single-use, ~60 s</small>"]
+
+    subgraph client["React 19 dashboard"]
+        SMD["SystemMonitorDrawer<br/>SystemMetricsChip"]
+        AJ["Analysis Jobs"]
+        TR["Trace"]
+        PP["Pipeline"]
+        LG["Logs"]
+        CH["Chat"]
+    end
+
+    Ticket -. "ticket=" .-> api
+    S1 -- "SSE stats" --> SMD
+    S2 -- "SSE progress" --> AJ
+    S2 -- "SSE stage events" --> TR
+    S3 -- "SSE queue depth" --> PP
+    S4 -- "SSE log lines" --> LG
+    S5 -- "ReadableStream tokens" --> CH
+    Refresh["15 s auto-refresh event"] -.-> client
+
+    classDef entry fill:#3d2f63,stroke:#8b6fd4,stroke-width:1.5px,color:#eef2f8
+    classDef svc fill:#2f4468,stroke:#5b7bb5,stroke-width:1.5px,color:#eef2f8
+    classDef store fill:#14564f,stroke:#2c9d8f,stroke-width:1.5px,color:#eef2f8
+    classDef tool fill:#1b2434,stroke:#5b7bb5,stroke-width:1px,color:#c9d6ea
+    classDef obs fill:#5a3410,stroke:#c9772e,stroke-width:1.5px,color:#f6e6d5
+
+    class S1,S2,S3,S4,S5 svc
+    class Ticket entry
+    class SMD,AJ,TR,PP,LG,CH tool
+    class Refresh obs
 ```
 
 - **Authentication Strategy**: All SSE connections authenticate using single-use tickets generated by `POST /v1/auth/sse-ticket`.
@@ -250,3 +290,15 @@ graph LR
 - **Linting**: `npm run lint` uses Oxlint.
 - **Styling**: Tailwind configuration features a custom 11-step `brand` palette (emerald base) and class-based dark mode.
 - **UX**: Dark mode flash prevention is implemented via an inline `<script>` tag in `index.html`.
+
+---
+
+## 8. Related documents
+
+- [SYSTEM_MONITOR.md](SYSTEM_MONITOR.md) — the telemetry behind the metrics chip and the monitor drawer
+- [JOBS.md](JOBS.md) — what the Analysis Jobs tab's stop / resume / delete buttons actually do
+- [PIPELINE.md](PIPELINE.md) §3 — the stage events the Trace tab renders, and why they are replayed on connect
+- [CHAT.md](CHAT.md) — the Chat tab's two endpoints and the agent handover it displays
+- [AUTH.md](AUTH.md) — the login flow, and the SSE tickets every stream on these tabs needs
+- [SEARCH.md](SEARCH.md) — what the Search tab's modes mean
+- [dashboard/README.md](../dashboard/README.md) — dev server, build, tests

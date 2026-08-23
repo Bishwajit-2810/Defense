@@ -97,25 +97,30 @@ The Defense platform includes a selective, corpus-tier agentic insight layer. 9 
 - Runs on dedicated `agent` LLM role (default: `llama3.1:8b-16k` with 16K context window)
 
 ```mermaid
+%%{init: {'theme':'base','themeVariables':{'fontFamily':'ui-sans-serif, system-ui, -apple-system, Roboto, Helvetica, Arial, sans-serif','fontSize':'14px','primaryColor':'#2f4468','primaryTextColor':'#eef2f8','primaryBorderColor':'#5b7bb5','lineColor':'#8fa1bd','textColor':'#eef2f8','actorBkg':'#2f4468','actorBorder':'#5b7bb5','actorTextColor':'#eef2f8','actorLineColor':'#8fa1bd','signalColor':'#a9bcd8','signalTextColor':'#c9d6ea','labelBoxBkgColor':'#3d2f63','labelBoxBorderColor':'#8b6fd4','labelTextColor':'#eef2f8','loopTextColor':'#c9d6ea','activationBkgColor':'#14564f','activationBorderColor':'#2c9d8f','noteBkgColor':'#3f3312','noteBorderColor':'#c99a2e','noteTextColor':'#f5ead1','sequenceNumberColor':'#0d1117','background':'transparent'}, 'sequence':{'useMaxWidth':true,'mirrorActors':false,'boxMargin':12,'messageAlign':'center','actorFontFamily':'ui-sans-serif, system-ui, -apple-system, Roboto, Helvetica, Arial, sans-serif','messageFontFamily':'ui-sans-serif, system-ui, -apple-system, Roboto, Helvetica, Arial, sans-serif','noteFontFamily':'ui-sans-serif, system-ui, -apple-system, Roboto, Helvetica, Arial, sans-serif','actorFontSize':14,'messageFontSize':13,'noteFontSize':13}}}%%
 sequenceDiagram
-    participant User
-    participant Runner
-    participant AgentLLM
-    participant MCPClient
-    participant MCPTools
+    autonumber
+    participant User as Operator
+    participant Runner as AgentRunner
+    participant AgentLLM as LLM (agent role)
+    participant MCPClient as MCP Client
+    participant MCPTools as MCP Tool Servers
 
-    User->>Runner: Submit Query
-    Runner->>AgentLLM: Initial Prompt + Question + Tools
-    loop Until Done or Budget Exhausted
-        AgentLLM->>Runner: Tool Call Request
-        Runner->>MCPClient: Invoke Tool
-        MCPClient->>MCPTools: Execute tool
-        MCPTools-->>MCPClient: Result / Error
-        MCPClient-->>Runner: Result String
-        Runner->>AgentLLM: Feedback Tool Result
+    User->>Runner: Submit query
+    Runner->>AgentLLM: System prompt + question + tool manifest
+    loop Until answered, or budget exhausted
+        AgentLLM->>Runner: Tool call request
+        Note over Runner: Guards: repeat-call refusal,<br/>allowlist check, budget decrement
+        Runner->>MCPClient: Invoke tool
+        MCPClient->>MCPTools: Execute
+        MCPTools-->>MCPClient: Result or error
+        MCPClient-->>Runner: Result string
+        Note over Runner: Capped at 6,000 chars<br/>(ensure_ascii=False)
+        Runner->>AgentLLM: Tool result
     end
-    AgentLLM->>Runner: Final Answer
-    Runner-->>User: Structured Report
+    AgentLLM->>Runner: Final answer
+    Note over Runner: Non-answer guards +<br/>citation verification
+    Runner-->>User: Grounded answer + citations
 ```
 
 ### 3.2 Hardening & Guardrails
@@ -153,13 +158,15 @@ sequenceDiagram
 
 ### 3.3 Run Lifecycle
 ```mermaid
+%%{init: {'theme':'base','themeVariables':{'fontFamily':'ui-sans-serif, system-ui, -apple-system, Roboto, Helvetica, Arial, sans-serif','fontSize':'14px','primaryColor':'#2f4468','primaryTextColor':'#eef2f8','primaryBorderColor':'#5b7bb5','lineColor':'#8fa1bd','textColor':'#eef2f8','labelColor':'#eef2f8','transitionColor':'#8fa1bd','transitionLabelColor':'#c9d6ea','stateBkg':'#2f4468','stateBorder':'#5b7bb5','altBackground':'#161e2e','stateLabelColor':'#eef2f8','nodeTextColor':'#eef2f8','mainBkg':'#2f4468','nodeBorder':'#5b7bb5','compositeBackground':'#161e2e','compositeBorder':'#3f5573','compositeTitleBackground':'#1b2434','specialStateColor':'#8fa1bd','innerEndBackground':'#8fa1bd','edgeLabelBackground':'#1b2434','background':'transparent'}, 'state':{'useMaxWidth':true}}}%%
 stateDiagram-v2
+    direction LR
     [*] --> queued
-    queued --> running: Agent picked up task
-    running --> completed: LLM generated final answer
-    running --> failed: Error or budget limit
-    queued --> cancelled: User cancelled
-    running --> cancelled: User cancelled
+    queued --> running: runner picked the task up
+    running --> completed: answer passed the non-answer guards
+    running --> failed: error, budget exhausted, or non-answer
+    queued --> cancelled: operator cancelled
+    running --> cancelled: operator cancelled
     completed --> [*]
     failed --> [*]
     cancelled --> [*]
@@ -175,16 +182,50 @@ The `mcp_client.py` connects to the three MCP servers:
 - **Result handling:** captures output, errors, duration
 
 ```mermaid
+%%{init: {'theme':'base','themeVariables':{'fontFamily':'ui-sans-serif, system-ui, -apple-system, Roboto, Helvetica, Arial, sans-serif','fontSize':'14px','primaryColor':'#2f4468','primaryTextColor':'#eef2f8','primaryBorderColor':'#5b7bb5','secondaryColor':'#14564f','secondaryTextColor':'#eef2f8','secondaryBorderColor':'#2c9d8f','tertiaryColor':'#3d2f63','tertiaryTextColor':'#eef2f8','tertiaryBorderColor':'#8b6fd4','mainBkg':'#2f4468','nodeBorder':'#5b7bb5','nodeTextColor':'#eef2f8','lineColor':'#8fa1bd','textColor':'#eef2f8','titleColor':'#c9d6ea','clusterBkg':'#161e2e','clusterBorder':'#3f5573','edgeLabelBackground':'#1b2434','background':'transparent'}, 'flowchart':{'curve':'basis','padding':14,'nodeSpacing':45,'rankSpacing':55,'useMaxWidth':true}}}%%
 graph LR
-    A[MCP Client] --> B(Stats/Corpus Server)
-    A --> C(Search/Vector Server)
-    A --> D(Data Quality Server)
-    
-    B -.-> T1(trend_query)
-    B -.-> T2(sentiment_over_time)
-    C -.-> T3(semantic_search)
-    C -.-> T4(search_comments)
-    D -.-> T5(coverage_stats)
+    A["MCP Client<br/><small>mcp_client.py</small>"]
+
+    subgraph analytics["analytics-mcp :8110"]
+        direction TB
+        T1["trend_query"]
+        T2["sentiment_over_time"]
+        T3["top_posts"]
+        T4["reaction_mix"]
+        T5["watchlist_timeline"]
+        T6["agreement_stats"]
+    end
+
+    subgraph retrieval["retrieval-mcp :8101"]
+        direction TB
+        R1["semantic_search"]
+        R2["search_comments"]
+        R3["get_post / get_thread"]
+        R4["representative_comments"]
+        R5["get_clusters"]
+        R6["stance_by_target<br/>stance_over_time"]
+        R7["coverage_stats"]
+    end
+
+    subgraph ingest["ingest-mcp :8102"]
+        direction TB
+        I1["pull_campaign"]
+        I2["fetch_more_comments"]
+        I3["refresh_post"]
+    end
+
+    A -- "Streamable HTTP" --> analytics
+    A -- "Streamable HTTP" --> retrieval
+    A -- "Streamable HTTP" --> ingest
+
+    classDef entry fill:#3d2f63,stroke:#8b6fd4,stroke-width:1.5px,color:#eef2f8
+    classDef svc fill:#2f4468,stroke:#5b7bb5,stroke-width:1.5px,color:#eef2f8
+    classDef store fill:#14564f,stroke:#2c9d8f,stroke-width:1.5px,color:#eef2f8
+    classDef tool fill:#1b2434,stroke:#5b7bb5,stroke-width:1px,color:#c9d6ea
+    classDef obs fill:#5a3410,stroke:#c9772e,stroke-width:1.5px,color:#f6e6d5
+
+    class A entry
+    class T1,T2,T3,T4,T5,T6,R1,R2,R3,R4,R5,R6,R7,I1,I2,I3 tool
 ```
 
 ## 5. Chat Agent Routing
@@ -213,3 +254,15 @@ The Agents page (`dashboard/src/pages/Agents.jsx`) provides:
 - Execution trace viewer (accordion with chronological tool calls, inputs, latency)
 - Grounding & injection status pill (validates answer against tool outputs)
 - Run history ledger with delete/cancel/clear-all
+
+---
+
+## 8. Related documents
+
+- [MCP_SERVERS.md](MCP_SERVERS.md) — the 18 tools these agents call, their schemas and stub modes
+- [CHAT.md](CHAT.md) — how a chat message is routed to one of these agents, and how a handover is reported
+- [LLM_BACKENDS.md](LLM_BACKENDS.md) — the dedicated `agent` role, why it needs the derived `llama3.1:8b-16k` tag, and the `agent` usage lane
+- [SEARCH.md](SEARCH.md) — the retrieval the `semantic_search` / `search_comments` tools sit on, with measured recall@k
+- [RAG_STATE_AND_ROADMAP.md](RAG_STATE_AND_ROADMAP.md) §6 Section 9 — the eight live agent failures that shaped the hardening in §3.2
+- [AGENTIC_RAG_NOVELTY.md](AGENTIC_RAG_NOVELTY.md) — the research framing, and which claims are measured
+- [evaluation.md](evaluation.md) §5 — how agent groundedness *would* be scored (unmeasured)

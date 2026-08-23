@@ -1,8 +1,14 @@
 # Deployment — Docker Compose vs Kubernetes, and the K8s Plan
 
-How the smart layer from [what.txt](../what.txt) is deployed: the MVP shape, the
+How the smart layer described in [architecture.md](architecture.md) is deployed: the MVP shape, the
 production shape, and the full Kubernetes plan that delivers the "proper scaling"
 the owner asked for.
+
+> **Implementation companions:** the five worker processes and their streams are
+> [PIPELINE.md](PIPELINE.md); the secret and tenancy policy a production deploy must
+> satisfy is [AUTH.md](AUTH.md) §2; the health and readiness probes are
+> [SYSTEM_MONITOR.md](SYSTEM_MONITOR.md) §9.
+
 
 ---
 
@@ -26,22 +32,64 @@ Kubernetes + KEDA for Production and Enterprise.
 
 ## 2. MVP architecture (Docker Compose)
 
-Single host with one GPU. One `docker-compose.yml` brings up:
+Single host with one GPU. The **target** Compose shape is below; §2b records how
+the checked-in `deploy/docker-compose.yml` differs from it (no `gateway`/NGINX,
+no `vllm`, and different worker names — it has **19 services**).
 
-```text
-services:
-  gateway        (NGINX)            → TLS, routing, rate limit
-  api            (FastAPI)          → auth + ingestion + reporting (combined for MVP)
-  worker-nlp     (Python)           → Stage-1 text suite + vision (image sentiment, OCR, GPU)
-  worker-llm     (Python)           → Stage-2 worker (text LLM + VLM); LLM_BACKEND=local|groq
-  vllm           (vLLM, optional)   → local backend only: LLM-A (+LLM-B) + VLM (Qwen2.5-VL) on GPU
-  agent-orch     (FastAPI)          → AI agents (insight/analyst, deep-dive, alerting) → LLM-B + MCP   [Phase 2]
-  mcp-servers    (FastAPI + MCP)    → analytics-mcp · retrieval-mcp · ingest-mcp (internal tools)        [Phase 2]
-  redis          (cache/queue)      → Redis Streams = bus + cache + dedup
-  postgres       (ops + jobs + vectors via pgvector)
-  clickhouse     (analytics)
-  minio          (object storage)
-  prometheus + grafana + loki       → monitoring
+```mermaid
+%%{init: {'theme':'base','themeVariables':{'fontFamily':'ui-sans-serif, system-ui, -apple-system, Roboto, Helvetica, Arial, sans-serif','fontSize':'14px','primaryColor':'#2f4468','primaryTextColor':'#eef2f8','primaryBorderColor':'#5b7bb5','secondaryColor':'#14564f','secondaryTextColor':'#eef2f8','secondaryBorderColor':'#2c9d8f','tertiaryColor':'#3d2f63','tertiaryTextColor':'#eef2f8','tertiaryBorderColor':'#8b6fd4','mainBkg':'#2f4468','nodeBorder':'#5b7bb5','nodeTextColor':'#eef2f8','lineColor':'#8fa1bd','textColor':'#eef2f8','titleColor':'#c9d6ea','clusterBkg':'#161e2e','clusterBorder':'#3f5573','edgeLabelBackground':'#1b2434','background':'transparent'}, 'flowchart':{'curve':'basis','padding':14,'nodeSpacing':45,'rankSpacing':55,'useMaxWidth':true}}}%%
+graph TD
+    subgraph edge["Edge"]
+        GW["gateway<br/><small>NGINX — TLS, routing, rate limit</small>"]
+    end
+
+    subgraph app["Application"]
+        API["api<br/><small>FastAPI — auth + ingestion + reporting,<br/>combined for the MVP</small>"]
+        WN["worker-nlp<br/><small>Stage-1 text suite + vision (GPU)</small>"]
+        WL["worker-llm<br/><small>Stage-2 text LLM + VLM<br/>LLM_BACKEND=local|groq</small>"]
+        VLLM["vllm<br/><small>optional, local backend only:<br/>LLM-A (+LLM-B) + VLM on GPU</small>"]
+    end
+
+    subgraph phase2["Phase 2"]
+        AO["agent-orch<br/><small>FastAPI — AI agents</small>"]
+        MCPS["mcp-servers<br/><small>analytics · retrieval · ingest</small>"]
+    end
+
+    subgraph data["Data"]
+        RD[("redis<br/><small>Streams = bus + cache + dedup</small>")]
+        PG[("postgres<br/><small>ops + jobs + vectors via pgvector</small>")]
+        CH[("clickhouse<br/><small>analytics</small>")]
+        MO[("minio<br/><small>object storage</small>")]
+    end
+
+    subgraph mon["Monitoring"]
+        PGF["prometheus + grafana + loki"]
+    end
+
+    GW --> API
+    API --> RD
+    RD --> WN
+    WN --> RD
+    RD --> WL
+    WL --> VLLM
+    WL --> PG
+    WL --> CH
+    WL --> MO
+    API --> AO
+    AO --> MCPS
+    MCPS --> PG
+    MCPS --> CH
+
+    class GW entry
+    class API,WN,WL,AO,MCPS svc
+    class VLLM entry
+    class RD,PG,CH,MO store
+    class PGF obs
+    classDef entry fill:#3d2f63,stroke:#8b6fd4,stroke-width:1.5px,color:#eef2f8
+    classDef svc fill:#2f4468,stroke:#5b7bb5,stroke-width:1.5px,color:#eef2f8
+    classDef store fill:#14564f,stroke:#2c9d8f,stroke-width:1.5px,color:#eef2f8
+    classDef tool fill:#1b2434,stroke:#5b7bb5,stroke-width:1px,color:#c9d6ea
+    classDef obs fill:#5a3410,stroke:#c9772e,stroke-width:1.5px,color:#f6e6d5
 ```
 
 - Queue = **Redis Streams** (no separate Kafka to operate yet).
@@ -121,43 +169,65 @@ Two things still reach outside the compose network:
 
 ## 3. Production architecture (Kubernetes)
 
-```text
-            Internet
-               │ TLS
-        ┌──────▼───────┐
-        │  Ingress     │  NGINX ingress controller (+ optional Linkerd mesh)
-        │  Controller  │
-        └──────┬───────┘
-   ┌───────────┼───────────────────────────┐
-   │           │                           │
-┌──▼───┐  ┌────▼─────┐  ┌──────────┐  ┌────▼──────┐
-│auth  │  │ingestion │  │reporting │  │user-mgmt  │   Deployments (HPA on CPU/RPS)
-│(pods)│  │ (pods)   │  │ (pods)   │  │ (pods)    │
-└──────┘  └────┬─────┘  └────┬─────┘  └───────────┘
-               │ produce      │ read
-          ┌────▼──────────────▼────┐
-          │   Kafka (StatefulSet/   │  partitioned topics: ingest, llm, dlq
-          │   operator, 3 brokers)  │
-          └────┬───────────────┬────┘
-        consume│               │consume
-   ┌───────────▼──┐      ┌─────▼─────────┐
-   │ nlp-workers  │      │ llm-workers   │   Deployments on GPU node pools
-   │ (GPU pool A) │      │ (GPU pool B)  │   KEDA scales on Kafka lag
-   │ KEDA-scaled  │      │ KEDA-scaled   │
-   └──────┬───────┘      └─────┬─────────┘
-          │ Triton svc          │ vLLM svc
-   ┌──────▼───────┐      ┌──────▼────────────────────┐
-   │ triton (GPU) │      │ Stage-2 backend:          │   LLM_BACKEND switch:
-   └──────────────┘      │  vllm A+B (GPU)  ⇄  Groq  │   local (in-cluster GPU)
-                         │                    (API)  │   or groq (egress HTTPS)
-                         └───────────────────────────┘
-          │ writes (assembler Deployment) │
-   ┌──────▼──────────────┬───────────┬──────────▼┐
-   │ postgres + pgvector │clickhouse │ minio/S3  │  StatefulSets / managed
-   │ (HA, replica;       │(cluster)  │           │
-   │  vectors)           │           │           │
-   └─────────────────────┴───────────┴───────────┘
-        observability namespace: prometheus, grafana, loki, jaeger, otel-collector
+```mermaid
+%%{init: {'theme':'base','themeVariables':{'fontFamily':'ui-sans-serif, system-ui, -apple-system, Roboto, Helvetica, Arial, sans-serif','fontSize':'14px','primaryColor':'#2f4468','primaryTextColor':'#eef2f8','primaryBorderColor':'#5b7bb5','secondaryColor':'#14564f','secondaryTextColor':'#eef2f8','secondaryBorderColor':'#2c9d8f','tertiaryColor':'#3d2f63','tertiaryTextColor':'#eef2f8','tertiaryBorderColor':'#8b6fd4','mainBkg':'#2f4468','nodeBorder':'#5b7bb5','nodeTextColor':'#eef2f8','lineColor':'#8fa1bd','textColor':'#eef2f8','titleColor':'#c9d6ea','clusterBkg':'#161e2e','clusterBorder':'#3f5573','edgeLabelBackground':'#1b2434','background':'transparent'}, 'flowchart':{'curve':'basis','padding':14,'nodeSpacing':45,'rankSpacing':55,'useMaxWidth':true}}}%%
+graph TD
+    Net["Internet"]
+    Ing["Ingress controller<br/><small>NGINX (+ optional Linkerd mesh)</small>"]
+    Net -- "TLS" --> Ing
+
+    subgraph deploys["Deployments — HPA on CPU/RPS"]
+        A1["auth"]
+        A2["ingestion"]
+        A3["reporting"]
+        A4["user-mgmt"]
+    end
+    Ing --> A1
+    Ing --> A2
+    Ing --> A3
+    Ing --> A4
+
+    Kafka["Kafka<br/><small>StatefulSet / operator, 3 brokers<br/>topics: ingest · llm · dlq</small>"]
+    A2 -- "produce" --> Kafka
+    A3 -- "read" --> Kafka
+
+    subgraph gpupools["GPU node pools — KEDA scales on Kafka lag"]
+        NLPW["nlp-workers<br/><small>GPU pool A</small>"]
+        LLMW["llm-workers<br/><small>GPU pool B</small>"]
+    end
+    Kafka -- "consume" --> NLPW
+    Kafka -- "consume" --> LLMW
+
+    TritonSvc["triton service<br/><small>GPU</small>"]
+    Backend["Stage-2 backend<br/><small>vLLM A+B in-cluster GPU ⇄ Groq API<br/>LLM_BACKEND switch: local or egress HTTPS</small>"]
+    NLPW --> TritonSvc
+    LLMW --> Backend
+
+    Asm["assembler<br/><small>Deployment</small>"]
+    LLMW --> Asm
+
+    subgraph data["StatefulSets / managed"]
+        PG[("postgres + pgvector<br/><small>HA, replica, vectors</small>")]
+        CH[("clickhouse<br/><small>cluster</small>")]
+        S3[("minio / S3")]
+    end
+    Asm -- "writes" --> PG
+    Asm --> CH
+    Asm --> S3
+
+    Obs["observability namespace<br/><small>prometheus · grafana · loki · jaeger · otel-collector</small>"]
+
+    class Net entry
+    class Ing,A1,A2,A3,A4,NLPW,LLMW,Asm svc
+    class Kafka,TritonSvc tool
+    class Backend entry
+    class PG,CH,S3 store
+    class Obs obs
+    classDef entry fill:#3d2f63,stroke:#8b6fd4,stroke-width:1.5px,color:#eef2f8
+    classDef svc fill:#2f4468,stroke:#5b7bb5,stroke-width:1.5px,color:#eef2f8
+    classDef store fill:#14564f,stroke:#2c9d8f,stroke-width:1.5px,color:#eef2f8
+    classDef tool fill:#1b2434,stroke:#5b7bb5,stroke-width:1px,color:#c9d6ea
+    classDef obs fill:#5a3410,stroke:#c9772e,stroke-width:1.5px,color:#f6e6d5
 ```
 
 ---
