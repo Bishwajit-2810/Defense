@@ -7,6 +7,11 @@
 > Companion to [AGENTIC_RAG_NOVELTY.md](AGENTIC_RAG_NOVELTY.md), which frames the
 > subsystem as a thesis contribution. This document is the engineering view.
 
+> **Companion:** [SEARCH.md](SEARCH.md) is the user-facing view of this layer — the
+> `/v1/search` modes, the identifier short-circuit, RRF, and the same measured
+> recall@k table read as a retrieval result rather than as a roadmap item.
+
+
 ---
 
 ## 0. Implementation status

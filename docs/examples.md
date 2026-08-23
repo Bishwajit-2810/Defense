@@ -6,6 +6,11 @@ showing the exact input and the structured JSON the service returns. These match
 the canonical schema in [architecture.md](architecture.md) §6, the input contract
 in [data_contract.md](data_contract.md), and the API in [api_design.md](api_design.md).
 
+> **Implementation companion:** the document shape below is assembled and
+> schema-validated by [ASSEMBLER.md](ASSEMBLER.md); the per-comment block it carries
+> is produced by [STAGE2_LLM.md](STAGE2_LLM.md) §3.
+
+
 > ## ⚠ These examples show the DESIGNED output, not a current run
 >
 > They were written to illustrate the full contract, and two parts of them are

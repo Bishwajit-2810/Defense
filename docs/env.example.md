@@ -95,7 +95,7 @@ Harmless, but it is a duplicate round-trip per post if you are counting cost.
 | `EMBEDDING_DIM` | Vector width, read by [`embeddings.py:33`](../src/defense/libs/embeddings.py#L33). **Must match the pgvector column width in the database** — changing it without a migration breaks inserts. |
 | `EMBEDDING_MODEL` | SentenceTransformer checkpoint. `paraphrase-multilingual-mpnet-base-v2` is 768-dim and covers Bangla, English, and romanized Banglish. This never goes through the LLM client. |
 | `MODEL_STUB_MODE` | `true` = no heavy ML weights are downloaded or loaded. Embeddings come from a deterministic stub, and the seven Stage-2 HF classifiers are skipped. It also drives the Hugging Face offline policy: `apply_hf_offline_policy()` sets `HF_HUB_OFFLINE`/`TRANSFORMERS_OFFLINE` so nothing reaches the network. Override that link with `HF_OFFLINE`. |
-| `EMBEDDING_STUB_MODE` | Overrides `MODEL_STUB_MODE` **for the sentence encoder alone**, in either direction — real vectors without loading the classifiers, or hash vectors while they stay on. `EMBEDDING_ALLOW_STUB=false` (the default) makes the encoder *refuse* rather than silently degrade to `stub:sha256`. |
+| `EMBEDDING_STUB_MODE` | Overrides `MODEL_STUB_MODE` **for the sentence encoder alone**, in either direction — real vectors without loading the classifiers, or hash vectors while they stay on. `EMBEDDING_ALLOW_STUB=false` — the value `.env`/`.env.example` ship, though the `Settings` default is `true` — makes the encoder *refuse* rather than silently degrade to `stub:sha256`. Delete the key and you get the permissive behaviour back. |
 | `COMMENT_EMBEDDINGS_ENABLED` | `true` = the assembler embeds comment text, not just captions. The signal in this corpus lives in the threads. Backfill existing rows with [`deploy/backfill_embeddings.py`](../deploy/backfill_embeddings.py). |
 | `COMMENT_EMBEDDING_MAX_PER_POST` | Per-post ceiling on comment **vectors** after near-duplicate grouping. **`0` (the default) disables the cap**, matching `ROUTER_COMMENT_TOP_N=0` in §5. A positive value here is *quieter* than a Stage-2 cap: the comments past it are still stored and still labelled, but they have **no vector**, so `search_comments` and `get_clusters` cannot reach them and the only symptom is an unexplained dip in `comment_vector_coverage` (`coverage_stats` derives the corpus-wide figure from this number). The old default of `1000` hid the tail of the one 2,857-comment thread — **1,857 comments, 18% of the corpus, invisible to comment search**. |
 | `RETRIEVAL_HYBRID` / `RETRIEVAL_RRF_K` / `RETRIEVAL_CANDIDATE_MULTIPLIER` | Hybrid retrieval: run the vector and keyword arms together and fuse by reciprocal rank (`k=60`), pulling `4×` the requested rows as candidates. On by default. |
@@ -264,3 +264,24 @@ for r in ['stage1','stage2','summary','agent','llm_a','llm_b','vlm']:
 
 Prints the model each role resolves to after your `.env` is applied. Cross-check the local
 column against `ollama list` — a name that isn't there fails at call time, not at start-up.
+
+---
+
+## Which document explains each knob's behaviour
+
+This file is the **inventory** — every variable, its default, and what breaks if
+you change it. For *why* a knob exists and what it costs to turn:
+
+| Knob family | Document |
+| ----------- | -------- |
+| `NEAR_DUP_*`, `UPSTREAM_API_*` | [INGESTION.md](INGESTION.md) |
+| `MODEL_STUB_MODE`, `STAGE1_*`, `SENTIMENT_MODEL`, `EMBEDDING_*`, `STAGE1_OCR_SENTIMENT`, `COMMENT_LAUGH_SENTIMENT` | [STAGE1_NLP.md](STAGE1_NLP.md) |
+| `ROUTER_*` | [ROUTER.md](ROUTER.md) |
+| `COMMENT_STANCE_*`, `COMMENT_LLM_MODE`, `COMMENT_DEDUP_PROPAGATE`, `FILTER_EMOJI_ONLY`, `STAGE2_CLASSIFIER_*`, `*_MAX_TOKENS`, `LLM_CACHE_DISABLED` | [STAGE2_LLM.md](STAGE2_LLM.md) |
+| `LLM_BACKEND`, `LOCAL_LLM_*`, `GROQ_API_KEY`, `*_LOCAL_MODEL` / `*_GROQ_MODEL`, `LLM_MAX_CONTINUATIONS`, `LLM_USAGE_TRACKING_DISABLED` | [LLM_BACKENDS.md](LLM_BACKENDS.md) |
+| `COMMENT_EMBEDDINGS_ENABLED`, `COMMENT_EMBEDDING_MAX_PER_POST`, `MINIO_*`, `CLICKHOUSE_URL`, `DATABASE_URL` | [ASSEMBLER.md](ASSEMBLER.md) |
+| `RETRIEVAL_RERANK`, `RETRIEVAL_CLUSTER_SCAN_CAP` | [SEARCH.md](SEARCH.md) |
+| `APP_ENV`, `JWT_*`, `SSE_TICKET_TTL`, `ALLOW_*`, `SIGNUP_TENANT_ID`, `RATE_LIMIT_*` | [AUTH.md](AUTH.md) |
+| `*_STREAM` / `*_GROUP` / `*_CONSUMER` / `*_MAX_RETRIES` | [PIPELINE.md](PIPELINE.md) |
+| `ANALYTICS_MCP_STUB`, `RETRIEVAL_MCP_STUB`, `AGENTS_SERVICE_URL`, `PUBLIC_BASE_URL` | [AGENTS.md](AGENTS.md) · [MCP_SERVERS.md](MCP_SERVERS.md) |
+| `LOG_*`, `OTEL_*` | [SYSTEM_MONITOR.md](SYSTEM_MONITOR.md) |

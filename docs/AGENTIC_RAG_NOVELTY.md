@@ -114,7 +114,7 @@ retrieval context is not the text the user might have read anyway — it is the
 > **"The system processes adversarial political content where prompt injection is
 > a realistic threat, not a hypothetical."**
 
-The agent runner ([runner.py](file:///home/bk/code/defense/src/defense/services/agents/runner.py)) implements
+The agent runner ([runner.py](../src/defense/services/agents/runner.py)) implements
 three defense-in-depth mitigations:
 
 1. **`<tool_data>` wrapping** — all tool results are enclosed in explicit
@@ -135,7 +135,7 @@ This is security-conscious agentic design for a **real-world adversarial corpus*
 > what the RAG retrieves."**
 
 The RAG system doesn't retrieve raw text. It retrieves analysis results that
-were produced by a **multi-voter ensemble** ([ensemble.py](file:///home/bk/code/defense/src/defense/libs/ensemble.py)):
+were produced by a **multi-voter ensemble** ([ensemble.py](../src/defense/libs/ensemble.py)):
 
 - **Heuristic** (emoji + lexicon rules — free)
 - **Seven ML sentiment heads** (cheap, batched, CPU): `xlmr`, `distilbert`,
@@ -247,7 +247,7 @@ STANCE_AGENT = AgentDefinition(
 > rollup `aggregate_target_stances()` writes is stored in Postgres and nowhere
 > else. ClickHouse `analysis_events` carries post-level **sentiment** only, and
 > stance-toward-an-entity is a deliberately separate judgement from
-> sentiment-toward-the-post ([prompts.py](file:///home/bk/code/defense/src/defense/services/workers/stage2_llm/prompts.py) §"t" vs "s"): a comment can praise a
+> sentiment-toward-the-post ([prompts.py](../src/defense/services/workers/stage2_llm/prompts.py) §"t" vs "s"): a comment can praise a
 > post that attacks an entity. Deriving one from the other would report a number
 > the pipeline never measured — and it would report it under the label of the
 > system's most novel component.
@@ -390,7 +390,7 @@ NARRATIVE_AGENT = AgentDefinition(
 | `get_clusters` | retrieval-mcp | Fetch embeddings from pgvector → run `cluster_embeddings()` → return cluster summaries with representative post IDs, each flagged `is_stub` when any member vector is a hash stub |
 
 **Why it's valuable:** This agent **directly uses** the clustering module
-([clustering.py](file:///home/bk/code/defense/src/defense/libs/clustering.py)) which already exists but is only consumed by reports. Making
+([clustering.py](../src/defense/libs/clustering.py)) which already exists but is only consumed by reports. Making
 it agent-accessible means the user can interactively explore "what are people
 talking about?" — a question the batch report answers statically, but the agent
 answers dynamically.
@@ -644,7 +644,7 @@ present in existing literature on Bangla/Banglish social media analysis:
 
 ### Adding a New Agent (3 Steps)
 
-**Step 1:** Define the agent in [registry.py](file:///home/bk/code/defense/src/defense/services/agents/registry.py):
+**Step 1:** Define the agent in [registry.py](../src/defense/services/agents/registry.py):
 
 ```python
 NEW_AGENT = AgentDefinition(
@@ -666,7 +666,7 @@ AGENT_REGISTRY = {
 ```
 
 **Step 2:** Add any new MCP tools to the appropriate server
-(e.g., [analytics_mcp/server.py](file:///home/bk/code/defense/src/defense/mcp_servers/analytics_mcp/server.py)):
+(e.g., [analytics_mcp/server.py](../src/defense/mcp_servers/analytics_mcp/server.py)):
 
 ```python
 @mcp.tool

@@ -213,3 +213,15 @@ The Agents page (`dashboard/src/pages/Agents.jsx`) provides:
 - Execution trace viewer (accordion with chronological tool calls, inputs, latency)
 - Grounding & injection status pill (validates answer against tool outputs)
 - Run history ledger with delete/cancel/clear-all
+
+---
+
+## 8. Related documents
+
+- [MCP_SERVERS.md](MCP_SERVERS.md) — the 18 tools these agents call, their schemas and stub modes
+- [CHAT.md](CHAT.md) — how a chat message is routed to one of these agents, and how a handover is reported
+- [LLM_BACKENDS.md](LLM_BACKENDS.md) — the dedicated `agent` role, why it needs the derived `llama3.1:8b-16k` tag, and the `agent` usage lane
+- [SEARCH.md](SEARCH.md) — the retrieval the `semantic_search` / `search_comments` tools sit on, with measured recall@k
+- [RAG_STATE_AND_ROADMAP.md](RAG_STATE_AND_ROADMAP.md) §6 Section 9 — the eight live agent failures that shaped the hardening in §3.2
+- [AGENTIC_RAG_NOVELTY.md](AGENTIC_RAG_NOVELTY.md) — the research framing, and which claims are measured
+- [evaluation.md](evaluation.md) §5 — how agent groundedness *would* be scored (unmeasured)

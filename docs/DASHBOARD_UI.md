@@ -250,3 +250,15 @@ graph LR
 - **Linting**: `npm run lint` uses Oxlint.
 - **Styling**: Tailwind configuration features a custom 11-step `brand` palette (emerald base) and class-based dark mode.
 - **UX**: Dark mode flash prevention is implemented via an inline `<script>` tag in `index.html`.
+
+---
+
+## 8. Related documents
+
+- [SYSTEM_MONITOR.md](SYSTEM_MONITOR.md) — the telemetry behind the metrics chip and the monitor drawer
+- [JOBS.md](JOBS.md) — what the Analysis Jobs tab's stop / resume / delete buttons actually do
+- [PIPELINE.md](PIPELINE.md) §3 — the stage events the Trace tab renders, and why they are replayed on connect
+- [CHAT.md](CHAT.md) — the Chat tab's two endpoints and the agent handover it displays
+- [AUTH.md](AUTH.md) — the login flow, and the SSE tickets every stream on these tabs needs
+- [SEARCH.md](SEARCH.md) — what the Search tab's modes mean
+- [dashboard/README.md](../dashboard/README.md) — dev server, build, tests

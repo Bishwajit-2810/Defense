@@ -113,7 +113,7 @@ and grounded reports — **corpus-tier only, never per post**
 (see [architecture.md](docs/architecture.md) §11).
 
 This folder answers the system-design request described by the owner in
-[what.txt](what.txt) — an upstream platform scrapes 1,000+ real-time
+the owner's requirements brief — an upstream platform scrapes 1,000+ real-time
 Bangla/English/Banglish posts **with their comments**; this smart layer pulls the
 **post-with-details** payload from that platform's REST API and returns structured
 JSON out. For the input contract see [data_contract.md](docs/data_contract.md); for
@@ -129,6 +129,7 @@ concrete input→output, see [examples.md](docs/examples.md).
 
 | Document                                             | What it covers                                                                                                                                                                    |
 | ---------------------------------------------------- | --------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- |
+| [TECH_STACK.md](docs/TECH_STACK.md)                       | **Tech stack** — every technology, the version actually installed, and why each pinned constraint exists |
 | [FEATURES.md](docs/FEATURES.md)                           | **Feature list** — every capability, what it does, and whether it is **measured**, works-but-unmeasured, **unexercised**, or planned. Start here for "what does this actually do?"     |
 | [masterplan.md](docs/masterplan.md)                       | **Single-file master plan** — every document below consolidated into one self-contained read                                                                                      |
 | [data_contract.md](docs/data_contract.md)                 | **Upstream input contract** — real post-with-details schema (embedded comments + engagement + reactions + shares), integration (pull + own DB), platform detection, field mapping |
@@ -148,6 +149,7 @@ concrete input→output, see [examples.md](docs/examples.md).
 | [PROJECT_ASSESSMENT.md](docs/PROJECT_ASSESSMENT.md)       | **Capstone / paper readiness review** — six independent audit passes, every finding with its evidence class (measured / probed / read), what was fixed, and what is still open       |
 | [run.md](docs/run.md) · [easy_run.md](docs/easy_run.md)        | Running it: the one-command quickstart, then the deep reference (every env var, scaling, troubleshooting)                                                                            |
 | [testing.md](docs/testing.md)                             | **Running the tests** — the three suites and their commands, what a plain `pytest` deliberately skips (including the one that would wipe your datastores), and what a green run does *not* prove |
+| [TESTING_RESULTS.md](docs/TESTING_RESULTS.md)             | **Latest full-chain run** — verbatim output of `pytest && vitest && lint && build && e2e`, and what a green run does *not* prove |
 | [env.example.md](docs/env.example.md)                     | **Every environment variable**, with its default and what happens if you change it — including the dead keys kept only because older docs mention them                               |
 | [AGENTIC_RAG_NOVELTY.md](docs/AGENTIC_RAG_NOVELTY.md)     | The agentic-RAG layer as a research contribution: what is novel, what is assembly, and which claims are measured                                                                     |
 | [RAG_STATE_AND_ROADMAP.md](docs/RAG_STATE_AND_ROADMAP.md) | Current state of retrieval + the agents, per-agent behaviour, and what is still missing to call it RAG rather than SQL-with-an-LLM-on-top                                            |
@@ -157,10 +159,34 @@ concrete input→output, see [examples.md](docs/examples.md).
 | [MCP_SERVERS.md](docs/MCP_SERVERS.md)                     | **MCP Servers** — analytics-mcp (ClickHouse), retrieval-mcp (pgvector), ingest-mcp (Redis) — all 18 tools, schemas, stub modes, agent-to-tool mapping, deployment                      |
 | [dashboard/README.md](dashboard/README.md)           | The React dashboard: dev server, build, tests                                                                                                                                       |
 
-Background: the original system-design request has been reconciled with
-[what.txt](what.txt), which is now the authoritative source and supersedes it.
-(`social_media_llm_architecture_prompt.md` was removed in commit `e9fba98`; the
-link is dropped rather than left dangling.)
+### Per-feature documents
+
+Every shipped capability has a document of its own, each ending in an
+**evidence-class table** (measured / works-unmeasured / unexercised / planned).
+
+| Document | What it covers |
+| -------- | -------------- |
+| [PIPELINE.md](docs/PIPELINE.md) | **Hub for the five stages** — the stream topology, the one envelope that threads through them, cancellation, retry/DLQ, and live progress |
+| [INGESTION.md](docs/INGESTION.md) | Upload vs upstream pull, the golden rules in the normalizer, exact + near-duplicate dedup, where a job's total is recorded |
+| [STAGE1_NLP.md](docs/STAGE1_NLP.md) | The three engines, every cheap-NLP signal, comment kinds and provenance, thread aggregation, sentiment fusion, the unexercised image path |
+| [ROUTER.md](docs/ROUTER.md) | The six gates and what each reads, named readers, comment selection (eligibility → dedup → top-N), task flags, how to read the routing rate |
+| [STAGE2_LLM.md](docs/STAGE2_LLM.md) | The two lanes, the eight-labeller ensemble and its abstention rules, escalation, the response cache keyed on the resolved model id |
+| [ASSEMBLER.md](docs/ASSEMBLER.md) | Canonical result + schema validation, the three-store fan-out, idempotency, embedding honesty, job accounting |
+| [JOBS.md](docs/JOBS.md) | Run / stop / resume / delete — why stop is a flag and resume is reconstructed from Postgres |
+| [LLM_BACKENDS.md](docs/LLM_BACKENDS.md) | The seven roles, `local` ⇄ `groq` switching, the tenant privacy lock, the circuit breaker, and the five usage lanes |
+| [SEARCH.md](docs/SEARCH.md) | Identifier lookup, the three arms, reciprocal-rank fusion — **and the measured recall@k table** |
+| [CHAT.md](docs/CHAT.md) | The chatbot, SSE token streaming, automatic agent handover, persisted conversations |
+| [REPORTS.md](docs/REPORTS.md) | SQL-derived aggregates, where the LLM may write prose, cluster summarisation, export formats |
+| [AUTH.md](docs/AUTH.md) | JWT policy, API keys, tenant scoping, SSE tickets, rate limiting |
+
+Background: the original system-design request was reconciled with the owner's
+requirements brief (`what.txt`), which superseded it. **Both source files have
+since been removed from the repository** — `social_media_llm_architecture_prompt.md`
+in commit `e9fba98`, `what.txt` in commit `036e013` — so their links are dropped
+rather than left dangling. What they specified now lives in
+[data_contract.md](docs/data_contract.md) (the input contract) and
+[architecture.md](docs/architecture.md) (the design), which are the authoritative
+sources going forward.
 
 **What it does, feature by feature:** [FEATURES.md](docs/FEATURES.md) — with each
 capability marked measured / unmeasured / unexercised / planned, so nothing on a
@@ -189,14 +215,16 @@ target (the routing rate) are flagged inline in each document.
   central cost-control idea, and the routing rate it produces is reported from the
   router's own counters rather than assumed.
 - **The router makes two decisions, not one.** The six gates decide **post-level**
-  work. Separately, the router picks **which comments** Stage 2 analyses — the
-  by default **every comment with text** (`ROUTER_COMMENT_TOP_N=0`) — and every
-  Stage-2 voter reads that one set, so the post-level breakdown and the
-  per-comment table always describe the same comments. Setting a positive cap
-  keeps only the top-N by reaction count and bounds per-post comment cost at
-  `ceil(N/25)` LLM calls; the comments below the cut are still kept and persisted,
-  and the result reports how many (`ensemble.not_analysed`) rather than implying
-  full coverage.
+  work. Separately, the router picks **which comments** Stage 2 analyses — by
+  default **every unique comment with text** (`ROUTER_COMMENT_TOP_N=0`), after
+  excluding textless kinds and collapsing repeat comments to their most-liked
+  occurrence — and every Stage-2 voter reads that one set, so the post-level
+  breakdown and the per-comment table always describe the same comments. Setting
+  a positive cap keeps only the top-N by reaction count and bounds per-post
+  comment cost at `ceil(N/25)` LLM calls; the comments below the cut are still
+  kept and persisted, and the result reports how many
+  (`ensemble.not_analysed`) rather than implying full coverage. Mechanism:
+  [ROUTER.md](docs/ROUTER.md) §5.
 - **Comment sentiment is an ensemble, not a model.** Each analysed comment
   collects up to **eight** verdicts — seven small sentiment heads batched on CPU
   (`STAGE2_CLASSIFIER_1..7`) and the context-aware LLM stance pass, the only
@@ -223,7 +251,9 @@ target (the routing rate) are flagged inline in each document.
   locked tenant's content off-box (PROJECT_ASSESSMENT §13.5).
 - **Queue-based, horizontally scalable.** API → ingestion → message bus →
   stateless GPU/CPU workers → result store. Workers scale independently per
-  stage.
+  stage. The chain is **linear** — ingestion → Stage 1 → router → Stage 2 →
+  assembler — with no bypass hop: the router's gate decides how much *work* a
+  post gets, not which stage it reaches ([PIPELINE.md](docs/PIPELINE.md) §1).
 - **Queue: Kafka for Production/Enterprise, Redis Streams for the MVP.** Start
   simple, migrate when throughput and replay/retention demand it.
 - **Jobs can be stopped and resumed, which the queue shape dictates.** A job is

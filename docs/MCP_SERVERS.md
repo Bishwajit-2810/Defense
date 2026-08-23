@@ -315,3 +315,13 @@ sequenceDiagram
     Server-->>MCP_Client: Streamable HTTP Response
     MCP_Client-->>Agent: Return tool results
 ```
+
+---
+
+## Related documents
+
+- [AGENTS.md](AGENTS.md) — the nine agents, their per-agent tool allowlists and budgets
+- [SEARCH.md](SEARCH.md) — the retrieval arms behind `semantic_search` / `search_comments`, and the measured recall@k table
+- [RAG_STATE_AND_ROADMAP.md](RAG_STATE_AND_ROADMAP.md) — what the retrieval layer stores, and the audit sections
+- [ASSEMBLER.md](ASSEMBLER.md) §3 — the ClickHouse tables `analytics-mcp` queries, and why the reaction columns live on the post row
+- [LLM_BACKENDS.md](LLM_BACKENDS.md) — the `agent` role these tools are called from

@@ -1,8 +1,14 @@
 # Infrastructure — GPU Sizing, Monitoring, Caching, Scaling
 
-Infrastructure and scaling for the smart layer from [what.txt](../what.txt): GPU
+Infrastructure and scaling for the smart layer in [architecture.md](architecture.md): GPU
 sizing, the monitoring stack, caching, and how it scales from 1k → 100k threads
 per batch. Cost figures live in [cost_estimation.md](cost_estimation.md).
+
+> **Implementation companions:** the stream topology these autoscalers key on is
+> [PIPELINE.md](PIPELINE.md) §1; the stores the assembler writes are
+> [ASSEMBLER.md](ASSEMBLER.md) §3; the telemetry is
+> [SYSTEM_MONITOR.md](SYSTEM_MONITOR.md).
+
 
 ---
 

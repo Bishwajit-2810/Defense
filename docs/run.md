@@ -493,8 +493,11 @@ curl -s -X POST http://127.0.0.1:8001/v1/agents/query \
 
 ### 11b. Dashboard
 
-The dashboard is static HTML/JS. It already targets the dev API on
-`http://127.0.0.1:8001` by default (`dashboard/app.js`), so just serve it:
+The shipped dashboard is **React 19 + Vite + Tailwind** (`dashboard/`) — see
+[DASHBOARD_UI.md](DASHBOARD_UI.md) and [dashboard/README.md](../dashboard/README.md)
+for the dev server and build. The original static HTML/JS build is preserved at
+`dashboard_legacy/`, targets the dev API on `http://127.0.0.1:8001` by default
+(`dashboard_legacy/app.js`), and can be served with no build step:
 
 ```bash
 cd $REPO/dashboard
@@ -697,8 +700,13 @@ as a real semantic vector (PROJECT_ASSESSMENT §13.2).
 
 | Variable | Purpose | Required? | Example / default |
 | --- | --- | --- | --- |
-| `NEAR_DUP_DEDUP` | Reuse a prior analysis for a post whose caption is within `NEAR_DUP_THRESHOLD` cosine of one already analysed, skipping Stage 1 and Stage 2. | default `true` | `false` |
-| `NEAR_DUP_THRESHOLD` | Cosine similarity required to count as a near-duplicate. | default `0.97` | `0.99` |
+| `NEAR_DUP_DEDUP` | Reuse a prior analysis for a post whose caption is within `NEAR_DUP_THRESHOLD` cosine of one already analysed, skipping Stage 1 and Stage 2. | default **`false`** | `true` |
+| `NEAR_DUP_THRESHOLD` | Cosine similarity required to count as a near-duplicate. | default **`0.95`** | `0.99` |
+
+> **This ships off.** `Settings.near_dup_dedup` defaults to `"false"` and nothing
+> in `.env` or `.env.example` overrides it, so near-duplicate reuse is available
+> rather than applied — set `NEAR_DUP_DEDUP=true` to exercise it. Earlier revisions
+> of this table said `true` / `0.97`; the code says `false` / `0.95`.
 
 In stub mode only *identical* captions match — identical text hashes to an
 identical vector, so cosine is exactly 1.0 and any repost takes this path. The
@@ -768,3 +776,20 @@ the first three, so a chatbot session cannot inflate the per-post cost figure.
 
 > `HOSTNAME` is read by the workers as their stream consumer name; it's set
 > automatically by the OS/container — don't set it yourself.
+
+---
+
+## Where the mechanism is documented
+
+This document is the operational reference — every variable, every port, every
+troubleshooting path. For what a component *does* and which of its claims are
+measured:
+
+[PIPELINE.md](PIPELINE.md) (the five stages and their streams) ·
+[INGESTION.md](INGESTION.md) · [STAGE1_NLP.md](STAGE1_NLP.md) ·
+[ROUTER.md](ROUTER.md) · [STAGE2_LLM.md](STAGE2_LLM.md) ·
+[ASSEMBLER.md](ASSEMBLER.md) · [JOBS.md](JOBS.md) ·
+[LLM_BACKENDS.md](LLM_BACKENDS.md) · [SEARCH.md](SEARCH.md) · [CHAT.md](CHAT.md) ·
+[REPORTS.md](REPORTS.md) · [AUTH.md](AUTH.md) · [AGENTS.md](AGENTS.md) ·
+[MCP_SERVERS.md](MCP_SERVERS.md) · [DASHBOARD_UI.md](DASHBOARD_UI.md) ·
+[SYSTEM_MONITOR.md](SYSTEM_MONITOR.md).

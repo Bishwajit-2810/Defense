@@ -14,7 +14,7 @@ For full real input→output examples see [examples.md](examples.md).
 
 > **This file is the contract as designed; [endpoints.md](endpoints.md) is the
 > surface as built** — copy-pasteable curl for what the running app serves
-> (**49 distinct `/v1` paths, 61 method+path pairs** as of 20 Aug 2026), including
+> (**52 distinct `/v1` paths, 64 method+path pairs** as of 23 Aug 2026), including
 > per-comment paging, chat history, the raw event stream and the report export
 > paths. Where the two disagree, endpoints.md is the current one. In particular the
 > `comment_analysis` block below predates the comment ensemble: the shipped shape
@@ -636,10 +636,11 @@ egresses to Groq.
 | `GET /v1/chat/models`              | Models available per backend (+ defaults) for the chat model picker                    |
 | `DELETE /v1/posts/{id}`            | Data deletion (retention / GDPR-style)                                                 |
 
-> This table is the **designed** surface. The app currently serves 49 distinct
+> This table is the **designed** surface. The app currently serves 52 distinct
 > `/v1` paths; [endpoints.md](endpoints.md) §3b lists the ones not covered here —
-> chat conversations, report export, pipeline stats, log streaming and the agent
-> registry introspection routes.
+> chat conversations, report export, pipeline stats, log reading and streaming,
+> the corpus overview, the Stage-1 NLP model override, the three System Monitor
+> telemetry routes, and the agent registry introspection routes.
 
 > The **MCP servers** (`analytics-mcp`, `retrieval-mcp`, `ingest-mcp` — see
 > [architecture.md](architecture.md) §11) are **internal** tool interfaces consumed

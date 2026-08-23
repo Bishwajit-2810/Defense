@@ -46,7 +46,10 @@
 >   applies the lock, and stamps the decision into the envelope.
 > - **Near-duplicate reuse composes rather than copies**, and reuses post-level
 >   analysis only: the comment thread of a caption-matched post is its own and is
->   reported unanalysed.
+>   reported unanalysed. It also **ships disabled** (`NEAR_DUP_DEDUP=false`) at a
+>   `0.95` threshold, so wherever this document treats dedup as a load-bearing
+>   cost lever, that lever is available rather than applied
+>   ([INGESTION.md](INGESTION.md) §3).
 > - **Cluster summarization delivers output.** The per-cluster LLM calls this
 >   document describes as the cost lever were, until §13.1, computed and then
 >   stripped by the API's response model.
@@ -56,12 +59,29 @@ layer. It consolidates the whole design — overview, architecture, alternatives
 models, infrastructure, cost, API, worked examples, deployment, and the phased
 roadmap — into one source of truth.
 
-> **Focused docs that supersede sections below:** For the dashboard UI, read
-> [DASHBOARD_UI.md](DASHBOARD_UI.md). For monitoring and observability, read
-> [SYSTEM_MONITOR.md](SYSTEM_MONITOR.md). For agents, read
-> [AGENTS.md](AGENTS.md). For MCP servers, read
-> [MCP_SERVERS.md](MCP_SERVERS.md). These focused docs are authoritative where
-> they diverge from the consolidated text below.
+> **Focused docs that supersede sections below.** Every component now has an
+> implementation document that describes what the code does and ends in an
+> evidence-class table. **They are authoritative wherever they diverge from the
+> consolidated text below**, which is a design document.
+>
+> | Sections below | Read instead |
+> | -------------- | ------------ |
+> | §5 Data flow, §6 Service breakdown, §10 Reliability | [PIPELINE.md](PIPELINE.md) — the stream topology, the single envelope, cancellation, retry/DLQ, live progress |
+> | §5 step 1–2 (ingest, dedup) | [INGESTION.md](INGESTION.md) |
+> | §5 step 4 (Stage 1) | [STAGE1_NLP.md](STAGE1_NLP.md) |
+> | §7 The hybrid routing strategy | [ROUTER.md](ROUTER.md) — **the chain is linear; there is no bypass hop** |
+> | §5 step 5–6 (Stage 2) | [STAGE2_LLM.md](STAGE2_LLM.md) |
+> | §8 Canonical output JSON, storage fan-out | [ASSEMBLER.md](ASSEMBLER.md) |
+> | §17 API — job control | [JOBS.md](JOBS.md) |
+> | §14 model roles, backend switching, cost counters | [LLM_BACKENDS.md](LLM_BACKENDS.md) |
+> | §14 RAG / retrieval | [SEARCH.md](SEARCH.md) · [RAG_STATE_AND_ROADMAP.md](RAG_STATE_AND_ROADMAP.md) |
+> | §11 Security | [AUTH.md](AUTH.md) |
+> | §17 chat / reports endpoints | [CHAT.md](CHAT.md) · [REPORTS.md](REPORTS.md) |
+> | Agentic layer | [AGENTS.md](AGENTS.md) · [MCP_SERVERS.md](MCP_SERVERS.md) |
+> | Dashboard UI | [DASHBOARD_UI.md](DASHBOARD_UI.md) |
+> | §15 Monitoring and observability | [SYSTEM_MONITOR.md](SYSTEM_MONITOR.md) |
+> | Evidence classes for every claim | [FEATURES.md](FEATURES.md) · [evaluation.md](evaluation.md) |
+> | §9 Technology stack | [TECH_STACK.md](TECH_STACK.md) — installed versions, not recommendations |
 
 ---
 

@@ -81,6 +81,19 @@ between them at any time without redeploying.
 
 ---
 
+> **Per-feature implementation documents.** This document is the architecture;
+> each component now has a document describing what the code does, ending in an
+> evidence-class table: [PIPELINE.md](PIPELINE.md) (the hub) ·
+> [INGESTION.md](INGESTION.md) · [STAGE1_NLP.md](STAGE1_NLP.md) ·
+> [ROUTER.md](ROUTER.md) · [STAGE2_LLM.md](STAGE2_LLM.md) ·
+> [ASSEMBLER.md](ASSEMBLER.md) · [JOBS.md](JOBS.md) ·
+> [LLM_BACKENDS.md](LLM_BACKENDS.md) · [SEARCH.md](SEARCH.md) ·
+> [CHAT.md](CHAT.md) · [REPORTS.md](REPORTS.md) · [AUTH.md](AUTH.md) ·
+> [AGENTS.md](AGENTS.md) · [MCP_SERVERS.md](MCP_SERVERS.md) ·
+> [DASHBOARD_UI.md](DASHBOARD_UI.md) · [SYSTEM_MONITOR.md](SYSTEM_MONITOR.md).
+> Where this document and one of those disagree, the feature document is what
+> runs.
+
 ## 1. Design principles
 
 1. **Hybrid intelligence, not LLM-everywhere.** The prompt explicitly forbids
@@ -270,8 +283,21 @@ Q&A, grounded reports, and targeted deep-dives (never per post) — see §11.
    > green. See [models.md](models.md) §2 for the role-to-model mapping.
 5. **Router/Triage (the "smart thinking layer").** For each thread the router
    decides:
+
+   > **Implementation note — the chain is linear.** As built, the router `XADD`s
+   > **every** post to `llm:stage2:queue`; there is no bypass hop to the
+   > assembler. What the gate decides is how much *work* the post gets, carried on
+   > the envelope as `task_flags.post_level_routed`: a "bypassed" post skips
+   > summary / post-type / insight and still has its **comments** analysed,
+   > because the whole comment ensemble lives in Stage 2. Sending bypassed posts
+   > straight to the assembler is what left the majority of posts with three empty
+   > columns in the per-comment comparison. `stats:llm_routed` still counts only
+   > the posts that received post-level tasks, so `estimated_llm_share` keeps its
+   > meaning. Detail: [ROUTER.md](ROUTER.md) §4, [PIPELINE.md](PIPELINE.md) §1.
+
    - All required fields produced with confidence ≥ threshold, and no LLM-only
-     task requested → **mark complete**, skip Stage 2.
+     task requested → **no post-level LLM work** (design intent: "skip Stage 2";
+     see the note above for what ships).
    - A `post_summary` is requested, or confidence is below threshold, or the
      thread is ambiguous / heavily Banglish / long → **route to Stage 2** with a
      compact, token-minimized prompt (post + a representative/clustered subset of
@@ -402,8 +428,12 @@ Levers that keep token usage and cost low:
 - **Confidence gating.** Only uncertain posts reach the LLM. Tune thresholds per
   task from a labeled validation set.
 - **Top-N comment selection (the biggest per-post lever).** The router hands
-  Stage 2 only the N most-reacted comments with text, bounding Stage-2 comment cost
-  at `ceil(N / COMMENT_STANCE_BATCH)` LLM calls however large the thread. It caps
+  Stage 2 only the N most-reacted **unique** comments with text — textless kinds
+  (`emoji`/`filtered`/`link`) are excluded, comments below
+  `ROUTER_COMMENT_MIN_WORDS` word tokens are excluded, and repeat comment texts
+  collapse to their most-liked occurrence (`duplicate_of`) — bounding Stage-2
+  comment cost at `ceil(N / COMMENT_STANCE_BATCH)` LLM calls however large the
+  thread. Mechanism: [ROUTER.md](ROUTER.md) §5. It caps
   every voter at once, which matters: a cap on the LLM alone still runs seven models
   over the whole thread and leaves the per-comment comparison with an empty LLM
   column. **It ships at `0` — the whole thread — so this lever is available, not

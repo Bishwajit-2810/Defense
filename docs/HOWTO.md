@@ -347,3 +347,28 @@ including what a green suite does not prove: **[testing.md](testing.md)**.
 
 When unsure about a field, a metric, or a tradeoff: **read the referenced doc
 section — do not guess.**
+
+---
+
+## Where each task's finished state is documented
+
+This guide is the build order. Once a component exists, its behaviour — and which
+of its claims are measured — is documented separately, and those documents are
+authoritative where they and this guide disagree:
+
+| Phase / task area | Document |
+| ----------------- | -------- |
+| The stage skeleton, streams, retry, cancellation | [PIPELINE.md](PIPELINE.md) |
+| Ingestion + normalizer + dedup | [INGESTION.md](INGESTION.md) |
+| Stage-1 NLP suite, fusion, vision | [STAGE1_NLP.md](STAGE1_NLP.md) |
+| The router's gates and comment selection | [ROUTER.md](ROUTER.md) |
+| Stage-2 tasks and the comment ensemble | [STAGE2_LLM.md](STAGE2_LLM.md) |
+| Assembler, schema validation, persistence | [ASSEMBLER.md](ASSEMBLER.md) |
+| Job control endpoints | [JOBS.md](JOBS.md) |
+| LLM client, roles, policy, usage counters | [LLM_BACKENDS.md](LLM_BACKENDS.md) |
+| Search + retrieval | [SEARCH.md](SEARCH.md) |
+| Chat, reports | [CHAT.md](CHAT.md) · [REPORTS.md](REPORTS.md) |
+| Auth, tenancy, rate limits | [AUTH.md](AUTH.md) |
+| Agents + MCP (Phase 2) | [AGENTS.md](AGENTS.md) · [MCP_SERVERS.md](MCP_SERVERS.md) |
+| Dashboard | [DASHBOARD_UI.md](DASHBOARD_UI.md) |
+| Observability | [SYSTEM_MONITOR.md](SYSTEM_MONITOR.md) |

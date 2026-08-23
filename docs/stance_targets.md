@@ -2,6 +2,13 @@
 
 **Status: BUILT (5 August 2026). Validation and the watchlist contents are not.**
 
+> **Implementation companions:** deterministic matching runs in
+> [STAGE1_NLP.md](STAGE1_NLP.md) §4 (free string work, so it happens even on posts
+> the router bypasses); the context-aware re-scoring and the watchlist escalation
+> rule are [STAGE2_LLM.md](STAGE2_LLM.md) §3 and §5; the agent that queries it is the
+> `stance` agent in [AGENTS.md](AGENTS.md) §2.4.
+
+
 | Part | State |
 | ---- | ----- |
 | `src/defense/libs/stance_targets.py` — loader + alias matcher | **done**, 36 tests |

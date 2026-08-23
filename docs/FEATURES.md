@@ -17,13 +17,17 @@ and what the image modality was before §9.3.
 | ⚠️ **Unexercised** | Implemented, but cannot currently produce a signal |
 | 📋 **Planned** | Designed, not built |
 
-**Scale (measured 20 Aug 2026):** **51,801 lines of Python across 174 files** —
-`src/defense/services/` 21,629, `tests/` 17,984, `src/defense/libs/` 5,556,
-`src/defense/mcp_servers/` 3,377, `eval/` 2,402, `run_all.py` 853. **1,315 tests**
-across 64 files. Working corpus: **50 posts, 10,272 comments** — the whole of
-`posts_with_details.json`, which is what ingestion uploads (the 43-post
-captioned subset is no longer any script's default input; see §3).
-*(Was 49,341 lines / 1,261 tests on 17 Aug; 27,537 lines / 673 tests on 5 Aug.)*
+**Scale (measured 23 Aug 2026):** **55,965 lines of Python across 181 files** —
+`src/defense/services/` 23,561, `tests/` 19,332, `src/defense/libs/` 5,707,
+`src/defense/mcp_servers/` 3,377, `eval/` 2,402, `run_all.py` 856,
+`src/defense/contracts/` 153. **1,396 tests** across 67 test files (1,393 pass,
+3 skipped — the `e2e`/`destructive` markers). Dashboard: **78** unit tests across
+12 files, plus 2 Playwright specs. Working
+corpus: **50 posts, 10,272 comments** — the whole of `posts_with_details.json`,
+which is what ingestion uploads (the 43-post captioned subset is no longer any
+script's default input; see §3).
+*(Was 51,801 lines / 1,315 tests on 20 Aug; 49,341 / 1,261 on 17 Aug;
+27,537 / 673 on 5 Aug.)*
 
 Test code is now 35% of the Python in the repository, up from 23% and 14% before
 that. That ratio is the more meaningful number: the growth is almost entirely
@@ -41,7 +45,7 @@ mutation-testing pass confirming they actually fail when the fixes are reverted.
 | **Platform detection** | Derives the platform from each post's URL host, so the service is not Facebook-specific. | ✅ Measured |
 | **Idempotent upsert** | Every post has a stable content hash; re-ingesting is safe and re-analysis is a first-class operation. Postgres upserts on `post_id`, object storage writes a deterministic key, and the two ClickHouse tables collapse to the newest row per post — `comment_sentiments` in the engine, `analysis_events` in the queries. **Until 5 Aug 2026 the last of those was missing**, so a re-analysed post was counted twice in every analytics aggregate; see PROJECT_ASSESSMENT §11.2. | ✅ Measured |
 | **Baseline preservation** | The upstream's coarse `sentiment`/`viralPotential` are kept as `baseline_*` and never overwritten, so our recomputation can be compared against theirs. | ✅ Measured |
-| **Near-duplicate reuse** | A post within cosine 0.97 of an already-analysed one reuses that result and skips both stages. The result is **composed, not copied**: identity, engagement, reactions and timestamps come from the new post, only the post-level analysis is reused, and `processing.reused_from` records the source. The **comment thread is never reused** — a caption match is not a thread match, so the new post's thread is reported unanalysed rather than inheriting labels for comments nobody read. Reuse goes through the assembler, so all three stores are written. | 🟡 Works, unmeasured — was a verbatim row copy until 5 Aug 2026 (§13.3) |
+| **Near-duplicate reuse** | A post within cosine **`NEAR_DUP_THRESHOLD` (default `0.95`)** of an already-analysed one reuses that result and skips both stages. **It ships disabled** — `NEAR_DUP_DEDUP` defaults to `false`, and nothing in `.env`/`.env.example` overrides it, so this is available rather than applied. The result is **composed, not copied**: identity, engagement, reactions and timestamps come from the new post, only the post-level analysis is reused, and `processing.reused_from` records the source. The **comment thread is never reused** — a caption match is not a thread match, so the new post's thread is reported unanalysed rather than inheriting labels for comments nobody read. Reuse goes through the assembler, so all three stores are written. | 🟡 Works, unmeasured — **and off by default**; was a verbatim row copy until 5 Aug 2026 (§13.3) |
 | **Working-corpus filter** | `eval/make_text_corpus.py` writes `posts_text_only.json` (43 captioned posts) and prints exactly what it dropped and why. The source corpus is never modified. It is no longer any script's default input: eval runs read the full `posts_with_details.json` (50 posts), matching what ingestion uploads, and each script reports any null-caption posts it skips. | ✅ Measured |
 
 ---
@@ -77,7 +81,7 @@ mutation-testing pass confirming they actually fail when the fixes are reverted.
 | **Env-tunable thresholds** | `ROUTER_CONFIDENCE_THRESHOLD`, `ROUTER_POST_TYPE_CONFIDENCE_THRESHOLD`, `ROUTER_TOXICITY_THRESHOLD`, `ROUTER_LONG_TEXT_CHARS` — which makes the gate sweepable rather than merely arbitrary. | ✅ Measured |
 | **Exercised bypass leg** | A bypassed post is validated end to end against the output schema. That branch had never once executed before §4. | ✅ Measured |
 | **Task flags** | Tells Stage 2 which tasks are actually needed, so a confidently-typed post does not pay for a redundant `post_type` call. | ✅ Measured |
-| **Comment selection (the whole thread, by default)** | A second, separate decision the router makes: which comments Stage 2 analyses. `ROUTER_COMMENT_TOP_N` defaults to **0 = every comment with text**, and the selection is recorded either way (`stage2_selected` per comment, `stage2_selection` per post). A positive value keeps the top-N by reaction count instead — ranked by `likes`, tie-broken by original index so the choice is reproducible — for when a run needs to be fast rather than complete. Marked on the comments rather than filtered out, so all three stores receive the whole thread regardless. | 🟡 Works, unmeasured |
+| **Comment selection (the whole thread, by default)** | A second, separate decision the router makes: which comments Stage 2 analyses. Three steps — **eligibility** (textless `emoji`/`filtered`/`link` kinds excluded; below `ROUTER_COMMENT_MIN_WORDS` word tokens excluded), **deduplication** (identical normalised texts collapse to their most-liked occurrence, marked `duplicate` / `duplicate_of`), then **top-N** by reaction count. Both caps default to **0 = every unique comment with text**, and the selection is recorded either way (`stage2_selected` / `stage2_skip_reason` per comment; `stage2_selection` per post, carrying `eligible` / `duplicates` / `cutoff_likes` / `top_likes`). Marked on the comments rather than filtered out, so all three stores receive the whole thread regardless. Full mechanism: [ROUTER.md](ROUTER.md) §5. | 🟡 Works, unmeasured — no figure for how many calls dedup saves |
 | **The gate decides post-level work only** | Comment analysis is **not** gated: every post reaches Stage 2 for its comments, and `stats:llm_routed` counts only the posts that got post-level tasks, so `estimated_llm_share` keeps its meaning. Bypassed posts used to go straight to the assembler, which left the majority of posts with three empty columns in the per-comment comparison and nothing saying why. | ✅ Measured |
 
 > **Read the routing rate as a measure of Stage-1 quality, not cost efficiency.**
@@ -248,7 +252,11 @@ Full design: **[stance_targets.md](stance_targets.md)**.
 | `eval/bakeoff_summary.py` | Per-model latency, truncation rate, language fidelity, grounding proxy | ✅ Measured |
 | `eval/sweep_threshold.py` | Cost-vs-threshold and cost-vs-comment-cap curves | ✅ Measured (cost axis only) |
 | `eval/harness.py` | Structural checks: input validation, platform detection, coverage | ✅ Measured |
-| **Accuracy metrics** | Macro-F1 per language bucket, κ agreement, calibration | 📋 **Planned — zero gold labels exist.** The one decisive gap (§7.2) |
+| `eval/build_retrieval_set.py` | 32 known-item retrieval queries, one relevant post each | ✅ Measured |
+| `eval/score_retrieval.py` | **recall@k / MRR@k / nDCG@k per retriever configuration** | ✅ **Measured — the one accuracy axis that exists.** `hybrid`/`chunked` reach recall@10 = 0.8750 vs 0.1875 on stub vectors ([evaluation.md](evaluation.md) §8.4) |
+| `eval/build_gold_set.py` | The stratified 300-comment sample — **samples, does not label** | ✅ Built |
+| `eval/score_gold.py` | Scores the **configured roster** per stratum, abstention and accuracy-when-answered reported separately | ✅ Built, **no input** |
+| **Labelling accuracy metrics** | Macro-F1 per language bucket, κ agreement, calibration | 📋 **Planned — 0 of 300 gold rows adjudicated.** The one decisive gap (§7.2) |
 
 ---
 
@@ -261,9 +269,13 @@ Being explicit about this is worth more in a defense than one more feature.
   keys and the objects are not in MinIO. Post sentiment is a **text**
   measurement. A failed fetch now reports `vision_status`, not a fabricated
   neutral verdict.
-- **Accuracy.** There are no gold labels, so there is no F1, no confusion matrix
-  and no ship gate. Everything above marked ✅ is a *system property* — a rate, a
-  count, a latency — not a correctness claim.
+- **Labelling accuracy.** There are no adjudicated gold labels, so there is no
+  F1, no confusion matrix and no ship gate for any sentiment labeller. Almost
+  everything above marked ✅ is a *system property* — a rate, a count, a latency —
+  not a correctness claim. **The one exception is retrieval**, which has genuine
+  accuracy numbers (recall@k / MRR@k / nDCG@k over 32 known-item queries,
+  [evaluation.md](evaluation.md) §8.4) — themselves lower bounds on a set with no
+  human relevance judgement. Quote that exception precisely or not at all.
 - **"Cost-efficient" as a headline.** The routing rate is 16%, not single digits,
   and cost is comment-dominated. The defensible claim is *"cheap NLP filters
   which comments and which posts deserve an LLM"* — narrower, and measured.
@@ -294,3 +306,23 @@ Being explicit about this is worth more in a defense than one more feature.
 | [AGENTS.md](AGENTS.md) | All 9 agent profiles, runner hardening, budget enforcement, chat routing |
 | [MCP_SERVERS.md](MCP_SERVERS.md) | All 3 MCP servers, 18 tools, agent-to-tool mapping, stub modes |
 | [run.md](run.md) / [easy_run.md](easy_run.md) | Getting it running, and every env knob |
+| [TECH_STACK.md](TECH_STACK.md) | Every technology and installed version, and why each pin exists |
+| [TESTING_RESULTS.md](TESTING_RESULTS.md) | The latest full-chain test run, verbatim |
+
+**Per-feature documents.** Each capability in the tables above has a document of
+its own, and each carries its own evidence-class table:
+
+| Section above | Document |
+| ------------- | -------- |
+| §1 Ingestion | [INGESTION.md](INGESTION.md) |
+| §2 Stage 1 | [STAGE1_NLP.md](STAGE1_NLP.md) |
+| §3 The router | [ROUTER.md](ROUTER.md) |
+| §4 Stage 2 | [STAGE2_LLM.md](STAGE2_LLM.md) |
+| §5 Watchlist stance | [stance_targets.md](stance_targets.md) |
+| §6 Pluggable LLM backend | [LLM_BACKENDS.md](LLM_BACKENDS.md) |
+| §7 Output, storage & API | [ASSEMBLER.md](ASSEMBLER.md) · [SEARCH.md](SEARCH.md) · [REPORTS.md](REPORTS.md) · [endpoints.md](endpoints.md) |
+| §8 Authentication & tenancy | [AUTH.md](AUTH.md) |
+| §9 Agentic insight layer | [AGENTS.md](AGENTS.md) · [MCP_SERVERS.md](MCP_SERVERS.md) · [RAG_STATE_AND_ROADMAP.md](RAG_STATE_AND_ROADMAP.md) · [CHAT.md](CHAT.md) |
+| §10 Dashboard & observability | [DASHBOARD_UI.md](DASHBOARD_UI.md) · [SYSTEM_MONITOR.md](SYSTEM_MONITOR.md) |
+| §11 Scale & operations | [PIPELINE.md](PIPELINE.md) · [JOBS.md](JOBS.md) · [deployment.md](deployment.md) |
+| §12 Evaluation | [evaluation.md](evaluation.md) |

@@ -100,8 +100,14 @@ Custom React hook (`dashboard/src/hooks/useSystemMetrics.js`):
 
 ### Backend Endpoints
 - `GET /v1/system/stats` — Returns current hardware metrics snapshot (JSON)
+- `GET /v1/system/health` — The cheap version: per-component up/down + status, for a
+  header chip or a probe. Use this rather than `/stats` when you only need liveness —
+  `/stats` shells out for GPU and Docker state and is materially more expensive.
 - `GET /v1/system/stream?ticket={ticket}` — SSE stream of `stats` events (real-time push)
 - Authentication: SSE ticket obtained via `POST /v1/auth/sse-ticket` (single-use)
+
+All three live in [`api/routers/system.py`](../src/defense/services/api/routers/system.py)
+and are listed in the endpoint reference at [endpoints.md](endpoints.md) §3b.
 
 ---
 
@@ -315,8 +321,12 @@ Span hierarchy: `Ingest → Worker (Stage 1) → Router → Worker (Stage 2) →
 ## 9. Health Checks
 
 ### Service Health Endpoints
-- API: `GET /v1/health`
-- Analytics MCP: `GET :8110/health`
+- API liveness: `GET /v1/health`
+- API readiness: `GET /v1/ready` — checks Postgres **and** Redis and returns
+  `{"status": "ready", "postgres": "ok", "redis": "ok"}`. This is the one to wire to
+  a Kubernetes readiness probe; `/v1/health` answers even when the datastores are down.
+- Component detail: `GET /v1/system/health` (§2)
+- Analytics MCP: `GET :8110/health` (host port 8110 → container 8100 under Compose, because 8100 is commonly taken on dev hosts)
 - Retrieval MCP: `GET :8101/health`
 - Ingest MCP: `GET :8102/health`
 
@@ -338,3 +348,14 @@ Span hierarchy: `Ingest → Worker (Stage 1) → Router → Worker (Stage 2) →
 ### Network Policies
 - Config: `deploy/k8s/networkpolicy.yaml`
 - Restricts inter-service communication to required paths only
+
+---
+
+## 11. Related documents
+
+- [PIPELINE.md](PIPELINE.md) — the streams whose depths and DLQs this monitors, and the progress-event contract
+- [JOBS.md](JOBS.md) — job counters and the SSE progress channel
+- [LLM_BACKENDS.md](LLM_BACKENDS.md) §4 — the usage counters `GET /v1/usage` reads, and the five lanes
+- [DASHBOARD_UI.md](DASHBOARD_UI.md) — the UI surfaces these endpoints feed
+- [AUTH.md](AUTH.md) §4 — SSE tickets, required by `/v1/system/stream`
+- [deployment.md](deployment.md) · [infrastructure.md](infrastructure.md) — the K8s and GPU context

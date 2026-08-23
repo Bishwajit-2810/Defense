@@ -1,12 +1,19 @@
 # AI Model Selection, RAG & Fine-Tuning
 
 Model recommendations per task, the Bangla/Banglish/English fine-tuning strategy,
-and the RAG evaluation for the smart layer in [what.txt](../what.txt). All small-model
+and the RAG evaluation for the smart layer in [architecture.md](architecture.md). All small-model
 choices favor open-source, GPU-efficient models with genuine Bangla support and
 run **self-hosted**. The Stage-2 LLM runs behind a **pluggable backend with two
 interchangeable providers — `local` (self-hosted vLLM) and `groq` (Groq Cloud
 API) — switchable at runtime** (see §2). Default is `local` (no per-token bill, no
 data egress); `groq` is an opt-in switch for fastest inference and zero GPU ops.
+
+> **Implementation companions:** the role→model resolution, backend switching and
+> per-role cost counters are [LLM_BACKENDS.md](LLM_BACKENDS.md); what Stage 1 does
+> with these models is [STAGE1_NLP.md](STAGE1_NLP.md); what Stage 2 does with them,
+> including the seven-head comment ensemble, is [STAGE2_LLM.md](STAGE2_LLM.md);
+> retrieval quality is measured in [SEARCH.md](SEARCH.md).
+
 
 The guiding rule from [architecture.md](architecture.md): **small models do the
 bulk work; the LLM is selective.** So the table below is mostly _small_ models,

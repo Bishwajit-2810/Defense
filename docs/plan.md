@@ -1,5 +1,11 @@
 # Implementation Plan & Roadmap
 
+> **Note (23 August 2026):** the `what.txt` link below is dead — that
+> requirements file was removed from the repository in commit `036e013`. The prose
+> is left as written because this document is a dated record; what `what.txt`
+> specified now lives in [data_contract.md](data_contract.md) and
+> [architecture.md](architecture.md).
+
 > **Status (5 August 2026):** Phase-1 pipeline items are built. What remains is
 > not code: install the ML extras for a real-mode run, label ~300 comments, seed
 > the auth tables, and fill in the watchlist. See

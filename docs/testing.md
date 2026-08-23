@@ -202,7 +202,7 @@ uv run pytest -q -m "not e2e"             # exclude the stack-dependent group
 * **Datastore-backed behaviour is covered by testcontainers**, not by your dev
   stack: `tests/conftest.py` can start throwaway Postgres and Redis containers.
   Nothing in a default run reads or writes the compose stack.
-* **There is still no measured accuracy for any labeller.** 1,370 passing tests
+* **There is still no measured accuracy for any labeller.** 1,393 passing tests
   are correctness and contract tests. `eval/gold/comments_gold_300.json` holds
   300 stratified rows and **0 are adjudicated**, deliberately — labels seeded
   from a model in this repo would measure agreement with itself. See
@@ -217,14 +217,21 @@ uv run pytest -q -m "not e2e"             # exclude the stack-dependent group
 ## 6. Before you push
 
 ```bash
-uv run pytest -q                     # 1377 passed, 3 skipped, and NO warnings summary
+uv run pytest -q                     # 1393 passed, 3 skipped, and NO warnings summary
 cd dashboard
-npm test -- --run                    # 62 passed
-npm run lint                         # must read "Found 0 warnings and 0 errors"
-npm run build                        # six chunks, no (!) advisory
+npm test -- --run                    # 78 passed across 12 files
+npm run lint                         # oxlint: silent, exit 0. ANY output is a failure
 npm run build                        # must succeed — the unit tests do not compile the app
-npm run test:e2e                     # 4 passed
+                                     # 5 JS chunks + 1 CSS, no (!) size advisory
+npm run test:e2e                     # 2 passed (chromium; Playwright starts vite itself)
 ```
+
+Measured 23 Aug 2026 on this checkout: **1,393 passed / 3 skipped in 56 s**
+(1,396 collected), **78** dashboard unit tests across 12 files, **2** Playwright
+specs. The three skips are the e2e/destructive markers a plain run excludes (§4).
+`npm run test:e2e` needs no server of its own — `playwright.config.ts` has a
+`webServer` block that runs `npm run dev` on `localhost:5173` and reuses an
+existing one.
 
 `npm run build` earns its place, but note what it does **not** catch: it does not
 resolve JSX identifiers. `PostModal` rendered `<AlertCircle>` without importing
@@ -232,3 +239,22 @@ it — a `ReferenceError` on the one path that exists to show the operator a
 comment-loading error — and the build passed the whole time. oxlint reports that
 as `react(jsx-no-undef)`, and it only became visible once the 63 warnings stopped
 burying it. Lint is not cosmetic here.
+
+---
+
+## 7. Related documents
+
+- [evaluation.md](evaluation.md) — the measurement plan a green suite does *not*
+  satisfy, including §8.4, the one axis (**retrieval**) that has real accuracy
+  numbers, and §8's status table for everything that does not
+- [FEATURES.md](FEATURES.md) — the evidence class of every capability
+- The per-feature documents each end in an evidence-class table:
+  [PIPELINE.md](PIPELINE.md) · [INGESTION.md](INGESTION.md) ·
+  [STAGE1_NLP.md](STAGE1_NLP.md) · [ROUTER.md](ROUTER.md) ·
+  [STAGE2_LLM.md](STAGE2_LLM.md) · [ASSEMBLER.md](ASSEMBLER.md) ·
+  [JOBS.md](JOBS.md) · [LLM_BACKENDS.md](LLM_BACKENDS.md) · [SEARCH.md](SEARCH.md) ·
+  [CHAT.md](CHAT.md) · [REPORTS.md](REPORTS.md) · [AUTH.md](AUTH.md)
+- [TESTING_RESULTS.md](TESTING_RESULTS.md) — the verbatim output of the full
+  `&&` chain below, with the stage-by-stage result table
+- [TECH_STACK.md](TECH_STACK.md) — the versions of every tool in that chain
+- [dashboard/README.md](../dashboard/README.md) — the frontend suites

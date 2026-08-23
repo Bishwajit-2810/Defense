@@ -1,8 +1,14 @@
 # Deployment — Docker Compose vs Kubernetes, and the K8s Plan
 
-How the smart layer from [what.txt](../what.txt) is deployed: the MVP shape, the
+How the smart layer described in [architecture.md](architecture.md) is deployed: the MVP shape, the
 production shape, and the full Kubernetes plan that delivers the "proper scaling"
 the owner asked for.
+
+> **Implementation companions:** the five worker processes and their streams are
+> [PIPELINE.md](PIPELINE.md); the secret and tenancy policy a production deploy must
+> satisfy is [AUTH.md](AUTH.md) §2; the health and readiness probes are
+> [SYSTEM_MONITOR.md](SYSTEM_MONITOR.md) §9.
+
 
 ---
 

@@ -11,6 +11,11 @@ embedded. Worked input→output runs are in [examples.md](examples.md); our REST
 contracts are in [api_design.md](api_design.md); the canonical output schema is in
 [architecture.md](architecture.md) §6.
 
+> **Implementation companion:** how a payload is pulled, validated, normalized,
+> deduplicated and enqueued — and which of the golden rules below is enforced
+> where — is [INGESTION.md](INGESTION.md).
+
+
 ---
 
 ## 0. The big picture — a service on top of an existing platform

@@ -2,10 +2,17 @@
 
 Monthly cost estimates for MVP / Production / Enterprise across compute,
 storage, networking, and LLM — sizing the "cost-effective" requirement from
-[what.txt](../what.txt). The Stage-2 LLM cost depends on the **selected backend**
+[architecture.md](architecture.md). The Stage-2 LLM cost depends on the **selected backend**
 (see [models.md](models.md) §2): `local` (self-hosted vLLM) is a **GPU line, no
 per-token charge**; `groq` (Groq Cloud API) is a **per-token API line, no LLM
 GPU**. Both are priced below.
+
+> **Implementation companions:** the gate that decides post-level spend and how to
+> read its rate is [ROUTER.md](ROUTER.md); the comment lane that dominates the bill
+> is [STAGE2_LLM.md](STAGE2_LLM.md); the counters that make any of this checkable —
+> five lanes, per backend and model, with `pipeline_tokens` isolating the per-post
+> figure — are [LLM_BACKENDS.md](LLM_BACKENDS.md) §4.
+
 
 > **These are planning-grade order-of-magnitude estimates, not quotes.** Cloud
 > GPU prices change frequently and vary by region, commitment (on-demand vs

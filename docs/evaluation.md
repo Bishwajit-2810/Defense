@@ -136,6 +136,7 @@ Targets are **launch bars** (MVP), tracked per language bucket; tighten over tim
 | Toxicity / hate                  | F1 **and** PR-AUC (class-imbalanced)                                 | PR-AUC ≥0.75; high-recall operating point      |
 | **OCR** (our own)                | CER / WER (bn + en)                                                  | CER ≤0.15 on legible images                    |
 | **`post_summary`**               | Faithfulness, coverage, language-correctness (below)                 | Faithfulness ≥0.90; correct-language =100%     |
+| **Retrieval** (posts) | recall@k / MRR@k / nDCG@k on the known-item set | **Measured: recall@10 = 0.8750** (`hybrid`, `chunked`) — §8.4 |
 
 **Calibration.** Beyond F1 we check **confidence calibration** (reliability curve /
 ECE) on the classifiers — because the **Router** ([architecture.md](architecture.md)
@@ -197,6 +198,12 @@ The hybrid design's promises are themselves tested ([architecture.md](architectu
   `tokens_by_backend_model` and `cost_by_backend_model`; a single blended rate is
   wrong for both backends in opposite directions.
 - **Latency / throughput** — per-stage p50/p95; end-to-end per batch (1k / 10k).
+- **Retrieval quality** — recall@k / MRR@k / nDCG@k per retriever configuration
+  (`python -m eval.score_retrieval`). This is the one accuracy axis that **is**
+  measured; §8.4 has the table and the four caveats that bound how it may be
+  quoted. Re-run it after any change to ranking — hybrid weights, chunking, the
+  encoder, the rerank flag — because a ranking change with no evaluation behind
+  it cannot be shown to help, only assumed to.
 - **Cache & dedup hit rates** — dedup on repetitive feeds, LLM-response cache.
   Note the cache key includes the **resolved model id**, so a model change must
   show as a miss; if it does not, the benchmark is comparing cached answers.
@@ -283,16 +290,26 @@ traceable.
 
 ## 8. Current state — what exists, and the one thing that does not
 
-**Status 5 August 2026.** Everything above is the plan. This is the gap between
+**Status 23 August 2026.** Everything above is the plan. This is the gap between
 it and the repository.
+
+> **Read this row split first.** "No measured accuracy" was true of the whole
+> project until 17 Aug 2026 and is now true of **labelling** only.
+> **Retrieval accuracy is measured** — recall@k / MRR@k / nDCG@k over 32
+> known-item queries, §8.4 — while **per-comment and per-post sentiment accuracy
+> is still unmeasured**, because the gold set holds 0 adjudicated labels. Both
+> facts belong in any results table; quoting either one alone misrepresents the
+> project in opposite directions.
 
 | | State |
 | --- | --- |
 | **Structural checks** | [eval/harness.py](../eval/harness.py) — `run_input_validation`, `run_platform_detection`, `run_coverage_check`. These pass and are real. |
 | **System-property measurement** | [eval/measure_routing_rate.py](../eval/measure_routing_rate.py) (routing rate, comment volume, post-vs-comment call split), [eval/make_text_corpus.py](../eval/make_text_corpus.py) (corpus + what it dropped), [eval/bakeoff_summary.py](../eval/bakeoff_summary.py) (per-model latency, truncation, language fidelity), [eval/sweep_threshold.py](../eval/sweep_threshold.py) (cost-vs-threshold and cost-vs-comment-cap curves), `GET /v1/usage` (tokens + cost per backend/model). |
-| **Regression coverage** | **1,315 tests across 64 files** (20 Aug 2026). Every finding in PROJECT_ASSESSMENT that was fixed has a test that fails if it regresses — which is the property that matters more than the count. |
+| **Regression coverage** | **1,396 tests collected across 67 files; 1,393 pass, 3 skipped in 56 s** (23 Aug 2026 — the 3 are the `e2e`/`destructive` markers a plain run excludes). Every finding in PROJECT_ASSESSMENT that was fixed has a test that fails if it regresses — which is the property that matters more than the count. |
+| **Retrieval harness** | **Built.** [eval/build_retrieval_set.py](../eval/build_retrieval_set.py) writes 32 known-item queries derived from each target post's own topics and entities; [eval/score_retrieval.py](../eval/score_retrieval.py) scores recall@k / MRR@k / nDCG@k per retriever configuration, running the **same arm functions the MCP server serves agents from**. Chunk configurations fail loudly rather than falling back to post vectors — a silent fallback would report `chunked` as a chunking result with no chunk read. |
+| **Retrieval numbers** | **Measured.** See §8.4. `hybrid` and `chunked` reach **recall@10 = 0.8750**; the stub-vector baseline scores **0.1875**, where 10 random posts out of 50 scores 0.20. Lower bounds — one relevant post is marked per query — and **not human relevance judgement** (`human_verified_count = 0`). |
 | **Accuracy harness** | **Built.** `eval/build_gold_set.py` writes the stratified 300-comment sample; `eval/score_gold.py` scores every labelling system against it — per-stratum, with abstention and accuracy-when-answered reported separately, and it refuses to print a confident percentage over a handful of rows. Since 16 Aug 2026 it scores the **configured roster** (`config.stage2_classifier_roster`), not a hardcoded pair: scoring 2 of the 7 voters and calling it "the ensemble" measures a system that is not in production. |
-| **Accuracy numbers** | **None.** `eval/gold/comments_gold_300.json` holds 300 sampled rows and **0 adjudicated labels** — every `label` is `null` by design, because seeding them from any model in this repo and then scoring that model would measure agreement with itself. |
+| **Labelling accuracy numbers** | **None.** `eval/gold/comments_gold_300.json` holds 300 sampled rows and **0 adjudicated labels** (`_meta.labelled: 0`) — every `label` is `null` by design, because seeding them from any model in this repo and then scoring that model would measure agreement with itself. Verified again 23 Aug 2026: still 300 rows, still 0 labels. |
 
 The last row is the decisive gap and the only remaining blocker on the research
 side ([PROJECT_ASSESSMENT.md](PROJECT_ASSESSMENT.md) §7.2). The harness exists and
@@ -364,3 +381,87 @@ and none of it needs labels:
   emotion.
 - **Target-mention volume** per watchlist entity, available even for bypassed
   posts because matching is free string work that runs in Stage 1.
+
+### 8.4 Retrieval evaluation — the one measured accuracy axis
+
+`python -m eval.score_retrieval` over **32 known-item queries**, k=10, on the live
+50-post corpus. The same set was run before and after real embeddings were
+enabled, so the two recall columns differ only in whether the vectors are hashes.
+
+| config | recall@10 (stub) | recall@10 (real) | MRR@10 (real) | nDCG@10 (real) |
+| :--- | ---: | ---: | ---: | ---: |
+| `vector` | 0.1875 | 0.6250 | 0.2869 | 0.3667 |
+| `lexical` (fts + trgm, fused) | 0.3750 | 0.7500 | 0.6503 | 0.6748 |
+| `chunk` | — | 0.6562 | 0.3014 | 0.3846 |
+| `hybrid` | 0.5312 | 0.8750 | 0.6108 | 0.6759 |
+| `chunked` = chunk + fts + trgm | — | **0.8750** | **0.6482** | **0.7041** |
+
+What the table establishes, and what it does not:
+
+- **Stub vectors were indistinguishable from chance** — 0.1875 recall@10, where
+  returning 10 random posts out of 50 scores 0.20. That claim had been prose for a
+  long time; this is the number.
+- **Real embeddings are worth 3.3× on the vector arm** (0.1875 → 0.6250), and the
+  end-to-end configuration went 0.5312 → 0.8750, a 65% relative gain.
+- **The lexical column moved too, and that was a bug fix, not a benefit.**
+  `plainto_tsquery` ANDs every term, so an eight-token question demanded all eight
+  words in one caption and matched **zero** rows across the whole set. Everything
+  previously credited to "full-text + trigram" was trigram alone.
+- **Chunking helps ranking, not recall, on this corpus.** Only 14 of 50 posts
+  exceed 600 characters, so 50 posts yielded 86 chunks and most are a single chunk
+  identical to the caption.
+- **`reranked` is implemented and unmeasured** — it needs the cross-encoder
+  weights, and the harness prints `skipped` rather than reporting the fused order
+  as though a rerank had happened.
+
+Four caveats bound every number above, and they belong in the same breath as the
+figures:
+
+1. **They are lower bounds.** The set marks **one** relevant post per query, so
+   every other on-topic post counts as a miss.
+2. **They compare retrievers against each other on one set.** They are not
+   absolute quality figures.
+3. **This is not human relevance judgement.** `human_verified_count = 0`; each
+   query was derived from its target post's own topics and entities. That
+   derivation also favours literal matching, which is why `lexical` alone posts a
+   higher MRR than `hybrid` — `hybrid` wins on recall@k, the metric that matters
+   when the whole top-k is handed to an LLM. A human upgrades a row by adding ids
+   to `relevant_post_ids` and setting `human_verified`.
+4. **The `stub` column reflects an unweighted fusion the server does not run.**
+   It was measured before the harness applied the 0.2 down-weight
+   `semantic_search` puts on a hash-stub query vector. The `real` columns are
+   unaffected — that weight is 1.0 either way.
+
+Rebuild the set with `python -m eval.build_retrieval_set`. Retriever internals are
+[SEARCH.md](SEARCH.md); the storage and audit history behind these numbers are
+[RAG_STATE_AND_ROADMAP.md](RAG_STATE_AND_ROADMAP.md).
+
+---
+
+## 9. Where each feature's evidence class is recorded
+
+Every feature document carries its own **evidence-class table** — which of its
+claims are measured, which work but are unmeasured, which are unexercised, and
+which are planned. They are the per-subject view of this document:
+
+| Document | Evidence table covers |
+| -------- | --------------------- |
+| [PIPELINE.md](PIPELINE.md) | Stream contracts, cancellation, retry/DLQ, per-stage latency |
+| [INGESTION.md](INGESTION.md) | Contract enforcement, dedup, upstream pull |
+| [STAGE1_NLP.md](STAGE1_NLP.md) | Every cheap-NLP signal, fusion, degradation reporting, the image path |
+| [ROUTER.md](ROUTER.md) | Routing rate, call split, gate correctness, comment selection |
+| [STAGE2_LLM.md](STAGE2_LLM.md) | Summary, truncation, the eight-labeller ensemble, caching |
+| [ASSEMBLER.md](ASSEMBLER.md) | Schema validity, idempotency, embedding honesty, job accounting |
+| [JOBS.md](JOBS.md) | Stop, resume, progress streams |
+| [LLM_BACKENDS.md](LLM_BACKENDS.md) | Backend switching, privacy lock, usage counters, parity |
+| [SEARCH.md](SEARCH.md) | The §8.4 numbers, in retriever terms |
+| [CHAT.md](CHAT.md) | Streaming, privacy, agent routing (routing accuracy unmeasured) |
+| [REPORTS.md](REPORTS.md) | Aggregate provenance, cluster cost, narrative faithfulness (unmeasured) |
+| [AUTH.md](AUTH.md) | Token policy, tenant scoping, rate limits (no pen test) |
+| [AGENTS.md](AGENTS.md) · [MCP_SERVERS.md](MCP_SERVERS.md) | Agent hardening, citation verification, tool contracts |
+| [SYSTEM_MONITOR.md](SYSTEM_MONITOR.md) | Telemetry coverage |
+| [stance_targets.md](stance_targets.md) | The watchlist's own two-metric validation (§8.2) |
+| [TESTING_RESULTS.md](TESTING_RESULTS.md) | The latest full-chain run — and, explicitly, what a green suite does *not* prove |
+
+If a claim appears on a slide and not in one of those tables, it has not been
+classified — which is the failure mode this whole document exists to prevent.
