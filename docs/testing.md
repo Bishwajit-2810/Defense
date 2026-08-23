@@ -6,9 +6,9 @@ machine with a live dev stack, and that is enforced rather than assumed (§4.1).
 
 ```bash
 # everything, from the repo root
-uv run pytest -q                                   # backend      → 1377 passed, 3 skipped
-cd dashboard && npm test -- --run                  # dashboard    → 62 passed
-cd dashboard && npm run test:e2e                   # browser      → 4 passed
+uv run pytest -q                                   # backend      → 1393 passed, 3 skipped
+cd dashboard && npm test -- --run                  # dashboard    → 78 passed (12 files)
+cd dashboard && npm run test:e2e                   # browser      → 2 passed
 ```
 
 One line, if you want a single gate before pushing:

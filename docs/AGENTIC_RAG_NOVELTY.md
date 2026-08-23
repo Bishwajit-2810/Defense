@@ -9,45 +9,64 @@
 ## 1. What You Already Have (Current Architecture)
 
 ```mermaid
+%%{init: {'theme':'base','themeVariables':{'fontFamily':'ui-sans-serif, system-ui, -apple-system, Roboto, Helvetica, Arial, sans-serif','fontSize':'14px','primaryColor':'#2f4468','primaryTextColor':'#eef2f8','primaryBorderColor':'#5b7bb5','secondaryColor':'#14564f','secondaryTextColor':'#eef2f8','secondaryBorderColor':'#2c9d8f','tertiaryColor':'#3d2f63','tertiaryTextColor':'#eef2f8','tertiaryBorderColor':'#8b6fd4','mainBkg':'#2f4468','nodeBorder':'#5b7bb5','nodeTextColor':'#eef2f8','lineColor':'#8fa1bd','textColor':'#eef2f8','titleColor':'#c9d6ea','clusterBkg':'#161e2e','clusterBorder':'#3f5573','edgeLabelBackground':'#1b2434','background':'transparent'}, 'flowchart':{'curve':'basis','padding':14,'nodeSpacing':45,'rankSpacing':55,'useMaxWidth':true}}}%%
 graph TB
-    subgraph "User Layer"
+    subgraph user["User layer"]
         UI["Dashboard / Chat UI"]
-        API["REST API /v1/search, /v1/chat, /v1/agents"]
+        API["REST API<br/>/v1/search · /v1/chat · /v1/agents"]
     end
 
-    subgraph "Agent Layer (Agentic RAG)"
-        Runner["AgentRunner — tool-use loop<br/>result cap · repeat guard · non-answer guards"]
-        Analyst["analyst · coverage · alerting"]
-        Coverage["stance · comparator · toxicity"]
-        Alerting["narrative · quality · reporter"]
+    subgraph agent["Agent layer (agentic RAG)"]
+        Runner["AgentRunner — tool-use loop<br/><small>result cap · repeat guard · non-answer guards</small>"]
+        G1["analyst · coverage · alerting"]
+        G2["stance · comparator · toxicity"]
+        G3["narrative · quality · reporter"]
     end
 
-    subgraph "MCP Tool Servers"
+    subgraph mcp["MCP tool servers"]
         RetMCP["retrieval-mcp :8101"]
-        AnaMCP["analytics-mcp :8102"]
-        IngMCP["ingest-mcp :8103"]
+        AnaMCP["analytics-mcp :8110"]
+        IngMCP["ingest-mcp :8102"]
     end
 
-    subgraph "Data & Intelligence"
-        PG["PostgreSQL + pgvector"]
-        Embed["SentenceTransformer 768-dim"]
-        Ensemble["Ensemble Voter (heuristic + 7 HF heads + LLM)"]
-        Stance["Stance Scoring (watchlist + clause-level cues)"]
-        Cluster["k-means / HDBSCAN Clustering"]
+    subgraph data["Data and intelligence"]
+        PG[("PostgreSQL + pgvector")]
+        CH[("ClickHouse")]
+        Embed["SentenceTransformer<br/>768-dim multilingual"]
+        Ensemble["Ensemble voter<br/><small>7 HF heads + LLM stance pass</small>"]
+        Stance["Stance scoring<br/><small>watchlist + clause-level cues</small>"]
+        Cluster["k-means / HDBSCAN<br/>clustering"]
     end
 
     UI --> API
     API --> Runner
-    Runner --> Analyst & Coverage & Alerting
-    Analyst -- "semantic_search, get_post, get_thread" --> RetMCP
-    Analyst -- "trend_query, sentiment_over_time, top_posts" --> AnaMCP
-    Coverage -- "fetch_more_comments" --> IngMCP
+    Runner --> G1
+    Runner --> G2
+    Runner --> G3
+    G1 -- "semantic_search · get_post · get_thread" --> RetMCP
+    G1 -- "trend_query · sentiment_over_time · top_posts" --> AnaMCP
+    G2 -- "stance_by_target · search_comments" --> RetMCP
+    G3 -- "get_clusters" --> RetMCP
+    G1 -- "fetch_more_comments" --> IngMCP
     RetMCP --> PG
+    AnaMCP --> CH
     AnaMCP --> PG
-    PG --> Embed
+    Embed --> PG
     Ensemble --> PG
     Stance --> PG
     Cluster --> PG
+
+    classDef entry fill:#3d2f63,stroke:#8b6fd4,stroke-width:1.5px,color:#eef2f8
+    classDef svc fill:#2f4468,stroke:#5b7bb5,stroke-width:1.5px,color:#eef2f8
+    classDef store fill:#14564f,stroke:#2c9d8f,stroke-width:1.5px,color:#eef2f8
+    classDef tool fill:#1b2434,stroke:#5b7bb5,stroke-width:1px,color:#c9d6ea
+    classDef obs fill:#5a3410,stroke:#c9772e,stroke-width:1.5px,color:#f6e6d5
+
+    class UI,API entry
+    class Runner,G1,G2,G3 svc
+    class RetMCP,AnaMCP,IngMCP svc
+    class PG,CH store
+    class Embed,Ensemble,Stance,Cluster tool
 ```
 
 ### Current Agent Inventory

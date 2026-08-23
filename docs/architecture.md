@@ -116,73 +116,73 @@ between them at any time without redeploying.
 
 ## 2. High-level architecture
 
-```text
-                          ┌─────────────────────────────┐
-   Clients                │  Web Dashboard (HTML/CSS/JS) │
- (dashboard, uploaders)   │  consumers / 3rd-party apps  │
-                          └───────────────┬─────────────┘
-                                          │ HTTPS
-                          ┌───────────────▼─────────────┐
-                          │   API Gateway + LB           │  NGINX / K8s Ingress
-                          │   (TLS, routing, rate limit) │
-                          └───────────────┬─────────────┘
-                                          │
-              ┌───────────────────────────┼───────────────────────────┐
-              │                           │                           │
-     ┌────────▼────────┐        ┌─────────▼─────────┐       ┌─────────▼────────┐
-     │  Auth Service   │        │ Ingestion Service │       │ Reporting / Query│
-     │ (JWT, API keys) │        │ (validate, dedup, │       │ + Agent Orchestr.│  FastAPI
-     │   (FastAPI)     │        │  enqueue) FastAPI │       │ (read APIs,      │
-     └─────────────────┘        └─────────┬─────────┘       │  agent runs)     │
-                                          │ produce         └────────┬─────────┘
-                                          │                          │ read / agent tools
-                                ┌─────────▼─────────┐       ┌─────────▼─────────────────┐
-                                │   Message Bus     │       │  Agentic insight layer    │
-                                │ Kafka / Redis Str │       │  AI agents (LLM-B/VLM) ──▶ │
-                                │  (partitioned)    │       │  MCP servers:             │
-                                └─────────┬─────────┘       │  analytics · retrieval ·  │
-                                          │ consume         │  ingest  (see §11)        │
-                                          │                 └─────────┬─────────────────┘
-                                          │                          │ read
-                                ┌─────────▼─────────┐                │
-                                │   Message Bus     │                │
-                                │ Kafka / Redis Str │                │
-                                │  (partitioned)    │                │
-                                └─────────┬─────────┘                │
-                                          │ consume                  │
+```mermaid
+%%{init: {'theme':'base','themeVariables':{'fontFamily':'ui-sans-serif, system-ui, -apple-system, Roboto, Helvetica, Arial, sans-serif','fontSize':'14px','primaryColor':'#2f4468','primaryTextColor':'#eef2f8','primaryBorderColor':'#5b7bb5','secondaryColor':'#14564f','secondaryTextColor':'#eef2f8','secondaryBorderColor':'#2c9d8f','tertiaryColor':'#3d2f63','tertiaryTextColor':'#eef2f8','tertiaryBorderColor':'#8b6fd4','mainBkg':'#2f4468','nodeBorder':'#5b7bb5','nodeTextColor':'#eef2f8','lineColor':'#8fa1bd','textColor':'#eef2f8','titleColor':'#c9d6ea','clusterBkg':'#161e2e','clusterBorder':'#3f5573','edgeLabelBackground':'#1b2434','background':'transparent'}, 'flowchart':{'curve':'basis','padding':14,'nodeSpacing':45,'rankSpacing':55,'useMaxWidth':true}}}%%
+graph TD
+    subgraph clients["Clients"]
+        Dash["Web dashboard<br/><small>React 19 + Vite + Tailwind</small>"]
+        Consumers["Downstream consumers<br/><small>3rd-party apps</small>"]
+    end
 
+    GW["API gateway + LB<br/><small>NGINX / K8s Ingress — TLS, routing, rate limit</small>"]
+    Dash -- "HTTPS" --> GW
+    Consumers -- "HTTPS" --> GW
 
-        │  STAGE 1 — Heavy LLM worker (GPU/Ollama), horizontally scaled      │
-        │  lang detect · NER · summarization (gemma) · text features         │
-        └─────────────────────────────────┬──────────────────────────────────┘
-                                          │ writes features + summary
-                                ┌─────────▼─────────────┐
-                                │ Router / Triage       │  post-level gate +
-                                │ (confidence gate,     │  comment selection
-                                │  comment selection)   │  (all with text, or top-N)
-                                └─────┬─────────────────┘
-                                      │
-                              ┌───────▼───────────────────────────┐
-                              │ STAGE 2 — Parallel Execution      │
-                              │ Lane A: post summary / type /      │
-                              │         insight (gated)            │
-                              │ Lane B: comment ensemble over the  │
-                              │   router's set — 7 cheap heads +   │
-                              │   LLM stance pass + dedup cache    │
-                              └───────┬───────────────────────────┘
-                              └─────────────┤
-                                ┌───────────▼───────────┐
-                                │  Result Assembler      │  builds final JSON
-                                │  + JSON schema validate│
-                                └───────────┬───────────┘
-                                            │ fan-out writes
-            ┌───────────────────┬───────────┼───────────────────┬───────────────┐
-       ┌────▼─────┐       ┌──────▼─────┐     ┌──────▼──────┐  ┌─────▼─────┐
-       │PostgreSQL│       │ ClickHouse │     │   Redis     │  │  Object   │
-       │ ops+jobs │       │ analytics  │     │ cache/dedup │  │  storage  │
-       │+pgvector │       └────────────┘     └─────────────┘  └───────────┘
-       │ vectors  │
-       └──────────┘
+    subgraph api["FastAPI services"]
+        Auth["Auth<br/><small>JWT · API keys · SSE tickets</small>"]
+        Ingest["Ingestion<br/><small>validate · dedup · enqueue</small>"]
+        Report["Reporting / query<br/><small>read APIs · report generation</small>"]
+    end
+    GW --> Auth
+    GW --> Ingest
+    GW --> Report
+
+    Bus["Message bus<br/><small>Redis Streams (MVP) · Kafka (prod), partitioned</small>"]
+    Ingest -- "produce" --> Bus
+
+    subgraph pipeline["Per-post pipeline"]
+        S1["Stage 1 — cheap NLP + fast LLM<br/><small>language · sentiment · emotion · NER · toxicity<br/>summary (gemma3:4b when STAGE1_LLM=true)</small>"]
+        Router["Router / triage<br/><small>post-level gate + comment selection</small>"]
+        S2["Stage 2 — two lanes<br/><small>Lane A: summary / post_type / insight (gated)<br/>Lane B: comment ensemble — 7 heads + LLM stance</small>"]
+        Asm["Result assembler<br/><small>build canonical JSON + schema validate</small>"]
+    end
+
+    Bus -- "consume" --> S1
+    S1 -- "features + summary" --> Router
+    Router -- "every post; task_flags carry the gate" --> S2
+    S2 --> Asm
+
+    subgraph agentlayer["Agentic insight layer — corpus tier"]
+        Agents["9 AI agents<br/><small>agent LLM role</small>"]
+        MCP["MCP servers<br/><small>analytics · retrieval · ingest</small>"]
+    end
+    Report -- "agent runs" --> Agents
+    Agents --> MCP
+
+    subgraph stores["Storage, split by access pattern"]
+        PG[("PostgreSQL + pgvector<br/><small>ops · jobs · vectors</small>")]
+        CH[("ClickHouse<br/><small>analytics</small>")]
+        RD[("Redis<br/><small>cache · dedup · counters</small>")]
+        OS[("Object storage<br/><small>raw payloads · reports</small>")]
+    end
+
+    Asm -- "fan-out writes" --> PG
+    Asm --> CH
+    Asm --> OS
+    Asm --> RD
+    MCP -- "read" --> PG
+    MCP -- "read" --> CH
+    Report -- "read" --> PG
+
+    class Dash,Consumers entry
+    class GW,Auth,Ingest,Report,S1,Router,S2,Asm,Agents,MCP svc
+    class Bus tool
+    class PG,CH,RD,OS store
+    classDef entry fill:#3d2f63,stroke:#8b6fd4,stroke-width:1.5px,color:#eef2f8
+    classDef svc fill:#2f4468,stroke:#5b7bb5,stroke-width:1.5px,color:#eef2f8
+    classDef store fill:#14564f,stroke:#2c9d8f,stroke-width:1.5px,color:#eef2f8
+    classDef tool fill:#1b2434,stroke:#5b7bb5,stroke-width:1px,color:#c9d6ea
+    classDef obs fill:#5a3410,stroke:#c9772e,stroke-width:1.5px,color:#f6e6d5
 ```
 
 The **Router/Triage** between Stage 1 and Stage 2 is the heart of the cost
@@ -393,18 +393,39 @@ at runtime per the routing rules in §5.
 
 ## 5. The hybrid routing strategy (core cost control)
 
-```text
-                     post features + confidences (from Stage 1)
-                                      │
-                          ┌───────────▼───────────┐
-                          │  Router decision tree  │
-                          └───────────┬───────────┘
-        ┌──────────────────────────────┼──────────────────────────────┐
-        │ all required fields           │ low confidence OR             │ LLM-only task
-        │ confident, no LLM task        │ ambiguous mixed-lang          │ requested
-        ▼                               ▼                               ▼
-   COMPLETE (no LLM)            LLM verify/refine               LLM generate
-   84% of posts (measured)     16% (measured)                  (summary/insight/report)
+```mermaid
+%%{init: {'theme':'base','themeVariables':{'fontFamily':'ui-sans-serif, system-ui, -apple-system, Roboto, Helvetica, Arial, sans-serif','fontSize':'14px','primaryColor':'#2f4468','primaryTextColor':'#eef2f8','primaryBorderColor':'#5b7bb5','secondaryColor':'#14564f','secondaryTextColor':'#eef2f8','secondaryBorderColor':'#2c9d8f','tertiaryColor':'#3d2f63','tertiaryTextColor':'#eef2f8','tertiaryBorderColor':'#8b6fd4','mainBkg':'#2f4468','nodeBorder':'#5b7bb5','nodeTextColor':'#eef2f8','lineColor':'#8fa1bd','textColor':'#eef2f8','titleColor':'#c9d6ea','clusterBkg':'#161e2e','clusterBorder':'#3f5573','edgeLabelBackground':'#1b2434','background':'transparent'}, 'flowchart':{'curve':'basis','padding':14,'nodeSpacing':45,'rankSpacing':55,'useMaxWidth':true}}}%%
+graph TD
+    In["Post features + confidences<br/><small>from Stage 1</small>"]
+    Gate{"Router decision<br/><small>six gates — any one fires</small>"}
+    In --> Gate
+
+    A["No post-level LLM work<br/><small>84% of posts (measured)</small>"]
+    B["Post-level tasks run<br/><small>16% (measured, gemma3:4b Stage 1)</small>"]
+
+    Gate -- "all required fields confident,<br/>no LLM-only task requested" --> A
+    Gate -- "low confidence · unknown post_type ·<br/>high toxicity · long code-mixed" --> B
+
+    Comments["Comment ensemble<br/><small>runs for EVERY post, gated or not</small>"]
+    A --> Comments
+    B --> Comments
+
+    Out["Stage 2 → assembler"]
+    Comments --> Out
+    B -- "summary · post_type · insight" --> Out
+
+    Note["The gate governs 30-55% of spend.<br/><small>85-96% of LLM calls are comment-level.</small>"]
+    Comments -.-> Note
+
+    class In entry
+    class Gate tool
+    class A,B,Comments,Out svc
+    class Note obs
+    classDef entry fill:#3d2f63,stroke:#8b6fd4,stroke-width:1.5px,color:#eef2f8
+    classDef svc fill:#2f4468,stroke:#5b7bb5,stroke-width:1.5px,color:#eef2f8
+    classDef store fill:#14564f,stroke:#2c9d8f,stroke-width:1.5px,color:#eef2f8
+    classDef tool fill:#1b2434,stroke:#5b7bb5,stroke-width:1px,color:#c9d6ea
+    classDef obs fill:#5a3410,stroke:#c9772e,stroke-width:1.5px,color:#f6e6d5
 ```
 
 > **Measured, 4 August 2026** ([PROJECT_ASSESSMENT.md](PROJECT_ASSESSMENT.md)
@@ -767,21 +788,34 @@ An optional layer that answers a question document-level sentiment cannot:
 **not "is this comment angry?" but "who is it angry at?"** Full design in
 [stance_targets.md](stance_targets.md).
 
-```text
-config/stance_targets.yml                (operator-supplied, versioned)
-        │
-        ▼
-src/defense/libs/stance_targets.py    alias matcher — Bangla script · romanized Banglish · English
-        │
-        ├──▶ STAGE 1: match every comment of EVERY post (pure string work, free)
-        │            + deterministic clause-based scorer  → target_stances
-        │
-        └──▶ STAGE 2: matched entities are injected into the comment-stance
-                     prompt THAT ALREADY RUNS  → target_stances (method="llm")
-                     ⇒ zero additional LLM calls
-        │
-        ▼
-per-post rollup: {entity: {mentions, supportive, opposing, neutral, method}}
+```mermaid
+%%{init: {'theme':'base','themeVariables':{'fontFamily':'ui-sans-serif, system-ui, -apple-system, Roboto, Helvetica, Arial, sans-serif','fontSize':'14px','primaryColor':'#2f4468','primaryTextColor':'#eef2f8','primaryBorderColor':'#5b7bb5','secondaryColor':'#14564f','secondaryTextColor':'#eef2f8','secondaryBorderColor':'#2c9d8f','tertiaryColor':'#3d2f63','tertiaryTextColor':'#eef2f8','tertiaryBorderColor':'#8b6fd4','mainBkg':'#2f4468','nodeBorder':'#5b7bb5','nodeTextColor':'#eef2f8','lineColor':'#8fa1bd','textColor':'#eef2f8','titleColor':'#c9d6ea','clusterBkg':'#161e2e','clusterBorder':'#3f5573','edgeLabelBackground':'#1b2434','background':'transparent'}, 'flowchart':{'curve':'basis','padding':14,'nodeSpacing':45,'rankSpacing':55,'useMaxWidth':true}}}%%
+graph TD
+    Cfg["config/stance_targets.yml<br/><small>operator-supplied, versioned</small>"]
+    Matcher["libs/stance_targets.py<br/><small>alias matcher — Bangla script ·<br/>romanized Banglish · English</small>"]
+    Cfg --> Matcher
+
+    S1["Stage 1<br/><small>match every comment of EVERY post<br/>pure string work, free</small>"]
+    Scorer["Deterministic clause-based scorer<br/><small>→ target_stances</small>"]
+    Matcher --> S1 --> Scorer
+
+    S2["Stage 2<br/><small>matched entities injected into the comment-stance<br/>prompt that ALREADY runs → zero extra LLM calls</small>"]
+    Matcher --> S2
+    S2 --> LLMOut["target_stances<br/><small>method = llm</small>"]
+
+    Rollup["Per-post rollup<br/><small>{entity: {mentions, supportive, opposing, neutral, method}}</small>"]
+    Scorer --> Rollup
+    LLMOut --> Rollup
+
+    class Cfg entry
+    class Matcher,S1,S2 svc
+    class Scorer,LLMOut tool
+    class Rollup store
+    classDef entry fill:#3d2f63,stroke:#8b6fd4,stroke-width:1.5px,color:#eef2f8
+    classDef svc fill:#2f4468,stroke:#5b7bb5,stroke-width:1.5px,color:#eef2f8
+    classDef store fill:#14564f,stroke:#2c9d8f,stroke-width:1.5px,color:#eef2f8
+    classDef tool fill:#1b2434,stroke:#5b7bb5,stroke-width:1px,color:#c9d6ea
+    classDef obs fill:#5a3410,stroke:#c9772e,stroke-width:1.5px,color:#f6e6d5
 ```
 
 Three design decisions worth knowing:

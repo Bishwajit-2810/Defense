@@ -523,9 +523,9 @@ None of the three suites needs this stack running — see
 **[testing.md](testing.md)** for the full reference:
 
 ```bash
-uv run pytest -q                                   # backend   → 1370 passed, 3 skipped (~50 s)
-cd dashboard && npm test -- --run                  # dashboard → 51 passed
-cd dashboard && npm run test:e2e                   # browser   → 4 passed (chromium)
+uv run pytest -q                                   # backend   → 1393 passed, 3 skipped (~50 s)
+cd dashboard && npm test -- --run                  # dashboard → 78 passed (12 files)
+cd dashboard && npm run test:e2e                   # browser   → 2 passed (chromium)
 ```
 
 Two groups are opt-in and skipped by default. One of them, `RUN_DESTRUCTIVE_E2E=1`,

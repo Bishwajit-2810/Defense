@@ -20,32 +20,43 @@ All servers:
 ### Architecture
 
 ```mermaid
+%%{init: {'theme':'base','themeVariables':{'fontFamily':'ui-sans-serif, system-ui, -apple-system, Roboto, Helvetica, Arial, sans-serif','fontSize':'14px','primaryColor':'#2f4468','primaryTextColor':'#eef2f8','primaryBorderColor':'#5b7bb5','secondaryColor':'#14564f','secondaryTextColor':'#eef2f8','secondaryBorderColor':'#2c9d8f','tertiaryColor':'#3d2f63','tertiaryTextColor':'#eef2f8','tertiaryBorderColor':'#8b6fd4','mainBkg':'#2f4468','nodeBorder':'#5b7bb5','nodeTextColor':'#eef2f8','lineColor':'#8fa1bd','textColor':'#eef2f8','titleColor':'#c9d6ea','clusterBkg':'#161e2e','clusterBorder':'#3f5573','edgeLabelBackground':'#1b2434','background':'transparent'}, 'flowchart':{'curve':'basis','padding':14,'nodeSpacing':45,'rankSpacing':55,'useMaxWidth':true}}}%%
 graph TD
-    Agent["Agent Orchestrator (runner.py)"]
-    Client["MCP Client"]
-    
+    Agent["Agent orchestrator<br/><small>services/agents/runner.py</small>"]
+    Client["MCP client<br/><small>services/agents/mcp_client.py</small>"]
+
     Agent --> Client
-    
-    subgraph "FastMCP Servers"
-        Analytics["Analytics MCP (:8110)"]
-        Retrieval["Retrieval MCP (:8101)"]
-        Ingest["Ingest MCP (:8102)"]
+
+    subgraph servers["FastMCP servers — 18 tools"]
+        Analytics["analytics-mcp :8110<br/><small>6 tools</small>"]
+        Retrieval["retrieval-mcp :8101<br/><small>9 tools</small>"]
+        Ingest["ingest-mcp :8102<br/><small>3 tools</small>"]
     end
-    
+
     Client -- "Streamable HTTP" --> Analytics
     Client -- "Streamable HTTP" --> Retrieval
     Client -- "Streamable HTTP" --> Ingest
-    
-    subgraph "Data Stores"
-        ClickHouse[("ClickHouse")]
-        Postgres[("PostgreSQL + pgvector")]
-        Redis[("Redis Streams")]
+
+    subgraph stores["Data stores"]
+        ClickHouse[("ClickHouse<br/><small>analysis_events · comment_sentiments</small>")]
+        Postgres[("PostgreSQL + pgvector<br/><small>analysis_results · comment_embeddings</small>")]
+        Redis[("Redis streams<br/><small>ingestion:queue</small>")]
     end
-    
+
     Analytics --> ClickHouse
     Analytics --> Postgres
     Retrieval --> Postgres
     Ingest --> Redis
+
+    classDef entry fill:#3d2f63,stroke:#8b6fd4,stroke-width:1.5px,color:#eef2f8
+    classDef svc fill:#2f4468,stroke:#5b7bb5,stroke-width:1.5px,color:#eef2f8
+    classDef store fill:#14564f,stroke:#2c9d8f,stroke-width:1.5px,color:#eef2f8
+    classDef tool fill:#1b2434,stroke:#5b7bb5,stroke-width:1px,color:#c9d6ea
+    classDef obs fill:#5a3410,stroke:#c9772e,stroke-width:1.5px,color:#f6e6d5
+
+    class Agent entry
+    class Client,Analytics,Retrieval,Ingest svc
+    class ClickHouse,Postgres,Redis store
 ```
 
 ## 2. Analytics MCP Server (Port 8110)
@@ -301,19 +312,26 @@ Started by `run_all.py --with-agents`:
 ## Tool Invocation Flow
 
 ```mermaid
+%%{init: {'theme':'base','themeVariables':{'fontFamily':'ui-sans-serif, system-ui, -apple-system, Roboto, Helvetica, Arial, sans-serif','fontSize':'14px','primaryColor':'#2f4468','primaryTextColor':'#eef2f8','primaryBorderColor':'#5b7bb5','lineColor':'#8fa1bd','textColor':'#eef2f8','actorBkg':'#2f4468','actorBorder':'#5b7bb5','actorTextColor':'#eef2f8','actorLineColor':'#8fa1bd','signalColor':'#a9bcd8','signalTextColor':'#c9d6ea','labelBoxBkgColor':'#3d2f63','labelBoxBorderColor':'#8b6fd4','labelTextColor':'#eef2f8','loopTextColor':'#c9d6ea','activationBkgColor':'#14564f','activationBorderColor':'#2c9d8f','noteBkgColor':'#3f3312','noteBorderColor':'#c99a2e','noteTextColor':'#f5ead1','sequenceNumberColor':'#0d1117','background':'transparent'}, 'sequence':{'useMaxWidth':true,'mirrorActors':false,'boxMargin':12,'messageAlign':'center','actorFontFamily':'ui-sans-serif, system-ui, -apple-system, Roboto, Helvetica, Arial, sans-serif','messageFontFamily':'ui-sans-serif, system-ui, -apple-system, Roboto, Helvetica, Arial, sans-serif','noteFontFamily':'ui-sans-serif, system-ui, -apple-system, Roboto, Helvetica, Arial, sans-serif','actorFontSize':14,'messageFontSize':13,'noteFontSize':13}}}%%
 sequenceDiagram
-    participant Agent as Agent Orchestrator
-    participant MCP_Client as MCP Client
-    participant Server as FastMCP Server
-    participant DB as Data Store
-    
+    autonumber
+    participant Agent as Agent orchestrator
+    participant MCP_Client as MCP client
+    participant Server as FastMCP server
+    participant DB as Data store
+
     Agent->>MCP_Client: Call tool (e.g. top_posts)
-    MCP_Client->>Server: HTTP POST /mcp/tools/call
-    Server->>Server: Validate parameters & Tenant ID
-    Server->>DB: Execute query/action
-    DB-->>Server: Return results
-    Server-->>MCP_Client: Streamable HTTP Response
-    MCP_Client-->>Agent: Return tool results
+    MCP_Client->>Server: Streamable HTTP request
+    Server->>Server: Validate parameters + scope to tenant
+    alt Parameters valid
+        Server->>DB: Execute query / action
+        DB-->>Server: Rows
+        Server-->>MCP_Client: Result payload
+    else Placeholder or unscoped id
+        Server-->>MCP_Client: ValueError — "not a post id"
+        Note over Server,MCP_Client: Refusing beats returning zero rows:<br/>an empty result teaches the model<br/>the corpus is empty.
+    end
+    MCP_Client-->>Agent: Tool result string
 ```
 
 ---

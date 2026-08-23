@@ -36,19 +36,27 @@ comments — §4.)
 
 ### Integration model — pull + our own separate database
 
-```text
-  ┌──────────────────────────┐      pull post-with-details      ┌───────────────────────────┐
-  │  EXISTING PLATFORM        │  ──  (post + comments +      ──▶ │  SMART LAYER               │
-  │  (upstream, source of     │       engagement + reactions +   │  ingest → analyze →        │
-  │   truth: scraping + DB)   │       shares, one payload)       │  OUR OWN DATABASE          │
-  └──────────────────────────┘                                  │  (Postgres+pgvector/       │
-                                                                 │   ClickHouse/Redis/object) │
-              ▲                                                  └──────────────┬─────────────┘
-              │ NO write-back into the upstream DB                              │ serve
-              └─────────────────  (read-only consumer)                 ┌────────▼────────┐
-                                                                       │ results/reports │
-                                                                       │ / dashboard     │
-                                                                       └─────────────────┘
+```mermaid
+%%{init: {'theme':'base','themeVariables':{'fontFamily':'ui-sans-serif, system-ui, -apple-system, Roboto, Helvetica, Arial, sans-serif','fontSize':'14px','primaryColor':'#2f4468','primaryTextColor':'#eef2f8','primaryBorderColor':'#5b7bb5','secondaryColor':'#14564f','secondaryTextColor':'#eef2f8','secondaryBorderColor':'#2c9d8f','tertiaryColor':'#3d2f63','tertiaryTextColor':'#eef2f8','tertiaryBorderColor':'#8b6fd4','mainBkg':'#2f4468','nodeBorder':'#5b7bb5','nodeTextColor':'#eef2f8','lineColor':'#8fa1bd','textColor':'#eef2f8','titleColor':'#c9d6ea','clusterBkg':'#161e2e','clusterBorder':'#3f5573','edgeLabelBackground':'#1b2434','background':'transparent'}, 'flowchart':{'curve':'basis','padding':14,'nodeSpacing':45,'rankSpacing':55,'useMaxWidth':true}}}%%
+graph LR
+    Up["EXISTING PLATFORM<br/><small>upstream source of truth:<br/>scraping + its own DB</small>"]
+    SL["SMART LAYER<br/><small>ingest → analyze →<br/>OUR OWN DATABASE</small>"]
+    Stores[("Postgres + pgvector ·<br/>ClickHouse · Redis · object storage")]
+    Out["Results / reports / dashboard"]
+
+    Up -- "pull post-with-details<br/><small>post + comments + engagement<br/>+ reactions + shares, one payload</small>" --> SL
+    SL --> Stores
+    Stores -- "serve" --> Out
+    SL -. "NO write-back — read-only consumer" .-> Up
+
+    class Up entry
+    class SL,Out svc
+    class Stores store
+    classDef entry fill:#3d2f63,stroke:#8b6fd4,stroke-width:1.5px,color:#eef2f8
+    classDef svc fill:#2f4468,stroke:#5b7bb5,stroke-width:1.5px,color:#eef2f8
+    classDef store fill:#14564f,stroke:#2c9d8f,stroke-width:1.5px,color:#eef2f8
+    classDef tool fill:#1b2434,stroke:#5b7bb5,stroke-width:1px,color:#c9d6ea
+    classDef obs fill:#5a3410,stroke:#c9772e,stroke-width:1.5px,color:#f6e6d5
 ```
 
 - **Pull, not push.** The smart layer **reads** the post-with-details payload
