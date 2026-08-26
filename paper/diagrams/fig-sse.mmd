@@ -1,0 +1,40 @@
+graph LR
+    Ticket["POST /v1/auth/sse-ticket<br/><small>single-use, ~60 s</small>"]
+    Refresh["15 s auto-refresh<br/>event"]
+
+    subgraph api["FastAPI — streaming endpoints"]
+        S1["GET /v1/system/stream"]
+        S2["GET /v1/analysis/{id}/stream"]
+        S3["GET /v1/pipeline/stream"]
+        S4["GET /v1/logs/stream"]
+        S5["POST /v1/chat/stream"]
+    end
+
+    subgraph client["React 19 dashboard"]
+        SMD["SystemMonitorDrawer<br/>SystemMetricsChip"]
+        AJ["Analysis Jobs"]
+        TR["Trace"]
+        PP["Pipeline"]
+        LG["Logs"]
+        CH["Chat"]
+    end
+
+    Ticket -. "ticket= query param" .-> api
+    S1 -- "stats" --> SMD
+    S2 -- "progress" --> AJ
+    S2 -- "stage events" --> TR
+    S3 -- "queue depth" --> PP
+    S4 -- "log lines" --> LG
+    S5 -- "ReadableStream<br/>tokens" --> CH
+    Refresh -.-> client
+
+
+    class S1,S2,S3,S4,S5 svc
+    class Ticket entry
+    class SMD,AJ,TR,PP,LG,CH tool
+    class Refresh obs
+
+    classDef entry fill:#eaecff,stroke:#4a3aa7,stroke-width:1.4px,color:#373660
+    classDef svc fill:#ddf0ff,stroke:#2a78d6,stroke-width:1.4px,color:#203d61
+    classDef obs fill:#ffe6db,stroke:#d25118,stroke-width:1.4px,color:#5b2d1d
+    classDef tool fill:#eef1f7,stroke:#747d88,stroke-width:1.2px,color:#3c4249

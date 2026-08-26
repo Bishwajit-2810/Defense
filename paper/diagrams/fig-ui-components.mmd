@@ -1,0 +1,46 @@
+graph TD
+    App["App.jsx<br/><small>activeTab state · auth gate</small>"]
+    Welcome["Welcome.jsx<br/><small>login / signup</small>"]
+    Header["Header<br/><small>LLM + NLP backend pills</small>"]
+    NavTabs["NavTabs<br/><small>the tab list of record</small>"]
+
+    App --> Welcome
+    App --> Header
+    App --> NavTabs
+
+    Pages["11 tab pages<br/><small>Overview · Posts · Analysis Jobs<br/>Reports · Search · Agents · Chat<br/>Pipeline · Trace · Warnings · Logs</small>"]
+    NavTabs -- "activeTab" --> Pages
+
+    subgraph shared["Shared components"]
+        PostModal["PostModal<br/><small>Posts · Trace · Warnings</small>"]
+        MarkdownView["MarkdownView<br/><small>Chat · Agents</small>"]
+        SystemMetricsChip["SystemMetricsChip"]
+        SystemMonitorDrawer["SystemMonitorDrawer"]
+        SystemMetricsChip --> SystemMonitorDrawer
+    end
+
+    Pages --> PostModal
+    Pages --> MarkdownView
+    Header --> SystemMetricsChip
+
+    subgraph libs["Hooks and utils"]
+        Hook["useSystemMetrics"]
+        API["utils/api.js<br/><small>hardcoded API_BASE</small>"]
+        Utils["coverage.js · sentiment.js"]
+        Hook ~~~ API ~~~ Utils
+    end
+
+    SystemMetricsChip -.-> Hook
+    Pages -.-> API
+    Pages -.-> Utils
+    SystemMonitorDrawer ~~~ Hook
+
+
+    class App,Welcome entry
+    class Header,NavTabs,Pages svc
+    class PostModal,MarkdownView,SystemMetricsChip,SystemMonitorDrawer tool
+    class Hook,API,Utils tool
+
+    classDef entry fill:#eaecff,stroke:#4a3aa7,stroke-width:1.4px,color:#373660
+    classDef svc fill:#ddf0ff,stroke:#2a78d6,stroke-width:1.4px,color:#203d61
+    classDef tool fill:#eef1f7,stroke:#747d88,stroke-width:1.2px,color:#3c4249

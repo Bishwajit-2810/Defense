@@ -1,0 +1,36 @@
+graph TD
+    subgraph prod["Production — Kubernetes"]
+        direction TB
+        K1["Ingress + stateless API replicas<br/><small>HPA on CPU and request rate</small>"]
+        K2["Worker Deployments<br/><small>KEDA ScaledObject per stage,<br/>scaling on consumer-group lag</small>"]
+        K3["Accelerator node pool<br/><small>inference servers</small>"]
+        K4["StatefulSets<br/><small>postgres · clickhouse<br/>object storage<br/>NetworkPolicy: private subnet</small>"]
+        K1 --- K2
+        K2 --- K3
+        K3 --- K4
+    end
+
+    subgraph mvp["MVP — Docker Compose"]
+        direction TB
+        M1["9 off-the-shelf images<br/><small>pgvector · redis · clickhouse<br/>minio · prometheus · grafana<br/>jaeger · loki · promtail</small>"]
+        M2["10 images built from this repository<br/><small>api · ingestion · stage1 · router<br/>stage2 · assembler · agents<br/>3 MCP servers</small>"]
+        M3["6 named volumes · 1 network"]
+        M1 --- M2
+        M2 --- M3
+    end
+
+    subgraph dev["Development — single host"]
+        direction TB
+        D1["Datastores in Docker<br/><small>postgres+pgvector · redis<br/>clickhouse · minio</small>"]
+        D2["11 host processes<br/><small>api :8001 · 5 stage workers<br/>3 MCP servers · agents :8010<br/>dashboard :8080</small>"]
+        D3["Ollama :11434<br/><small>4 local models</small>"]
+        D1 --- D2
+        D2 --- D3
+    end
+
+
+    class D1,M1,K4 store
+    class D2,D3,M2,M3,K1,K2,K3 svc
+
+    classDef svc fill:#ddf0ff,stroke:#2a78d6,stroke-width:1.4px,color:#203d61
+    classDef store fill:#d8f7e6,stroke:#008d5a,stroke-width:1.4px,color:#0a4730

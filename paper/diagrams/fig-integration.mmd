@@ -1,0 +1,18 @@
+graph TD
+    Up["EXISTING PLATFORM<br/><small>upstream source of truth:<br/>scraping + its own DB</small>"]
+    SL["SMART LAYER<br/><small>ingest → analyze →<br/>OUR OWN DATABASE</small>"]
+    Stores[("Postgres + pgvector · ClickHouse<br/>Redis · object storage")]
+    Out["Results / reports / dashboard"]
+
+    Up -- "pull post-with-details<br/><small>post + comments<br/>engagement + reactions<br/>shares, one payload</small>" --> SL
+    SL -. "NO write-back —<br/>read-only consumer" .-> Up
+    SL --> Stores
+    Stores -- "serve" --> Out
+
+    class Up entry
+    class SL,Out svc
+    class Stores store
+
+    classDef entry fill:#eaecff,stroke:#4a3aa7,stroke-width:1.4px,color:#373660
+    classDef svc fill:#ddf0ff,stroke:#2a78d6,stroke-width:1.4px,color:#203d61
+    classDef store fill:#d8f7e6,stroke:#008d5a,stroke-width:1.4px,color:#0a4730

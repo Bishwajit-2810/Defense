@@ -1,0 +1,65 @@
+graph TD
+    subgraph clients["Clients"]
+        Dash["Web dashboard<br/><small>React 19 + Vite + Tailwind</small>"]
+        Consumers["Downstream consumers<br/><small>3rd-party apps</small>"]
+    end
+
+    GW["API gateway + LB<br/><small>NGINX / K8s Ingress — TLS, routing, rate limit</small>"]
+    Dash -- "HTTPS" --> GW
+    Consumers -- "HTTPS" --> GW
+
+    subgraph api["FastAPI services"]
+        Auth["Auth<br/><small>JWT · API keys · SSE tickets</small>"]
+        Ingest["Ingestion<br/><small>validate · dedup · enqueue</small>"]
+        Report["Reporting / query<br/><small>read APIs · report generation</small>"]
+    end
+    GW --> Auth
+    GW --> Ingest
+    GW --> Report
+
+    Bus["Message bus<br/><small>Redis Streams (MVP) · Kafka (prod), partitioned</small>"]
+    Ingest -- "produce" --> Bus
+
+    subgraph pipeline["Per-post pipeline"]
+        S1["Stage 1 — cheap NLP + fast LLM<br/><small>language · sentiment · emotion · NER · toxicity<br/>summary (gemma3:4b when STAGE1_LLM=true)</small>"]
+        Router["Router / triage<br/><small>post-level gate + comment selection</small>"]
+        S2["Stage 2 — two lanes<br/><small>Lane A: summary / post_type / insight (gated)<br/>Lane B: comment ensemble — 7 heads + LLM stance</small>"]
+        Asm["Result assembler<br/><small>build canonical JSON + schema validate</small>"]
+    end
+
+    Bus -- "consume" --> S1
+    S1 -- "features + summary" --> Router
+    Router -- "every post;<br/>task_flags<br/>carry the gate" --> S2
+    S2 --> Asm
+
+    subgraph agentlayer["Agentic insight layer — corpus tier"]
+        Agents["9 AI agents<br/><small>agent LLM role</small>"]
+        MCP["MCP servers<br/><small>analytics · retrieval · ingest</small>"]
+    end
+    Report -- "agent runs" --> Agents
+    Agents --> MCP
+
+    subgraph stores["Storage, split by access pattern"]
+        PG[("PostgreSQL + pgvector<br/><small>ops · jobs · vectors</small>")]
+        CH[("ClickHouse<br/><small>analytics</small>")]
+        RD[("Redis<br/><small>cache · dedup · counters</small>")]
+        OS[("Object storage<br/><small>raw payloads · reports</small>")]
+    end
+
+    Asm -- "fan-out writes" --> PG
+    Asm --> CH
+    Asm --> OS
+    Asm --> RD
+    MCP -- "read" --> PG
+    MCP -- "read" --> CH
+    Report -- "read" --> PG
+
+    class Dash,Consumers entry
+    class GW,Auth,Ingest,Report,S1,Router,S2,Asm,Agents,MCP svc
+    class Bus tool
+    class PG,CH,RD,OS store
+
+    classDef entry fill:#eaecff,stroke:#4a3aa7,stroke-width:1.4px,color:#373660
+    classDef svc fill:#ddf0ff,stroke:#2a78d6,stroke-width:1.4px,color:#203d61
+    classDef store fill:#d8f7e6,stroke:#008d5a,stroke-width:1.4px,color:#0a4730
+    classDef tool fill:#eef1f7,stroke:#747d88,stroke-width:1.2px,color:#3c4249

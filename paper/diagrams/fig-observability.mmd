@@ -1,0 +1,56 @@
+graph TD
+    subgraph workers["Pipeline stages"]
+        W1["Stage-1 workers"]
+        W2["Stage-2 workers"]
+        WA["Assembler · router<br/>ingestion"]
+    end
+
+    subgraph agg["Telemetry stores"]
+        Redis[("Redis<br/><small>streams · pub/sub<br/>counters</small>")]
+        Prom["Prometheus"]
+        Loki["Loki"]
+        Jaeger["Jaeger"]
+    end
+
+    subgraph backend["FastAPI endpoints"]
+        API_Sys["/v1/system/stats<br/>/v1/system/stream"]
+        API_Pipe["/v1/pipeline/stats<br/>/v1/pipeline/stream"]
+        API_Log["/v1/logs<br/>/v1/logs/stream"]
+        Usage["/v1/usage"]
+    end
+
+    subgraph frontend["React dashboard"]
+        SMD["System<br/>MonitorDrawer"]
+        SMC["System<br/>MetricsChip"]
+        PP["Pipeline page"]
+        LP["Logs page"]
+    end
+
+    W1 --> Redis
+    W2 --> Redis
+    WA --> Redis
+    W1 -. "traces" .-> Jaeger
+    W2 -. "traces" .-> Jaeger
+    WA -. "log lines" .-> Loki
+
+    Redis --> API_Pipe
+    Redis --> Usage
+    Prom --> API_Sys
+    Loki --> API_Log
+
+    API_Sys --> SMD
+    API_Sys --> SMC
+    API_Pipe --> PP
+    API_Log --> LP
+
+
+    class W1,W2,WA svc
+    class Redis store
+    class Prom,Loki,Jaeger obs
+    class API_Sys,API_Pipe,API_Log,Usage svc
+    class SMD,SMC,PP,LP entry
+
+    classDef entry fill:#eaecff,stroke:#4a3aa7,stroke-width:1.4px,color:#373660
+    classDef svc fill:#ddf0ff,stroke:#2a78d6,stroke-width:1.4px,color:#203d61
+    classDef store fill:#d8f7e6,stroke:#008d5a,stroke-width:1.4px,color:#0a4730
+    classDef obs fill:#ffe6db,stroke:#d25118,stroke-width:1.4px,color:#5b2d1d

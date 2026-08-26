@@ -1,0 +1,43 @@
+graph TD
+    Sel["Router-selected comment set"]
+
+    subgraph cheap["Seven cheap heads — ≈0.92 s per comment, batched on CPU"]
+        direction TB
+        R1["xlmr · distilbert<br/>twitter_xlmr"]
+        R2["banglabert<br/>bengali_sentiment_bert"]
+        R3["mbert · modernbert"]
+    end
+
+    LLM["LLM stance pass<br/><small>the only labeller that<br/>sees the post · 25 comments<br/>per call · 3 batches in flight</small>"]
+
+    Sel --> cheap
+    Sel --> LLM
+
+    PL["parallel_labels<br/><small>up to eight verdicts<br/>kept separately</small>"]
+    cheap --> PL
+    LLM --> PL
+
+    Comb{"ensemble.combine()<br/><small>the SINGLE writer of<br/>the comment's sentiment</small>"}
+    PL --> Comb
+
+    O1["final label"]
+    O2["label_voters · label_sources<br/>winning_sources<br/>label_agreement"]
+    O3["zero voters ⇒ uncertain<br/><small>never neutral</small>"]
+    Comb --> O1
+    O1 --> O2
+    O2 --> O3
+
+    Note["Abstention protocol: a head that<br/>fails to load contributes nothing;<br/>a label outside the taxonomy<br/>contributes nothing; a tie decided<br/>by one source is recorded as<br/>tie_broken_by. Five of the seven<br/>are multilingual encoders on<br/>overlapping data, so their<br/>agreement is correlated."]
+    Comb -.-> Note
+
+    class Sel entry
+    class R1,R2,R3,LLM svc
+    class PL,O1,O2 tool
+    class Comb store
+    class O3,Note obs
+
+    classDef entry fill:#eaecff,stroke:#4a3aa7,stroke-width:1.4px,color:#373660
+    classDef svc fill:#ddf0ff,stroke:#2a78d6,stroke-width:1.4px,color:#203d61
+    classDef store fill:#d8f7e6,stroke:#008d5a,stroke-width:1.4px,color:#0a4730
+    classDef obs fill:#ffe6db,stroke:#d25118,stroke-width:1.4px,color:#5b2d1d
+    classDef tool fill:#eef1f7,stroke:#747d88,stroke-width:1.2px,color:#3c4249

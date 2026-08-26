@@ -1,0 +1,23 @@
+sequenceDiagram
+    autonumber
+    participant User as Operator
+    participant Runner as AgentRunner
+    participant AgentLLM as LLM (agent role)
+    participant MCPClient as MCP Client
+    participant MCPTools as MCP Tool Servers
+
+    User->>Runner: Submit query
+    Runner->>AgentLLM: System prompt + question + tool manifest
+    loop Until answered, or budget exhausted
+        AgentLLM->>Runner: Tool call request
+        Note over Runner: Guards: repeat-call refusal,<br/>allowlist check, budget decrement
+        Runner->>MCPClient: Invoke tool
+        MCPClient->>MCPTools: Execute
+        MCPTools-->>MCPClient: Result or error
+        MCPClient-->>Runner: Result string
+        Note over Runner: Capped at 6,000 chars<br/>(ensure_ascii=False)
+        Runner->>AgentLLM: Tool result
+    end
+    AgentLLM->>Runner: Final answer
+    Note over Runner: Non-answer guards +<br/>citation verification
+    Runner-->>User: Grounded answer + citations

@@ -1,0 +1,28 @@
+graph TD
+    Svc["Services<br/><small>api · stage-1 worker · stage-2 worker<br/>assembler · router · ingestion</small>"]
+
+    subgraph infra["Logging infrastructure"]
+        PT["Promtail"]
+        Loki[("Grafana Loki")]
+        Grafana["Grafana dashboard"]
+        PT -- "JSON lines" --> Loki
+        Loki --> Grafana
+    end
+
+    RedisBuf[("Redis buffer<br/><small>logs:recent · logs:live</small>")]
+    Tab["Dashboard Logs tab"]
+
+    Svc -- "stdout / stderr" --> PT
+    Svc -. "structlog sink" .-> RedisBuf
+    RedisBuf -- "SSE /v1/logs/stream" --> Tab
+
+
+    class Svc svc
+    class PT,Grafana obs
+    class Loki,RedisBuf store
+    class Tab entry
+
+    classDef entry fill:#eaecff,stroke:#4a3aa7,stroke-width:1.4px,color:#373660
+    classDef svc fill:#ddf0ff,stroke:#2a78d6,stroke-width:1.4px,color:#203d61
+    classDef store fill:#d8f7e6,stroke:#008d5a,stroke-width:1.4px,color:#0a4730
+    classDef obs fill:#ffe6db,stroke:#d25118,stroke-width:1.4px,color:#5b2d1d

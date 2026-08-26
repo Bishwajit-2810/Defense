@@ -1,0 +1,58 @@
+graph TD
+    Net["Internet"]
+    Ing["Ingress controller<br/><small>NGINX (+ optional Linkerd mesh)</small>"]
+    Net -- "TLS" --> Ing
+
+    subgraph deploys["Deployments — HPA on CPU/RPS"]
+        A1["auth"]
+        A2["ingestion"]
+        A3["reporting"]
+        A4["user-mgmt"]
+    end
+    Ing --> A1
+    Ing --> A2
+    Ing --> A3
+    Ing --> A4
+
+    Kafka["Kafka<br/><small>StatefulSet / operator, 3 brokers<br/>topics: ingest · llm · dlq</small>"]
+    A2 -- "produce" --> Kafka
+    A3 -- "read" --> Kafka
+
+    subgraph gpupools["GPU node pools — KEDA scales on Kafka lag"]
+        NLPW["nlp-workers<br/><small>GPU pool A</small>"]
+        LLMW["llm-workers<br/><small>GPU pool B</small>"]
+    end
+    Kafka -- "consume" --> NLPW
+    Kafka -- "consume" --> LLMW
+
+    TritonSvc["triton service<br/><small>GPU</small>"]
+    Backend["Stage-2 backend<br/><small>vLLM A+B in-cluster GPU ⇄ Groq API<br/>LLM_BACKEND switch: local or egress HTTPS</small>"]
+    NLPW --> TritonSvc
+    LLMW --> Backend
+
+    Asm["assembler<br/><small>Deployment</small>"]
+    LLMW --> Asm
+
+    subgraph data["StatefulSets / managed"]
+        PG[("postgres + pgvector<br/><small>HA, replica, vectors</small>")]
+        CH[("clickhouse<br/><small>cluster</small>")]
+        S3[("minio / S3")]
+    end
+    Asm -- "writes" --> PG
+    Asm --> CH
+    Asm --> S3
+
+    Obs["observability namespace<br/><small>prometheus · grafana · loki · jaeger · otel-collector</small>"]
+
+    class Net entry
+    class Ing,A1,A2,A3,A4,NLPW,LLMW,Asm svc
+    class Kafka,TritonSvc tool
+    class Backend entry
+    class PG,CH,S3 store
+    class Obs obs
+
+    classDef entry fill:#eaecff,stroke:#4a3aa7,stroke-width:1.4px,color:#373660
+    classDef svc fill:#ddf0ff,stroke:#2a78d6,stroke-width:1.4px,color:#203d61
+    classDef store fill:#d8f7e6,stroke:#008d5a,stroke-width:1.4px,color:#0a4730
+    classDef obs fill:#ffe6db,stroke:#d25118,stroke-width:1.4px,color:#5b2d1d
+    classDef tool fill:#eef1f7,stroke:#747d88,stroke-width:1.2px,color:#3c4249

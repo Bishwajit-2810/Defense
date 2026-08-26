@@ -1,0 +1,24 @@
+graph TD
+    subgraph stage1["NLP fleet — Stage 1"]
+        W1["Stage-1 worker<br/><small>pulls a batch from the queue,<br/>calls Triton over gRPC/HTTP</small>"]
+        Triton["Triton / ONNX Runtime<br/>+ CTranslate2<br/><small>dynamic batching · INT8/FP16<br/>many small models share a GPU</small>"]
+        W1 --> Triton
+    end
+
+    subgraph stage2["LLM roles — Stage 2, pluggable backend"]
+        W2["Stage-2 worker<br/><small>OpenAI-compatible client —<br/>picks the role per task</small>"]
+        Local["vLLM on our GPUs<br/><small>LLM-A 7B/8B fast<br/>LLM-B 14B/32B quality<br/>quantized, paged KV</small>"]
+        Groq["Groq Cloud API<br/><small>OpenAI-compatible<br/>Llama/Qwen on LPU<br/>per-token, no GPU ops</small>"]
+        W2 -- "LLM_BACKEND<br/>=local" --> Local
+        W2 -- "LLM_BACKEND<br/>=groq" --> Groq
+    end
+
+    Triton ~~~ W2
+
+    class W1,W2 svc
+    class Triton tool
+    class Local,Groq entry
+
+    classDef entry fill:#eaecff,stroke:#4a3aa7,stroke-width:1.4px,color:#373660
+    classDef svc fill:#ddf0ff,stroke:#2a78d6,stroke-width:1.4px,color:#203d61
+    classDef tool fill:#eef1f7,stroke:#747d88,stroke-width:1.2px,color:#3c4249

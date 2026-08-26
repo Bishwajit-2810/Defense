@@ -1,0 +1,11 @@
+stateDiagram-v2
+    direction LR
+    [*] --> queued
+    queued --> running: runner picked<br/>the task up
+    running --> completed: answer passed the<br/>non-answer guards
+    running --> failed: error, budget exhausted<br/>or non-answer
+    queued --> cancelled: operator cancelled
+    running --> cancelled: operator cancelled
+    completed --> [*]
+    failed --> [*]
+    cancelled --> [*]

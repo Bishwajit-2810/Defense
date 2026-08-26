@@ -1,0 +1,20 @@
+graph LR
+    Up["Upstream monitoring<br/>platform"]
+    Op["Operator /<br/>analyst"]
+    P(("0 · Social-media smart layer"))
+    Down["Downstream<br/>consumer app"]
+    Backend["LLM backend<br/><small>self-hosted vLLM or Ollama<br/>Groq Cloud</small>"]
+
+    Up -- "post-with-details payload<br/>post · comments<br/>engagement<br/>reactionBreakdown<br/>sampleShares" --> P
+    P -. "no write-back —<br/>read-only consumer" .-> Up
+    Op -- "analysis request<br/>agent question<br/>watchlist configuration" --> P
+    P -- "structured JSON · grounded<br/>briefing · report PDF" --> Op
+    P -- "canonical result JSON<br/>per thread" --> Down
+    P -- "prompt · token budget" --> Backend
+    Backend -- "completion<br/>finish_reason<br/>token counts" --> P
+
+    class Up,Op,Down,Backend entry
+    class P svc
+
+    classDef entry fill:#eaecff,stroke:#4a3aa7,stroke-width:1.4px,color:#373660
+    classDef svc fill:#ddf0ff,stroke:#2a78d6,stroke-width:1.4px,color:#203d61
