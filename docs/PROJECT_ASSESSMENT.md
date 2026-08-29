@@ -83,6 +83,78 @@ Bangla / English / Banglish)
 > feature document states the behaviour and the reason, and this document remains
 > the record of how it was found.
 >
+> ### Addendum — 29 August 2026 (five defects found from the dashboard, none reopening a finding below)
+>
+> Current repository: **185 Python files, 58,475 lines**; **1,420 tests collected
+> across 68 files — 1,417 pass, 3 skipped**. Dashboard: 96 unit tests across 12
+> files, 2 Playwright specs. The API still serves **52 distinct `/v1` paths / 64
+> method+path pairs** — the changes below add query parameters and a request
+> field, not routes.
+>
+> | Defect | Why it survived | Fix |
+> | --- | --- | --- |
+> | **The Jobs tab's per-row "Download Report" reported on the whole corpus.** It passed only `job.campaign_id`, and every job created by `POST /v1/analysis/run` from explicit `post_ids` has **no** campaign — so the request fell through to `campaign_id=all`. A one-post job downloaded a fifty-post PDF named `analysis_report_all.pdf`. | Campaign was the only scope `_generate_report_content` understood, so there was no wrong answer to give — the aggregation did exactly what it was asked. Nothing in the rendered document stated its own scope, so the output could not contradict the filename either. | `post_ids` on `POST /v1/reports`, `job_id` on `export_latest`; the filter is applied in **every** aggregate (the topics query had a hand-rolled second copy of the `WHERE` clause and was missed on the first pass); the 5-minute report cache is keyed on the scope, not just the campaign; `scope_label` travels into the metrics, the LLM prompt and the PDF header ([REPORTS.md](REPORTS.md) §1.1, `tests/test_report_scope.py`). |
+> | **The Trace tab came back blank after visiting any other tab, and abandoned a running trace.** | `App.jsx` renders tabs as `{activeTab === 'x' && <Page />}`, so leaving a tab unmounts it. The trace lived in `useState` and its cleanup closed the `EventSource`. Both halves are ordinary React; the bug is in the *combination*, which no unit test that mounts one page can see. | The session and its stream moved into `dashboard/src/utils/traceSession.js`, outside React; the page is a `useSyncExternalStore` view. A reload re-attaches to a job still in flight (the stage-event replay rebuilds the rail). Tests unmount the page and assert the stream is still consuming ([DASHBOARD_UI.md](DASHBOARD_UI.md) §6.1). |
+> | **No layer of the Trace rail had ever turned green.** | The workers publish `status: "running" \| "done"` (`libs/progress.py`); the rail coloured on `processing` / `completed`. A vocabulary mismatch between publisher and renderer, where both halves are individually valid — no error, no failing test, and the rail still *moved*, so it read as styling. | The renderer accepts both vocabularies, and [PIPELINE.md](PIPELINE.md) §3 now states which two values are actually sent. |
+>
+> A fourth, found the same evening by asking why a `done` job showed **0%**, and
+> the most instructive of the four because *every layer was individually
+> defensible*:
+>
+> `analysis_results` is upserted `ON CONFLICT (post_id)`, so a post analysed
+> twice has one row and only `updated_at` moves. Resume's completeness test was
+> `updated_at >= job.created_at` — which does not ask "did this job finish this
+> post", it asks "has anything touched this post since the job started". A
+> **different run of the same post** finished 7 seconds before job `e7ec04a6`'s
+> own post reached the router; resume read that row, declared the job complete
+> and wrote `done` while the post was still inside Stage 2. It wrote no counters,
+> so the Jobs tab drew a confident 0% beside the `done`. And resume was reachable
+> at all because liveness is judged on `jobs.updated_at`, which **only the
+> assembler writes** — so a job whose single post is legitimately spending
+> minutes in Stage 2 has a row frozen at its creation time and reads as stalled.
+>
+> Fixed at each layer rather than at the symptom: the assembler stamps
+> `processing.job_id` on every result (the row can now say *which run* produced
+> it); resume requires that attribution, treats a foreign job's id as positive
+> evidence the post has **not** landed, and says so in its `reason` when a
+> pre-stamp row can only be matched by timestamp; the shortcut writes the
+> counters it asserts; stage frames carry wall-clock `ts` and liveness takes the
+> more recent of the row and the pipeline; and the Jobs tab renders a missing
+> counter as **—** instead of coercing `null` to `0`. [JOBS.md](JOBS.md) §3, §4.2.
+>
+> The same evening produced a **fifth**, which is the first one's other half and
+> worth recording separately because the fix for one did not fix the other.
+> `job:{id}:total` and `job:{id}:completed` are two Redis keys with a 24 h TTL
+> that **expire independently**, so a finished job is routinely left holding one
+> without the other. Two live jobs showed both halves at once: a 1-post
+> `analysis_run` with only `:total` rendered **0%**, a 50-post `posts_upload`
+> with only `:completed` rendered **—**. Both had finished. Three layers were
+> wrong: the API coerced a missing `completed` to `0` while reporting a missing
+> `total` as `null` (so a caller could not tell "no counter" from "none landed");
+> the tab coerced `null` to `0` before dividing; and neither consulted the
+> durable record. `status` is a Postgres column that does not expire, and `done`
+> *means* every post landed. The counters are now reported as `null` when absent,
+> a terminal `done` reads as 100% marked as **derived from the status**, and
+> `cancelled`/`failed` never render as complete. [JOBS.md](JOBS.md) §4.2.
+>
+> A note for anyone re-running the audits: **`#L` citations in this document
+> drift silently.** Editing a file above a cited line invalidates every citation
+> below it, with no error anywhere. Five below now land on blank lines
+> (`deps.py:170`, `runner.py:315`, `stage2_llm/worker.py:379`, `config.py:52`,
+> `text_analyzer.py:401`); they are left as written, like the `dashboard/app.js`
+> links above, because this is a dated record. Resolve them against the commit
+> they were written at, not against `HEAD`.
+>
+> Two smaller things from the same pass, recorded because each is a category
+> rather than an incident. **The Playwright specs had been failing since the
+> product was renamed** (`793d5c8`): both asserted the `<title>` and Welcome
+> heading read "Defense Analysis" while the app ships as *Selective Intelligence*
+> — an end-to-end spec pinned to a product name fails on a rebrand and says
+> nothing about the app. And **calling a FastAPI endpoint function directly
+> bypasses dependency resolution**: `export_report(report_id="export_latest")`
+> omitted `type`, so the `Query("mass_reaction")` **object** — not its default —
+> travelled into `ReportRequest`. Every argument on that call is now explicit.
+>
 > ---
 >
 > ## Implementation status — 4 August 2026

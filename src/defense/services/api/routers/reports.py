@@ -81,6 +81,7 @@ def _row_to_report(row: dict) -> ReportResponse:
         updated_at=row.get("updated_at"),
         download_url=options.get("download_url") if isinstance(options, dict) else None,
         period=content.get("period"),
+        scope_label=content.get("scope_label"),
         summary=content.get("summary"),
         summary_source=content.get("summary_source"),
         clusters=content.get("clusters"),
@@ -93,16 +94,34 @@ def _row_to_report(row: dict) -> ReportResponse:
     )
 
 
-async def _generate_report_content(db: AsyncSession, campaign_id: str, tenant_id: str = "default") -> dict:
+async def _generate_report_content(
+    db: AsyncSession,
+    campaign_id: str,
+    tenant_id: str = "default",
+    post_ids: list[str] | None = None,
+) -> dict:
     """Aggregate stored analysis results into report content.
 
     Synchronous-at-request-time generation: the corpus is aggregated with a few
     SQL queries (cheap at MVP scale), so reports complete immediately instead
     of waiting on a queue consumer.
+
+    ``post_ids`` scopes the whole report to an explicit set of posts. Campaign
+    was previously the *only* scope, so a report for a job that ran specific
+    post ids — which is every ``POST /v1/analysis/run`` with no campaign — fell
+    back to ``campaign_id="all"`` and silently aggregated the entire tenant
+    corpus. A one-post job produced a fifty-post report, and nothing on the page
+    said so.
     """
     scoped = campaign_id not in ("", "all")
+    post_scoped = bool(post_ids)
     where = "WHERE ar.tenant_id = :tid" + (" AND ar.campaign_id = :cid" if scoped else "")
     params: dict = {"tid": tenant_id, "cid": campaign_id} if scoped else {"tid": tenant_id}
+    if post_scoped:
+        # Postgres upserts analysis_results ON CONFLICT (post_id), so this is one
+        # row per post however many times the post has been re-analysed.
+        where += " AND ar.post_id = ANY(:pids)"
+        params["pids"] = list(post_ids)
 
     # --- Headline metrics -----------------------------------------------
     head = (
@@ -146,7 +165,10 @@ async def _generate_report_content(db: AsyncSession, campaign_id: str, tenant_id
     ).mappings().all()
 
     # --- Topic clusters: count + dominant sentiment per topic -------------
-    topic_filter = "WHERE ar.tenant_id = :tid" + (" AND ar.campaign_id = :cid" if scoped else "")
+    # Was a second, hand-rolled copy of `where` — which meant it did not pick up
+    # the post scope, and the topic clusters in a two-post report were computed
+    # over the whole corpus. One scope, one place.
+    topic_filter = where
     topic_rows = (
         await db.execute(
             text(
@@ -265,7 +287,11 @@ async def _generate_report_content(db: AsyncSession, campaign_id: str, tenant_id
     if head["first_at"] and head["last_at"]:
         period = f"{head['first_at']:%Y-%m-%d} → {head['last_at']:%Y-%m-%d}"
 
-    scope_label = f"campaign {campaign_id}" if scoped else "all campaigns"
+    scope_label = (
+        f"{len(post_ids)} selected post(s)" if post_scoped
+        else f"campaign {campaign_id}" if scoped
+        else "all campaigns"
+    )
     sent_text = ", ".join(f"{k}: {v}" for k, v in sent_map.items()) or "no data"
     top_topics = ", ".join(c["label"] for c in clusters[:5]) or "none"
     warn_count = tox_stats.get("warn_count") or len(warnings_list)
@@ -277,6 +303,8 @@ async def _generate_report_content(db: AsyncSession, campaign_id: str, tenant_id
 
     return {
         "period": period,
+        "scope_label": scope_label,
+        "scope_post_ids": list(post_ids) if post_scoped else None,
         "summary": summary,
         "clusters": clusters,
         "warnings": warnings_list,
@@ -298,6 +326,7 @@ async def _llm_narrative(
     campaign_id: str,
     report_type: str | None,
     backend_override: str | None,
+    scope_label: str | None = None,
 ) -> str | None:
     """Ask LLM-B for a grounded executive summary of the aggregated metrics.
 
@@ -310,7 +339,7 @@ async def _llm_narrative(
         prompt = (
             "You are an analyst writing the executive summary of a social-media "
             f"monitoring report (type: {report_type or 'trend'}, scope: "
-            f"{'campaign ' + campaign_id if campaign_id not in ('', 'all') else 'all campaigns'}).\n"
+            f"{scope_label or ('campaign ' + campaign_id if campaign_id not in ('', 'all') else 'all campaigns')}).\n"
             "Below are the aggregated metrics computed from the analyzed posts. "
             "Write 3-5 factual, neutral sentences: overall volume, dominant "
             "sentiment and what drives it, the main topic clusters, and any "
@@ -351,6 +380,7 @@ async def _embedding_clusters(
     campaign_id: str,
     backend_override: str | None,
     tenant_id: str = "default",
+    post_ids: list[str] | None = None,
 ) -> tuple[list[dict], bool]:
     """Cluster post embeddings (pgvector → k-means) and summarize one slice per
     cluster with a single LLM-B call each — N posts, ~k LLM calls (§5).
@@ -377,6 +407,11 @@ async def _embedding_clusters(
     if scoped:
         where += " AND ar.campaign_id = :cid"
         params["cid"] = campaign_id
+    # Must track _generate_report_content's scope, or a post-scoped report would
+    # carry cluster summaries drawn from posts it does not otherwise mention.
+    if post_ids:
+        where += " AND ar.post_id = ANY(:pids)"
+        params["pids"] = list(post_ids)
 
     rows = (
         await db.execute(
@@ -577,12 +612,15 @@ async def create_report(
 
     # Corpus-wide reports (the dashboard) omit campaign_id → default to "all".
     campaign_id = body.campaign_id or "all"
+    post_ids = list(body.post_ids) if body.post_ids else None
 
     selector = {
         "campaign_id": campaign_id,
         "filters": body.filters.model_dump(exclude_none=True) if body.filters else {},
         "tenant_id": tenant_id,
     }
+    if post_ids:
+        selector["post_ids"] = post_ids
     options = {
         "title": body.title,
         "type": body.type,
@@ -597,7 +635,9 @@ async def create_report(
     # Generate the report content inline — the aggregation is a handful of SQL
     # queries, so reports complete at request time (no queue consumer needed).
     try:
-        content = await _generate_report_content(db, campaign_id, tenant_id=tenant_id)
+        content = await _generate_report_content(
+            db, campaign_id, tenant_id=tenant_id, post_ids=post_ids
+        )
         content["summary_source"] = "aggregate"
 
         # Grounded reports (default) get an LLM-B narrative on top of the
@@ -611,7 +651,10 @@ async def create_report(
                     backend_override = raw_override
             except Exception:
                 pass
-            narrative = await _llm_narrative(content, campaign_id, body.type, backend_override)
+            narrative = await _llm_narrative(
+                content, campaign_id, body.type, backend_override,
+                scope_label=content.get("scope_label"),
+            )
             if narrative:
                 content["aggregate_summary"] = content["summary"]
                 content["summary"] = narrative
@@ -622,7 +665,7 @@ async def create_report(
             # never fail report creation if clustering/LLM is unavailable.
             try:
                 emb_clusters, emb_are_stub = await _embedding_clusters(
-                    db, campaign_id, backend_override, tenant_id=tenant_id
+                    db, campaign_id, backend_override, tenant_id=tenant_id, post_ids=post_ids
                 )
                 content["embedding_clusters"] = emb_clusters
                 content["embedding_clusters_are_stub"] = emb_are_stub
@@ -657,7 +700,12 @@ async def create_report(
             detail="Failed to generate report",
         ) from exc
 
-    log.info("report_generated", report_id=report_id, campaign_id=campaign_id)
+    log.info(
+        "report_generated",
+        report_id=report_id,
+        campaign_id=campaign_id,
+        posts_scoped=len(post_ids) if post_ids else None,
+    )
     return ReportResponse(
         id=report_id,
         report_id=report_id,
@@ -668,6 +716,7 @@ async def create_report(
         created_at=now,
         updated_at=now,
         period=content.get("period"),
+        scope_label=content.get("scope_label"),
         summary=content.get("summary"),
         summary_source=content.get("summary_source"),
         clusters=content.get("clusters"),
@@ -692,14 +741,62 @@ async def create_report(
 )
 async def export_latest_report(
     campaign_id: str = Query("all", description="Campaign ID or 'all'"),
+    job_id: str | None = Query(
+        None,
+        description="Scope the report to the posts of this analysis job "
+        "(the Jobs tab's per-row download). Overrides campaign_id when the job carries post ids.",
+    ),
     type: str = Query("mass_reaction", description="Report type"),
     format: str = Query("pdf", description="pdf or html"),
     db: AsyncSession = Depends(get_db),
     redis: aioredis.Redis = Depends(get_redis),
     current_user: dict = Depends(get_current_user),
 ):
-    """Generate a fresh grounded mass reaction report and stream it directly for download."""
+    """Generate a fresh grounded mass reaction report and stream it directly for download.
+
+    With ``job_id`` the report covers *that job's posts and nothing else*. The
+    Jobs tab used to call this with the job's ``campaign_id``, which is null for
+    every run started from explicit post ids — so it fell back to ``all`` and a
+    one-post job downloaded a report on the entire corpus.
+    """
     tenant_id = current_user.get("tenant_id", "default")
+
+    # --- Resolve the job's scope ------------------------------------------
+    post_ids: list[str] | None = None
+    if job_id:
+        job_row = (
+            await db.execute(
+                text(
+                    """
+                    SELECT selector FROM jobs
+                    WHERE id = :id AND (tenant_id = :tid OR selector->>'tenant_id' = :tid)
+                    """
+                ),
+                {"id": job_id, "tid": tenant_id},
+            )
+        ).mappings().first()
+        if not job_row:
+            raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="No such job")
+        selector = job_row["selector"] or {}
+        if isinstance(selector, str):
+            try:
+                selector = json.loads(selector)
+            except (json.JSONDecodeError, TypeError):
+                selector = {}
+        raw_ids = selector.get("post_ids")
+        if isinstance(raw_ids, list) and raw_ids:
+            post_ids = [str(p) for p in raw_ids]
+        job_campaign = selector.get("campaign_id")
+        if not post_ids and job_campaign:
+            campaign_id = str(job_campaign)
+        # A job that named neither is a genuine whole-corpus run; it falls
+        # through to the campaign path below and reports on everything, which is
+        # then the truth rather than an accident.
+
+    # --- Reuse a recent identical report ----------------------------------
+    # Keyed on the scope, not just the campaign: a corpus-wide report generated
+    # a minute ago is not an answer to "report on this job's one post", and
+    # returning it is how the wrong PDF arrives with the right filename.
     recent_row = None
     try:
         recent_row = (
@@ -710,11 +807,16 @@ async def export_latest_report(
                     WHERE type = 'report' AND status = 'done'
                       AND (tenant_id = :tid OR selector->>'tenant_id' = :tid)
                       AND COALESCE(selector->>'campaign_id', 'all') = :cid
+                      AND COALESCE(selector->'post_ids', 'null'::jsonb) = CAST(:pids AS jsonb)
                       AND created_at >= NOW() - INTERVAL '5 minutes'
                     ORDER BY created_at DESC LIMIT 1
                     """
                 ),
-                {"tid": tenant_id, "cid": campaign_id},
+                {
+                    "tid": tenant_id,
+                    "cid": campaign_id,
+                    "pids": json.dumps(post_ids) if post_ids else "null",
+                },
             )
         ).mappings().first()
     except Exception:
@@ -724,10 +826,16 @@ async def export_latest_report(
     if rep_id:
         return await export_report(rep_id, format=format, db=db, current_user=current_user)
 
+    scope_title = (
+        f"{len(post_ids)} post(s) from job {job_id[:8]}" if post_ids and job_id
+        else f"{len(post_ids)} selected post(s)" if post_ids
+        else campaign_id
+    )
     req = ReportRequest(
         campaign_id=campaign_id,
+        post_ids=post_ids,
         type=type,
-        title=f"Mass Reaction Analysis ({campaign_id})",
+        title=f"Mass Reaction Analysis ({scope_title})",
         options={"grounded": True},
     )
     rep_resp = await create_report(req, Request({"type": "http"}), db=db, redis=redis, current_user=current_user)
@@ -764,6 +872,11 @@ def _report_to_html(report_data: dict) -> str:
     title = html_escape(str(report_data.get("title") or report_data.get("type") or "Mass Reaction & Intelligence Report"))
     report_id = html_escape(str(report_data.get("id") or report_data.get("report_id") or "N/A"))
     campaign_id = html_escape(str(report_data.get("campaign_id") or "all"))
+    # Falls back to the campaign so an older stored report still renders.
+    scope_label = html_escape(str(
+        report_data.get("scope_label")
+        or (f"campaign {campaign_id}" if campaign_id not in ("", "all") else "all campaigns")
+    ))
     created_at = report_data.get("created_at") or datetime.now(tz=timezone.utc).isoformat()
     if isinstance(created_at, datetime):
         date_str = created_at.strftime("%Y-%m-%d %H:%M UTC")
@@ -1199,7 +1312,7 @@ def _report_to_html(report_data: dict) -> str:
 <div class="header">
     <h1>{title}</h1>
     <div class="meta-line">
-        Report ID: {report_id} &bull; Campaign: {campaign_id} &bull; Generated: {date_str} &bull; Engine: Stage 1/2 LLM ({summary_source})
+        Report ID: {report_id} &bull; Scope: {scope_label} &bull; Campaign: {campaign_id} &bull; Generated: {date_str} &bull; Engine: Stage 1/2 LLM ({summary_source})
     </div>
 </div>
 
@@ -1381,7 +1494,19 @@ async def export_report(
 ):
     """Return an analysis report as a formatted PDF or HTML file download."""
     if report_id == "export_latest":
-        return await export_latest_report(campaign_id="all", format=format, db=db, redis=None, current_user=current_user)
+        # Every parameter is passed explicitly. Calling an endpoint function
+        # directly bypasses FastAPI's dependency resolution, so an omitted
+        # argument arrives as the `Query(...)` object itself rather than as its
+        # default value — and that object then travels into ReportRequest.
+        return await export_latest_report(
+            campaign_id="all",
+            job_id=None,
+            type="mass_reaction",
+            format=format,
+            db=db,
+            redis=None,
+            current_user=current_user,
+        )
 
     tenant_id = current_user.get("tenant_id", "default")
     row = await _get_report_row(db, report_id, tenant_id=tenant_id)

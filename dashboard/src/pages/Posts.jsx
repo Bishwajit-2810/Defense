@@ -1,8 +1,9 @@
 import React, { useState, useEffect, useMemo, useRef, useCallback } from 'react';
-import { Search as SearchIcon, X, Copy, Check } from 'lucide-react';
+import { Search as SearchIcon, X, Copy, Check, Play, Activity, Loader2 } from 'lucide-react';
 import { apiCall, API_BASE, getAuthHeaders } from '../utils/api.js';
 import { commentScrape, scrapeTooltip } from '../utils/coverage';
 import { formatAlertReason } from '../utils/sentiment.js';
+import { setPostId as setTracePostId } from '../utils/traceSession.js';
 import PostModal from '../components/PostModal';
 
 // Every field an operator might paste or type. `post_id` and `platform_post_id`
@@ -41,6 +42,9 @@ export default function Posts() {
   const searchSeq = useRef(0);
   const [wantSummary, setWantSummary] = useState(true);
   const [selectedPost, setSelectedPost] = useState(null);
+  // Which row is mid-enqueue, and the outcome of the last single-post re-run.
+  const [rerunning, setRerunning] = useState(null);
+  const [rerunNote, setRerunNote] = useState(null);
 
   // useCallback so the two effects below can name it as a dependency. Without
   // it the identity changes every render, so listing it would refetch in a loop
@@ -114,6 +118,53 @@ export default function Posts() {
       setCopied(id);
       setTimeout(() => setCopied(c => (c === id ? null : c)), 1200);
     } catch { /* clipboard blocked — the full id is in the title tooltip */ }
+  };
+
+  // Re-analyse exactly one row.
+  //
+  // The table has rows whose Summary cell reads "—": the post went through the
+  // pipeline without `want_summary`, or the router bypassed Stage 2, so no
+  // summary was ever generated. Until now the only remedy on this page was to
+  // re-upload the whole file. `POST /v1/analysis/run` takes `post_ids`, so a
+  // single post can be re-normalized from its stored raw_payload and pushed back
+  // through Stage 1 — and `want_summary` forces it through Stage 2, which is
+  // what actually produces the missing summary.
+  const rerunPost = async (postId) => {
+    if (!postId || rerunning) return;
+    setRerunning(postId);
+    setRerunNote(null);
+    try {
+      const resp = await apiCall('/v1/analysis/run', {
+        method: 'POST',
+        body: JSON.stringify({
+          post_ids: [postId],
+          options: { tasks: ['all'], want_summary: true, summary_lang: 'auto', llm_backend: 'auto' },
+        }),
+      });
+      const jobId = resp.analysis_id || resp.id || resp.job_id;
+      setRerunNote({
+        postId,
+        kind: 'ok',
+        text: `Queued ${postId.slice(0, 8)}… as job ${String(jobId || '').slice(0, 8)}… — the row updates when it lands.`,
+      });
+      // The job is asynchronous: nothing has changed in the table yet. The
+      // 15-second auto-refresh picks the result up; this is the nudge that makes
+      // a fast run show up without waiting for it.
+      setTimeout(fetchPosts, 4000);
+    } catch (err) {
+      setRerunNote({ postId, kind: 'error', text: `Re-run failed: ${err.message}` });
+    } finally {
+      setRerunning(null);
+    }
+  };
+
+  // Hand the row to the Trace tab. The post id goes into the trace session
+  // directly rather than through an event, because Trace is not mounted yet —
+  // the navigation below is what mounts it, and it reads the store on the way in.
+  const tracePost = (postId) => {
+    if (!postId) return;
+    setTracePostId(postId);
+    window.dispatchEvent(new CustomEvent('dashboard-navigate', { detail: { tab: 'trace' } }));
   };
 
   const downloadZip = async () => {
@@ -304,6 +355,19 @@ export default function Posts() {
           </div>
         </div>
         
+        {rerunNote && (
+          <div className={`px-4 py-2 border-b text-xs flex items-center justify-between gap-4 ${
+            rerunNote.kind === 'ok'
+              ? 'bg-emerald-50 dark:bg-emerald-900/10 border-emerald-200 dark:border-emerald-900/40 text-emerald-700 dark:text-emerald-400'
+              : 'bg-rose-50 dark:bg-rose-900/10 border-rose-200 dark:border-rose-900/40 text-rose-700 dark:text-rose-400'
+          }`}>
+            <span className="font-mono">{rerunNote.text}</span>
+            <button onClick={() => setRerunNote(null)} aria-label="Dismiss" className="shrink-0 opacity-70 hover:opacity-100">
+              <X className="w-3.5 h-3.5" />
+            </button>
+          </div>
+        )}
+
         {fromServer && (
           <div className="px-4 py-2 bg-brand-50 dark:bg-brand-900/10 border-b border-brand-200 dark:border-brand-900/40 text-xs text-brand-700 dark:text-brand-400">
             {serverHits.matchType === 'exact_id'
@@ -356,6 +420,8 @@ export default function Posts() {
                   langStr += ` +${post.language_mix.length - 1}`;
                 }
                 const summary = post.post_summary || '—';
+                const hasSummary = Boolean(post.post_summary);
+                const busy = rerunning === post.post_id;
 
                 return (
                   <tr key={post.post_id || i} className={`hover:bg-slate-50 dark:hover:bg-zinc-900/50 cursor-pointer transition-colors ${post.watchlist_alert ? 'bg-rose-50/30 dark:bg-rose-900/10' : ''}`} onClick={() => setSelectedPost(post)}>
@@ -391,7 +457,14 @@ export default function Posts() {
                       </span>
                     </td>
                     <td className="px-4 py-3">{toxScore !== null ? renderToxicityBar(toxScore) : '—'}</td>
-                    <td className="px-4 py-3 max-w-[200px] truncate" title={summary}>{summary}</td>
+                    {/* A missing summary is a state the operator can fix from
+                        this row, so it says so instead of showing a bare dash
+                        that reads like "this post has nothing to summarise". */}
+                    <td className="px-4 py-3 max-w-[200px] truncate" title={hasSummary ? summary : 'No summary was generated for this post — use Re-run to generate one.'}>
+                      {hasSummary
+                        ? summary
+                        : <span className="text-amber-600 dark:text-amber-500">no summary</span>}
+                    </td>
                     <td className="px-4 py-3 whitespace-nowrap" title={`${scrapeTooltip(scrape, post.platform)}\n\n${coverage}`}>
                       {/* Numbers only. The scrape-state tag lives on the post
                           detail, not in a 50-row list where it repeats on almost
@@ -415,12 +488,41 @@ export default function Posts() {
                     </td>
                     <td className="px-4 py-3 text-xs">{dateStr}</td>
                     <td className="px-4 py-3 text-right">
-                      <button 
-                        onClick={(e) => { e.stopPropagation(); setSelectedPost(post); }}
-                        className="px-3 py-1 bg-white dark:bg-zinc-800 border border-slate-200 dark:border-zinc-700 rounded text-xs font-medium hover:bg-slate-50 dark:hover:bg-zinc-700 transition-colors"
-                      >
-                        Details
-                      </button>
+                      <div className="flex items-center justify-end gap-1.5">
+                        {/* Re-analyse this post and nothing else. The whole-file
+                            re-upload above is the wrong tool for one row with a
+                            missing summary. */}
+                        <button
+                          onClick={(e) => { e.stopPropagation(); rerunPost(post.post_id); }}
+                          disabled={!post.post_id || Boolean(rerunning)}
+                          title={hasSummary
+                            ? 'Re-analyse only this post through the real pipeline (asks for an LLM summary)'
+                            : 'Re-analyse only this post and generate the missing summary'}
+                          className={`px-2.5 py-1 rounded text-xs font-medium border transition-colors flex items-center gap-1 disabled:opacity-40 disabled:cursor-not-allowed ${
+                            hasSummary
+                              ? 'bg-white dark:bg-zinc-800 border-slate-200 dark:border-zinc-700 hover:bg-slate-50 dark:hover:bg-zinc-700'
+                              : 'bg-amber-50 dark:bg-amber-900/20 border-amber-300 dark:border-amber-800 text-amber-700 dark:text-amber-400 hover:bg-amber-100 dark:hover:bg-amber-900/40'
+                          }`}
+                        >
+                          {busy ? <Loader2 className="w-3 h-3 animate-spin" /> : <Play className="w-3 h-3" />}
+                          {busy ? 'Queuing' : 'Re-run'}
+                        </button>
+                        <button
+                          onClick={(e) => { e.stopPropagation(); tracePost(post.post_id); }}
+                          disabled={!post.post_id}
+                          title="Open the Trace tab with this post id, to watch it move layer by layer"
+                          className="px-2.5 py-1 bg-white dark:bg-zinc-800 border border-slate-200 dark:border-zinc-700 rounded text-xs font-medium hover:bg-slate-50 dark:hover:bg-zinc-700 transition-colors flex items-center gap-1 disabled:opacity-40"
+                        >
+                          <Activity className="w-3 h-3" />
+                          Trace
+                        </button>
+                        <button 
+                          onClick={(e) => { e.stopPropagation(); setSelectedPost(post); }}
+                          className="px-3 py-1 bg-white dark:bg-zinc-800 border border-slate-200 dark:border-zinc-700 rounded text-xs font-medium hover:bg-slate-50 dark:hover:bg-zinc-700 transition-colors"
+                        >
+                          Details
+                        </button>
+                      </div>
                     </td>
                   </tr>
                 );

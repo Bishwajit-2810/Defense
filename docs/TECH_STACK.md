@@ -216,7 +216,7 @@ Details: [SYSTEM_MONITOR.md](SYSTEM_MONITOR.md).
 
 | Tool | Version | Scope |
 | ---- | ------- | ----- |
-| pytest | 9.0.3 | 1,396 tests across 67 files |
+| pytest | 9.0.3 | 1,420 tests across 68 files |
 | pytest-asyncio | 1.4.0 | The async suites |
 | testcontainers[postgres,redis] | 4.15.0 | Throwaway datastores — a default run never touches the dev stack |
 | httpx | 0.28.1 | API tests via ASGI transport |

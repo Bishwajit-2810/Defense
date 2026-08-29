@@ -52,11 +52,13 @@ graph TD
         Hook["useSystemMetrics"]
         API["utils/api.js<br/><small>hardcoded API_BASE</small>"]
         Utils["coverage.js · sentiment.js"]
+        TraceStore["utils/traceSession.js<br/><small>owns the trace + its SSE<br/>OUTSIDE React — survives unmount</small>"]
     end
 
     SystemMetricsChip -.-> Hook
     Pages -.-> API
     Pages -.-> Utils
+    Pages -. "useSyncExternalStore" .-> TraceStore
 
     classDef entry fill:#3d2f63,stroke:#8b6fd4,stroke-width:1.5px,color:#eef2f8
     classDef svc fill:#2f4468,stroke:#5b7bb5,stroke-width:1.5px,color:#eef2f8
@@ -68,6 +70,7 @@ graph TD
     class Header,NavTabs,Pages svc
     class PostModal,MarkdownView,SystemMetricsChip,SystemMonitorDrawer tool
     class Hook,API,Utils tool
+    class TraceStore store
 ```
 
 ## 3. Authentication Flow
@@ -97,18 +100,22 @@ Intelligence explorer and bulk upload interface.
 - **Navigation Bypass**: Exact ID queries automatically route to the specific post.
 - **Upload**: Batch JSON upload via drag & drop (`POST /v1/posts/upload`).
 - **Intelligence Table**: Displays Post ID (with copy button), Platform, Language, Sentiment pill, Toxicity bar, Summary, Comment Scrape Ratio (analysed/stored/total), and Timestamp.
+- **Missing summaries are named, not dashed**: a post analysed without `want_summary` (or bypassed by the router) has no `post_summary`. The cell reads **"no summary"** in amber rather than `—`, because it is a state the operator can fix from the row.
+- **Per-row actions** (added 29 Aug 2026): **Re-run** re-analyses *that one post* via `POST /v1/analysis/run` with `post_ids: [id]` and `want_summary: true` — which forces it through Stage 2, the stage that actually writes the summary. Before this the only remedy on the page was re-uploading the whole JSON file. **Trace** puts the post id into the trace session and switches to the Trace tab.
 - **Deep Inspection**: Clicking a row opens the `PostModal`.
-- **Export**: PDF export (`GET /v1/reports/export_latest`) and ZIP export (`GET /v1/analysis/export`).
-- **APIs Used**: `GET /v1/analysis/latest?limit=100&include=results`, `GET /v1/search`
+- **Export**: PDF export (`GET /v1/reports/export_latest`) and ZIP export (`GET /v1/analysis/export`). This one is corpus- or campaign-wide by design — for a report on a single job's posts, use the Jobs tab's per-row download (§4.3).
+- **APIs Used**: `GET /v1/analysis/latest?limit=100&include=results`, `GET /v1/search`, `POST /v1/analysis/run`
 
 ### 4.3 Analysis Jobs
 Job management and live execution tracking.
 - **Job Submission**: Select Campaign ID and toggle LLM summaries.
 - **Live SSE Progress**: Connects to `EventSource(/v1/analysis/{id}/stream?ticket=...)`. Handles `progress`, `stage`, `done`, `cancelled`, `error`, `connected` events.
 - **Stall Detection**: Flags jobs with `>5 min` without a progress update.
+- **Progress falls back to the status**: `total` and `completed` are two Redis keys with a 24 h TTL that expire *independently*, so a finished job is routinely left holding one without the other. Both counters present → a real ratio. Otherwise a terminal `done` reads as **100%**, marked `*` with a tooltip saying it is derived from the status rather than counted — `done` means every post landed. `cancelled` / `failed` never get the full bar, and a running job with no counters shows **—**. Real counters win over the status even when they disagree. The cell used to coerce `null` to `0` first and print a confident **0%** (missing `completed`, beside a `done` status) or a confident **100%** (missing `total`) — two fabrications for the same absence. See [JOBS.md](JOBS.md) §4.2.
 - **Controls**: Track (attach SSE), Stop (graceful cancel), Resume (re-queues unanalyzed), Re-run, Download Report (PDF), Delete.
+- **Download Report is scoped to the job**: it calls `GET /v1/reports/export_latest?job_id={id}`, and the API resolves that job's own selector. Until 29 Aug 2026 it passed only `job.campaign_id` — which is null for every job created from explicit `post_ids` — so the request fell through to `campaign_id=all` and a **one-post job downloaded a report on the whole corpus**, under a filename that said otherwise. The PDF now also prints its own `Scope:` line, so a reader can tell the two apart. See [REPORTS.md](REPORTS.md) §"Scoping".
 - **Safety**: Modal confirmations for destructive actions.
-- **APIs Used**: `GET /v1/analysis?limit=25`, `POST /v1/analysis/run`, `POST /v1/analysis/{id}/cancel`, `POST /v1/analysis/{id}/resume`, `DELETE /v1/analysis/{id}`
+- **APIs Used**: `GET /v1/analysis?limit=25`, `POST /v1/analysis/run`, `POST /v1/analysis/{id}/cancel`, `POST /v1/analysis/{id}/resume`, `DELETE /v1/analysis/{id}`, `GET /v1/reports/export_latest?job_id=…`
 
 ### 4.4 Reports
 Intelligence synthesis and PDF generation.
@@ -161,11 +168,12 @@ High-level overview of the multi-stage ingestion process.
 ### 4.9 Trace
 Deep-dive debugger for individual post processing.
 - **Debugger**: Re-runs a selected post through all 5 pipeline stages.
-- **Selection**: Post selector dropdown.
-- **Status Grid**: 5-layer live status (idle/processing/completed) for ingest, stage1, router, stage2, and assembler.
+- **Selection**: a dropdown of the latest 50 posts **or a pasted post id**. The dropdown alone could not reach a post outside that window — an id from a ticket, a log line or the Posts tab now runs directly, and the dropdown carries it as an explicit option rather than snapping the selection to a row nobody picked.
+- **Status Grid**: 5-layer live status for ingest, stage1, router, stage2 and assembler, plus each layer's `ms`. The workers publish `running` / `done` (`libs/progress.py`); the rail coloured on `processing` / `completed` until 29 Aug 2026, so **no layer had ever turned green**. Both vocabularies are accepted now.
 - **Visuals**: Comment sentiment doughnut chart and processing latency bar chart.
 - **Output**: Canonical result viewer and event tape log.
-- **Streaming**: Live updates via `EventSource(/v1/analysis/{jobId}/stream)`.
+- **Streaming**: Live updates via `EventSource(/v1/analysis/{jobId}/stream)`, deduped on the frame's monotonic `seq` — the replay buffer and live pub/sub overlap by exactly one frame by construction (PIPELINE.md §3).
+- **The session outlives the component** — see §6.
 
 ### 4.10 Warnings
 Threat intelligence and alerting center.
@@ -279,13 +287,44 @@ graph LR
 - **Global Polling**: A 15s auto-refresh interval dispatches an `auto-refresh` window event for non-SSE tabs.
 - **Keybindings**: `Alt+M` or `Ctrl+Shift+M` globally toggles the System Monitor.
 - **Session Management**: An `auth-expired` custom event handles global logout actions across the application.
+- **Cross-tab navigation**: there is no router — the active tab is `useState` in `App.jsx`. A page that hands work to another one (Posts sending a post id to Trace) dispatches a `dashboard-navigate` window event carrying `{ tab }`, rather than threading a navigation callback through every page's props.
+
+### 6.1 State that must outlive its tab
+
+`App.jsx` renders each page as `{activeTab === 'x' && <Page />}`, so **switching
+tabs unmounts the page and destroys its `useState`**. That is fine for a table
+that refetches, and wrong for anything holding a live stream.
+
+The Trace tab was the case where it was wrong. Its whole trace — job id, layer
+rail, event tape, canonical result — lived in `useState`, and its cleanup closed
+the `EventSource`. Leaving the tab therefore came back to *"Nothing traced yet"*
+and, worse, silently abandoned a post mid-pipeline.
+
+`dashboard/src/utils/traceSession.js` (29 Aug 2026) inverts that: the module owns
+the session **and the stream**, and `Trace.jsx` is a `useSyncExternalStore` view
+over it. Frames keep arriving while the operator reads Posts or Logs, and the
+page re-renders from the store when it mounts again. Consequences worth knowing:
+
+- A small slice (post id, job id, status) is mirrored into `sessionStorage`, so a
+  full page **reload** re-attaches to a job still in flight — the API replays
+  `job:{id}:stage_events` on connect, which is what makes re-attaching rebuild
+  the whole rail instead of joining mid-post.
+- `Clear` closes the stream and empties the rail but **keeps the selected post**:
+  the selection is configuration, not trace output.
+- The SSE `error` listener fires for *both* a server-sent `event: error` frame
+  and a plain transport drop. Only the first carries `e.data` — that is how they
+  are told apart, and why a stream the server closed because it was finished no
+  longer reports "failed".
+- Posts writes the post id into this store **directly** before dispatching
+  `dashboard-navigate`, because Trace is not mounted yet; an event would have
+  nowhere to land.
 
 ## 7. Build & Development
 
 - **Development**: Run `npm run dev` to start the Vite dev server on port 8080.
 - **Production**: Run `npm run build`. The Vite configuration includes manual chunk splitting (charts, react, icons, vendor) for optimal caching.
 - **Testing**:
-  - `npm test` executes Vitest unit tests.
+  - `npm test` executes Vitest unit tests (**87 across 12 files**).
   - `npm run test:e2e` executes Playwright browser tests.
 - **Linting**: `npm run lint` uses Oxlint.
 - **Styling**: Tailwind configuration features a custom 11-step `brand` palette (emerald base) and class-based dark mode.

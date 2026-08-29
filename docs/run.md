@@ -523,8 +523,8 @@ None of the three suites needs this stack running — see
 **[testing.md](testing.md)** for the full reference:
 
 ```bash
-uv run pytest -q                                   # backend   → 1393 passed, 3 skipped (~50 s)
-cd dashboard && npm test -- --run                  # dashboard → 78 passed (12 files)
+uv run pytest -q                                   # backend   → 1417 passed, 3 skipped (~55 s)
+cd dashboard && npm test -- --run                  # dashboard → 96 passed (12 files)
 cd dashboard && npm run test:e2e                   # browser   → 2 passed (chromium)
 ```
 

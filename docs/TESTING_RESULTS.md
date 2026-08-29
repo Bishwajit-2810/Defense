@@ -27,18 +27,31 @@ beforehand.
 
 | Stage | Result | Duration |
 | ----- | ------ | -------- |
-| `uv run pytest -q` | **1,393 passed, 3 skipped** | 49.10 s |
-| `npm test -- --run` (vitest) | **78 passed** across **12 files** | 2.57 s |
+| `uv run pytest -q` | **1,417 passed, 3 skipped** | 61.80 s |
+| `npm test -- --run` (vitest) | **96 passed** across **12 files** | 3.0 s |
 | `npm run lint` (oxlint) | **clean** — no output, exit 0 | <1 s |
-| `npm run build` (vite) | **built** — 1,817 modules, 5 JS chunks + 1 CSS | 784 ms |
-| `npm run test:e2e` (Playwright) | **2 passed** (chromium) | 2.3 s |
+| `npm run build` (vite) | **built** — 1,818 modules, 5 JS chunks + 1 CSS | 793 ms |
+| `npm run test:e2e` (Playwright) | **2 passed** (chromium) | 0.9 s |
 
-- **Run at:** 2026-08-23 13:17:27 → 13:18:27 (+06:00) — **60 s wall clock**
+- **Run at:** 2026-08-29 23:12:52 → 23:14:05 (+06:00) — **73 s wall clock**
 - **Environment:** Python 3.12.12 · uv 0.12.5 · Node 26.7.0 · npm 12.0.2 ·
   Linux 7.1.8-arch1-3
 - **Configuration:** the repository's `.env` as committed — `MODEL_STUB_MODE` off
   with `EMBEDDING_STUB_MODE=false`, no ML extras beyond what is installed. No
   Docker stack and no Ollama were required.
+
+> **What changed since the 23 Aug run.** +24 backend tests
+> ([`tests/test_report_scope.py`](../tests/test_report_scope.py) — report scope;
+> `test_job_lifecycle.py` — resume provenance, counter seeding, pipeline liveness
+> and the jobs list's nullable counters) and +18 dashboard tests (the Trace
+> session, the Posts per-row actions, and the Jobs progress cell).
+>
+> **The Playwright stage was failing before this run, and not for a code reason:**
+> both specs asserted the heading and `<title>` read *"Defense Analysis"*, while
+> the product was renamed **Selective Intelligence** in commit `793d5c8`. A chain
+> whose last stage tests a name the product no longer uses is not the single
+> pass/fail signal this document claims it is, so the assertions were corrected to
+> the shipped name.
 
 ### The 3 skips are deliberate
 
@@ -63,21 +76,21 @@ here reads or writes the compose stack.
 ........................................................................ [ 20%]
 ........................................................................ [ 25%]
 ........................................................................ [ 30%]
-........................................................................ [ 36%]
-........................................................................ [ 41%]
-.......................................ss............................... [ 46%]
-........................................................................ [ 51%]
-........................................................................ [ 56%]
-........................................................................ [ 61%]
-........................................................................ [ 67%]
-........................................................................ [ 72%]
-...............................................s........................ [ 77%]
-........................................................................ [ 82%]
-........................................................................ [ 87%]
-........................................................................ [ 92%]
-........................................................................ [ 97%]
-............................                                             [100%]
-1393 passed, 3 skipped in 49.10s
+........................................................................ [ 35%]
+........................................................................ [ 40%]
+.......................................ss............................... [ 45%]
+........................................................................ [ 50%]
+........................................................................ [ 55%]
+........................................................................ [ 60%]
+........................................................................ [ 65%]
+........................................................................ [ 70%]
+...........................................................s............ [ 76%]
+........................................................................ [ 81%]
+........................................................................ [ 86%]
+........................................................................ [ 91%]
+........................................................................ [ 96%]
+....................................................                     [100%]
+1417 passed, 3 skipped in 61.80s (0:01:01)
 npm notice run dashboard@0.0.0 test
 npm notice run vitest --run
 
@@ -85,9 +98,9 @@ npm notice run vitest --run
 
 
  Test Files  12 passed (12)
-      Tests  78 passed (78)
-   Start at  13:18:20
-   Duration  2.57s (transform 1.67s, setup 1.46s, import 4.12s, tests 4.10s, environment 12.86s)
+      Tests  96 passed (96)
+   Start at  23:13:58
+   Duration  3.03s (transform 2.49s, setup 1.43s, import 5.14s, tests 5.00s, environment 13.23s)
 
 npm notice run dashboard@0.0.0 lint
 npm notice run oxlint
@@ -95,30 +108,26 @@ npm notice run dashboard@0.0.0 build
 npm notice run vite build
 vite v8.2.1 building client environment for production...
 
-transforming...✓ 1817 modules transformed.
+transforming...✓ 1818 modules transformed.
 rendering chunks...
 computing gzip size...
 dist/index.html                             1.08 kB │ gzip:  0.52 kB
-dist/assets/index-BdBCIROS.css             59.45 kB │ gzip: 10.20 kB
+dist/assets/index-EPRhjZZI.css             60.03 kB │ gzip: 10.27 kB
 dist/assets/rolldown-runtime-CbXtAM7H.js    0.58 kB │ gzip:  0.36 kB
-dist/assets/icons-x7_JM6QN.js              14.61 kB │ gzip:  5.37 kB
+dist/assets/icons-CEbNI2jo.js              14.79 kB │ gzip:  5.44 kB
 dist/assets/charts-DB-ZizL1.js            179.33 kB │ gzip: 61.92 kB
 dist/assets/react-NtOV-0Rg.js             181.73 kB │ gzip: 57.15 kB
-dist/assets/index-CoxbxR2Q.js             239.25 kB │ gzip: 53.44 kB
+dist/assets/index-DxzzVrE7.js             247.70 kB │ gzip: 56.02 kB
 
-✓ built in 784ms
+✓ built in 979ms
 npm notice run dashboard@0.0.0 test:e2e
 npm notice run playwright test
-[WebServer] npm notice run dashboard@0.0.0 dev
-
-[WebServer] npm notice run vite
-
 
 Running 2 tests using 2 workers
 
-[1/2] [chromium] › tests/dashboard.spec.ts:3:1 › has title
-[2/2] [chromium] › tests/dashboard.spec.ts:8:1 › shows welcome screen elements
-  2 passed (2.3s)
+[1/2] [chromium] › tests/dashboard.spec.ts:13:1 › shows welcome screen elements
+[2/2] [chromium] › tests/dashboard.spec.ts:8:1 › has title
+  2 passed (1.1s)
 ```
 
 ## Reading the build output
@@ -153,7 +162,7 @@ deliberately not bundled into a build-config fix.
 
 The most important section, and the reason [testing.md](testing.md) §5 exists.
 
-- **There is no measured accuracy for any labeller.** 1,393 passing tests are
+- **There is no measured accuracy for any labeller.** 1,417 passing tests are
   **correctness and contract** tests. `eval/gold/comments_gold_300.json` holds 300
   stratified rows and **0 are adjudicated** — deliberately, because labels seeded
   from a model in this repo would measure agreement with itself. A green suite is

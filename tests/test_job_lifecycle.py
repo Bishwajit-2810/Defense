@@ -84,8 +84,16 @@ class FakeRedis:
         return True
 
     async def rpush(self, key, value):
-        self.keys.setdefault(key, [])
-        return 1
+        self.keys.setdefault(key, []).append(value)
+        return len(self.keys[key])
+
+    async def lrange(self, key, start, stop):
+        items = self.keys.get(key) or []
+        if not isinstance(items, list):
+            return []
+        # Redis indices are inclusive on both ends, and -1 means "last".
+        end = None if stop == -1 else stop + 1
+        return items[start:end]
 
     async def ltrim(self, key, a, b):
         return True
@@ -446,9 +454,16 @@ class ResumeDb:
     """A job over `total` posts of which the first `done` have fresh results."""
 
     def __init__(self, *, total=300, done=30, status="running", updated_at=LONG_AGO,
-                 created_at=LONG_AGO, options=None, selector=None, locked=False):
+                 created_at=LONG_AGO, options=None, selector=None, locked=False,
+                 produced_by="job-1", has_provenance=True):
         self.post_ids = [f"p{i:04d}" for i in range(total)]
         self.done_ids = self.post_ids[:done]
+        # Which run wrote those results, and whether the row records that at all.
+        # `analysis_results` is upserted per post, so a result existing says
+        # nothing about *which* job produced it — the whole point of the
+        # provenance check the resume endpoint now makes.
+        self.produced_by = produced_by
+        self.has_provenance = has_provenance
         self.row = {
             "id": "job-1",
             "status": status,
@@ -470,8 +485,15 @@ class ResumeDb:
             return _Result([self.row])
         if sql.startswith("SELECT id, raw_payload FROM posts"):
             return _Result([{"id": p, "raw_payload": {"id": p}} for p in self.post_ids])
-        if sql.startswith("SELECT post_id FROM analysis_results"):
-            return _Result([(p,) for p in self.done_ids])
+        if sql.startswith("SELECT post_id, result->'processing'->>'job_id'"):
+            return _Result([
+                {
+                    "post_id": p,
+                    "produced_by": self.produced_by if self.has_provenance else None,
+                    "has_provenance": self.has_provenance,
+                }
+                for p in self.done_ids
+            ])
         if sql.startswith("SELECT privacy_locked FROM tenant_policies"):
             return _Result([(True,)] if self.locked else [])
         return _Result([], rowcount=1)
@@ -598,6 +620,61 @@ def test_resume_accepts_a_job_that_went_quiet(_no_overrides):
     assert res.json()["resumed"] is True
 
 
+def test_resume_refuses_a_job_whose_pipeline_is_still_publishing(_no_overrides):
+    """`jobs.updated_at` is written by the ASSEMBLER and by nobody else.
+
+    A post spends minutes in Stage 1 and Stage 2 on a local LLM, and the row is
+    untouched for every second of it — so judging liveness by the row alone calls
+    a healthy job stalled after five minutes and hands it to resume, which
+    re-enqueues a post that is still being worked on. That second run is what
+    produced the duplicate-result confusion this endpoint's provenance check now
+    has to defend against; better not to start it.
+    """
+    from defense.services.api.routers import analysis
+    from defense.libs.progress import buffer_key, stage_event
+
+    db = ResumeDb(total=300, done=30,
+                  updated_at=NOW - timedelta(seconds=analysis._STALE_JOB_SECONDS + 600))
+    r = FakeRedis()
+    frame = stage_event("stage2", "running", job_id="job-1", post_id="p0031")
+    frame["ts"] = datetime.now(tz=timezone.utc).timestamp() - 5
+    r.keys[buffer_key("job-1")] = [json.dumps(frame)]
+
+    res = _client(db, r).post("/v1/analysis/job-1/resume")
+
+    assert res.status_code == 409
+    assert "the pipeline" in res.json()["detail"]
+    assert "nlp:stage1:queue" not in r.streams
+
+
+def test_resume_accepts_a_job_whose_frames_are_as_old_as_its_row(_no_overrides):
+    """Guard against the liveness check being written so broadly nothing resumes."""
+    from defense.services.api.routers import analysis
+    from defense.libs.progress import buffer_key, stage_event
+
+    stale = analysis._STALE_JOB_SECONDS + 600
+    db = ResumeDb(total=300, done=30, updated_at=NOW - timedelta(seconds=stale))
+    r = FakeRedis()
+    frame = stage_event("stage2", "running", job_id="job-1", post_id="p0031")
+    frame["ts"] = datetime.now(tz=timezone.utc).timestamp() - stale
+    r.keys[buffer_key("job-1")] = [json.dumps(frame)]
+
+    res = _client(db, r).post("/v1/analysis/job-1/resume")
+
+    assert res.status_code == 200, res.text
+
+
+def test_resume_treats_a_missing_frame_buffer_as_no_evidence(_no_overrides):
+    """The buffer has a 1 h TTL. Its absence must not read as 'still alive'."""
+    from defense.services.api.routers import analysis
+
+    db = ResumeDb(total=300, done=30,
+                  updated_at=NOW - timedelta(seconds=analysis._STALE_JOB_SECONDS + 600))
+    res = _client(db, FakeRedis()).post("/v1/analysis/job-1/resume")
+
+    assert res.status_code == 200, res.text
+
+
 def test_resume_of_an_all_done_job_just_finishes_the_row(_no_overrides):
     """The assembler died before the last post flipped the status."""
     db = ResumeDb(total=30, done=30)
@@ -610,6 +687,77 @@ def test_resume_of_an_all_done_job_just_finishes_the_row(_no_overrides):
     assert body["resumed"] is False and body["status"] == "done"
     assert "nlp:stage1:queue" not in r.streams
     assert [s for s, _ in db.statements if "SET status = 'done'" in s]
+
+
+# ---------------------------------------------------------------------------
+# Resume must attribute results to THIS job
+# ---------------------------------------------------------------------------
+#
+# The defect these pin, observed live on 29 Aug 2026: job `e7ec04a6` analysed one
+# post. A *different* run of the same post finished at 16:31:36 and upserted
+# `analysis_results` — 7 seconds before this job's post even reached the router.
+# Resume's completeness test was `updated_at >= job.created_at`, which that
+# foreign write satisfied, so the job was marked `done` while its own post was
+# still inside Stage 2. Nothing wrote the counters, and the Jobs tab drew a
+# confident **0%** next to a `done` status.
+
+
+def test_resume_ignores_a_result_another_job_produced(_no_overrides):
+    """`analysis_results` is upserted per post, so a row proves a post was
+    analysed — not that THIS job analysed it."""
+    db = ResumeDb(total=1, done=1, produced_by="some-other-job")
+    r = FakeRedis()
+
+    res = _client(db, r).post("/v1/analysis/job-1/resume")
+
+    assert res.status_code == 200, res.text
+    body = res.json()
+    # The job is NOT done: its own post never landed.
+    assert body["resumed"] is True
+    assert body["progress"]["completed"] == 0
+    assert body["progress"]["remaining"] == 1
+    assert not [s for s, _ in db.statements if "SET status = 'done'" in s]
+    assert len(_stage1_entries(r)) == 1
+
+
+def test_resume_accepts_a_result_this_job_produced(_no_overrides):
+    db = ResumeDb(total=1, done=1, produced_by="job-1")
+    r = FakeRedis()
+
+    body = _client(db, r).post("/v1/analysis/job-1/resume").json()
+
+    assert body["resumed"] is False and body["status"] == "done"
+    assert "nlp:stage1:queue" not in r.streams
+
+
+def test_resume_says_when_a_result_predates_provenance(_no_overrides):
+    """A row written before stamping cannot be attributed either way. It still
+    counts — re-running the whole corpus on an upgrade would be worse — but the
+    answer must say the match is by timestamp, not present a guess as a fact."""
+    db = ResumeDb(total=2, done=2, has_provenance=False)
+    r = FakeRedis()
+
+    body = _client(db, r).post("/v1/analysis/job-1/resume").json()
+
+    assert body["resumed"] is False and body["status"] == "done"
+    assert "predate job provenance" in body["reason"]
+    assert "timestamp only" in body["reason"]
+
+
+def test_resume_shortcut_writes_the_counters_it_asserts(_no_overrides):
+    """A `done` row whose counters say 0/N renders as a confident 0%.
+
+    The assembler owns these keys; when completion is established anywhere else,
+    that route has to write them or the status and the progress bar next to it
+    disagree.
+    """
+    db = ResumeDb(total=4, done=4)
+    r = FakeRedis()
+
+    _client(db, r).post("/v1/analysis/job-1/resume")
+
+    assert r.keys["job:job-1:total"] == 4
+    assert r.keys["job:job-1:completed"] == 4
 
 
 def test_resume_is_a_conflict_on_a_completed_job(_no_overrides):
@@ -640,8 +788,113 @@ def test_resume_counts_only_results_written_after_the_job_started(_no_overrides)
 
     _client(db, r).post("/v1/analysis/job-1/resume")
 
-    since = [p for s, p in db.statements if s.startswith("SELECT post_id FROM analysis_results")]
+    since = [
+        p for s, p in db.statements
+        if s.startswith("SELECT post_id, result->'processing'->>'job_id'")
+    ]
     assert since and since[0]["since"] == db.row["created_at"]
     assert "updated_at >= :since" in [
-        s for s, _ in db.statements if s.startswith("SELECT post_id FROM analysis_results")
+        s for s, _ in db.statements
+        if s.startswith("SELECT post_id, result->'processing'->>'job_id'")
     ][0]
+
+
+# ---------------------------------------------------------------------------
+# Stage frames carry wall-clock time
+# ---------------------------------------------------------------------------
+
+
+def test_stage_event_carries_a_wall_clock_timestamp():
+    """`ms` is a duration; `ts` is *when*.
+
+    The distinction is load-bearing outside the Trace tab: this buffer is the
+    only per-job record of activity, because `jobs.updated_at` is written by the
+    assembler alone. Without `ts` the resume endpoint cannot tell a job that is
+    mid-Stage-2 from one that died there.
+    """
+    import time as _time
+    from defense.libs.progress import stage_event
+
+    before = _time.time()
+    ev = stage_event("stage2", "running", job_id="job-1", post_id="p1", ms=12.5)
+    after = _time.time()
+
+    # `ts` is rounded to milliseconds, so it can land a hair outside the window.
+    assert before - 0.01 <= ev["ts"] <= after + 0.01
+    assert ev["ms"] == 12.5          # still a duration, not overwritten
+    assert ev["event"] == "stage"    # still not "done" — that closes the stream
+
+
+# ---------------------------------------------------------------------------
+# The jobs list must not fabricate a counter it does not have
+# ---------------------------------------------------------------------------
+#
+# `job:{id}:total` and `job:{id}:completed` are separate Redis keys with a 24 h
+# TTL, and they expire INDEPENDENTLY. Both halves were live on 29 Aug 2026: one
+# finished job held `:total` with no `:completed`, another held `:completed` with
+# no `:total`. The list coerced a missing `completed` to 0, so the first reported
+# **0%** — a finished job showing none of its work done.
+
+
+class _JobsListDb:
+    """Answers the jobs list query with one row."""
+
+    def __init__(self, row):
+        self.row = row
+
+    async def execute(self, stmt, params=None):
+        sql = " ".join(str(stmt).split())
+        if sql.startswith("SELECT id, type, status, selector, created_at, updated_at FROM jobs"):
+            return _Result([self.row])
+        return _Result([])
+
+
+def _list_jobs(counters):
+    """Call GET /v1/analysis with `counters` present in Redis."""
+    from datetime import datetime, timezone as _tz
+
+    now = datetime.now(tz=_tz.utc)
+    db = _JobsListDb({
+        "id": "job-1", "type": "analysis_run", "status": "done",
+        "selector": {"tenant_id": "default", "post_ids": ["p1"]},
+        "created_at": now, "updated_at": now,
+    })
+    r = FakeRedis()
+    r.keys.update(counters)
+
+    async def _mget(keys):
+        return [r.keys.get(k) for k in keys]
+
+    r.mget = _mget
+    return _client(db, r).get("/v1/analysis?limit=25").json()["jobs"][0]
+
+
+def test_jobs_list_reports_a_missing_completed_as_null_not_zero():
+    job = _list_jobs({"job:job-1:total": 1})
+
+    assert job["total"] == 1
+    # The defect: this was 0, and a done job rendered as 0%.
+    assert job["completed"] is None
+
+
+def test_jobs_list_reports_a_missing_total_as_null():
+    job = _list_jobs({"job:job-1:completed": 50})
+
+    assert job["total"] is None
+    assert job["completed"] == 50
+
+
+def test_jobs_list_keeps_a_genuine_zero():
+    """A counter that exists and says zero is a measurement, not an absence."""
+    job = _list_jobs({"job:job-1:total": 8, "job:job-1:completed": 0})
+
+    assert job["total"] == 8
+    assert job["completed"] == 0
+
+
+def test_jobs_list_falls_back_to_the_selector_for_the_post_count():
+    """`post_count` comes from Postgres, so it survives the counters' TTL."""
+    job = _list_jobs({})
+
+    assert job["total"] is None and job["completed"] is None
+    assert job["post_count"] == 1

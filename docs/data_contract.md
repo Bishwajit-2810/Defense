@@ -338,15 +338,16 @@ the upstream no longer ships (**OCR text, embeddings**) is **computed by us**.
 
 ### 5.1 Provenance fields the output carries about itself
 
-Three fields describe *how the row was produced* rather than what it says. Each
+Four fields describe *how the row was produced* rather than what it says. Each
 exists because its absence made a wrong answer indistinguishable from a right one
-(PROJECT_ASSESSMENT §9.11, §13.2, §13.3):
+(PROJECT_ASSESSMENT §9.11, §13.2, §13.3, and the 29 Aug 2026 addendum):
 
 | Field | Meaning | Why it is not inferable |
 | ----- | ------- | ----------------------- |
 | `processing.stub_mode` / `nlp_engine` / `degraded_components` | which engine actually ran, and what fell back | `engine: "models"` says what was *intended*; only these say what **ran** |
 | `analysis_results.embedding_is_stub` (column, not in the JSON) | the stored vector is a deterministic hash of the text, not a semantic embedding | the stub is the same `EMBEDDING_DIM` size as a real vector, so nothing downstream can tell from the vector itself — deriving it from the dimension recorded every stub as real |
 | `processing.reused_from` | this post's analysis was **copied from a near-duplicate caption**; no model ran for it | a reused row otherwise looks like a genuinely cheap analysis: `stage1_ms: 0`, `stage2_ms: 0`, `llm_used: false` |
+| `processing.job_id` | **which run** produced this row (null for a replayed post; key absent on rows written before 29 Aug 2026) | `analysis_results` is upserted `ON CONFLICT (post_id)`: a second job analysing the same post overwrites the row and moves only `updated_at`. "Did job X finish post P?" answered from timestamps really answers "did *anything* touch P since X started" — which a concurrent re-run satisfies, and did: it marked a job `done` whose post was still in Stage 2 ([JOBS.md](JOBS.md) §3) |
 
 `reused_from` is `{source_post_id, similarity, reused}`. Only **post-level**
 analysis is reused — `reused: "post_level_analysis_only"`. The new post's

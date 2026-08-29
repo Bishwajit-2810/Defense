@@ -136,9 +136,28 @@ Three constraints shaped it, and each one is a rule for anyone adding an event:
   capped list, `job:{job_id}:stage_events`, which the SSE endpoint replays on
   connect. Each event carries a monotonic `seq` so a client can drop the
   duplicate when a frame arrives both replayed and live.
+- **Timestamped.** Every frame carries wall-clock `ts` (epoch seconds) alongside
+  `ms`, which is a *duration*. This buffer is the only per-job record of
+  **activity**: `jobs.updated_at` is written by the assembler alone, so it does
+  not move for the minutes a post spends in Stage 1 and Stage 2, and an idleness
+  check against it calls a healthy job stalled. The resume endpoint reads the
+  newest frame's `ts` for exactly this reason ([JOBS.md](JOBS.md) §3).
 
 The stage rail the dashboard draws comes from `progress.STAGES` —
 `("ingest", "stage1", "router", "stage2", "assembler")`.
+
+**The `status` values are `running` and `done`** — those are the only two any
+worker publishes. The Trace tab coloured its rail on `processing` / `completed`
+until 29 Aug 2026, so no layer had ever turned green: a vocabulary mismatch
+between publisher and renderer that no test and no error could surface, because
+both halves were individually valid. Anything reading these frames should key on
+what `progress.py` sends.
+
+Client side, the replay makes one more thing possible: a browser that reloads
+mid-job can **re-attach** to the stream and rebuild the whole rail rather than
+joining mid-post. The Trace tab does exactly that, holding its session outside
+React so leaving the tab does not abandon the post —
+[DASHBOARD_UI.md](DASHBOARD_UI.md) §6.1.
 
 ## 4. Running the stages
 

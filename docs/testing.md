@@ -6,8 +6,8 @@ machine with a live dev stack, and that is enforced rather than assumed (§4.1).
 
 ```bash
 # everything, from the repo root
-uv run pytest -q                                   # backend      → 1393 passed, 3 skipped
-cd dashboard && npm test -- --run                  # dashboard    → 78 passed (12 files)
+uv run pytest -q                                   # backend      → 1417 passed, 3 skipped
+cd dashboard && npm test -- --run                  # dashboard    → 96 passed (12 files)
 cd dashboard && npm run test:e2e                   # browser      → 2 passed
 ```
 
@@ -131,8 +131,17 @@ script or CI step. Tests live beside the code (`src/**/*.{test,spec}.{js,jsx,ts,
 those up and failing them with "Playwright Test did not expect test() to be
 called here".
 
-Nine files today: `App`, `MarkdownView`, `sentiment`, `PostModal`, and one per
-page for `AnalysisJobs`, `Posts`, `Search`, `Logs` and `Trace`.
+Twelve files today: `App`, `MarkdownView`, `PostModal`, `SystemMetricsChip`,
+`SystemMonitorDrawer`, `useSystemMetrics`, `sentiment`, and one per page for
+`AnalysisJobs`, `Posts`, `Search`, `Logs` and `Trace`.
+
+`Trace.test.jsx` carries a second suite, **"Trace session"**, which pins
+behaviour a component test normally cannot reach: the trace lives in
+`utils/traceSession.js`, *outside* React, so the tests unmount the page and then
+assert the stream is still open, that a frame arriving while unmounted is applied,
+and that remounting rebuilds the rail. It calls `resetTraceSession()` in
+`beforeEach` — module state deliberately outlives the component, so it also
+outlives a test.
 
 **A flaky test is worse than no test.** If a dashboard test fails in the full run
 but passes on its own, suspect a race in the *component*, not just the test —
@@ -202,7 +211,7 @@ uv run pytest -q -m "not e2e"             # exclude the stack-dependent group
 * **Datastore-backed behaviour is covered by testcontainers**, not by your dev
   stack: `tests/conftest.py` can start throwaway Postgres and Redis containers.
   Nothing in a default run reads or writes the compose stack.
-* **There is still no measured accuracy for any labeller.** 1,393 passing tests
+* **There is still no measured accuracy for any labeller.** 1,417 passing tests
   are correctness and contract tests. `eval/gold/comments_gold_300.json` holds
   300 stratified rows and **0 are adjudicated**, deliberately — labels seeded
   from a model in this repo would measure agreement with itself. See
@@ -217,18 +226,26 @@ uv run pytest -q -m "not e2e"             # exclude the stack-dependent group
 ## 6. Before you push
 
 ```bash
-uv run pytest -q                     # 1393 passed, 3 skipped, and NO warnings summary
+uv run pytest -q                     # 1417 passed, 3 skipped, and NO warnings summary
 cd dashboard
-npm test -- --run                    # 78 passed across 12 files
+npm test -- --run                    # 96 passed across 12 files
 npm run lint                         # oxlint: silent, exit 0. ANY output is a failure
 npm run build                        # must succeed — the unit tests do not compile the app
                                      # 5 JS chunks + 1 CSS, no (!) size advisory
 npm run test:e2e                     # 2 passed (chromium; Playwright starts vite itself)
 ```
 
-Measured 23 Aug 2026 on this checkout: **1,393 passed / 3 skipped in 56 s**
-(1,396 collected), **78** dashboard unit tests across 12 files, **2** Playwright
+Measured 29 Aug 2026 on this checkout: **1,417 passed / 3 skipped in 62 s**
+(1,420 collected), **96** dashboard unit tests across 12 files, **2** Playwright
 specs. The three skips are the e2e/destructive markers a plain run excludes (§4).
+The full verbatim chain is [TESTING_RESULTS.md](TESTING_RESULTS.md).
+
+**The Playwright specs had been failing since the product was renamed** (commit
+`793d5c8`): both asserted the `<title>` and Welcome heading read "Defense
+Analysis", when the app ships as **Selective Intelligence**. Worth remembering as
+a category — an end-to-end spec that pins a *product name* fails on a rebrand and
+tells you nothing about the app, so it reads as a broken build for as long as
+nobody runs the last stage of the chain.
 `npm run test:e2e` needs no server of its own — `playwright.config.ts` has a
 `webServer` block that runs `npm run dev` on `localhost:5173` and reuses an
 existing one.

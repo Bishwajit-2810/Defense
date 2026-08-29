@@ -463,10 +463,15 @@ with 30 of 300 posts analysed. Nothing marks that job as dead — its row still
 reads `running` and its Redis counters went with the power — so **what is left is
 derived from Postgres alone**: the selector gives the full post set, and a post
 counts as done when its `analysis_results` row was written at or after the job's
-`created_at`. That table is `UNIQUE (post_id)` with no job column, so the
-timestamp is the only discriminator there is; it also means a post another job
-re-analysed in the meantime counts as done, which is the right answer — a fresh
-result exists either way.
+`created_at` **and carries this job's id** in `processing.job_id`.
+
+The provenance half was added 29 Aug 2026. `analysis_results` is upserted
+`ON CONFLICT (post_id)`, so the timestamp alone asks "has anything touched this
+post since the job started" — a question a concurrent re-run of the same post
+answers yes to while the job's own post is still in the pipeline. It marked a job
+`done` with its post inside Stage 2. A row carrying another job's id now counts
+as evidence *against* completion; a row with no `job_id` key predates stamping,
+still counts, and the response says it was matched by timestamp only.
 
 Only the 270 are re-enqueued, under the same job id. The counters are rebuilt
 with `completed` **seeded** at 30, which is what makes the assembler finish the
@@ -479,9 +484,11 @@ The job's stored `options` are reused, so a run started with `want_summary`
 resumes with it; `llm_backend` is **re-resolved** against the tenant's policy
 rather than trusted, so a stored `groq` cannot outlive a privacy lock.
 
-`409` while the job is still writing progress (it is busy, not interrupted —
-stop it first), and there is no per-post partial resume: a post that was
-mid-flight is redone from Stage 1.
+`409` while the job is still reporting progress (it is busy, not interrupted —
+stop it first). Liveness reads **both** `jobs.updated_at` and the newest stage
+frame's `ts`, because the row is written by the assembler alone and stays frozen
+for the whole time a post spends in Stage 1 and Stage 2. There is no per-post
+partial resume: a post that was mid-flight is redone from Stage 1.
 
 ### Delete — `DELETE /v1/analysis/{id}`
 
@@ -547,6 +554,8 @@ _cluster/corpus_ level — a tool-using loop over MCP servers, grounded and cite
 ```json
 {
   "type": "brand_mentions",
+  "campaign_id": "cmold8r53…",
+  "post_ids": ["cmor32gy…"],
   "filter": { "brand": "BrandX", "from": "...", "to": "..." },
   "options": { "grounded": true }
 }
@@ -555,6 +564,13 @@ _cluster/corpus_ level — a tool-using loop over MCP servers, grounded and cite
 → `202 Accepted` with `report_id` and `status_url`. `grounded: true` runs the
 **Insight agent** (MCP retrieval + analytics tools + LLM-B) for citation-backed
 output — see [models.md](models.md) §5 and [architecture.md](architecture.md) §11.
+
+`campaign_id` and `post_ids` are both optional and both narrow the same
+aggregation; omitting them reports the whole tenant corpus. `post_ids` exists
+because campaign was once the *only* scope, and a job run from explicit post ids
+has no campaign — see [REPORTS.md](REPORTS.md) §1.1 for what that cost. The
+response and the rendered PDF carry `scope_label`, so a reader can tell which of
+the three a report is.
 
 ---
 

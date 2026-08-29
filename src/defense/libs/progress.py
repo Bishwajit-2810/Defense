@@ -34,11 +34,17 @@ Design constraints:
   connect. That makes the trace correct for a late subscriber and survives a page
   reload. Each event carries a monotonic ``seq`` so a client can drop the
   duplicate when a frame arrives both replayed and live.
+* **Timestamped.** Every frame carries wall-clock ``ts``. Beyond the trace, this
+  buffer is the only per-job record of *activity*: ``jobs.updated_at`` is written
+  by the assembler alone, so it stays at the creation time for the entire minutes
+  a post spends in Stage 1 and Stage 2, and an idleness check against it calls a
+  perfectly healthy job stalled.
 """
 
 from __future__ import annotations
 
 import json
+import time
 from typing import Any
 
 from defense.contracts.events import emit_pipeline_event, PostIngested, PostAnalyzed, PostRouted, PostEnriched, ResultAssembled
@@ -117,6 +123,12 @@ def stage_event(
         "status": status,
         "job_id": job_id,
         "post_id": post_id,
+        # Wall-clock, epoch seconds. `ms` is a duration; this is *when*, and the
+        # difference matters outside the trace: the jobs row is only written by
+        # the assembler, so a job whose post is legitimately spending four
+        # minutes in Stage 2 has an `updated_at` frozen at creation and reads as
+        # stalled. The newest frame is the job's real proof of life.
+        "ts": round(time.time(), 3),
     }
     if ms is not None:
         event["ms"] = round(float(ms), 1)

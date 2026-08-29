@@ -286,8 +286,8 @@ pools, data-layer scale-out, hybrid local+groq burst, continuous fine-tuning).
 ## 4b. How to run the tests
 
 ```bash
-uv run pytest -q                            # 1393 passed, 3 skipped
-cd dashboard && npm test -- --run           # 78 passed (12 files)
+uv run pytest -q                            # 1417 passed, 3 skipped
+cd dashboard && npm test -- --run           # 96 passed (12 files)
 cd dashboard && npm run lint && npm run build && npm run test:e2e
 ```
 

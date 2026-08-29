@@ -257,10 +257,22 @@ export default function AnalysisJobs() {
     }
   };
 
-  const downloadJobReport = async (campaignId) => {
+  // Download the report FOR THIS JOB.
+  //
+  // This used to pass only `job.campaign_id`, and a job created by
+  // `POST /v1/analysis/run` with explicit post ids has no campaign — so the
+  // request fell through to `campaign_id=all` and a one-post job downloaded a
+  // report covering the whole corpus, with a filename that said otherwise.
+  // `job_id` makes the API resolve the job's own selector and scope the report
+  // to its posts.
+  const downloadJobReport = async (job) => {
+    const jobId = jobIdOf(job);
+    const campaign = job?.campaign_id || 'all';
     try {
-      const campaign = campaignId || 'all';
-      const res = await fetch(`${API_BASE}/v1/reports/export_latest?campaign_id=${encodeURIComponent(campaign)}&format=pdf`, {
+      const params = new URLSearchParams({ format: 'pdf' });
+      if (jobId) params.set('job_id', jobId);
+      else params.set('campaign_id', campaign);
+      const res = await fetch(`${API_BASE}/v1/reports/export_latest?${params}`, {
         headers: getAuthHeaders()
       });
       if (!res.ok) {
@@ -271,7 +283,8 @@ export default function AnalysisJobs() {
       const url = window.URL.createObjectURL(blob);
       const a = document.createElement('a');
       a.href = url;
-      a.download = `analysis_report_${campaign}.pdf`;
+      // Named after what it actually contains.
+      a.download = jobId ? `analysis_report_job_${jobId.slice(0, 8)}.pdf` : `analysis_report_${campaign}.pdf`;
       document.body.appendChild(a);
       a.click();
       window.URL.revokeObjectURL(url);
@@ -342,13 +355,34 @@ export default function AnalysisJobs() {
     };
   };
 
-  const renderProgressBar = (progress) => {
+  // `progress` is null when the job's Redis counters are gone or were never
+  // written — a job older than their 24 h TTL, a Redis restart, or a job whose
+  // completion was established somewhere other than the assembler. That is
+  // "unknown", and it used to be rendered as a confident **0%** on a `done` row
+  // (counters missing) or a confident **100%** (total missing) — two different
+  // fabrications for the same absence of data, standing next to a status that
+  // contradicted them.
+  const renderProgressBar = (progress, note, derived = false) => {
+    if (progress === null) {
+      return (
+        <div className="flex items-center gap-2" title={note || 'No progress counters for this job — they expire after 24 h.'}>
+          <div className="w-24 h-2 bg-slate-200 dark:bg-zinc-700 rounded-full overflow-hidden">
+            <div className="h-full w-full bg-slate-300 dark:bg-zinc-600 opacity-40"></div>
+          </div>
+          <span className="text-xs text-slate-400 dark:text-zinc-500">—</span>
+        </div>
+      );
+    }
     return (
-      <div className="flex items-center gap-2">
+      <div className="flex items-center gap-2" title={note || undefined}>
         <div className="w-24 h-2 bg-slate-200 dark:bg-zinc-700 rounded-full overflow-hidden">
           <div className="h-full bg-brand-500" style={{ width: `${progress}%` }}></div>
         </div>
-        <span className="text-xs text-slate-500">{progress}%</span>
+        {/* A derived 100% is marked, because it is read off the status rather
+            than counted. Same number, weaker evidence — say which. */}
+        <span className="text-xs text-slate-500">
+          {progress}%{derived && <span className="text-slate-400 dark:text-zinc-500" aria-label="derived from status">*</span>}
+        </span>
       </div>
     );
   };
@@ -463,8 +497,12 @@ export default function AnalysisJobs() {
                   const jid = job.job_id || job.id || job.analysis_id || `Job ${i + 1}`;
                   const type = job.job_type || job.type || 'analysis';
                   const status = job.status || 'unknown';
-                  const completed = job.completed || 0;
-                  const total = job.total || 0;
+                  // Distinguish "the counter says 0" from "there is no counter".
+                  // `total` is null once `job:{id}:total` expires or is lost;
+                  // `completed` is null the same way. Coercing either to 0 is
+                  // what turned a missing counter into a percentage.
+                  const total = typeof job.total === 'number' ? job.total : null;
+                  const completed = typeof job.completed === 'number' ? job.completed : null;
                   const isFinished = status === 'completed' || status === 'done';
                   // Only a job that is actually still moving can be stopped or
                   // tracked — a cancelled or failed one has nothing to stop.
@@ -478,7 +516,35 @@ export default function AnalysisJobs() {
                   // out to be alive is refused by the API with a 409 that says
                   // to stop it first, which is surfaced verbatim.
                   const canResume = !isFinished;
-                  const progress = total > 0 ? Math.round((completed / total) * 100) : (isFinished ? 100 : 0);
+                  // Progress has two sources, and the durable one wins when the
+                  // ephemeral one is incomplete.
+                  //
+                  // The counters are Redis keys with a 24 h TTL that expire
+                  // INDEPENDENTLY: a job can hold `:total` without `:completed`
+                  // (renders 0 %) or `:completed` without `:total` (renders as
+                  // unknown). Both were live on 29 Aug 2026 — two finished jobs,
+                  // two different wrong answers, from the same missing data.
+                  //
+                  // `status` is in Postgres and does not expire, and `done`
+                  // *means* every post landed: the assembler writes it only once
+                  // `completed + failed >= total`. So a done job with unusable
+                  // counters is 100% — derived from the status, and the tooltip
+                  // says so rather than passing it off as a measurement. Failed
+                  // and cancelled are NOT complete and never get the full bar.
+                  const measured = total !== null && total > 0 && completed !== null
+                    ? Math.round((completed / total) * 100)
+                    : null;
+                  const derivedComplete = measured === null && isFinished;
+                  const progress = measured !== null ? measured : (derivedComplete ? 100 : null);
+                  const progressNote = measured !== null
+                    ? `${completed} of ${total} posts landed`
+                    : derivedComplete
+                      ? 'Complete — derived from the job status, not from its counters. The Redis progress counters have a 24 h TTL and this job\'s have expired or were never written.'
+                      : status === 'cancelled'
+                        ? 'Stopped before finishing, and its counters are gone — how much had landed is no longer recorded.'
+                        : status === 'failed'
+                          ? 'This job failed; its counters are gone.'
+                          : 'No progress counters for this job yet.';
                   const busy = busyJob === jid;
                   
                   return (
@@ -495,7 +561,7 @@ export default function AnalysisJobs() {
                           </button>
                         ) : '-'}
                       </td>
-                      <td className="px-6 py-4 whitespace-nowrap text-sm text-slate-500">{job.total || job.post_count || '-'}</td>
+                      <td className="px-6 py-4 whitespace-nowrap text-sm text-slate-500">{total ?? job.post_count ?? '-'}</td>
                       <td className="px-6 py-4 whitespace-nowrap text-sm">
                         <span className={`px-2 py-1 rounded-full text-xs font-medium ${
                           isFinished ? 'bg-emerald-100 text-emerald-700 dark:bg-emerald-900/30 dark:text-emerald-400' :
@@ -509,7 +575,7 @@ export default function AnalysisJobs() {
                         </span>
                       </td>
                       <td className="px-6 py-4 whitespace-nowrap text-sm">
-                        {renderProgressBar(progress)}
+                        {renderProgressBar(progress, progressNote, derivedComplete)}
                       </td>
                       <td className="px-6 py-4 whitespace-nowrap text-xs text-slate-500">
                         {job.started_at ? new Date(job.started_at).toLocaleString() : (job.created_at ? new Date(job.created_at).toLocaleString() : '-')}
@@ -539,7 +605,11 @@ export default function AnalysisJobs() {
                             </button>
                           )}
                           {isFinished && (
-                            <button onClick={() => downloadJobReport(job.campaign_id)} className="text-brand-500 hover:text-brand-600 text-xs font-semibold text-left flex items-center gap-1">
+                            <button
+                              onClick={() => downloadJobReport(job)}
+                              title="Report covering only the posts this job analysed"
+                              className="text-brand-500 hover:text-brand-600 text-xs font-semibold text-left flex items-center gap-1"
+                            >
                               <Download size={12} /> Download Report
                             </button>
                           )}

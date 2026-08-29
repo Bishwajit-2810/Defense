@@ -1,19 +1,30 @@
-import React, { useState, useEffect, useRef, useCallback } from 'react';
-import { GitCommit } from 'lucide-react';
+import React, { useState, useEffect, useCallback, useSyncExternalStore } from 'react';
+import { GitCommit, Loader2 } from 'lucide-react';
 import { Chart as ChartJS, ArcElement, Tooltip, Legend, CategoryScale, LinearScale, BarElement, Title } from 'chart.js';
 import { Doughnut, Bar } from 'react-chartjs-2';
-import { apiCall, API_BASE, getSseQueryAsync } from '../utils/api.js';
+import { apiCall } from '../utils/api.js';
 import { orderedBreakdown, sentimentColors } from '../utils/sentiment';
+import {
+  TRACE_LAYERS,
+  subscribe,
+  getSnapshot,
+  setPostId,
+  setWantSummary,
+  startTrace,
+  clearTrace,
+  reattach,
+  hasResumableJob,
+  isRunning,
+} from '../utils/traceSession.js';
 
 ChartJS.register(ArcElement, Tooltip, Legend, CategoryScale, LinearScale, BarElement, Title);
 
-const TRACE_LAYERS = [
-  { key: 'ingest', label: 'Ingestion', desc: 'Consumes raw data from the stream.' },
-  { key: 'stage1', label: 'Stage 1 (NLP & LLM)', desc: 'Extracts entities, metrics, and generates heavy LLM summarization.' },
-  { key: 'router', label: 'Router', desc: 'Filters emoji-only spam and routes valid comments to Stage 2.' },
-  { key: 'stage2', label: 'Stage 2 (Parallel)', desc: 'Runs LLM, XLM-R, and DistilBERT concurrently on valid comments. Checks Watchlist Alerts.' },
-  { key: 'assembler', label: 'Assembler', desc: 'Merges partial results and writes final JSON to the database.' }
-];
+// The pipeline publishes `running` / `done` (libs/progress.py); the rail used to
+// colour on `processing` / `completed`, which nothing ever sends — so every layer
+// stayed grey however far the post got. Both vocabularies are accepted here so
+// the rail cannot silently stop lighting up again.
+const LAYER_DONE = new Set(['done', 'completed', 'ok']);
+const LAYER_ACTIVE = new Set(['running', 'processing', 'started']);
 
 function TraceVisuals({ result, traceState }) {
   if (!result && (!traceState || !traceState.stage1)) return null;
@@ -90,23 +101,16 @@ function TraceVisuals({ result, traceState }) {
 
 export default function Trace() {
   const [posts, setPosts] = useState([]);
-  const [selectedPostId, setSelectedPostId] = useState('');
-  const [wantSummary, setWantSummary] = useState(true);
-  const [status, setStatus] = useState('idle');
-  const [traceState, setTraceState] = useState({});
-  const [tape, setTape] = useState([]);
-  const [result, setResult] = useState(null);
-  const eventSourceRef = useRef(null);
+  const [notice, setNotice] = useState(null);
 
-  // Declared above the effects that depend on them: a dependency array is
-  // evaluated during render, so naming a `const` from further down the component
-  // throws on the temporal dead zone.
-  const stopTrace = useCallback(() => {
-    if (eventSourceRef.current) {
-      eventSourceRef.current.close();
-      eventSourceRef.current = null;
-    }
-  }, []);
+  // The trace itself lives in `utils/traceSession`, outside React. Tabs are
+  // rendered as `{activeTab === 'trace' && <Trace />}`, so this component is
+  // unmounted the moment the operator looks at anything else — holding the trace
+  // in `useState` is what made the page come back blank, and what abandoned a
+  // still-running trace on the way out.
+  const session = useSyncExternalStore(subscribe, getSnapshot, getSnapshot);
+  const { postId, wantSummary, status, jobId, layers, tape, result, error } = session;
+  const running = isRunning(status);
 
   // Loading the list and choosing a default are two concerns, and mixing them is
   // what made this un-declarable as a dependency: the fetch closed over
@@ -123,116 +127,39 @@ export default function Trace() {
     }
   }, []);
 
-  useEffect(() => {
-    fetchPosts();
-    return () => stopTrace();
-  }, [fetchPosts, stopTrace]);
+  // No cleanup that closes the stream: the session owns it, and a tab switch is
+  // not a reason to stop following a post through the pipeline.
+  useEffect(() => { fetchPosts(); }, [fetchPosts]);
 
-  // Default to the first post, and only while nothing is selected.
-  //
-  // The update is functional (`prev => prev || …`) rather than guarded by a read
-  // of `selectedPostId`, because the guard loses a race that a real operator can
-  // win: pick a post in the moment between the list arriving and this effect
-  // committing, and a preselect computed from the stale value overwrites the
-  // choice. Reading `prev` at apply time cannot do that, and it takes
-  // `selectedPostId` out of the dependency array as a bonus.
+  // Default to the first post, and only while nothing is selected. The store
+  // keeps the operator's choice across mounts, so this fires once per session.
   useEffect(() => {
-    if (posts.length > 0) {
-      setSelectedPostId(prev => prev || posts[0].post_id || posts[0].id);
+    if (posts.length > 0 && !getSnapshot().postId) {
+      setPostId(posts[0].post_id || posts[0].id || '');
     }
   }, [posts]);
 
+  // A reload drops the EventSource but not the job. Re-attaching replays the
+  // buffered stage events, so the rail rebuilds instead of starting mid-post.
+  useEffect(() => {
+    if (hasResumableJob()) reattach();
+  }, []);
+
   const handleRunTrace = async () => {
-    if (!selectedPostId) {
-      alert('Pick a post to trace first.');
-      return;
-    }
-
-    stopTrace();
-    setTraceState(
-      TRACE_LAYERS.reduce((acc, layer) => ({ ...acc, [layer.key]: { status: 'idle' } }), {})
-    );
-    setTape([]);
-    setResult(null);
-    setStatus('starting');
-
+    setNotice(null);
     try {
-      const resp = await apiCall('/v1/analysis/run', {
-        method: 'POST',
-        body: JSON.stringify({
-          post_ids: [selectedPostId],
-          options: { want_summary: wantSummary }
-        })
-      });
-
-      const newJobId = resp.analysis_id || resp.id || resp.job_id;
-      if (!newJobId) throw new Error('No job ID in response');
-      
-      setStatus('live');
-      
-      const qs = await getSseQueryAsync();
-      const es = new EventSource(`${API_BASE}/v1/analysis/${newJobId}/stream${qs}`);
-      eventSourceRef.current = es;
-
-      const handleEvent = (e) => {
-        try {
-          const data = JSON.parse(e.data);
-          setTape(prev => [...prev, data]);
-          
-          if (data.status === 'completed' || data.status === 'failed') {
-            setStatus(data.status === 'completed' ? 'done' : 'failed');
-            es.close();
-            if (data.status === 'completed') fetchFinalResult(newJobId);
-          } else if (data.stage) {
-            setTraceState(prev => ({
-              ...prev,
-              [data.stage]: { status: data.status, detail: data.detail || {} }
-            }));
-          }
-        } catch {}
-      };
-
-      es.addEventListener('progress', handleEvent);
-      es.addEventListener('stage', handleEvent);
-      
-      es.addEventListener('done', () => {
-        setStatus('done');
-        es.close();
-        fetchFinalResult(newJobId);
-      });
-
-      es.addEventListener('error', () => {
-        setStatus('failed');
-        es.close();
-      });
-
-      es.onerror = () => {
-        // Fallback for network drops
-        setStatus('failed');
-        es.close();
-      };
+      await startTrace({ postId, wantSummary });
     } catch (err) {
-      setStatus('failed');
-      alert('Trace failed to start: ' + err.message);
+      setNotice(err.message);
     }
   };
 
-  const fetchFinalResult = async (id) => {
-    try {
-      if (!id) return;
-      const data = await apiCall(`/v1/analysis/${id}?include=results`);
-      const finalRes = (data.results && data.results[0]) ? data.results[0] : data;
-      setResult(finalRes);
-    } catch {}
-  };
-
-  const clearTrace = () => {
-    stopTrace();
-    setStatus('idle');
-    setTape([]);
-    setTraceState({});
-    setResult(null);
-  };
+  // The id may be one the recent-50 list does not contain — pasted from a ticket,
+  // or carried over from the Posts tab. The dropdown then carries an extra option
+  // for it rather than snapping the selection to something the operator did not
+  // pick, which is what a plain `<select>` does with an unknown value.
+  const known = posts.some(p => (p.post_id || p.id) === postId);
+  const statusLabel = status === 'live' ? (jobId ? 'live' : 'starting') : status;
 
   return (
     <div className="space-y-6 animate-in fade-in slide-in-from-bottom-4 duration-500">
@@ -245,55 +172,86 @@ export default function Trace() {
         <div className="flex justify-between items-start mb-4">
           <div>
             <h3 className="font-semibold text-lg">Trace Configuration</h3>
-            <p className="text-slate-500 text-sm">Re-runs a stored post through the real pipeline and follows it live.</p>
+            <p className="text-slate-500 text-sm">Re-runs a stored post through the real pipeline and follows it live. The trace keeps running while you are on another tab.</p>
           </div>
           <span className={`px-2 py-1 rounded-full text-xs font-medium uppercase tracking-wider ${
-            status === 'live' ? 'bg-brand-500 text-white animate-pulse' :
+            running ? 'bg-brand-500 text-white animate-pulse' :
             status === 'done' ? 'bg-emerald-100 text-emerald-700 dark:bg-emerald-900/30 dark:text-emerald-400' :
             status === 'failed' ? 'bg-rose-100 text-rose-700 dark:bg-rose-900/30 dark:text-rose-400' :
+            status === 'timeout' || status === 'cancelled' ? 'bg-amber-100 text-amber-700 dark:bg-amber-900/30 dark:text-amber-400' :
             'bg-slate-100 text-slate-700 dark:bg-zinc-800 dark:text-zinc-400'
           }`}>
-            {status}
+            {statusLabel}
           </span>
         </div>
         
         <div className="flex flex-wrap items-end gap-4">
           <div className="flex flex-col flex-grow min-w-[200px]">
-            <label className="text-xs font-semibold text-slate-500 mb-1">Post</label>
+            <label className="text-xs font-semibold text-slate-500 mb-1" htmlFor="trace-post-select">Post</label>
             <select 
-              value={selectedPostId}
-              onChange={(e) => setSelectedPostId(e.target.value)}
+              id="trace-post-select"
+              value={postId}
+              onChange={(e) => setPostId(e.target.value)}
               className="px-3 py-3 text-sm bg-white dark:bg-zinc-900 border border-slate-200 dark:border-zinc-700 rounded-lg w-full"
             >
-              {posts.length === 0 ? (
-                <option value="">Loading stored posts...</option>
-              ) : (
-                posts.map((p, i) => {
-                  const pid = p.post_id || p.id || `Post ${i}`;
-                  const label = p.post_text || p.title || p.platform_post_id || pid;
-                  return <option key={pid} value={pid}>{label.slice(0, 60)}{label.length > 60 ? '...' : ''}</option>;
-                })
+              {/* The id carried in from the Posts tab, or pasted below, may not
+                  be one of the recent 50 — and it is still selected. Without an
+                  option to hold it the browser falls back to index -1 and the
+                  control reads as empty while the trace is about to run on it. */}
+              {postId && !known && (
+                <option value={postId}>{postId} (by id)</option>
               )}
+              {posts.length === 0 && !postId && (
+                <option value="">Loading stored posts...</option>
+              )}
+              {posts.map((p, i) => {
+                const pid = p.post_id || p.id || `Post ${i}`;
+                const label = p.post_text || p.title || p.platform_post_id || pid;
+                return <option key={pid} value={pid}>{label.slice(0, 60)}{label.length > 60 ? '...' : ''}</option>;
+              })}
             </select>
           </div>
-          <label className="flex items-center gap-2 text-sm cursor-pointer mb-3">
+          <div className="flex flex-col min-w-[260px]">
+            {/* The dropdown only holds the latest 50. An id out of a ticket, a
+                log line or the Posts tab has to be traceable without hunting for
+                it in a list it may not be in at all. */}
+            <label className="text-xs font-semibold text-slate-500 mb-1" htmlFor="trace-post-id">Or paste a post id</label>
+            <input
+              id="trace-post-id"
+              type="text"
+              value={postId}
+              spellCheck={false}
+              placeholder="cmor32gy…"
+              onChange={(e) => setPostId(e.target.value.trim())}
+              className="px-3 py-3 text-sm font-mono bg-white dark:bg-zinc-900 border border-slate-200 dark:border-zinc-700 rounded-lg w-full"
+            />
+          </div>
+          <label className="flex items-center gap-2 text-sm cursor-pointer mb-3" title="Forces the post through Stage 2 so a missing post summary is generated.">
             <input type="checkbox" checked={wantSummary} onChange={(e) => setWantSummary(e.target.checked)} className="rounded text-brand-500" />
             Request summary
           </label>
           <button 
             onClick={handleRunTrace}
-            disabled={status === 'live'}
-            className="px-6 py-3 bg-brand-500 hover:bg-brand-600 text-white rounded-lg font-medium transition-colors"
+            disabled={running || !postId}
+            className="px-6 py-3 bg-brand-500 hover:bg-brand-600 disabled:opacity-50 disabled:cursor-not-allowed text-white rounded-lg font-medium transition-colors flex items-center gap-2"
           >
-            {status === 'live' ? 'Tracing...' : 'Run Trace'}
+            {running && <Loader2 size={16} className="animate-spin" />}
+            {running ? 'Tracing...' : 'Run Trace'}
           </button>
           <button 
-            onClick={clearTrace}
+            onClick={() => { setNotice(null); clearTrace(); }}
             className="px-6 py-3 bg-slate-100 dark:bg-zinc-800 hover:bg-slate-200 dark:hover:bg-zinc-700 text-slate-700 dark:text-slate-300 rounded-lg font-medium transition-colors"
           >
             Clear
           </button>
         </div>
+
+        {(notice || error) && (
+          <p role="alert" className="mt-4 text-sm text-rose-600 dark:text-rose-400">{notice || error}</p>
+        )}
+        {jobId && (
+          <p className="mt-4 text-xs text-slate-500 dark:text-zinc-500 font-mono">job {jobId}</p>
+        )}
       </div>
 
       <div className="bg-white dark:bg-[#09090b] border border-slate-200 dark:border-zinc-800 rounded-xl overflow-hidden shadow-sm p-6">
@@ -306,21 +264,26 @@ export default function Trace() {
         ) : (
           <div className="space-y-4">
             {TRACE_LAYERS.map(layer => {
-              const state = traceState[layer.key] || { status: 'idle' };
+              const state = layers[layer.key] || { status: 'idle' };
+              const done = LAYER_DONE.has(state.status);
+              const active = LAYER_ACTIVE.has(state.status);
               return (
                 <div key={layer.key} className="flex items-center gap-4">
                   <div className={`w-32 text-right font-medium text-sm cursor-help ${
-                    state.status === 'completed' ? 'text-emerald-600 dark:text-emerald-400' :
-                    state.status === 'processing' ? 'text-brand-600 dark:text-brand-400' :
+                    done ? 'text-emerald-600 dark:text-emerald-400' :
+                    active ? 'text-brand-600 dark:text-brand-400' :
                     'text-slate-400 dark:text-zinc-600'
                   }`} title={layer.desc}>
                     {layer.label}
                   </div>
-                  <div className="flex-grow bg-slate-50 dark:bg-[#121214] rounded px-4 py-2 text-sm font-mono text-slate-600 dark:text-slate-400">
+                  <div className="flex-grow bg-slate-50 dark:bg-[#121214] rounded px-4 py-2 text-sm font-mono text-slate-600 dark:text-slate-400 break-all">
                     {state.status === 'idle' ? 'waiting...' :
-                     state.status === 'processing' ? 'processing...' :
+                     active && !state.detail ? 'processing...' :
                      JSON.stringify(state.detail)}
                   </div>
+                  {typeof state.ms === 'number' && (
+                    <div className="w-20 text-right text-xs text-slate-400 dark:text-zinc-500 shrink-0">{Math.round(state.ms)} ms</div>
+                  )}
                 </div>
               );
             })}
@@ -337,8 +300,8 @@ export default function Trace() {
         </div>
       )}
 
-      {(result || (traceState && traceState.stage1)) && (
-        <TraceVisuals result={result} traceState={traceState} />
+      {(result || layers.stage1) && (
+        <TraceVisuals result={result} traceState={layers} />
       )}
 
       {tape.length > 0 && (
@@ -346,8 +309,8 @@ export default function Trace() {
           <h3 className="font-semibold text-lg mb-4">Event Tape</h3>
           <div className="space-y-2">
             {tape.map((t, i) => (
-              <div key={i} className="bg-slate-50 dark:bg-[#121214] p-2 rounded text-xs font-mono flex gap-4">
-                <span className="text-slate-400 w-24 shrink-0">{t.stage || t.status}</span>
+              <div key={t.seq ?? `frame-${i}`} className="bg-slate-50 dark:bg-[#121214] p-2 rounded text-xs font-mono flex gap-4">
+                <span className="text-slate-400 w-24 shrink-0">{t.stage || t.event || t.status}</span>
                 <span className="text-slate-600 dark:text-slate-400 truncate">{JSON.stringify(t.detail || t)}</span>
               </div>
             ))}

@@ -28,6 +28,19 @@ function App() {
     return () => window.removeEventListener('auth-expired', handleAuthExpired);
   }, []);
 
+  // Cross-tab navigation. There is no router here — the active tab is state in
+  // this component — so a page that wants to hand work to another one (Posts
+  // sending a post id to Trace) says so with an event rather than by having a
+  // navigation callback threaded through every page's props.
+  useEffect(() => {
+    const handleNavigate = (e) => {
+      const tab = e?.detail?.tab;
+      if (tab) setActiveTab(tab);
+    };
+    window.addEventListener('dashboard-navigate', handleNavigate);
+    return () => window.removeEventListener('dashboard-navigate', handleNavigate);
+  }, []);
+
   useEffect(() => {
     const handleKeyDown = (e) => {
       // Toggle System Monitor with Alt+M or Ctrl+Shift+M
