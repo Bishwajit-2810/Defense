@@ -1,6 +1,6 @@
 import React, { useState, useEffect, useRef } from 'react';
 import {
-  MessageSquare, Send, Bot, User, Trash2, Wrench, Server, CheckCircle2,
+  MessageSquare, Send, Bot, User, Trash2, Wrench, Server, CheckCircle2, SkipForward,
   XCircle, Loader2, ChevronDown, ChevronRight, Plus, Pencil, ArrowRight, CloudOff
 } from 'lucide-react';
 import { apiCall, API_BASE, getAuthHeaders } from '../utils/api.js';
@@ -636,11 +636,17 @@ function ProvenanceBar({ meta }) {
 
 function ToolChip({ tool }) {
   const state = tool.status || (tool.error ? 'error' : 'ok');
+  // A repeat the runner refused is reported as a call that ran in 0 ms unless
+  // the chip says otherwise, which reads as a suspiciously fast tool rather
+  // than as the guard doing its job.
+  const skipped = state === 'skipped';
   const icon = state === 'running'
     ? <Loader2 size={12} className="animate-spin text-amber-500" />
     : state === 'error'
       ? <XCircle size={12} className="text-red-500" />
-      : <CheckCircle2 size={12} className="text-emerald-500" />;
+      : skipped
+        ? <SkipForward size={12} className="text-amber-500" />
+        : <CheckCircle2 size={12} className="text-emerald-500" />;
 
   return (
     <div className="flex items-center gap-2 text-xs font-mono bg-white/60 dark:bg-zinc-900/60 border border-slate-200 dark:border-zinc-700 rounded-md px-2 py-1">
@@ -654,8 +660,14 @@ function ToolChip({ tool }) {
       {typeof tool.result_size === 'number' && (
         <span className="text-slate-400">{tool.result_size} rows</span>
       )}
-      {typeof tool.duration_ms === 'number' && (
-        <span className="text-slate-400">{tool.duration_ms}ms</span>
+      {skipped ? (
+        <span className="text-amber-600 dark:text-amber-400">
+          refused · repeat of #{tool.repeat_of}
+        </span>
+      ) : (
+        typeof tool.duration_ms === 'number' && (
+          <span className="text-slate-400">{tool.duration_ms}ms</span>
+        )
       )}
       {tool.error && (
         <span className="text-red-500 truncate max-w-[220px]" title={tool.error}>{tool.error}</span>

@@ -632,10 +632,30 @@ export default function Agents() {
                       {(currentRun.tools_used || currentRun.traces || []).map((t, idx) => {
                         const name = t.tool_name || t.name || 'tool';
                         const args = t.arguments || t.tool_input || {};
+                        // A call the runner refused is still recorded, and the
+                        // reason it was refused is the interesting part — without
+                        // it the trace shows four calls where only two ran.
+                        const skipped = t.status === 'skipped';
                         return (
                           <div key={idx} className="bg-slate-50 dark:bg-zinc-900 p-3 rounded-lg border border-slate-200 dark:border-zinc-800">
                             <div className="flex items-center justify-between text-brand-600 dark:text-brand-400 font-semibold mb-1">
-                              <span>#{idx + 1} {name}</span>
+                              <span className="flex items-center gap-2 flex-wrap">
+                                <span>#{t.call_number || idx + 1} {name}</span>
+                                {t.mcp_server && (
+                                  <span className="px-1.5 py-0.5 rounded bg-slate-200 dark:bg-zinc-800 text-slate-600 dark:text-zinc-400 text-[10px] font-normal">
+                                    {t.mcp_server}
+                                  </span>
+                                )}
+                                {skipped ? (
+                                  <span className="px-1.5 py-0.5 rounded bg-amber-100 dark:bg-amber-900/30 text-amber-700 dark:text-amber-400 text-[10px] font-normal">
+                                    refused · repeat of #{t.repeat_of}
+                                  </span>
+                                ) : (
+                                  <span className="px-1.5 py-0.5 rounded bg-emerald-100 dark:bg-emerald-900/30 text-emerald-700 dark:text-emerald-400 text-[10px] font-normal">
+                                    {t.status || 'ok'}{typeof t.duration_ms === 'number' ? ` · ${t.duration_ms} ms` : ''}
+                                  </span>
+                                )}
+                              </span>
                               {t.error && <span className="text-rose-500">Error: {t.error}</span>}
                             </div>
                             <pre className="text-[11px] text-slate-600 dark:text-zinc-400 overflow-x-auto">

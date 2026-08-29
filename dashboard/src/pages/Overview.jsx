@@ -169,6 +169,10 @@ export default function Overview({ isActive }) {
   const commentTokens = lanes.comment?.tokens || 0;
 
   const pipelineCalls = postCalls + commentCalls + stage1Calls;
+  // Every lane the table below renders, not just the three pipeline ones: the
+  // share column divided by pipelineCalls, so the interactive lane — which is
+  // not a pipeline lane and is often the largest — reported 145%.
+  const allLaneCalls = Object.values(lanes).reduce((n, l) => n + (l?.calls || 0), 0);
   const totalTokens = usage?.total_tokens || 0;
   const estimatedCost = Number(usage?.estimated_cost_usd || 0);
 
@@ -413,7 +417,7 @@ export default function Overview({ isActive }) {
           <div className="space-y-3">
             <h4 className="text-xs font-bold uppercase tracking-wider text-slate-500 dark:text-zinc-400 flex items-center justify-between">
               <span>Spend by Pipeline & Interactive Lane</span>
-              <span className="font-mono text-[10px] text-slate-400">{pipelineCalls} total calls</span>
+              <span className="font-mono text-[10px] text-slate-400">{allLaneCalls} total calls</span>
             </h4>
             <div className="bg-white dark:bg-[#18181b] border border-slate-200 dark:border-zinc-800 rounded-lg overflow-hidden">
               <table className="w-full text-xs text-left">
@@ -428,8 +432,14 @@ export default function Overview({ isActive }) {
                 <tbody className="divide-y divide-slate-100 dark:divide-zinc-800/50">
                   {Object.entries(LANE_HINTS).map(([laneKey, laneHint]) => {
                     const l = lanes[laneKey] || { calls: 0, tokens: 0 };
-                    const callPct = pipelineCalls ? Math.round(((l.calls || 0) / (pipelineCalls || 1)) * 100) : 0;
-                    const tokPct = totalTokens ? Math.round(((l.tokens || 0) / (totalTokens || 1)) * 100) : 0;
+                    // The API computes both shares over the same denominator it
+                    // reports; prefer them, and fall back to the lane totals.
+                    const callPct = Math.round(
+                      (l.call_share ?? (allLaneCalls ? (l.calls || 0) / allLaneCalls : 0)) * 100
+                    );
+                    const tokPct = Math.round(
+                      (l.token_share ?? (totalTokens ? (l.tokens || 0) / totalTokens : 0)) * 100
+                    );
                     return (
                       <tr key={laneKey} className="hover:bg-slate-50/50 dark:hover:bg-zinc-800/30 transition-colors">
                         <td className="py-2.5 px-3">
