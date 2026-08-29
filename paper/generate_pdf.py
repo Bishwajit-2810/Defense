@@ -14,6 +14,7 @@ Usage
 -----
     python3 generate_pdf.py                     # final_paper.txt -> final_paper.pdf
     python3 generate_pdf.py in.txt out.pdf
+    python3 generate_pdf.py --render-charts     # export every @CHART to figures/
 
 Only ``reportlab`` is required to build the PDF.  Charts declared with
 ``@CHART`` are drawn from their inline data with ``reportlab.graphics``.  A
@@ -26,6 +27,12 @@ The diagram PNGs are produced from the Mermaid sources in ``diagrams/`` by
 ``python3 generate_pdf.py --render-diagrams``, which needs Node and a Chrome
 binary.  That step is separate from the build so that the PDF can be produced on
 a machine with neither.
+
+``--render-charts`` exports every ``@CHART`` block to ``figures/fig-<name>.png``
+so that every figure in the report exists as an image on disk beside the
+diagrams and screenshots.  The PDF build does not read those files - it draws
+the charts as vector graphics - so the export is for reuse in slides and posters
+rather than for the build.  It needs ``pdftoppm`` from poppler.
 
 Markup reference
 ----------------
@@ -100,6 +107,7 @@ from reportlab.platypus.tableofcontents import TableOfContents
 HERE = os.path.dirname(os.path.abspath(__file__))
 DIAGRAM_SRC = os.path.join(HERE, "diagrams")     # mermaid sources
 FIGURE_DIR = os.path.join(HERE, "figures")       # rendered PNGs
+CHART_DPI = 200                                  # raster resolution for --render-charts
 MAX_FIG_H = 212 * 2.834645669  # 212 mm: the frame is 250 mm tall, so a tall
                                # figure plus its caption still fits on one page.
                                # Raising this is the only lever on legibility for
@@ -1718,6 +1726,75 @@ def restyle_diagrams():
     print("restyled %d of %d sources" % (changed, len(sources)))
 
 
+def render_charts(src):
+    """Render every ``@CHART`` block in *src* to ``figures/fig-<name>.png``.
+
+    The PDF build draws charts as vector graphics straight into the story and
+    never reads these files, so this step is purely for export: it puts the
+    charts alongside the diagrams and screenshots, so every figure in the report
+    exists as an image on disk rather than only inside the PDF.
+
+    Two hops, because reportlab's raster backend (``renderPM``) needs an
+    optional Cairo dependency that the PDF build does not: the Drawing goes to a
+    one-page PDF through ``renderPDF``, and ``pdftoppm`` rasterises that at
+    ``--chart-dpi``.  Poppler is the only external requirement and it is a
+    lighter one than the Node and Chrome that :func:`render_diagrams` needs.
+    """
+    import shutil
+    import subprocess
+    import tempfile
+
+    from reportlab.graphics import renderPDF
+
+    if shutil.which("pdftoppm") is None:
+        sys.exit("pdftoppm (poppler-utils) not found; cannot rasterise charts")
+    os.makedirs(FIGURE_DIR, exist_ok=True)
+
+    with open(src, encoding="utf-8") as fh:
+        lines = fh.read().split("\n")
+
+    written, i = [], 0
+    while i < len(lines):
+        line = lines[i]
+        if not line.startswith("@CHART|"):
+            i += 1
+            continue
+        parts = [c.strip() for c in line.split("|")]
+        kind, label = parts[1], parts[2]
+        labels, series, ylabel, height = [], [], None, 78 * mm
+        i += 1
+        while i < len(lines) and not lines[i].startswith("@ENDCHART"):
+            raw = lines[i]
+            cells = [c.strip() for c in raw.split("|")]
+            if raw.startswith("@LABELS|"):
+                labels = cells[1:]
+            elif raw.startswith("@SERIES|"):
+                series.append((cells[1], [float(v) for v in cells[2:]]))
+            elif raw.startswith("@YLABEL|"):
+                ylabel = cells[1]
+            elif raw.startswith("@CHARTHEIGHT|"):
+                height = float(cells[1]) * mm
+            i += 1
+        i += 1
+
+        drawing = make_chart(kind, labels, series, ylabel, height=height)
+        out = os.path.join(FIGURE_DIR, "fig-%s.png" % label.split(":", 1)[1])
+        with tempfile.TemporaryDirectory() as tmp:
+            pdf = os.path.join(tmp, "chart.pdf")
+            renderPDF.drawToFile(drawing, pdf, "chart")
+            stem = os.path.join(tmp, "page")
+            subprocess.run(
+                ["pdftoppm", "-png", "-r", str(CHART_DPI), "-cropbox",
+                 "-singlefile", pdf, stem],
+                check=True)
+            shutil.move(stem + ".png", out)
+        written.append(out)
+        print("  wrote %s" % os.path.relpath(out, HERE))
+
+    print("rendered %d charts to %s" % (len(written), os.path.relpath(FIGURE_DIR, HERE)))
+    return written
+
+
 def render_diagrams():
     """Render every ``diagrams/*.mmd`` to ``figures/*.png``.
 
@@ -1791,7 +1868,14 @@ def main(argv):
         argv = [a for a in argv if a != "--render-diagrams"]
         if len(argv) == 1:
             return 0
+    charts_only = "--render-charts" in argv
+    argv = [a for a in argv if a != "--render-charts"]
     src = argv[1] if len(argv) > 1 else os.path.join(HERE, "final_paper.txt")
+    if charts_only:
+        if not os.path.exists(src):
+            sys.exit("source not found: %s" % src)
+        render_charts(src)
+        return 0
     dst = argv[2] if len(argv) > 2 else os.path.join(HERE, "final_paper.pdf")
     if not os.path.exists(src):
         sys.exit("source not found: %s" % src)
