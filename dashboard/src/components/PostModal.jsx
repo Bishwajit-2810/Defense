@@ -135,7 +135,7 @@ export default function PostModal({ post, onClose }) {
     `);
     w.document.write('</head><body class="bg-white dark:bg-white text-slate-900">');
     w.document.write('<div style="margin-bottom: 20px;">');
-    w.document.write('<h2 class="text-2xl font-bold mb-1">Defense Analysis — Post Detail</h2>');
+    w.document.write('<h2 class="text-2xl font-bold mb-1">Selective Intelligence — Post Detail</h2>');
     w.document.write('<div class="text-sm text-slate-500 mb-4">Post ID: ' + (post.post_id || 'Unknown') + '</div>');
     w.document.write(clone.innerHTML);
     w.document.write('</div>');

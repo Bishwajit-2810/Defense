@@ -1065,7 +1065,7 @@ async def collect_full_system_snapshot(
         "pipeline": pipe,
         "ai_runtime": ai,
         "api_service": {
-            "title": "Defense Analysis API",
+            "title": "Selective Intelligence API",
             "version": "1.0.0",
             "environment": app_env(),
             "rate_limit_enabled": config.rate_limit_enabled,

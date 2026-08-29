@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""run_all.py — one-command launcher for the Smart Layer.
+"""run_all.py — one-command launcher for Selective Intelligence.
 
 Run it with uv (recommended):
 
@@ -737,7 +737,7 @@ def load_posts(skip_if_loaded: bool) -> None:
 def banner(with_agents: bool, dash_port: int | None, manual_load: bool = False) -> None:
     print()
     ok("════════════════════════════════════════════════════════════")
-    ok("  Smart Layer is up.")
+    ok("  Selective Intelligence is up.")
     print(f"   • API        →  http://127.0.0.1:{API_PORT}/v1/health")
     if dash_port:
         print(f"   • Dashboard  →  http://127.0.0.1:{dash_port}   (log in with API key: demo)")
@@ -766,7 +766,7 @@ def banner(with_agents: bool, dash_port: int | None, manual_load: bool = False) 
 # Main
 # --------------------------------------------------------------------------- #
 def main() -> None:
-    ap = argparse.ArgumentParser(description="One-command launcher for the Smart Layer.")
+    ap = argparse.ArgumentParser(description="One-command launcher for Selective Intelligence.")
     ap.add_argument("--with-agents", action="store_true", help="also start agents + 3 MCP servers")
     ap.add_argument("--no-dashboard", action="store_true", help="don't serve the web UI")
     ap.add_argument("--no-load", action="store_true", help="don't push the 50 sample posts")

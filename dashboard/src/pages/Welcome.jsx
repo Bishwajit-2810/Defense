@@ -54,10 +54,10 @@ export default function Welcome({ onAuthenticated }) {
           </div>
         </div>
         <h2 className="mt-6 text-center text-3xl font-extrabold text-slate-900 dark:text-white tracking-tight">
-          Defense Analysis
+          Selective Intelligence
         </h2>
         <p className="mt-2 text-center text-sm text-slate-500 dark:text-zinc-400 font-medium uppercase tracking-widest">
-          Intelligence Platform v2
+          Cost-Aware Analysis Layer
         </p>
       </div>
 

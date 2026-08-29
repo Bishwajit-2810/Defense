@@ -1,4 +1,4 @@
-"""Defense Analysis API — FastAPI application entry point."""
+"""Selective Intelligence API — FastAPI application entry point."""
 
 from __future__ import annotations
 
@@ -59,10 +59,10 @@ async def lifespan(app: FastAPI):  # noqa: ARG001 - FastAPI passes the app in
 
 
 app = FastAPI(
-    title="Defense Analysis API",
+    title="Selective Intelligence API",
     version="1.0.0",
     description=(
-        "API gateway for the Defense social-media analysis platform. "
+        "API gateway for the Selective Intelligence social-media analysis platform. "
         "Handles ingest, analysis orchestration, report generation, and search."
     ),
     docs_url="/docs",

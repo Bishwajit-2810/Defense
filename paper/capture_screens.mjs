@@ -69,6 +69,17 @@ async function closeModal(page) {
   await sleep(800);
 }
 
+/** Wait until the search button stops reading "Searching..." — the results in
+ *  the figure must be the ones the query returned, not the previous mode's. */
+async function settled(page, timeout = 120000) {
+  await page
+    .getByRole('button', { name: /^Search$/ })
+    .last()
+    .waitFor({ state: 'visible', timeout })
+    .catch(() => {});
+  await sleep(1500);
+}
+
 /** Click a left-hand nav tab and wait for its content to settle. */
 async function tab(page, label, settle = 1500) {
   await page.getByRole('button', { name: label, exact: true }).first().click();
@@ -217,14 +228,14 @@ async function main() {
     await tab(page, 'Search', 1500);
     await page.getByPlaceholder(/Post id, platform id/i).fill('politics');
     await page.getByRole('button', { name: /^Search$/ }).last().click();
-    await sleep(3500);
+    await settled(page);
     await shot(page, 'search');
     // Same query in vector mode: the mode badge and the stub-vector notice are
     // both part of what the figure is meant to show.
     await page.getByText(/Semantic Search \(pgvector/i).click();
     await sleep(500);
     await page.getByRole('button', { name: /^Search$/ }).last().click();
-    await sleep(4000);
+    await settled(page);
     await shot(page, 'search-semantic');
   }
 
@@ -243,6 +254,14 @@ async function main() {
   // ------------------------------------------------------------------ logs
   if (want('logs')) {
     await tab(page, 'Logs', 3000);
+    // The console is fed by an SSE stream that has to connect and then receive
+    // something; screenshotting on a timer catches "Waiting for logs...".
+    await page
+      .getByText(/INFO|DEBUG|WARNING|ERROR/)
+      .first()
+      .waitFor({ state: 'visible', timeout: 120000 })
+      .catch(() => {});
+    await sleep(6000);
     await shot(page, 'logs');
   }
 
@@ -360,7 +379,7 @@ async function main() {
     // server closes the connection, the page marks the trace failed, and the
     // figure would show a failure that belongs to the stream rather than to the
     // run. See the limitation recorded in Section 6.2.
-    for (let i = 0; i < 44; i++) {
+    for (let i = 0; i < 55; i++) {
       await sleep(5000);
       if (await page.getByText(/Canonical Result/i).count()) break;
     }
