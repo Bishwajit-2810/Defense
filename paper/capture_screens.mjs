@@ -80,11 +80,66 @@ async function settled(page, timeout = 120000) {
   await sleep(1500);
 }
 
+/**
+ * Wait until a live surface has actually rendered data.
+ *
+ * Every streaming panel in this dashboard paints a placeholder first
+ * ("CONNECTING TO REAL-TIME TELEMETRY STREAM...", "Waiting for logs...",
+ * "Awaiting data stream...") and only swaps in content once its SSE stream has
+ * connected *and* delivered a frame.  Screenshotting on a fixed timer therefore
+ * photographs the placeholder, which is what produced the first pass of these
+ * figures.  Wait on the placeholder leaving and on a concrete value arriving,
+ * and report rather than swallow a timeout, so a bad capture is loud.
+ */
+async function streamed(page, name, { gone, present, timeout = 90000 }) {
+  const t0 = Date.now();
+  if (gone) {
+    await page
+      .getByText(gone)
+      .first()
+      .waitFor({ state: 'hidden', timeout })
+      .catch(() => console.warn(`  ! ${name}: placeholder ${gone} still visible after ${timeout}ms`));
+  }
+  if (present) {
+    await page
+      .getByText(present)
+      .first()
+      .waitFor({ state: 'visible', timeout })
+      .catch(() => console.warn(`  ! ${name}: expected content ${present} never appeared`));
+  }
+  console.log(`  . ${name}: settled in ${Date.now() - t0}ms`);
+}
+
 /** Click a left-hand nav tab and wait for its content to settle. */
 async function tab(page, label, settle = 1500) {
   await page.getByRole('button', { name: label, exact: true }).first().click();
   await page.waitForLoadState('networkidle').catch(() => {});
   await sleep(settle);
+}
+
+/**
+ * Open the Logs tab and make sure its stream is actually connected.
+ *
+ * The console authenticates its EventSource with a single-use ticket.  On a
+ * cold mount the connection can lose the race for that ticket and settle on
+ * "Disconnected" without retrying itself, so the tab has to be re-entered to
+ * force a fresh mount and a fresh ticket.  Without this the figure is a
+ * photograph of an empty console, which is what shipped in the first pass.
+ */
+async function logsConnected(page, attempts = 6) {
+  for (let i = 1; i <= attempts; i++) {
+    await tab(page, 'Logs', 3000);
+    await streamed(page, `logs (attempt ${i})`, {
+      gone: /Waiting for logs|Disconnected/i,
+      present: /INFO|DEBUG|WARNING|ERROR/,
+      timeout: 25000,
+    });
+    const body = await page.locator('body').innerText();
+    if (!/Waiting for logs|Disconnected/i.test(body)) return true;
+    await tab(page, 'Overview', 1200); // leave and come back: new mount, new ticket
+  }
+  console.warn(`  ! logs: never connected after ${attempts} attempts`);
+  return false;
 }
 
 async function main() {
@@ -242,25 +297,37 @@ async function main() {
   // -------------------------------------------------------------- pipeline
   if (want('pipeline')) {
     await tab(page, 'Pipeline', 2500);
+    await streamed(page, 'pipeline', {
+      gone: /CONNECTING|Awaiting data stream/i,
+      present: /In Flight/i,
+    });
     await shot(page, 'pipeline');
   }
 
   // -------------------------------------------------------------- warnings
   if (want('warnings')) {
     await tab(page, 'Warnings', 2500);
+    // The alert scan runs on mount and reports "scanned the 0 most recent
+    // analysed posts" until it finishes; wait for the refresh to end and for a
+    // non-zero scan count, or the figure shows an empty table over no data.
+    await streamed(page, 'warnings', {
+      gone: /Refreshing/i,
+      present: /scanned the [1-9]\d* most recent/i,
+      timeout: 240000,
+    });
     await shot(page, 'warnings');
   }
 
   // ------------------------------------------------------------------ logs
   if (want('logs')) {
-    await tab(page, 'Logs', 3000);
-    // The console is fed by an SSE stream that has to connect and then receive
-    // something; screenshotting on a timer catches "Waiting for logs...".
-    await page
-      .getByText(/INFO|DEBUG|WARNING|ERROR/)
-      .first()
-      .waitFor({ state: 'visible', timeout: 120000 })
-      .catch(() => {});
+    await logsConnected(page);
+    // NOTE: the console auto-scrolls to the tail and the API out-logs the
+    // workers by roughly ten to one (measured on the stream: api 77, stage1 7,
+    // router 3 over 30s), so the visible frame is usually all `api` rows even
+    // while the pipeline is busy.  The stream genuinely carries every service -
+    // the `service` column proves it - but do not add a wait for a worker row
+    // here: getByText matches the whole page, so such a wait passes instantly
+    // against nav text and gives false confidence rather than a better frame.
     await sleep(6000);
     await shot(page, 'logs');
   }
@@ -269,7 +336,11 @@ async function main() {
   if (want('monitor')) {
     await tab(page, 'Overview', 1500);
     await page.keyboard.press('Alt+m');
-    await sleep(3000);
+    await streamed(page, 'monitor', {
+      gone: /CONNECTING TO REAL-TIME TELEMETRY/i,
+      present: /Uptime|Hostname|Cores|Load/i,
+    });
+    await sleep(1500);
     await shot(page, 'monitor');
     await page.keyboard.press('Alt+m');
     await sleep(600);
@@ -279,7 +350,8 @@ async function main() {
   if (want('busy')) {
     await tab(page, 'Pipeline', 3000);
     await shot(page, 'pipeline-live');
-    await tab(page, 'Logs', 4000);
+    await logsConnected(page);
+    await sleep(4000);
     await shot(page, 'logs-live');
     await tab(page, 'Analysis Jobs', 3000);
     await shot(page, 'jobs-live');
@@ -426,7 +498,8 @@ async function main() {
     }
     await sleep(2000);
     await shot(jobs, 'jobs-live');
-    await tab(page, 'Logs', 3000);
+    await logsConnected(page);
+    await sleep(3000);
     await shot(page, 'logs-live');
     await jobs.close();
   }
