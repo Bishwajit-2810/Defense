@@ -4,12 +4,12 @@ graph TD
     Down["Downstream consumer"]
     Backend["LLM backend"]
 
-    P1(("1 · Ingest"))
-    P2(("2 · Cheap NLP"))
-    P3(("3 · Route"))
-    P4(("4 · LLM analysis"))
-    P5(("5 · Assemble"))
-    P6(("6 · Insight"))
+    P1(("1.0 · Ingest"))
+    P2(("2.0 · Cheap NLP"))
+    P3(("3.0 · Route"))
+    P4(("4.0 · LLM analysis"))
+    P5(("5.0 · Assemble"))
+    P6(("6.0 · Insight"))
 
     D1[("D1 posts and<br/>raw payloads")]
     D2[("D2 analysis_results<br/>+ embedding")]
@@ -17,23 +17,23 @@ graph TD
     D4[("D4 model registry<br/>configuration")]
     D5[("D5 analytics events<br/>comment sentiments")]
 
-    Up -- "post-with-details" --> P1
-    P1 --> D1
-    P1 -- "normalised<br/>envelope" --> P2
-    D4 --> P2
-    P2 -- "stage1_result:<br/>language · sentiment<br/>emotion · topics<br/>post_type · toxicity<br/>entities · embedding<br/>per-comment labels" --> P3
-    P3 -- "task_flags.<br/>post_level_routed" --> P4
-    P3 -- "selected<br/>comment set" --> P4
-    P4 <--> Backend
-    P4 <--> D3
-    P4 -- "stage2_result:<br/>summary · post_type<br/>insight · eight labels<br/>per comment<br/>target stances" --> P5
-    P5 --> D1
-    P5 --> D2
-    P5 --> D5
-    P5 -- "canonical<br/>result JSON" --> Down
-    D2 --> P6
-    D5 --> P6
-    P6 -- "grounded briefing<br/>with citations" --> Op
+    Up -- "[1] post-with-details" --> P1
+    Op -- "[2] analysis request" --> P1
+    P1 -- "[3] raw payload" --> D1
+    P1 -- "[4] normalised<br/>envelope" --> P2
+    D4 -- "[5] model config" --> P2
+    P2 -- "[6] stage-1 result" --> P3
+    P3 -- "[7] task flags ·<br/>selected comments" --> P4
+    P4 <-- "[8] prompt /<br/>completion" --> Backend
+    P4 <-- "[9] cache ·<br/>counters" --> D3
+    P4 -- "[10] stage-2 result" --> P5
+    P5 -- "[11] canonical JSON" --> D1
+    P5 -- "[12] results +<br/>embedding" --> D2
+    P5 -- "[13] events + comment<br/>labels" --> D5
+    P5 -- "[14] canonical<br/>result JSON" --> Down
+    D2 -- "[15] results +<br/>vectors" --> P6
+    D5 -- "[16] comment<br/>sentiments" --> P6
+    P6 -- "[17] grounded briefing" --> Op
 
     class Up,Op,Down,Backend entry
     class P1,P2,P3,P4,P5,P6 svc

@@ -4,8 +4,8 @@ graph TD
     Stores[("Postgres + pgvector · ClickHouse<br/>Redis · object storage")]
     Out["Results / reports / dashboard"]
 
-    Up -- "pull post-with-details<br/><small>post + comments<br/>engagement + reactions<br/>shares, one payload</small>" --> SL
-    SL -. "NO write-back —<br/>read-only consumer" .-> Up
+    Up -- "pull post-with-details" --> SL
+    SL -. "no write-back" .-> Up
     SL --> Stores
     Stores -- "serve" --> Out
 

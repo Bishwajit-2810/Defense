@@ -19,7 +19,7 @@ graph TD
     A --> CH[("ClickHouse")]
     A --> OS[("Object storage")]
 
-    Note["The chain is linear — there is<br/>no bypass hop. The gate sets<br/>task_flags.post_level_routed,<br/>which decides how much work a<br/>post receives, not which stage<br/>it reaches."]
+    Note["The chain is linear — no bypass hop<br/><small>the gate sets how much work a post receives,<br/>not which stage it reaches</small>"]
     R -.-> Note
 
     class Up,PG,CH,OS store

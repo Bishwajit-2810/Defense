@@ -29,7 +29,7 @@ graph TD
 
     Bus -- "consume" --> S1
     S1 -- "features + summary" --> Router
-    Router -- "every post;<br/>task_flags<br/>carry the gate" --> S2
+    Router -- "every post, with task_flags" --> S2
     S2 --> Asm
 
     subgraph agentlayer["Agentic insight layer — corpus tier"]
@@ -44,6 +44,8 @@ graph TD
         CH[("ClickHouse<br/><small>analytics</small>")]
         RD[("Redis<br/><small>cache · dedup · counters</small>")]
         OS[("Object storage<br/><small>raw payloads · reports</small>")]
+        PG ~~~ RD
+        CH ~~~ OS
     end
 
     Asm -- "fan-out writes" --> PG

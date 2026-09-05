@@ -9,8 +9,8 @@ graph TD
         W2["Stage-2 worker<br/><small>OpenAI-compatible client —<br/>picks the role per task</small>"]
         Local["vLLM on our GPUs<br/><small>LLM-A 7B/8B fast<br/>LLM-B 14B/32B quality<br/>quantized, paged KV</small>"]
         Groq["Groq Cloud API<br/><small>OpenAI-compatible<br/>Llama/Qwen on LPU<br/>per-token, no GPU ops</small>"]
-        W2 -- "LLM_BACKEND<br/>=local" --> Local
-        W2 -- "LLM_BACKEND<br/>=groq" --> Groq
+        W2 -- "LLM_BACKEND=local" --> Local
+        W2 -- "LLM_BACKEND=groq" --> Groq
     end
 
     Triton ~~~ W2

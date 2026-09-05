@@ -55,8 +55,13 @@ Body
     ``@CODE|text``             monospaced line
     ``@PAGEBREAK``             force a page break
 Blocks (numbered automatically per chapter; the second field is a *label*)
-    ``@TABLE|tab:name|Caption`` .. ``@ENDTABLE`` with ``@TH|a|b`` and ``@TR|a|b``
-    ``@FIGURE|fig:name|Caption`` .. ``@ENDFIGURE`` with ``@FIGDESC|text``
+    ``@TABLE|tab:name|Caption`` .. ``@ENDTABLE`` with ``@TH|a|b`` and ``@TR|a|b``;
+        an optional ``@TSTYLE|grid`` boxes every cell (criterion checklists) and
+        ``@TSTYLE|gantt`` additionally paints a cell whose text is ``X``
+    ``@EQ|eq:name|body`` .. ``@ENDEQ`` with ``@WHERE|text``; the body accepts
+        ``_{i}``/``^{2}`` for sub- and superscripts and ``@x`` for a maths italic
+    ``@FIGURE|fig:name|Caption`` .. ``@ENDFIGURE`` with ``@FIGNOTE|text``
+                               (unlabelled), ``@FIGDESC|text``
     ``@CHART|kind|fig:name|Caption`` .. ``@ENDCHART`` with ``@LABELS|``,
         ``@SERIES|``, ``@YLABEL|``, ``@FIGDESC|``;  *kind* is bar | hbar | pie | line
 
@@ -76,6 +81,7 @@ Inline markup inside any text: ``**bold**``, ``*italic*``, ``` `mono` ```.
 from __future__ import annotations
 
 import html
+import json
 import os
 import re
 import sys
@@ -108,6 +114,15 @@ HERE = os.path.dirname(os.path.abspath(__file__))
 DIAGRAM_SRC = os.path.join(HERE, "diagrams")     # mermaid sources
 FIGURE_DIR = os.path.join(HERE, "figures")       # rendered PNGs
 CHART_DPI = 200                                  # raster resolution for --render-charts
+# A diagram's node label is set at DIAGRAM_FONT_UNITS SVG units.  Stretching
+# every drawing to the frame width made that label print anywhere between 6 pt
+# and 18 pt depending only on how much the drawing happened to contain, so the
+# scale is pinned to a target printed size instead and a drawing is enlarged no
+# further than that.  See diagram_plan().
+DIAGRAM_FONT_UNITS = 19.0  # mermaid label size, in SVG user units
+DIAGRAM_TEXT_PT = 9.5      # printed size of a node label, in points
+DIAGRAM_METRICS = "diagram-metrics.json"
+
 MAX_FIG_H = 212 * 2.834645669  # 212 mm: the frame is 250 mm tall, so a tall
                                # figure plus its caption still fits on one page.
                                # Raising this is the only lever on legibility for
@@ -124,6 +139,13 @@ MARGIN_R = 22 * mm
 MARGIN_T = 25 * mm
 MARGIN_B = 22 * mm
 FRAME_W = PAGE_W - MARGIN_L - MARGIN_R
+FRAME_H = PAGE_H - MARGIN_T - MARGIN_B
+
+# A diagram that lands alone on its page can use the whole frame height, less
+# the room its caption needs underneath.  Every diagram is set upright: a wide
+# one gets more room from a quarter-turn, but a figure the reader has to rotate
+# the page for is not worth the points it buys.
+SOLO_FIG_H = FRAME_H - 52
 
 # ---------------------------------------------------------------------------
 # Palette
@@ -216,10 +238,41 @@ def register_fonts() -> dict:
     return resolved
 
 
+def register_symbol_fonts():
+    """Register a maths face and a dingbat face.
+
+    Liberation Serif carries no set-membership, ceiling or tick glyph, so an
+    equation or a check mark typeset in the body face would silently render as
+    a black box.  DejaVu Serif covers the maths repertoire and DejaVu Sans the
+    tick, so both are registered under fixed names and used only for the runs
+    that need them - the body text keeps the body face throughout.
+    """
+    names = {"Math": F_BODY, "Math-Italic": F_BODY_I, "Math-Bold": F_BODY_B,
+             "Sym": F_BODY}
+    quads = [("Math", "/usr/share/fonts/TTF/DejaVuSerif.ttf"),
+             ("Math-Italic", "/usr/share/fonts/TTF/DejaVuSerif-Italic.ttf"),
+             ("Math-Bold", "/usr/share/fonts/TTF/DejaVuSerif-Bold.ttf"),
+             ("Sym", "/usr/share/fonts/TTF/DejaVuSans.ttf")]
+    for name, path in quads:
+        if os.path.exists(path):
+            try:
+                pdfmetrics.registerFont(TTFont(name, path))
+                names[name] = name
+            except Exception:  # pragma: no cover - defensive
+                pass
+    if names["Math"] == "Math":
+        pdfmetrics.registerFontFamily(
+            "Math", normal="Math", bold=names["Math-Bold"],
+            italic=names["Math-Italic"], boldItalic=names["Math-Italic"])
+    return names
+
+
 FONTS = register_fonts()
 F_BODY, F_BODY_B, F_BODY_I, _ = FONTS["Body"]
 F_HEAD, F_HEAD_B, F_HEAD_I, _ = FONTS["Head"]
 F_MONO, F_MONO_B, _, _ = FONTS["Mono"]
+_SYMBOL = register_symbol_fonts()
+F_MATH, F_MATH_I, F_SYM = _SYMBOL["Math"], _SYMBOL["Math-Italic"], _SYMBOL["Sym"]
 
 
 # ---------------------------------------------------------------------------
@@ -238,9 +291,22 @@ def build_styles() -> dict:
         allowWidows=0, allowOrphans=0,
     )
     s["BodyFirst"] = ParagraphStyle("BodyFirst", parent=s["Body"], spaceBefore=2)
+    # The chapter outline is set in the ordinary body face at ordinary weight:
+    # the FYDP template asks for a plain sentence or two, not a styled epigraph.
     s["Intro"] = ParagraphStyle(
-        "Intro", parent=s["Body"], fontName=F_BODY_I, textColor=MUTED,
-        spaceAfter=11, leftIndent=0,
+        "Intro", parent=s["Body"], fontName=F_BODY, spaceAfter=11, leftIndent=0,
+    )
+    s["Eq"] = ParagraphStyle(
+        "Eq", parent=s["Body"], fontName=F_MATH, fontSize=11.5, leading=17,
+        alignment=TA_CENTER, spaceBefore=0, spaceAfter=0,
+    )
+    s["EqNum"] = ParagraphStyle(
+        "EqNum", parent=s["Body"], fontName=F_MATH, fontSize=11,
+        alignment=2, spaceBefore=0, spaceAfter=0,          # 2 = TA_RIGHT
+    )
+    s["EqWhere"] = ParagraphStyle(
+        "EqWhere", parent=s["Body"], fontSize=10.2, leading=14.2,
+        leftIndent=10, spaceBefore=3, spaceAfter=9, textColor=MUTED,
     )
     s["Bullet"] = ParagraphStyle(
         "Bullet", parent=s["Body"], leftIndent=15, bulletIndent=3,
@@ -375,7 +441,9 @@ def rich(text: str) -> str:
     out = _RE_MONO.sub(lambda m: '<font face="%s" size="9.6">%s</font>' % (F_MONO, m.group(1)), out)
     out = _RE_BOLD.sub(lambda m: "<b>%s</b>" % m.group(1), out)
     out = _RE_ITAL.sub(lambda m: "<i>%s</i>" % m.group(1), out)
-    return out
+    # The body face carries no tick or cross glyph; borrow one rather than
+    # emit the black box reportlab substitutes for a missing character.
+    return glyph_rescue(out)
 
 
 # ---------------------------------------------------------------------------
@@ -476,17 +544,65 @@ def figure_path(ref):
     return os.path.join(FIGURE_DIR, ref.replace(":", "-") + ".png")
 
 
+_DIAGRAM_METRICS = None
+
+
+def diagram_metrics():
+    """The SVG user-unit size of every rendered diagram, keyed by file stem.
+
+    Written by :func:`render_diagrams` beside the PNGs, because the printed size
+    of a diagram's text depends on its size in SVG units and the PNG has lost
+    that: the optimiser rescales anything wider than 1,900 px, so pixels no
+    longer carry the scale.  Missing or stale entries simply fall back to the
+    old fit-to-frame behaviour.
+    """
+    global _DIAGRAM_METRICS
+    if _DIAGRAM_METRICS is None:
+        try:
+            with open(os.path.join(FIGURE_DIR, DIAGRAM_METRICS),
+                      encoding="utf-8") as fh:
+                _DIAGRAM_METRICS = json.load(fh)
+        except Exception:                              # absent or unparseable
+            _DIAGRAM_METRICS = {}
+    return _DIAGRAM_METRICS
+
+
+def diagram_plan(ref):
+    """Printed size for diagram *ref* as ``(width_pt, height_pt)``.
+
+    One scale is chosen for every diagram - ``DIAGRAM_TEXT_PT`` points per
+    ``DIAGRAM_FONT_UNITS`` SVG units - so that a node label is the same size in
+    every figure.  A drawing too large to fit at that scale gets the largest
+    scale that does fit.  Returns None when the diagram is not one of ours.
+    """
+    m = diagram_metrics().get(ref.replace(":", "-"))
+    if not m:
+        return None
+    pw, ph = m[0] + 2 * SVG_MARGIN, m[1] + 2 * SVG_MARGIN
+    if pw <= 0 or ph <= 0:
+        return None
+    scale = min(FRAME_W / pw, SOLO_FIG_H / ph,
+                DIAGRAM_TEXT_PT / DIAGRAM_FONT_UNITS)
+    return pw * scale, ph * scale
+
+
 def image_flowable(ref):
     """Return a scaled Image for *ref*, or None when no rendering exists.
 
-    The diagrams are rasterised at three device pixels per SVG unit, which keeps
-    the effective resolution above 300 dpi at the widths used here.  Tall
-    diagrams are bounded by height rather than width so that the caption is
-    never pushed off the page.
+    Diagrams are placed at one fixed scale so their type is uniform across the
+    report (see :func:`diagram_plan`); screenshots and charts, which carry no
+    text at a known size, still fill the frame and are bounded by height so the
+    caption is never pushed off the page.
     """
     path = figure_path(ref)
     if not os.path.exists(path):
         return None
+    plan = diagram_plan(ref)
+    if plan is not None:
+        w, h = plan
+        img = Image(path, width=w, height=h)
+        img.hAlign = "CENTER"
+        return img
     try:
         iw, ih = ImageReader(path).getSize()
     except Exception:                                  # unreadable or truncated
@@ -744,7 +860,99 @@ def _weights(header, rows, font_size, pad):
     return [f + surplus * e / pool for f, e in zip(floors, extra)]
 
 
-def make_table(header, rows):
+def make_equation(body, number):
+    """One numbered display equation: centred body, right-aligned number.
+
+    Laid out as a borderless two-column table so that the number sits on the
+    equation's own baseline at the right margin, which is what "consistent
+    numbering and alignment" means for a report of this kind - every equation
+    in the document is set on the same grid regardless of its height.
+    """
+    num_w = 20 * mm
+    body_p = Paragraph(math_markup(body), ST["Eq"])
+    num_p = Paragraph("(%s)" % number, ST["EqNum"])
+    t = Table([[body_p, num_p]], colWidths=[FRAME_W - num_w, num_w],
+              hAlign="LEFT")
+    t.setStyle(TableStyle([
+        ("VALIGN", (0, 0), (-1, -1), "MIDDLE"),
+        ("LEFTPADDING", (0, 0), (-1, -1), 0),
+        ("RIGHTPADDING", (0, 0), (-1, -1), 0),
+        ("TOPPADDING", (0, 0), (-1, -1), 7),
+        ("BOTTOMPADDING", (0, 0), (-1, -1), 7),
+    ]))
+    return t
+
+
+_RE_SUB = re.compile(r"_\{([^}]*)\}|_(\w)")
+_RE_SUP = re.compile(r"\^\{([^}]*)\}|\^(\w)")
+_RE_EMPH = re.compile(r"@([A-Za-z][A-Za-z0-9]*)")
+
+
+def _body_glyphs():
+    """The set of code points the body face can actually draw.
+
+    reportlab substitutes a black box for a missing glyph without warning, so
+    the characters an equation needs are checked against the font rather than
+    assumed - the same "ask the producer what it really emits" rule the system
+    under study applies to its own stage boundaries.
+    """
+    try:
+        face = pdfmetrics.getFont(F_BODY).face
+        table = getattr(face, "charToGlyph", None)
+        if table:
+            return set(table)
+    except Exception:  # pragma: no cover - base-14 fallback has no cmap
+        pass
+    return None
+
+
+_BODY_GLYPHS = _body_glyphs()
+_RE_NONASCII = re.compile(r"[^\x00-\xff]")
+
+
+def glyph_rescue(markup):
+    """Wrap any character the body face lacks in a face that carries it."""
+    if _BODY_GLYPHS is None:
+        return markup
+
+    def sub(m):
+        ch = m.group(0)
+        if ord(ch) in _BODY_GLYPHS:
+            return ch
+        face = F_SYM if ch in "\u2713\u2717\u2610\u2611" else F_MATH
+        return '<font face="%s">%s</font>' % (face, ch)
+
+    return _RE_NONASCII.sub(sub, markup)
+
+
+def rich_math(text):
+    """``rich`` plus the equation mini-language, for prose that carries symbols."""
+    out = rich(text)
+    out = _RE_SUB.sub(lambda m: "<sub>%s</sub>" % (m.group(1) or m.group(2)), out)
+    out = _RE_SUP.sub(lambda m: "<super>%s</super>" % (m.group(1) or m.group(2)), out)
+    out = _RE_EMPH.sub(
+        lambda m: '<font face="%s">%s</font>' % (F_MATH_I, m.group(1)), out)
+    return out
+
+
+def math_markup(text):
+    """Render the equation mini-language into reportlab inline markup.
+
+    ``_{i}`` and ``^{2}`` are subscript and superscript, ``@x`` sets a single
+    identifier in the maths italic, and everything else is passed through in
+    the upright maths face.  Keeping the notation in the source readable is
+    deliberate: an equation that cannot be proof-read in the plain-text source
+    is an equation whose typo reaches the PDF.
+    """
+    out = html.escape(text, quote=False)
+    out = _RE_SUB.sub(lambda m: "<sub>%s</sub>" % (m.group(1) or m.group(2)), out)
+    out = _RE_SUP.sub(lambda m: "<super>%s</super>" % (m.group(1) or m.group(2)), out)
+    out = _RE_EMPH.sub(
+        lambda m: '<font face="%s">%s</font>' % (F_MATH_I, m.group(1)), out)
+    return glyph_rescue(out)
+
+
+def make_table(header, rows, grid=False, fill=None):
     n_cols = len(header) if header else max(len(r) for r in rows)
     font_size, pad = _table_metrics(n_cols)
     body_style = ParagraphStyle("cell%d" % n_cols, parent=ST["Cell"],
@@ -752,11 +960,30 @@ def make_table(header, rows):
     head_style = ParagraphStyle("chead%d" % n_cols, parent=ST["CellHead"],
                                 fontSize=font_size, leading=font_size * 1.3)
 
+    label_style = body_style
+    if grid:
+        body_style = ParagraphStyle("cellc%d" % n_cols, parent=body_style,
+                                    alignment=TA_CENTER)
+        head_style = ParagraphStyle("cheadc%d" % n_cols, parent=head_style,
+                                    alignment=TA_CENTER)
+        # A timeline's first column is a task name, not a mark: it reads left.
+        if fill is None:
+            label_style = body_style
+
+    filled = []
     cells = []
     if header:
         cells.append([Paragraph(rich(c), head_style) for c in header])
     for r in rows:
-        cells.append([Paragraph(rich(c), body_style) for c in r])
+        row = []
+        for i, c in enumerate(r):
+            style = label_style if i == 0 else body_style
+            if fill is not None and c.strip() == fill:
+                filled.append((len(row), len(cells)))
+                row.append(Paragraph("", style))
+            else:
+                row.append(Paragraph(rich(c), style))
+        cells.append(row)
 
     t = Table(cells, colWidths=_weights(header, rows, font_size, pad),
               repeatRows=1 if header else 0, hAlign="LEFT", splitByRow=1)
@@ -779,6 +1006,20 @@ def make_table(header, rows):
         ]
         for i in range(2, len(cells), 2):
             style.append(("BACKGROUND", (0, i), (-1, i), colors.HexColor("#f7f9fc")))
+    if grid:
+        # Every cell gets its own box: this is the criterion-checklist layout
+        # the FYDP template specifies, where the box is the unit of meaning.
+        style = [st for st in style
+                 if st[0] not in ("LINEBELOW", "BACKGROUND")
+                 or (st[0] == "BACKGROUND" and st[1] == (0, 0))]
+        style += [
+            ("GRID", (0, 0), (-1, -1), 0.7, RULE),
+            ("VALIGN", (0, 0), (-1, -1), "MIDDLE"),
+            ("TOPPADDING", (0, 0), (-1, -1), 6),
+            ("BOTTOMPADDING", (0, 0), (-1, -1), 6),
+        ]
+    for col, row in filled:
+        style.append(("BACKGROUND", (col, row), (col, row), ACCENT))
     t.setStyle(TableStyle(style))
     return t
 
@@ -914,7 +1155,7 @@ class ReportDoc(BaseDocTemplate):
 TITLE_FIELDS = ("degree", "supervised_by", "cosupervised_by", "dept", "university",
                 "city", "date", "byline")
 
-LABEL_RE = re.compile(r"^@(FIGURE|TABLE)\|([a-z]+:[a-z0-9_-]+)\|", re.I)
+LABEL_RE = re.compile(r"^@(FIGURE|TABLE|EQ)\|([a-z]+:[a-z0-9_-]+)\|", re.I)
 CHART_LABEL_RE = re.compile(r"^@CHART\|[a-z]+\|([a-z]+:[a-z0-9_-]+)\|", re.I)
 CHAPTER_RE = re.compile(r"^@CHAPTER\|([^|]+)\|")
 REF_RE = re.compile(r"\{\{([a-z]+:[a-z0-9_-]+)\}\}", re.I)
@@ -990,23 +1231,28 @@ class Parser:
         the same single-source-of-truth rule the system under study applies to
         its stream names.
         """
-        chapter, fig_n, tab_n = "0", 0, 0
+        chapter, fig_n, tab_n, eq_n = "0", 0, 0, 0
         for raw in self.lines:
             line = raw.strip()
             m = CHAPTER_RE.match(line)
             if m:
-                chapter, fig_n, tab_n = m.group(1).strip(), 0, 0
+                chapter, fig_n, tab_n, eq_n = m.group(1).strip(), 0, 0, 0
                 continue
             m = LABEL_RE.match(line) or CHART_LABEL_RE.match(line)
             if not m:
                 continue
-            kind = "TABLE" if line.upper().startswith("@TABLE") else "FIGURE"
+            upper = line.upper()
+            kind = ("TABLE" if upper.startswith("@TABLE")
+                    else "EQ" if upper.startswith("@EQ") else "FIGURE")
             label = m.group(m.lastindex)
             if label in self.numbers:
                 raise ValueError("duplicate block label %r" % label)
             if kind == "TABLE":
                 tab_n += 1
                 self.numbers[label] = "%s.%d" % (chapter, tab_n)
+            elif kind == "EQ":
+                eq_n += 1
+                self.numbers[label] = "%s.%d" % (chapter, eq_n)
             else:
                 fig_n += 1
                 self.numbers[label] = "%s.%d" % (chapter, fig_n)
@@ -1033,11 +1279,12 @@ class Parser:
             S.append(make_toc())
         elif line == "@LOF":
             self._break()
-            S.append(self._front_head("List of Figures", toc=False))
+            # Listed in the contents, as the FYDP template's own contents page is.
+            S.append(self._front_head("List of Figures", toc=True))
             S.append(make_list_index("LOFEntry"))
         elif line == "@LOT":
             self._break()
-            S.append(self._front_head("List of Tables", toc=False))
+            S.append(self._front_head("List of Tables", toc=True))
             S.append(make_list_index("LOTEntry"))
         elif line.startswith("@FRONT|"):
             p = self._split(line)
@@ -1049,6 +1296,8 @@ class Parser:
             self._emit_chapter(p[1], p[2])
         elif line.startswith("@INTRO|"):
             S.append(Paragraph(rich(line.split("|", 1)[1]), ST["Intro"]))
+        elif line.startswith("@EQ|"):
+            self._emit_equation(line)
         elif line.startswith("@H2|"):
             S.append(self._head(line.split("|", 1)[1], "H2"))
         elif line.startswith("@H3|"):
@@ -1175,8 +1424,11 @@ class Parser:
     def _emit_table(self, line):
         p = self._split(line)
         number, caption = self._number_for(p[1]), p[2]
-        header, rows = None, []
-        for raw in self._collect_block("@ENDTABLE", ("@TH|", "@TR|")):
+        header, rows, tstyle = None, [], ""
+        for raw in self._collect_block("@ENDTABLE", ("@TH|", "@TR|", "@TSTYLE|")):
+            if raw.startswith("@TSTYLE|"):
+                tstyle = raw.split("|", 1)[1].strip().lower()
+                continue
             cells = [c.strip() for c in raw.split("|")[1:]]
             if raw.startswith("@TH|"):
                 header = cells
@@ -1187,26 +1439,44 @@ class Parser:
         self.story.append(Spacer(1, 4))
         self.story.append(TocEntry("LOTEntry", label, self._key("tbl")))
         self.story.append(cap)
-        self.story.append(make_table(header, rows))
+        self.story.append(make_table(
+            header, rows,
+            grid=tstyle in ("grid", "gantt"),
+            fill="X" if tstyle == "gantt" else None))
         self.story.append(Spacer(1, 9))
+
+    def _emit_equation(self, line):
+        # Split on the first two bars only: a vertical bar inside the body is
+        # set-cardinality notation, not a field separator.
+        _, label, body = line.split("|", 2)
+        number = self._number_for(label.strip())
+        where = []
+        for raw in self._collect_block("@ENDEQ", ("@WHERE|",)):
+            where.append(raw.split("|", 1)[1])
+        block = [make_equation(body, number)]
+        for w in where:
+            block.append(Paragraph(rich_math(w), ST["EqWhere"]))
+        self.story.append(KeepTogether(block))
 
     def _emit_figure(self, line):
         p = self._split(line)
         ref, number, caption = p[1], self._number_for(p[1]), p[2]
         height = 68 * mm
-        desc, walk = [], []
+        desc, walk, note = [], [], []
         for raw in self._collect_block(
-                "@ENDFIGURE", ("@FIGDESC|", "@FIGREAD|", "@FIGHEIGHT|")):
+                "@ENDFIGURE", ("@FIGDESC|", "@FIGREAD|", "@FIGNOTE|", "@FIGHEIGHT|")):
             if raw.startswith("@FIGDESC|"):
                 desc.append(raw.split("|", 1)[1])
             elif raw.startswith("@FIGREAD|"):
                 walk.append(raw.split("|", 1)[1])
+            elif raw.startswith("@FIGNOTE|"):
+                note.append(raw.split("|", 1)[1])
             elif raw.startswith("@FIGHEIGHT|"):
                 height = float(raw.split("|", 1)[1]) * mm
 
         art = image_flowable(ref)
-        lead = "<b>Figure note.</b> " if art is not None else "<b>Image description.</b> "
-        if art is None:
+        missing = art is None
+        if missing:
             art = FigurePlaceholder(height)
 
         cap, label = self._caption("Figure", number, caption, "Caption")
@@ -1215,13 +1485,24 @@ class Parser:
         # heading at the foot of the previous page.
         self.story.append(KeepTogether([Spacer(1, 5), art, cap]))
         self.story.append(TocEntry("LOFEntry", label, self._key("fig")))
+        # emitted for a missing rendering whichever note markup the figure uses,
+        # because grepping the built PDF for this string is how a build with an
+        # empty frame in it is caught
+        if missing:
+            self.story.append(Paragraph("<b>Image description.</b> " + rich(caption),
+                                        ST["FigDesc"]))
         # the walkthrough runs first: it says what is drawn, so that the note
         # after it can be about what the drawing means
         for w in walk:
             self.story.append(
                 Paragraph("<b>How to read it.</b> " + rich(w), ST["FigDesc"]))
+        # @FIGNOTE carries its own opening ("In Figure 3.2, ..."), so it takes no
+        # bold lead: the reference into the data flow diagram is the lead
+        for n in note:
+            self.story.append(Paragraph(rich(n), ST["FigDesc"]))
         for d in desc:
-            self.story.append(Paragraph(lead + rich(d), ST["FigDesc"]))
+            self.story.append(
+                Paragraph("<b>Figure note.</b> " + rich(d), ST["FigDesc"]))
 
     def _emit_chart(self, line):
         p = self._split(line)
@@ -1353,11 +1634,13 @@ def classdef_lines():
             for role, (fill, stroke, ink, width) in DIAGRAM_ROLES.items()]
 
 
+DIAGRAM_SMALL_EM = 0.90   # relative size of <small> detail text in a node
+
 MERMAID_THEME = {
     "theme": "base",
     "themeVariables": {
         "fontFamily": "Liberation Sans, Helvetica, Arial, sans-serif",
-        "fontSize": "18px",
+        "fontSize": "%gpx" % DIAGRAM_FONT_UNITS,
         "primaryColor": DIAGRAM_ROLES["svc"][0],
         "primaryTextColor": DIAGRAM_ROLES["svc"][2],
         "primaryBorderColor": DIAGRAM_ROLES["svc"][1],
@@ -1407,6 +1690,11 @@ MERMAID_THEME = {
     "sequence": {"useMaxWidth": True, "mirrorActors": False, "boxMargin": 12,
                  "actorFontSize": 17, "messageFontSize": 16, "noteFontSize": 16},
     "state": {"useMaxWidth": True},
+    # <small> defaults to 0.8em, which printed the detail lines inside nodes at
+    # ~0.8 of an already-small label; mermaid measures labels during layout, so
+    # this has to reach it as themeCSS rather than as raster-time CSS or the
+    # text outgrows the node box it was measured for.
+    "themeCSS": "small{font-size:%.2fem;opacity:.86}" % DIAGRAM_SMALL_EM,
 }
 
 # Applied to the rendered SVG rather than the source: mermaid has no config for
@@ -1419,7 +1707,9 @@ DIAGRAM_CSS = (
 )
 
 CHROME_CANDIDATES = ("/usr/bin/google-chrome-stable", "/usr/bin/google-chrome",
-                     "/usr/bin/chromium", "/usr/bin/chromium-browser")
+                     "/usr/bin/chromium", "/usr/bin/chromium-browser",
+                     os.path.expanduser(
+                         "~/.cache/ms-playwright/chromium-1234/chrome-linux64/chrome"))
 
 
 SVG_SCALE = 3.0          # nominal raster scale
@@ -1638,27 +1928,110 @@ def _rasterise(chrome, svg_path, png_path):
                # finish before the frame is captured, which also makes the
                # rasterisation reproducible.
                "--run-all-compositor-stages-before-draw",
-               "--screenshot=" + os.path.abspath(png_path),
+               # a tall diagram needs longer than the 8 s this used to allow:
+               # the frame was landing before the foot of the drawing had been
+               # painted, which is the partial capture guarded against below
+               "--virtual-time-budget=%d" % min(20000, max(8000, int(page_h * 12))),
                "file://" + html]
         # headless Chrome occasionally wedges instead of exiting.  Each attempt
         # gets its own profile directory: a wedged process keeps a lock on the
         # one it was using, so a retry that reuses it inherits the hang — which
         # is exactly how a transient stall turned into a failed build.
-        last = ""
-        for attempt in range(3):
+        # Chrome occasionally screenshots mid-paint even with every compositor
+        # stage forced, and on a large diagram the missing region is a white
+        # band at the foot that silently truncates the bottom node - the
+        # level-1 DFD shipped for one build with its operator entity sliced in
+        # half, and the component tree with its last node cut.  Two successive
+        # captures can be clipped identically, so agreement between them is not
+        # a test; what is a test is that mermaid's viewBox ends flush with its
+        # own ink, so a complete capture has a blank border of about
+        # SVG_MARGIN on every edge.  Retry until that holds.
+        last, shots = "", []
+        for attempt in range(4):
+            shot = os.path.join(tmp, "shot-%d.png" % attempt)
             profile = os.path.join(tmp, "profile-%d" % attempt)
             try:
-                res = subprocess.run(cmd + ["--user-data-dir=" + profile],
+                res = subprocess.run(cmd + ["--screenshot=" + shot,
+                                            "--user-data-dir=" + profile],
                                      capture_output=True, text=True, timeout=240)
             except subprocess.TimeoutExpired:
                 last = "chrome timed out"
                 continue
-            if os.path.exists(png_path):
-                return int(round(page_w * scale)), int(round(page_h * scale))
-            last = res.stderr.strip()[:200] or "no screenshot"
-        raise RuntimeError(last)
+            if not os.path.exists(shot):
+                last = res.stderr.strip()[:200] or "no screenshot"
+                continue
+            gaps = _ink_gaps(shot, page_w, page_h)
+            shots.append((_ink_extent(shot), shot, gaps))
+            if _paint_settled(gaps):
+                break
+            last = ("partial paint: blank border l/r/t/b = %.0f/%.0f/%.0f/%.0f "
+                    "units, expected about %d" % (gaps + (SVG_MARGIN,)))
+        if not shots:
+            raise RuntimeError(last)
+        best = max(shots)
+        shutil.copyfile(best[1], png_path)
+        # a truncated figure is worse than a failed build, so say so rather
+        # than write it out quietly
+        if not _paint_settled(best[2]):
+            raise RuntimeError(last)
+        return (int(round(page_w * scale)), int(round(page_h * scale)), w, h)
     finally:
         shutil.rmtree(tmp, ignore_errors=True)
+
+
+def _plan_note(vw, vh):
+    """The label size, in points, a diagram of *vw* x *vh* SVG units will print."""
+    pw, ph = vw + 2 * SVG_MARGIN, vh + 2 * SVG_MARGIN
+    return DIAGRAM_FONT_UNITS * min(FRAME_W / pw, SOLO_FIG_H / ph,
+                                    DIAGRAM_TEXT_PT / DIAGRAM_FONT_UNITS)
+
+
+def _ink_extent(png_path):
+    """The area of the non-white bounding box of a raster, in pixels.
+
+    Used to compare two captures of the same drawing: the larger extent is the
+    more completely painted one.
+    """
+    # getbbox() finds the non-*zero* box, so difference it against white first
+    from PIL import Image, ImageChops
+
+    with Image.open(png_path) as im:
+        rgb = im.convert("RGB")
+        white = Image.new("RGB", rgb.size, (255, 255, 255))
+        box = ImageChops.difference(rgb, white).getbbox()
+    if box is None:
+        return 0
+    return (box[2] - box[0]) * (box[3] - box[1])
+
+
+def _ink_gaps(png_path, page_w, page_h):
+    """Blank border around a raster's ink, as (left, right, top, bottom) SVG units."""
+    from PIL import Image, ImageChops
+
+    with Image.open(png_path) as im:
+        rgb = im.convert("RGB")
+        W, H = rgb.size
+        box = ImageChops.difference(
+            rgb, Image.new("RGB", rgb.size, (255, 255, 255))).getbbox()
+    if box is None or not W or not H:
+        return (1e9, 1e9, 1e9, 1e9)
+    return (box[0] * page_w / W, (W - box[2]) * page_w / W,
+            box[1] * page_h / H, (H - box[3]) * page_h / H)
+
+
+def _paint_settled(gaps):
+    """True when the blank border looks like the margin and not a lost band.
+
+    Measured over all of this report's diagrams: a complete capture leaves
+    ``SVG_MARGIN`` plus a unit or two of antialiasing on every edge.  The two
+    sequence diagrams are the one legitimate exception, carrying a wide but
+    *symmetric* side padding inside their own viewBox, so the left and right
+    edges are compared with each other rather than against the margin.
+    """
+    left, right, top, bottom = gaps
+    limit = SVG_MARGIN * 4
+    return (top <= limit and bottom <= limit
+            and (max(left, right) <= limit or abs(left - right) <= limit))
 
 
 def _looks_blank(png_path, w, h):
@@ -1829,7 +2202,7 @@ def render_diagrams():
         sources = sorted(glob.glob(os.path.join(DIAGRAM_SRC, "*.mmd")))
         if not sources:
             sys.exit("no mermaid sources in %s" % DIAGRAM_SRC)
-        failed = []
+        failed, metrics = [], {}
         for src in sources:
             name = os.path.splitext(os.path.basename(src))[0]
             svg = os.path.join(tmp, name + ".svg")
@@ -1842,14 +2215,32 @@ def render_diagrams():
                 print("  FAIL %s: %s" % (name, res.stderr.strip()[:160]))
                 continue
             try:
-                w, h = _rasterise(chrome, svg, dst)
+                w, h, vw, vh = _rasterise(chrome, svg, dst)
                 if _looks_blank(dst, w, h):
                     raise RuntimeError("rasterised blank")
             except Exception as exc:                     # noqa: BLE001
                 failed.append(name)
                 print("  FAIL %s: %s" % (name, exc))
                 continue
-            print("  ok   %-22s %dx%d" % (name, w, h))
+            metrics[name] = [round(vw, 2), round(vh, 2)]
+            print("  ok   %-22s %5dx%-5d  %4.0fx%-4.0f units  label %.1f pt"
+                  % (name, w, h, vw, vh, _plan_note(vw, vh)))
+        # the SVG unit size is what fixes the printed text size; the PNG cannot
+        # carry it because the optimiser rescales anything wider than 1,900 px
+        if metrics:
+            keep = {}
+            path = os.path.join(FIGURE_DIR, DIAGRAM_METRICS)
+            if os.path.exists(path):
+                try:
+                    with open(path, encoding="utf-8") as fh:
+                        keep = json.load(fh)
+                except Exception:                        # rewrite a broken file
+                    keep = {}
+            keep.update(metrics)
+            with open(path, "w", encoding="utf-8") as fh:
+                json.dump(dict(sorted(keep.items())), fh, indent=1, sort_keys=True)
+                fh.write("\n")
+            print("wrote %s (%d diagrams)" % (path, len(keep)))
         print("rendered %d of %d diagrams" % (len(sources) - len(failed), len(sources)))
         if failed:
             sys.exit("failed: %s" % ", ".join(failed))

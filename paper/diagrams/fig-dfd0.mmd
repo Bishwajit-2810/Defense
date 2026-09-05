@@ -1,17 +1,17 @@
-graph LR
+graph TD
     Up["Upstream monitoring<br/>platform"]
     Op["Operator /<br/>analyst"]
     P(("0 · Selective Intelligence"))
     Down["Downstream<br/>consumer app"]
     Backend["LLM backend<br/><small>self-hosted vLLM or Ollama<br/>Groq Cloud</small>"]
 
-    Up -- "post-with-details payload<br/>post · comments<br/>engagement<br/>reactionBreakdown<br/>sampleShares" --> P
-    P -. "no write-back —<br/>read-only consumer" .-> Up
-    Op -- "analysis request<br/>agent question<br/>watchlist configuration" --> P
-    P -- "structured JSON · grounded<br/>briefing · report PDF" --> Op
-    P -- "canonical result JSON<br/>per thread" --> Down
-    P -- "prompt · token budget" --> Backend
-    Backend -- "completion<br/>finish_reason<br/>token counts" --> P
+    Up -- "post-with-details payload" --> P
+    P -. "no write-back" .-> Up
+    Op -- "requests and questions" --> P
+    P -- "results and briefings" --> Op
+    P -- "canonical result JSON" --> Down
+    P -- "prompts" --> Backend
+    Backend -- "completions" --> P
 
     class Up,Op,Down,Backend entry
     class P svc
