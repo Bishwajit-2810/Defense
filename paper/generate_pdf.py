@@ -1578,10 +1578,10 @@ def build(src, dst):
     story = Parser(text).parse()
     doc = ReportDoc(
         dst,
-        title="Selective Intelligence: A Cost-Aware Hybrid NLP–LLM Microservice",
+        title="Selective Intelligence: Cost Aware Hybrid NLP LLM with Watchlist Driven Agentic RAG for Bangla Social Media Analysis",
         author="Final Year Design Project",
-        subject="Thread-level sentiment, watchlist-driven target stance, and an "
-                "MCP-backed agentic RAG insight layer for code-mixed Bangla social media",
+        subject="Cost-aware hybrid NLP and LLM analysis with a watchlist-driven "
+                "agentic RAG layer for code-mixed Bangla social media",
     )
     # The index flowables print physical page numbers; hand them the document's
     # roman/arabic labeller so the printed value matches the page footer.

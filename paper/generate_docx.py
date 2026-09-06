@@ -305,14 +305,32 @@ def build_table(header, rows, numbers, grid=False, fill=None):
 
 
 def _proportional(header, rows, n):
-    """Column widths from the longest content in each column, floored."""
+    """Column widths from the longest content in each column, damped and floored.
+
+    Straight proportionality to the longest cell collapses a short-label column
+    next to a prose one - a four-column cost table gave its first column 7 % of
+    the width and broke "Development" one character per line.  Damping the
+    demand by a square root pulls the extremes together without making every
+    column equal, and the floor is the last line of defence.
+    """
     demand = [0] * n
     for r in ([header] if header else []) + rows:
         for i, c in enumerate(r[:n]):
             demand[i] = max(demand[i], len(re.sub(r"[*`]", "", c)))
-    total = sum(demand) or n
-    floor = int(CONTENT_W * 0.07)
-    widths = [max(floor, int(CONTENT_W * d / total)) for d in demand]
+    # A column must also be wide enough for its longest unbreakable word, or
+    # Word hyphen-free-wraps "Community" as "Commu / nity".  Roughly 120 twips
+    # per character at the body size, plus cell padding, capped so that one
+    # long identifier cannot claim the whole table.
+    longest = [0] * n
+    for r in ([header] if header else []) + rows:
+        for i, c in enumerate(r[:n]):
+            for w in re.sub(r"[*`]", "", c).split():
+                longest[i] = max(longest[i], len(w))
+    damped = [max(d, 1) ** 0.5 for d in demand]
+    total = sum(damped) or n
+    floors = [max(int(CONTENT_W * 0.08),
+                  min(int(CONTENT_W * 0.22), lw * 120 + 240)) for lw in longest]
+    widths = [max(f, int(CONTENT_W * d / total)) for f, d in zip(floors, damped)]
     scale = CONTENT_W / sum(widths)
     return [int(w * scale) for w in widths]
 
@@ -482,12 +500,12 @@ def styles_xml():
 
     s = ['<?xml version="1.0" encoding="UTF-8" standalone="yes"?>',
          '<w:styles xmlns:w="http://schemas.openxmlformats.org/wordprocessingml/2006/main">',
-         '<w:docDefaults><w:rPrDefault><w:rPr>%s<w:sz w:val="24"/>'
+         '<w:docDefaults><w:rPrDefault><w:rPr>%s<w:sz w:val="23"/>'
          '<w:szCs w:val="24"/></w:rPr></w:rPrDefault>'
          '<w:pPrDefault><w:pPr><w:spacing w:after="160" w:line="276" '
          'w:lineRule="auto"/></w:pPr></w:pPrDefault></w:docDefaults>' % serif,
          _style("Normal", "Normal", None,
-                '<w:jc w:val="both"/><w:spacing w:after="160" w:line="288" w:lineRule="auto"/>',
+                '<w:jc w:val="both"/><w:spacing w:after="150" w:line="276" w:lineRule="auto"/>',
                 serif)]
 
     # Numbered outline headings — these are what the TOC field reads.

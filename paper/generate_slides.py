@@ -556,10 +556,8 @@ def build():
     p.space_after = Pt(4)
     p.line_spacing = 0.92
     _runs(p, "Selective Intelligence", 40, INK, bold=True)
-    para(tf, "A Cost-Aware Hybrid NLP–LLM Microservice for Thread-Level "
-             "Sentiment and Watchlist-Driven Target Stance over Code-Mixed "
-             "Bangla Social Media, with an MCP-Backed Agentic RAG Insight "
-             "Layer", size=14.5, color=TEAL, align=PP_ALIGN.CENTER,
+    para(tf, "Cost Aware Hybrid NLP LLM with Watchlist Driven Agentic RAG "
+             "for Bangla Social Media Analysis", size=14.5, color=TEAL, align=PP_ALIGN.CENTER,
          after=0, line=1.0)
 
     sub = s.placeholders[1]
