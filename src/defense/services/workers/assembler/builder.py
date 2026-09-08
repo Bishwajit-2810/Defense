@@ -239,6 +239,7 @@ def build_canonical_result(
     normalized_post: dict,
     stage1_result: dict,
     stage2_result: dict | None,
+    job_id: str | None = None,
 ) -> dict:
     """Merge all sources into the canonical output schema.
 
@@ -253,6 +254,19 @@ def build_canonical_result(
     stage2_result:
         Output from the Stage-2 LLM worker, or None when Stage 2 was
         skipped (high-confidence NLP-only path).
+    job_id:
+        The analysis job this run belongs to, stamped onto
+        ``processing.job_id``. Posts replayed or XADDed by hand legitimately
+        have none, and the key is then present and null.
+
+        This exists because **the row alone cannot say which run produced it**.
+        ``analysis_results`` is upserted `ON CONFLICT (post_id)`, so a post
+        re-analysed by a second job overwrites the first job's row and only
+        `updated_at` moves. Asking "did job X finish post P?" by comparing
+        `updated_at` to the job's `created_at` answers *"some run touched this
+        post since job X started"* — which any concurrent re-run satisfies. That
+        is not a hypothetical: it marked a job `done` whose post was still inside
+        Stage 2 (see `POST /v1/analysis/{id}/resume`).
 
     Returns
     -------
@@ -463,6 +477,11 @@ def build_canonical_result(
         # {role: resolved model id} — summarization and classification no longer
         # share a model, so a single `llm_model` can't attribute the summary.
         "role_models": s2_proc.get("role_models") if stage2_result is not None else None,
+        # Which run produced this row. Always present — a null says "this
+        # assembler stamped provenance and the post had no job", which is a
+        # different fact from a pre-stamp row where the key is absent entirely,
+        # and callers need to tell those apart before trusting the field.
+        "job_id": job_id,
         "schema_version": SCHEMA_VERSION,
     }
     # Forward every Stage-1 provenance field that exists, rather than naming a

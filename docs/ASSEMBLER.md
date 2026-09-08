@@ -136,6 +136,18 @@ holds the line.
 Idempotent writes are also what make the pipeline's at-least-once retry safe: a
 retried post overwrites its own row rather than adding a second.
 
+**The cost of that upsert: the row cannot say which run wrote it.** Two jobs
+analysing the same post leave **one** row, the second overwriting the first, and
+the only thing that moves is `updated_at`. Anything asking "did job X finish post
+P?" from timestamps is really asking "did *anything* touch P since X started" —
+and a concurrent re-run answers yes. That is not theoretical: it marked a job
+`done` whose post was still inside Stage 2 ([JOBS.md](JOBS.md) §3). Since 29 Aug
+2026 the assembler stamps **`processing.job_id`** onto every result it builds, so
+provenance is a property of the row rather than an inference from its clock. It
+is `null` for a post replayed or XADDed outside a job, and the key is **absent**
+on rows written before stamping — a caller must tell those two apart before
+trusting the field.
+
 ## 5. Embedding honesty
 
 The embedding and its `embedding_is_stub` flag are carried on the envelope and
@@ -163,7 +175,7 @@ The assembler owns the job lifecycle's end. `_track_job_progress`:
    `completed + failed >= total`;
 4. flips the `jobs` row to `done` / `failed` / `running` accordingly.
 
-Three details that are load-bearing:
+Four details that are load-bearing:
 
 - **The assembler's own trace frame is published *before* this call**, because
   `_track_job_progress` may publish the terminal `done` event that closes the
@@ -174,6 +186,14 @@ Three details that are load-bearing:
 - **`cancelled` is terminal.** The assembler refuses to write a cancelled job's
   row back to `running`/`done`, so counter reconciliation cannot revive a job the
   operator stopped ([JOBS.md](JOBS.md) §3).
+- **Step 4 is also the job's only heartbeat.** `jobs.updated_at` is written here
+  and nowhere else, once per landing — so it does not move at all for the minutes
+  a post spends in Stage 1 and Stage 2, and a one-post job's row is untouched from
+  creation until it finishes. Any liveness check built on that column alone calls
+  a healthy job stalled; the stage frames carry wall-clock `ts` for exactly this
+  reason ([PIPELINE.md](PIPELINE.md) §3). Equally, **any route that declares a job
+  finished must write these counters**, or the status and the progress beside it
+  disagree ([JOBS.md](JOBS.md) §4.2).
 
 It also publishes a per-post completion event on `analysis:done:{post_id}`
 (non-fatal if it fails), and — uniquely among the five stages — **does not check
@@ -207,6 +227,7 @@ Full list with failure modes: [env.example.md](env.example.md).
 | Degradation + embedding-stub flags survive to the API | ✅ Measured end to end |
 | Near-duplicate reuse | 🟡 Works, unmeasured — was a verbatim row copy until 5 Aug 2026 |
 | Job counter reconciliation, `cancelled` terminal | ✅ Measured |
+| `processing.job_id` attributes a stored result to the run that produced it | ✅ Measured — `tests/test_job_lifecycle.py` |
 | Throughput of the fan-out under load | 🟡 **Not benchmarked** |
 
 Cross-references: [PIPELINE.md](PIPELINE.md) · [STAGE2_LLM.md](STAGE2_LLM.md) ·

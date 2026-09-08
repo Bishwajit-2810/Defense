@@ -1086,6 +1086,13 @@
             "null"
           ],
           "description": "What the router decided, carried through Stage 2 so llm_used is read from the decision rather than inferred from a payload's existence."
+        },
+        "job_id": {
+          "type": [
+            "string",
+            "null"
+          ],
+          "description": "The analysis job that produced this row, or null for a post replayed outside a job. analysis_results is upserted ON CONFLICT (post_id), so a re-analysis overwrites the row and only updated_at moves — this is the only field that says WHICH run the stored result came from. An absent key means the row predates provenance stamping and nothing can be concluded from it."
         }
       }
     },

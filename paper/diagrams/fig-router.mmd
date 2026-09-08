@@ -1,0 +1,36 @@
+graph TD
+    In["Post features + confidences<br/><small>from Stage 1</small>"]
+    Gate{"Router decision<br/><small>six gates — any one fires</small>"}
+    In --> Gate
+
+    B["Post-level tasks run<br/><small>16% of posts (measured)</small>"]
+    A["No post-level LLM work<br/><small>84% of posts (measured)</small>"]
+
+    Gates["Any one of the six gates<br/><small>low confidence · unknown post_type<br/>high toxicity · long code-mixed<br/>LLM-only task · explicit request</small>"]
+    Gates -.- Gate
+
+    Gate -- "a gate fires" --> B
+    Gate -- "no gate fires" --> A
+
+    Comments["Comment ensemble<br/><small>runs for EVERY post, gated or not</small>"]
+    B --> Comments
+    A --> Comments
+
+    Out["Stage 2 → assembler"]
+    B -- "post-level products" --> Out
+    Comments -- "comment labels" --> Out
+
+    Note["The gate governs 30–55% of spend.<br/><small>85–96% of LLM calls are comment-level.</small>"]
+    Comments -.-> Note
+
+    class In entry
+    class Gate tool
+    class Gates grey
+    class A,B,Comments,Out svc
+    class Note obs
+
+    classDef entry fill:#eaecff,stroke:#4a3aa7,stroke-width:1.4px,color:#373660
+    classDef svc fill:#ddf0ff,stroke:#2a78d6,stroke-width:1.4px,color:#203d61
+    classDef obs fill:#ffe6db,stroke:#d25118,stroke-width:1.4px,color:#5b2d1d
+    classDef tool fill:#eef1f7,stroke:#747d88,stroke-width:1.2px,color:#3c4249
+    classDef grey fill:#eef1f7,stroke:#9aa3ae,stroke-width:1.2px,color:#3c4249

@@ -425,6 +425,13 @@ class ReportRequest(BaseModel):
     # campaign_id is optional: the dashboard generates corpus-wide reports with no
     # campaign scope. When omitted it defaults to "all" (every campaign).
     campaign_id: Optional[str] = Field(None, description="Campaign to scope the report to")
+    # Campaign used to be the only scope. A job created by POST /v1/analysis/run
+    # with explicit post_ids has no campaign, so its report fell through to "all"
+    # and covered the whole corpus — a one-post job produced a whole-corpus PDF.
+    post_ids: Optional[List[str]] = Field(
+        None,
+        description="Scope the report to exactly these posts (takes effect alongside campaign_id)",
+    )
     type: Optional[str] = Field(None, description="Report type, e.g. 'trend' (free-form)")
     title: Optional[str] = None
     include_sentiment: bool = True
@@ -446,6 +453,11 @@ class ReportResponse(BaseModel):
     download_url: Optional[str] = None
     # Generated content (populated when status == "done"; rendered by the dashboard)
     period: Optional[str] = None
+    # What the report actually covers ("all campaigns", "campaign x", "3 selected
+    # post(s)"). Rendered on the PDF: a report scoped to one job and a report on
+    # the whole corpus otherwise look identical, and the reader cannot tell which
+    # they are holding.
+    scope_label: Optional[str] = None
     summary: Optional[str] = None
     summary_source: Optional[str] = None  # "llm" (grounded narrative) | "aggregate"
     clusters: Optional[List[Dict[str, Any]]] = None

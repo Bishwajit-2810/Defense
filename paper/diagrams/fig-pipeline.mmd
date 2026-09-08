@@ -1,0 +1,31 @@
+graph TD
+    Up["ingestion:queue"]
+
+    subgraph chain["Per-post pipeline — five stages, four hops"]
+        direction TB
+        I["1 Ingestion<br/><small>ingestion-workers</small>"]
+        S1["2 Stage-1 NLP<br/><small>stage1-nlp-group</small>"]
+        R["3 Router<br/><small>router-workers</small>"]
+        S2["4 Stage-2 LLM<br/><small>stage2-llm-workers</small>"]
+        A["5 Assembler<br/><small>assembler-group</small>"]
+        I -- "nlp:stage1:queue" --> S1
+        S1 -- "router:queue" --> R
+        R -- "llm:stage2:queue" --> S2
+        S2 -- "assembler:queue" --> A
+    end
+
+    Up --> I
+    A --> PG[("PostgreSQL<br/>+ pgvector")]
+    A --> CH[("ClickHouse")]
+    A --> OS[("Object storage")]
+
+    Note["The chain is linear — no bypass hop<br/><small>the gate sets how much work a post receives,<br/>not which stage it reaches</small>"]
+    R -.-> Note
+
+    class Up,PG,CH,OS store
+    class I,S1,R,S2,A svc
+    class Note obs
+
+    classDef svc fill:#ddf0ff,stroke:#2a78d6,stroke-width:1.4px,color:#203d61
+    classDef store fill:#d8f7e6,stroke:#008d5a,stroke-width:1.4px,color:#0a4730
+    classDef obs fill:#ffe6db,stroke:#d25118,stroke-width:1.4px,color:#5b2d1d

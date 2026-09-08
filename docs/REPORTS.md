@@ -24,6 +24,59 @@
 | `GET /v1/reports/export_latest/export` | The same, as a file response |
 
 The dashboard's **Reports** tab is the client — [DASHBOARD_UI.md](DASHBOARD_UI.md).
+The **Jobs** tab is a second one: its per-row *Download Report* calls
+`export_latest?job_id=…` (§1.1).
+
+## 1.1 Scoping — what a report actually covers
+
+A report has **three** possible scopes, and they compose:
+
+| Scope | Set by | Filter |
+| ----- | ------ | ------ |
+| Whole tenant corpus | the default (`campaign_id=all`, no post ids) | `ar.tenant_id = :tid` |
+| One campaign | `campaign_id` | `+ ar.campaign_id = :cid` |
+| An explicit set of posts | `post_ids` on `POST /v1/reports`, or `job_id` on `export_latest` | `+ ar.post_id = ANY(:pids)` |
+
+Post scoping was added **29 Aug 2026**, and the reason is worth keeping. Campaign
+used to be the only scope. Every job created by `POST /v1/analysis/run` from
+explicit `post_ids` has **no campaign**, so the Jobs tab's per-row download fell
+through to `campaign_id=all`: a job that analysed *one* post produced a report
+over all fifty, under a filename that claimed otherwise, and nothing in the PDF
+contradicted it — the scope was never printed.
+
+Three things follow, all of which are load-bearing:
+
+* **Every aggregate takes the same filter.** A single unscoped query is enough to
+  report the whole corpus inside a document that claims to be about two posts.
+  The topics aggregate had its own hand-rolled copy of the `WHERE` clause and was
+  missed on the first pass; there is now one `where` string and the topic query
+  uses it. `_embedding_clusters` takes the scope too, or the cluster summaries
+  would be drawn from posts the report never mentions.
+* **The 5-minute report cache is keyed on the scope, not just the campaign.**
+  Reusing a corpus report generated a minute ago for a one-post request is the
+  same bug wearing a different hat: the right filename over the wrong PDF.
+* **`scope_label` travels with the document** ("all campaigns" / "campaign x" /
+  "N selected post(s)") into the metrics block, into the LLM narrative prompt, and
+  onto the rendered header as `Scope:`. A stored report from before this change
+  has no label and falls back to its campaign.
+
+Deduplication is not a concern here: Postgres upserts `analysis_results`
+`ON CONFLICT (post_id)`, so it holds one row per post however many times that post
+has been re-analysed. (The ClickHouse `analysis_events` table is append-only and
+*does* need `LIMIT 1 BY post_id` — see [`tests/test_analytics_storage_contract.py`](../tests/test_analytics_storage_contract.py).)
+
+```bash
+# A report on exactly the posts one job analysed
+curl -s -H "$KEY" "$API/v1/reports/export_latest?job_id=<job_id>&format=pdf" -o job.pdf
+
+# Or name the posts yourself
+curl -s -X POST $API/v1/reports -H "$KEY" -H "Content-Type: application/json" \
+  -d '{"post_ids":["cmor32gy…"],"options":{"grounded":true}}'
+```
+
+An unknown `job_id` is a **404**, not a silent whole-corpus report. A job that
+names neither a campaign nor post ids genuinely is corpus-wide, and reports as
+such — which is then the truth rather than an accident.
 
 ## 2. Generation is synchronous, and that is a deliberate scale choice
 
@@ -35,7 +88,7 @@ better; at production scale this is the component to move behind the bus.
 ## 3. The numbers come from SQL, not from a model
 
 `_generate_report_content` aggregates `analysis_results`, tenant-scoped and
-optionally campaign-scoped:
+optionally campaign- or post-scoped (§1.1):
 
 | Section | Query |
 | ------- | ----- |
@@ -121,6 +174,9 @@ literal `{}` and is now fixed ([JOBS.md](JOBS.md) §1).
 | Claim | State |
 | ----- | ----- |
 | Every report number is a SQL aggregate over stored results | ✅ Measured |
+| Every aggregate carries the report's scope (no unscoped query) | ✅ Measured — [`tests/test_report_scope.py`](../tests/test_report_scope.py) asserts it per query |
+| `job_id` resolves to that job's posts, and an unknown job is a 404 | ✅ Measured |
+| The rendered PDF states its own scope | ✅ Measured |
 | Narrative failure degrades to the SQL summary | ✅ Measured |
 | Cluster summarisation costs ~k calls, not N | ✅ Measured |
 | Stub-vector flag reaches the report document | ✅ Measured |

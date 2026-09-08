@@ -1,0 +1,86 @@
+{
+ "fig-agent-layer": [
+  984.41,
+  1248.13
+ ],
+ "fig-agent-lifecycle": [
+  920.35,
+  258.62
+ ],
+ "fig-agent-loop": [
+  1245.0,
+  813.0
+ ],
+ "fig-architecture": [
+  1204.84,
+  1903.55
+ ],
+ "fig-compose": [
+  976.99,
+  991.7
+ ],
+ "fig-deploy-tiers": [
+  1199.94,
+  701.5
+ ],
+ "fig-dfd0": [
+  787.84,
+  599.95
+ ],
+ "fig-dfd1": [
+  1277.58,
+  1733.78
+ ],
+ "fig-ensemble": [
+  1099.16,
+  1219.48
+ ],
+ "fig-integration": [
+  334.89,
+  600.26
+ ],
+ "fig-k8s": [
+  950.41,
+  1200.89
+ ],
+ "fig-logging": [
+  543.86,
+  597.36
+ ],
+ "fig-mcp-sequence": [
+  949.0,
+  690.0
+ ],
+ "fig-observability": [
+  1260.43,
+  724.51
+ ],
+ "fig-pipeline": [
+  841.64,
+  1055.83
+ ],
+ "fig-rag-flow": [
+  603.42,
+  801.4
+ ],
+ "fig-router": [
+  698.11,
+  906.92
+ ],
+ "fig-serving": [
+  584.67,
+  760.0
+ ],
+ "fig-sse": [
+  1258.33,
+  710.38
+ ],
+ "fig-stance": [
+  788.3,
+  743.5
+ ],
+ "fig-ui-components": [
+  1296.99,
+  959.5
+ ]
+}

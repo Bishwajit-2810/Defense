@@ -237,3 +237,114 @@ describe('AnalysisJobs resume', () => {
     expect(within(done).queryByRole('button', { name: /resume/i })).toBeNull();
   });
 });
+
+/**
+ * Progress must not invent a number it does not have.
+ *
+ * A `done` job with `completed: 0` against `total: 1` rendered a confident
+ * **0%** — observed live on 29 Aug 2026, on a job whose completion had been
+ * recorded outside the assembler so no counter was ever written. The mirror
+ * image was just as wrong: with `total` missing the page fell back to
+ * `isFinished ? 100 : 0` and drew a confident **100%**. Two fabrications for the
+ * same absence of data, both standing next to a status that contradicted them.
+ */
+describe('AnalysisJobs progress', () => {
+  const progressCell = (row) => row.querySelectorAll('td')[5];
+
+  it('renders a real ratio when both counters are present', async () => {
+    mockJobs([{ ...RUNNING, total: 10, completed: 3 }]);
+    render(<AnalysisJobs />);
+
+    const row = await rowFor(RUNNING);
+    expect(progressCell(row).textContent).toContain('30%');
+  });
+
+  // The two counters are separate Redis keys with a 24 h TTL and they expire
+  // INDEPENDENTLY. Both halves were live on 29 Aug 2026: one finished job held
+  // `:total` without `:completed`, another held `:completed` without `:total` —
+  // two finished jobs, two different wrong answers, from the same missing data.
+  // `status` lives in Postgres and does not expire, and `done` means every post
+  // landed, so it is the durable source when the counters cannot answer.
+
+  it('completes a done job whose completed counter expired', async () => {
+    const job = { id: 'nocount-1111-aaaa', type: 'analysis_run', status: 'done', total: 1, completed: null };
+    mockJobs([job]);
+    render(<AnalysisJobs />);
+
+    const row = await rowFor(job);
+    expect(progressCell(row).textContent).toContain('100%');
+    // Not a standalone 0% — that was the missing counter coerced to zero.
+    // ("100%" contains "0%", so this has to match on the boundary.)
+    expect(progressCell(row).textContent).not.toMatch(/(^|[^\d])0%/);
+  });
+
+  it('completes a done job whose total counter expired', async () => {
+    const job = { id: 'nototal-1111-aaaa', type: 'analysis_run', status: 'done', total: null, completed: 50 };
+    mockJobs([job]);
+    render(<AnalysisJobs />);
+
+    const row = await rowFor(job);
+    expect(progressCell(row).textContent).toContain('100%');
+  });
+
+  it('marks a derived 100% as derived', async () => {
+    const job = { id: 'derived-1111-aaaa', type: 'analysis_run', status: 'done', total: null, completed: null };
+    mockJobs([job]);
+    render(<AnalysisJobs />);
+
+    const row = await rowFor(job);
+    // Same number, weaker evidence — read off the status, not counted.
+    expect(progressCell(row).textContent).toContain('100%*');
+    expect(progressCell(row).querySelector('[aria-label="derived from status"]')).not.toBeNull();
+  });
+
+  it('does not claim a cancelled job is complete', async () => {
+    const job = { id: 'stopped-1111-aaaa', type: 'analysis_run', status: 'cancelled', total: null, completed: null };
+    mockJobs([job]);
+    render(<AnalysisJobs />);
+
+    const row = await rowFor(job);
+    // Stopped is not finished. How much landed is simply no longer recorded.
+    expect(progressCell(row).textContent).toContain('—');
+    expect(progressCell(row).textContent).not.toContain('100%');
+  });
+
+  it('does not claim a failed job is complete', async () => {
+    const job = { id: 'broken-1111-aaaa', type: 'analysis_run', status: 'failed', total: null, completed: null };
+    mockJobs([job]);
+    render(<AnalysisJobs />);
+
+    const row = await rowFor(job);
+    expect(progressCell(row).textContent).not.toContain('100%');
+  });
+
+  it('shows unknown for a running job with no counters yet', async () => {
+    const job = { id: 'fresh-1111-aaaa', type: 'analysis_run', status: 'running', total: null, completed: null };
+    mockJobs([job]);
+    render(<AnalysisJobs />);
+
+    const row = await rowFor(job);
+    expect(progressCell(row).textContent).toContain('—');
+  });
+
+  it('trusts real counters over the status', async () => {
+    const job = { id: 'partial-1111-aaaa', type: 'analysis_run', status: 'done', total: 10, completed: 7 };
+    mockJobs([job]);
+    render(<AnalysisJobs />);
+
+    const row = await rowFor(job);
+    // A measurement beats an inference, even a contradictory one — and the
+    // contradiction is worth seeing rather than smoothing over.
+    expect(progressCell(row).textContent).toContain('70%');
+  });
+
+  it('keeps a genuine zero distinct from a missing one', async () => {
+    const job = { id: 'zero-1111-aaaa', type: 'analysis_run', status: 'running', total: 8, completed: 0 };
+    mockJobs([job]);
+    render(<AnalysisJobs />);
+
+    const row = await rowFor(job);
+    // Nothing has landed yet, and the counters say so — that IS 0%.
+    expect(progressCell(row).textContent).toContain('0%');
+  });
+});

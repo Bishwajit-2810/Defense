@@ -1653,11 +1653,17 @@ as they complete, for live dashboards.
   neither the assembler nor the §17.3 counter reconciliation may overwrite it.
 - **Resume re-enqueues only what an interrupted job never finished**, derived
   from Postgres alone — the selector for the full set, and an `analysis_results`
-  row written at or after the job's `created_at` for what is done — because the
-  Redis progress counters do not survive the power cut that makes resume
-  necessary. The counters are rebuilt with `completed` seeded, so progress
-  continues at 30/300 rather than restarting, and the job still finishes on its
-  last post. Refused while the job is still writing progress.
+  row written at or after the job's `created_at` **and stamped with that job's
+  id** for what is done — because the Redis progress counters do not survive the
+  power cut that makes resume necessary. The provenance half is load-bearing:
+  that table is upserted `ON CONFLICT (post_id)`, so a timestamp alone cannot
+  tell this job's result from a concurrent re-run's, and it once marked a job
+  `done` whose post was still in Stage 2 ([JOBS.md](JOBS.md) §3). The counters are
+  rebuilt with `completed` seeded, so progress continues at 30/300 rather than
+  restarting, and the job still finishes on its last post. Refused while the job
+  is still reporting progress — judged from **both** the jobs row and the newest
+  stage frame, because the row is written by the assembler alone and does not
+  move while a post is inside a stage.
 - **Delete removes the job, not the analysis.** `analysis_results` is keyed by
   post, written by several jobs and by ingest, and is what every read path uses;
   `DELETE /v1/posts/{id}` is the endpoint that removes a post's data.

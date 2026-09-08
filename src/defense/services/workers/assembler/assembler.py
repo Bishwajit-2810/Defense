@@ -303,7 +303,9 @@ async def _process_message(
                 reuse_meta.get("score", 0.0),
             )
         else:
-            result = build_canonical_result(normalized_post, stage1_result, stage2_result)
+            result = build_canonical_result(
+                normalized_post, stage1_result, stage2_result, job_id=job_id
+            )
         result["tenant_id"] = env.get("tenant_id") or normalized_post.get("tenant_id") or "default"
 
     except (ValueError, KeyError) as exc:

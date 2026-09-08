@@ -50,11 +50,18 @@ npm run build      # not optional before pushing, but it does NOT resolve JSX id
                    # (5 JS chunks + 1 CSS by design — vite.config.js splits the vendor libs)
 ```
 
-Seven unit-test files (one per page for AnalysisJobs / Posts / Search / Logs,
-plus `App`, `MarkdownView`, `sentiment`) and two Playwright specs — of which
-`tests/example.spec.ts` is the untouched scaffold that visits playwright.dev, so
-half a green e2e run is not about this dashboard. The backend suite and the
-opt-in groups are in [`../testing.md`](../docs/testing.md).
+**Twelve** unit-test files — one per page for `AnalysisJobs`, `Posts`, `Search`,
+`Logs` and `Trace`, plus `App`, `MarkdownView`, `PostModal`,
+`SystemMetricsChip`, `SystemMonitorDrawer`, `useSystemMetrics` and `sentiment` —
+and two Playwright specs, both in `tests/dashboard.spec.ts` and both about this
+dashboard. (The generated `example.spec.ts` scaffold that visited playwright.dev
+is gone; a run is no longer half about someone else's site.) The backend suite
+and the opt-in groups are in [`../testing.md`](../docs/testing.md).
+
+**An e2e spec must not pin a product name.** Both specs asserted the `<title>`
+and Welcome heading read *"Defense Analysis"* and had been failing since the app
+was renamed **Selective Intelligence** — a red last stage that said nothing about
+whether the dashboard works. Corrected 29 Aug 2026.
 
 ## What to keep in mind when editing
 
@@ -122,7 +129,38 @@ opt-in groups are in [`../testing.md`](../docs/testing.md).
   is worth pressing, and the API applies the same threshold when it accepts or
   refuses a resume — so if one moves, move both, or the tab will offer an action
   the API rejects. The badge exists because a power-cut job's row reads `running`
-  forever, which is the most misleading thing this table can display.
+  forever, which is the most misleading thing this table can display. Note the
+  asymmetry the API has and this tab does not: since 29 Aug 2026 the API also
+  consults the job's **stage frames**, because `jobs.updated_at` is written by the
+  assembler alone and does not move while a single post sits in Stage 2. The badge
+  can therefore say "stalled" on a job the API will refuse to resume — which is
+  the safe direction, but do not add a second source here without matching it.
+- **Do not render a number you do not have — and know which source is durable.**
+  The Jobs tab's progress cell read
+  `total > 0 ? completed/total : (isFinished ? 100 : 0)`, coercing a missing
+  counter to `0` first. `total` and `completed` are two Redis keys with a 24 h
+  TTL that expire **independently**, so a finished job routinely holds one
+  without the other: two live jobs on 29 Aug 2026 rendered **0%** and **—**, and
+  both had finished. The counters are ephemeral detail; `status` is a Postgres
+  column and `done` *means* every post landed. So: both counters → a real ratio;
+  otherwise terminal `done` → 100% marked `*` as derived; `cancelled`/`failed`
+  never complete; running with no counters → **—**; a counter that exists and
+  says zero is a measurement and still renders 0%. Same rule as "a missing value
+  and a neutral value must not render the same", two rows up.
+- **State that must survive a tab switch does not belong in `useState`.** `App`
+  renders every page as `{activeTab === 'x' && <Page />}`, so leaving a tab
+  *unmounts* it. Fine for a table that refetches; wrong for anything holding a
+  live stream. The Trace tab kept its whole trace in `useState` and closed its
+  `EventSource` on cleanup, so switching tabs came back to "Nothing traced yet"
+  and abandoned a post mid-pipeline. It now lives in
+  [`src/utils/traceSession.js`](src/utils/traceSession.js) — the module owns the
+  session and the stream, and the page is a `useSyncExternalStore` view over it.
+  Its tests unmount the page and assert the stream is still consuming.
+- **Cross-tab navigation is an event, not a prop chain.** There is no router; the
+  active tab is `useState` in `App.jsx`. A page handing work to another one
+  dispatches `dashboard-navigate` with `{ tab }`. Data goes the other way: Posts
+  writes the post id into the trace store *directly* before navigating, because
+  Trace is not mounted yet and an event would have nowhere to land.
 - **Action outcomes and stream progress are two different lines.** `notice` holds
   what the last stop/resume/delete did; `liveProgress` belongs to the SSE stream
   and is rewritten by every frame. They were one field until resuming a job —

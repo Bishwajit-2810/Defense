@@ -1,0 +1,19 @@
+sequenceDiagram
+    autonumber
+    participant Agent as Agent orchestrator
+    participant MCP_Client as MCP client
+    participant Server as FastMCP server
+    participant DB as Data store
+
+    Agent->>MCP_Client: Call tool (e.g. top_posts)
+    MCP_Client->>Server: Streamable HTTP request
+    Server->>Server: Validate parameters + scope to tenant
+    alt Parameters valid
+        Server->>DB: Execute query / action
+        DB-->>Server: Rows
+        Server-->>MCP_Client: Result payload
+    else Placeholder or unscoped id
+        Server-->>MCP_Client: ValueError — "not a post id"
+        Note over Server,MCP_Client: Refusing beats returning zero rows:<br/>an empty result teaches the model<br/>the corpus is empty.
+    end
+    MCP_Client-->>Agent: Tool result string

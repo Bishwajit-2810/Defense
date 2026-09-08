@@ -1,0 +1,22 @@
+graph TD
+    Q["Question"] --> R["AgentRunner<br/><small>tool-use loop</small>"]
+    R --> S["semantic_search"]
+    S --> E["embed query<br/><small>libs/embeddings.py</small>"]
+    S --> L["lexical arm<br/><small>tsvector + trigram</small>"]
+    E --> PG[("analysis_results.embedding<br/><small>HNSW cosine</small>")]
+    L --> PG
+    PG --> F["reciprocal rank fusion<br/><small>k = 60</small>"]
+    F --> K["top-k rows"]
+    K --> R
+    R --> A["Answer + citations"]
+
+
+    class Q,A entry
+    class R,S,E,L,F svc
+    class PG store
+    class K tool
+
+    classDef entry fill:#eaecff,stroke:#4a3aa7,stroke-width:1.4px,color:#373660
+    classDef svc fill:#ddf0ff,stroke:#2a78d6,stroke-width:1.4px,color:#203d61
+    classDef store fill:#d8f7e6,stroke:#008d5a,stroke-width:1.4px,color:#0a4730
+    classDef tool fill:#eef1f7,stroke:#747d88,stroke-width:1.2px,color:#3c4249

@@ -12,6 +12,7 @@ import { render, screen, waitFor, within, fireEvent, act } from '@testing-librar
 import { vi } from 'vitest';
 
 import Posts from './Posts.jsx';
+import { getSnapshot as getTraceSnapshot, resetTraceSession } from '../utils/traceSession.js';
 
 const apiCall = vi.fn();
 
@@ -60,6 +61,7 @@ beforeEach(() => {
     return { results: [] };
   });
   Object.assign(navigator, { clipboard: { writeText: vi.fn().mockResolvedValue() } });
+  resetTraceSession();
 });
 afterEach(() => { vi.useRealTimers(); });
 
@@ -214,5 +216,80 @@ describe('Posts search', () => {
 
     await act(async () => { fireEvent.click(screen.getByLabelText('Clear search')); });
     expect(screen.getByText(/cmoldbhw\.\.\./)).toBeInTheDocument();
+  });
+});
+
+/**
+ * Re-running one post, and handing one post to the Trace tab.
+ *
+ * The row that prompted this had a Summary cell reading "—": the post was
+ * analysed without `want_summary`, and the only remedy the page offered was
+ * re-uploading the whole JSON file.
+ */
+describe('Posts single-post actions', () => {
+  const rowFor = async (prefix) => (await screen.findByText(new RegExp(prefix + '\\.\\.\\.'))).closest('tr');
+
+  it('re-runs exactly one post, asking for the summary', async () => {
+    apiCall.mockImplementation(async (path) => {
+      if (path.startsWith('/v1/analysis/latest')) return { results: [LOADED, OTHER] };
+      if (path === '/v1/analysis/run') return { analysis_id: 'job-rerun-1' };
+      return { results: [] };
+    });
+
+    render(<Posts />);
+    const row = await rowFor('cmp58e24');
+
+    await act(async () => { fireEvent.click(within(row).getByRole('button', { name: /Re-run/i })); });
+
+    const [, opts] = apiCall.mock.calls.find(([path]) => path === '/v1/analysis/run');
+    const body = JSON.parse(opts.body);
+    // One post — not the campaign, not the page.
+    expect(body.post_ids).toEqual([LOADED.post_id]);
+    expect(body.options.want_summary).toBe(true);
+    expect(await screen.findByText(/Queued cmp58e24/)).toBeInTheDocument();
+  });
+
+  it('says so when the re-run cannot be queued', async () => {
+    apiCall.mockImplementation(async (path) => {
+      if (path.startsWith('/v1/analysis/latest')) return { results: [LOADED, OTHER] };
+      if (path === '/v1/analysis/run') throw new Error('No posts matched the selector');
+      return { results: [] };
+    });
+
+    render(<Posts />);
+    const row = await rowFor('cmp58e24');
+
+    await act(async () => { fireEvent.click(within(row).getByRole('button', { name: /Re-run/i })); });
+
+    expect(await screen.findByText(/Re-run failed: No posts matched the selector/)).toBeInTheDocument();
+  });
+
+  it('flags a row that has no summary', async () => {
+    apiCall.mockImplementation(async (path) => {
+      if (path.startsWith('/v1/analysis/latest')) {
+        return { results: [post({ post_id: 'cmor32gy000000000000000a', post_summary: null })] };
+      }
+      return { results: [] };
+    });
+
+    render(<Posts />);
+
+    // A bare dash reads as "nothing to summarise"; this is a fixable state.
+    expect(await screen.findByText('no summary')).toBeInTheDocument();
+  });
+
+  it('hands the post id to the Trace tab and navigates there', async () => {
+    const navigated = vi.fn();
+    window.addEventListener('dashboard-navigate', navigated);
+
+    render(<Posts />);
+    const row = await rowFor('cmp58e24');
+
+    await act(async () => { fireEvent.click(within(row).getByRole('button', { name: /Trace/i })); });
+
+    expect(getTraceSnapshot().postId).toBe(LOADED.post_id);
+    expect(navigated).toHaveBeenCalled();
+    expect(navigated.mock.calls[0][0].detail).toEqual({ tab: 'trace' });
+    window.removeEventListener('dashboard-navigate', navigated);
   });
 });

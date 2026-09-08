@@ -20,7 +20,7 @@ from sqlalchemy.ext.asyncio import AsyncSession
 import redis.asyncio as aioredis
 from defense.libs.labels import label_provenance
 from defense.libs.jobs import clear_cancelled, mark_cancelled, purge_job_keys
-from defense.libs.progress import publish_stage, replay_events
+from defense.libs.progress import buffer_key as progress_buffer_key, publish_stage, replay_events
 from defense.services.api.deps import get_current_user, get_db, get_redis, rate_limit, resolve_llm_backend
 from defense.services.api.models import (
     AnalysisDetailResponse,
@@ -361,8 +361,14 @@ async def list_analysis_jobs(
             selector = r["selector"] or {}
             post_ids = selector.get("post_ids") or []
             
+            # Both are None when the key is gone, never 0. These counters are
+            # Redis keys with a 24 h TTL and they expire INDEPENDENTLY — a job
+            # can be left holding `:total` without `:completed` or the reverse,
+            # which is exactly what two live jobs looked like on 29 Aug 2026.
+            # Coercing the missing one to 0 turns "no counter" into "none of them
+            # landed", and a finished job then reports 0 %.
             total_val = int(totals[i]) if totals[i] is not None else None
-            completed_val = int(completions[i]) if completions[i] is not None else 0
+            completed_val = int(completions[i]) if completions[i] is not None else None
             
             jobs.append(
                 {
@@ -408,6 +414,60 @@ async def _job_row_for_tenant(db: AsyncSession, analysis_id: str, tenant_id: str
             detail=f"Analysis job '{analysis_id}' not found",
         )
     return row
+
+
+_JOB_COUNTER_TTL = 86_400  # matches the assembler's _PROGRESS_TTL
+
+
+async def _seed_job_counters(
+    redis: aioredis.Redis, analysis_id: str, *, total: int, completed: int
+) -> None:
+    """Write the counters for a job whose completion was established elsewhere.
+
+    The assembler owns these keys in the normal case. When a job is declared
+    finished by some other route — the resume endpoint's "already complete"
+    shortcut — nothing writes them, and the Jobs tab then reads `completed: 0`
+    against a `done` row and draws a confident **0%**. Progress is allowed to be
+    unknown; it is not allowed to contradict the status next to it.
+
+    Best-effort: a Redis failure must not turn a successful reconciliation into
+    an error response.
+    """
+    try:
+        await redis.set(f"job:{analysis_id}:total", total, ex=_JOB_COUNTER_TTL)
+        await redis.set(f"job:{analysis_id}:completed", completed, ex=_JOB_COUNTER_TTL)
+    except Exception as exc:  # noqa: BLE001 — reporting must not fail the call
+        log.warning(
+            "job_counter_seed_failed", analysis_id=analysis_id, error=str(exc)
+        )
+
+
+async def _seconds_since_last_stage_event(
+    redis: aioredis.Redis, analysis_id: str, *, now: datetime
+) -> float | None:
+    """Seconds since this job's most recent stage frame, or None if there is none.
+
+    Reads only the newest entry of the replay buffer. Returns None — meaning "no
+    evidence", never "idle" — when the buffer is empty, expired (1 h TTL), or
+    predates timestamped frames, so a caller must treat the absence as unknown
+    rather than as proof the job is dead.
+    """
+    try:
+        tail = await redis.lrange(progress_buffer_key(analysis_id), -1, -1)
+    except Exception:
+        return None
+    if not tail:
+        return None
+    raw = tail[0]
+    if isinstance(raw, (bytes, bytearray)):
+        raw = raw.decode()
+    try:
+        ts = json.loads(raw).get("ts")
+    except (json.JSONDecodeError, TypeError, AttributeError):
+        return None
+    if not isinstance(ts, (int, float)):
+        return None
+    return max(0.0, now.timestamp() - float(ts))
 
 
 async def _progress_snapshot(redis: aioredis.Redis, analysis_id: str) -> dict[str, Any]:
@@ -574,17 +634,29 @@ async def resume_analysis(
     if job_status not in _TERMINAL_JOB_STATUSES:
         updated_at = job_row["updated_at"] or job_row["created_at"]
         idle_for: float | None = None
+        now = datetime.now(tz=timezone.utc)
         if updated_at is not None:
-            now = datetime.now(tz=timezone.utc)
             if updated_at.tzinfo is None:
                 updated_at = updated_at.replace(tzinfo=timezone.utc)
             idle_for = (now - updated_at).total_seconds()
+
+        # `jobs.updated_at` is written by the ASSEMBLER and by nobody else, so it
+        # sits at the creation time for the whole time a post spends in Stage 1
+        # and Stage 2 — minutes, on a local LLM. Judging liveness by it alone
+        # declares a perfectly healthy job stalled and hands it to resume, which
+        # then re-enqueues a post that is still being worked on. The stage-event
+        # buffer is the per-post proof of life the jobs row cannot be.
+        stage_idle = await _seconds_since_last_stage_event(redis, analysis_id, now=now)
+        if stage_idle is not None and (idle_for is None or stage_idle < idle_for):
+            idle_for = stage_idle
+
         if idle_for is not None and idle_for < _STALE_JOB_SECONDS:
+            where = "the pipeline" if stage_idle is not None and stage_idle <= idle_for else "the job row"
             raise HTTPException(
                 status_code=status.HTTP_409_CONFLICT,
                 detail=(
-                    f"Job '{analysis_id}' is still making progress (last update "
-                    f"{int(idle_for)}s ago) — stop it first, then resume"
+                    f"Job '{analysis_id}' is still making progress ({where} last "
+                    f"reported {int(idle_for)}s ago) — stop it first, then resume"
                 ),
             )
 
@@ -597,24 +669,58 @@ async def resume_analysis(
         )
 
     all_ids = [r["id"] for r in rows]
-    done_ids = {
-        r[0]
-        for r in (
-            await db.execute(
-                text(
-                    "SELECT post_id FROM analysis_results "
-                    "WHERE tenant_id = :tid AND post_id = ANY(:ids) "
-                    "AND updated_at >= :since"
-                ),
-                {"tid": tenant_id, "ids": all_ids, "since": job_row["created_at"]},
-            )
-        ).all()
+
+    # Which of this job's posts already have a result — and, critically, whether
+    # THIS job produced it.
+    #
+    # `analysis_results` is upserted `ON CONFLICT (post_id)`: a second run of the
+    # same post overwrites the row and moves `updated_at`. This check used to be
+    # `updated_at >= job.created_at` alone, which asks "has anything touched this
+    # post since the job started?" — a question a *concurrent re-run of the same
+    # post* answers yes to. That is how a job whose only post was still inside
+    # Stage 2 got marked `done`: an earlier run of the same post landed 20
+    # seconds before this job's post even reached the router, and its `updated_at`
+    # satisfied the test.
+    #
+    # `processing.job_id` (stamped by the assembler) answers the real question.
+    # The timestamp arm is kept only for rows written before stamping existed —
+    # `? 'job_id'` tells the two apart, so an unstamped row is never silently
+    # treated as proof.
+    result_rows = (
+        await db.execute(
+            text(
+                """
+                SELECT post_id,
+                       result->'processing'->>'job_id'  AS produced_by,
+                       (result->'processing' ? 'job_id') AS has_provenance
+                FROM analysis_results
+                WHERE tenant_id = :tid AND post_id = ANY(:ids)
+                  AND updated_at >= :since
+                """
+            ),
+            {"tid": tenant_id, "ids": all_ids, "since": job_row["created_at"]},
+        )
+    ).mappings().all()
+
+    done_ids = {r["post_id"] for r in result_rows if r["produced_by"] == analysis_id}
+    # A row that carries provenance naming a *different* job is positive evidence
+    # that this job's own post has not landed — not merely absent evidence.
+    foreign_ids = {
+        r["post_id"]
+        for r in result_rows
+        if r["has_provenance"] and r["produced_by"] != analysis_id
     }
+    legacy_ids = {r["post_id"] for r in result_rows if not r["has_provenance"]}
+    # Unstamped rows can only be read the old, ambiguous way. They count, but the
+    # answer says so rather than presenting a guess as a fact.
+    done_ids |= legacy_ids
+
     remaining = [r for r in rows if r["id"] not in done_ids]
 
     if not remaining:
-        # Every post has a result from this job's lifetime; the row was simply
-        # never flipped because the assembler died before the last one landed.
+        # Every post has a result attributable to this job (or a pre-provenance
+        # row we cannot attribute at all); the row was simply never flipped
+        # because the assembler died before the last one landed.
         await db.execute(
             text(
                 "UPDATE jobs SET status = 'done', updated_at = NOW(), error = NULL "
@@ -623,14 +729,39 @@ async def resume_analysis(
             {"id": analysis_id},
         )
         await db.commit()
-        log.info("analysis_resume_already_complete", analysis_id=analysis_id, total=len(all_ids))
+        # Bring the Redis counters in line with the status we just wrote.
+        # Without this the Jobs tab reads `completed: 0` against `total: N` for a
+        # job whose row says `done` and renders a confident **0%** — the status
+        # and the progress bar disagreeing is worse than either being missing.
+        await _seed_job_counters(redis, analysis_id, total=len(all_ids), completed=len(done_ids))
+        log.info(
+            "analysis_resume_already_complete",
+            analysis_id=analysis_id,
+            total=len(all_ids),
+            attributed=len(all_ids) - len(legacy_ids),
+            unattributable=len(legacy_ids),
+        )
         return {
             "analysis_id": analysis_id,
             "resumed": False,
             "status": "done",
-            "reason": "every post in the selector already has a result from this job",
+            "reason": (
+                "every post in the selector already has a result from this job"
+                if not legacy_ids
+                else (
+                    f"every post in the selector has a result; {len(legacy_ids)} of them "
+                    "predate job provenance, so they are matched by timestamp only"
+                )
+            ),
             "progress": {"total": len(all_ids), "completed": len(done_ids), "remaining": 0},
         }
+
+    if foreign_ids:
+        log.info(
+            "analysis_resume_foreign_results_ignored",
+            analysis_id=analysis_id,
+            posts=len(foreign_ids),
+        )
 
     # --- Options: reuse the request's, re-resolve the backend --------------
     # Stored so a resumed job asks for the same tasks the original did; the
@@ -1546,14 +1677,19 @@ async def get_analysis(
     progress: dict[str, Any] | None = None
     try:
         raw_total = await redis.get(f"job:{analysis_id}:total")
-        completed = int(await redis.get(f"job:{analysis_id}:completed") or 0)
-        failed = int(await redis.get(f"job:{analysis_id}:failed") or 0)
+        raw_completed = await redis.get(f"job:{analysis_id}:completed")
+        raw_failed = await redis.get(f"job:{analysis_id}:failed")
+        # Ints for the reconciliation arithmetic below, None for what is
+        # reported: "the counter is gone" and "the counter says zero" are
+        # different facts and the caller has to be able to tell them apart.
+        completed = int(raw_completed) if raw_completed is not None else 0
+        failed = int(raw_failed) if raw_failed is not None else 0
         if raw_total is not None or completed or failed:
             total = int(raw_total) if raw_total is not None else None
             progress = {
                 "total": total,
-                "completed": completed,
-                "failed": failed,
+                "completed": completed if raw_completed is not None else None,
+                "failed": failed if raw_failed is not None else None,
             }
             # Reconcile a stale row: only the assembler writes the terminal
             # status, so a job whose LAST post was dead-lettered leaves the row

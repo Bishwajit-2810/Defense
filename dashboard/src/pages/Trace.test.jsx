@@ -12,6 +12,7 @@ import { render, screen, waitFor, act, fireEvent } from '@testing-library/react'
 import { vi } from 'vitest';
 
 import Trace from './Trace.jsx';
+import { resetTraceSession, getSnapshot } from '../utils/traceSession.js';
 
 const apiCall = vi.fn();
 vi.mock('../utils/api.js', () => ({
@@ -52,6 +53,9 @@ const listLoaded = async () => {
 };
 
 beforeEach(() => {
+  // The trace session deliberately outlives the component, so it also outlives
+  // a test — reset it or each case inherits the last one's job and rail.
+  resetTraceSession();
   apiCall.mockReset();
   apiCall.mockImplementation(async (path) => {
     if (String(path).includes('/v1/analysis/latest')) return { results: POSTS };
@@ -118,37 +122,98 @@ describe('Trace post list', () => {
     logged.mockRestore();
   });
 
-  it('closes an open trace stream on unmount', async () => {
-    // `handleRunTrace` bails with an alert when nothing is selected, so this
-    // selects explicitly rather than relying on the mount-time preselect having
-    // landed — waiting on that made the test flaky under load, and a flaky test
-    // is worse than no test.
-    const alerted = vi.fn();
-    vi.stubGlobal('alert', alerted);
-
-    const { unmount } = render(<Trace />);
+  it('traces a post id that is not in the dropdown', async () => {
+    render(<Trace />);
     await listLoaded();
-    await act(async () => {
-      fireEvent.change(screen.getByRole('combobox'), { target: { value: POSTS[0].post_id } });
-    });
-    expect(screen.getByRole('combobox').value).toBe(POSTS[0].post_id);
 
+    const pasted = 'cmor32gyffffffffffffffff';
+    await act(async () => {
+      fireEvent.change(screen.getByLabelText(/paste a post id/i), { target: { value: pasted } });
+    });
     await act(async () => {
       fireEvent.click(screen.getByRole('button', { name: /Run Trace/i }));
     });
 
-    // If the guard fired, say so — otherwise the stream assertion below reports
-    // "0 streams" and hides the reason.
-    expect(alerted).not.toHaveBeenCalled();
-    await waitFor(
-      () => expect(apiCall).toHaveBeenCalledWith('/v1/analysis/run', expect.objectContaining({ method: 'POST' })),
-      { timeout: 4000 }
-    );
+    // The id the operator typed is the id that runs — not the preselected row.
+    await waitFor(() => expect(apiCall).toHaveBeenCalledWith(
+      '/v1/analysis/run',
+      expect.objectContaining({ body: expect.stringContaining(pasted) })
+    ));
+    // And the dropdown carries it rather than snapping back to a known row.
+    expect(screen.getByRole('combobox').value).toBe(pasted);
+  });
+});
+
+describe('Trace session', () => {
+  // The bug this pins: tabs render as `{activeTab === 'trace' && <Trace />}`, so
+  // leaving the tab unmounts the page. When the trace lived in `useState` that
+  // threw away the rail and closed the stream — the page came back blank and a
+  // running trace had been abandoned.
+  const runATrace = async () => {
+    const view = render(<Trace />);
+    await listLoaded();
+    await act(async () => {
+      fireEvent.click(screen.getByRole('button', { name: /Run Trace/i }));
+    });
     await waitFor(() => expect(FakeEventSource.instances.length).toBeGreaterThan(0), { timeout: 4000 });
+    return { es: FakeEventSource.instances[0], unmount: view.unmount };
+  };
+
+  const emit = (es, type, payload) => act(async () => {
+    (es.listeners[type] || []).forEach(fn => fn({ data: JSON.stringify(payload) }));
+  });
+
+  it('keeps the stream open when the tab is switched away', async () => {
+    const { es, unmount } = await runATrace();
 
     await act(async () => { unmount(); });
 
-    expect(FakeEventSource.open.length).toBe(0);
-    vi.unstubAllGlobals();
+    // The whole fix: leaving the tab must not abandon a post mid-pipeline.
+    expect(es.closed).toBe(false);
+    expect(FakeEventSource.open.length).toBe(1);
+  });
+
+  it('still shows the rail after unmounting and remounting', async () => {
+    const { es, unmount } = await runATrace();
+    await emit(es, 'stage', { event: 'stage', stage: 'stage1', status: 'done', seq: 1, detail: { engine: 'llm' } });
+    await act(async () => { unmount(); });
+
+    // Coming back to the tab: the rail is rebuilt from the session rather than
+    // from an empty state, which is what used to show "Nothing traced yet".
+    render(<Trace />);
+    await waitFor(() => expect(screen.getAllByText(/"engine":"llm"/).length).toBeGreaterThan(0));
+    expect(screen.queryAllByText(/Nothing traced yet/).length).toBe(0);
+  });
+
+  it('applies a frame that arrives while the tab is unmounted', async () => {
+    const { es, unmount } = await runATrace();
+    await act(async () => { unmount(); });
+
+    await emit(es, 'stage', { event: 'stage', stage: 'router', status: 'done', seq: 3, detail: { use_llm: true } });
+
+    render(<Trace />);
+    await waitFor(() => expect(screen.getAllByText(/"use_llm":true/).length).toBeGreaterThan(0));
+  });
+
+  it('dedupes a frame that arrives replayed and live', async () => {
+    const { es } = await runATrace();
+    const frame = { event: 'stage', stage: 'ingest', status: 'done', seq: 7, detail: { platform: 'facebook' } };
+    await emit(es, 'stage', { ...frame, replay: true });
+    await emit(es, 'stage', frame);
+
+    expect(getSnapshot().tape.filter(t => t.seq === 7).length).toBe(1);
+  });
+
+  it('closes the stream and empties the rail on Clear', async () => {
+    const { es } = await runATrace();
+    await act(async () => {
+      fireEvent.click(screen.getAllByRole('button', { name: /^Clear$/i })[0]);
+    });
+
+    expect(es.closed).toBe(true);
+    expect(getSnapshot().status).toBe('idle');
+    expect(getSnapshot().tape).toEqual([]);
+    // The selection is configuration, not output — Clear must not lose it.
+    expect(getSnapshot().postId).toBe(POSTS[0].post_id);
   });
 });

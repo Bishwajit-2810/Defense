@@ -45,8 +45,8 @@ export default function Header({ authStatus, onLogout, onOpenSystemMonitor }) {
           <Shield size={24} />
         </div>
         <div>
-          <h1 className="font-bold text-lg leading-tight">Defense Analysis</h1>
-          <div className="text-xs text-slate-500 dark:text-zinc-400 font-medium tracking-wide uppercase">Intelligence Platform</div>
+          <h1 className="font-bold text-lg leading-tight">Selective Intelligence</h1>
+          <div className="text-xs text-slate-500 dark:text-zinc-400 font-medium tracking-wide uppercase">Cost-Aware Analysis Layer</div>
         </div>
       </div>
 

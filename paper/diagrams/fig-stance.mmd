@@ -1,0 +1,26 @@
+graph TD
+    Cfg["config/stance_targets.yml<br/><small>operator-supplied, versioned</small>"]
+    Matcher["libs/stance_targets.py<br/><small>alias matcher — Bangla script ·<br/>romanized Banglish · English</small>"]
+    Cfg --> Matcher
+
+    S1["Stage 1<br/><small>match every comment of EVERY post<br/>pure string work, free</small>"]
+    Scorer["Deterministic clause-based scorer<br/><small>→ target_stances</small>"]
+    Matcher --> S1 --> Scorer
+
+    S2["Stage 2<br/><small>matched entities injected into the comment-stance<br/>prompt that ALREADY runs → zero extra LLM calls</small>"]
+    Matcher --> S2
+    S2 --> LLMOut["target_stances<br/><small>method = llm</small>"]
+
+    Rollup["Per-post rollup<br/><small>{entity: {mentions, supportive,<br/>opposing, neutral, method}}</small>"]
+    Scorer --> Rollup
+    LLMOut --> Rollup
+
+    class Cfg entry
+    class Matcher,S1,S2 svc
+    class Scorer,LLMOut tool
+    class Rollup store
+
+    classDef entry fill:#eaecff,stroke:#4a3aa7,stroke-width:1.4px,color:#373660
+    classDef svc fill:#ddf0ff,stroke:#2a78d6,stroke-width:1.4px,color:#203d61
+    classDef store fill:#d8f7e6,stroke:#008d5a,stroke-width:1.4px,color:#0a4730
+    classDef tool fill:#eef1f7,stroke:#747d88,stroke-width:1.2px,color:#3c4249

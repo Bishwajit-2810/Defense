@@ -1,0 +1,52 @@
+graph TB
+    subgraph user["User layer"]
+        UI["Dashboard / Chat UI"]
+        API["REST API<br/><small>/v1/search · /v1/chat<br/>/v1/agents</small>"]
+    end
+
+    subgraph agent["Agent layer (agentic RAG)"]
+        Runner["AgentRunner — tool-use loop<br/><small>result cap · repeat guard<br/>non-answer guards</small>"]
+        G1["analyst · coverage<br/>alerting"]
+        G2["stance · comparator<br/>toxicity"]
+        G3["narrative · quality<br/>reporter"]
+    end
+
+    subgraph mcp["MCP tool servers"]
+        RetMCP["retrieval-mcp :8101<br/><small>semantic_search<br/>get_post · get_thread<br/>search_comments<br/>stance_by_target<br/>get_clusters</small>"]
+        AnaMCP["analytics-mcp :8110<br/><small>trend_query<br/>sentiment_over_time<br/>top_posts</small>"]
+        IngMCP["ingest-mcp :8102<br/><small>fetch_more_comments</small>"]
+    end
+
+    subgraph data["Data and intelligence"]
+        PG[("PostgreSQL + pgvector")]
+        CH[("ClickHouse")]
+        Intel["Intelligence writers<br/><small>SentenceTransformer 768-dim<br/>ensemble voter (7 HF heads<br/>+ LLM stance) · stance scoring<br/>k-means / HDBSCAN clustering</small>"]
+    end
+
+    UI --> API
+    API --> Runner
+    Runner --> G1
+    Runner --> G2
+    Runner --> G3
+    G1 --> RetMCP
+    G1 --> AnaMCP
+    G1 --> IngMCP
+    G2 --> RetMCP
+    G3 --> RetMCP
+    RetMCP --> PG
+    AnaMCP --> CH
+    AnaMCP --> PG
+    Intel --> PG
+    RetMCP ~~~ Intel
+
+
+    class UI,API entry
+    class Runner,G1,G2,G3 svc
+    class RetMCP,AnaMCP,IngMCP svc
+    class PG,CH store
+    class Intel tool
+
+    classDef entry fill:#eaecff,stroke:#4a3aa7,stroke-width:1.4px,color:#373660
+    classDef svc fill:#ddf0ff,stroke:#2a78d6,stroke-width:1.4px,color:#203d61
+    classDef store fill:#d8f7e6,stroke:#008d5a,stroke-width:1.4px,color:#0a4730
+    classDef tool fill:#eef1f7,stroke:#747d88,stroke-width:1.2px,color:#3c4249

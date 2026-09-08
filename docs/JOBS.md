@@ -87,7 +87,7 @@ a power cut:
 
 1. The job's **selector** gives the full post set.
 2. A post counts as **done** when its `analysis_results` row was written at or
-   after the job started.
+   after the job started **and carries this job's id** (`processing.job_id`).
 3. The remaining posts are re-enqueued at Stage 1 with the job's original
    `options`.
 4. The Redis counters are **rebuilt to match** — `total` = the whole set,
@@ -95,25 +95,64 @@ a power cut:
    assembler finish the job when the remainder lands instead of flipping it done
    on the first one. Progress continues at **30/300** rather than restarting at 0.
 
-`analysis_results` is keyed `UNIQUE (post_id)` with no job column, so that
-timestamp is the only available discriminator. It means a post another job
-re-analysed in the meantime also counts as done — which is correct: a fresh
-result exists either way.
+### Why step 2 needs provenance, not a timestamp
+
+`analysis_results` is keyed `UNIQUE (post_id)` and upserted `ON CONFLICT
+(post_id)`. A post analysed twice has **one** row, and the second run overwrites
+the first; the only thing that moves is `updated_at`.
+
+Until 29 Aug 2026 step 2 was the timestamp alone. That does not ask "did this job
+finish this post" — it asks *"has anything touched this post since this job
+started"*, and any concurrent re-run of the same post answers yes. This was
+documented here as correct on the grounds that "a fresh result exists either
+way". It is not correct, and the failure is not subtle:
+
+> Job `e7ec04a6` analysed one post. A **different** run of the same post finished
+> at 16:31:36 and upserted the row — seven seconds *before* this job's own post
+> reached the router. Resume read that row, concluded the job was complete,
+> flipped it to `done`, and returned `resumed: false`. The job's actual post was
+> still inside Stage 2, and remained there.
+
+The assembler now stamps `processing.job_id` onto every result, so the question
+is answerable exactly. Three cases, and the API distinguishes all three:
+
+| Row | Read as |
+| --- | ------- |
+| `processing.job_id` == this job | done, confirmed |
+| `processing.job_id` == another job | **not** done — positive evidence this job's own post has not landed |
+| `processing.job_id` key **absent** (written before stamping) | counts as done, matched by timestamp only — and the response's `reason` says so rather than presenting the guess as a fact |
+
+The shortcut that flips a job to `done` also **writes the Redis counters** it
+just asserted. It did not, and a `done` row with no `completed` counter is what
+the Jobs tab drew as a confident **0%** next to it — see §4.2.
 
 ### What resume refuses to do
 
 | Condition | Response |
 | --------- | -------- |
 | Job status `done` | **409** — nothing to resume |
-| Job is non-terminal and its row was touched < **300 s** ago | **409** — *"still making progress … stop it first, then resume"* |
+| Job is non-terminal and **either** its row **or its pipeline** reported < **300 s** ago | **409** — *"still making progress … stop it first, then resume"* |
 | Selector has neither `campaign_id` nor `post_ids` | **422** — no post set to resume; start a new run |
 
-`jobs.updated_at` is the heartbeat: the assembler writes `running` to the row as
-every post lands, so a job that is genuinely moving touches it continuously.
-Nothing else in the system can tell a power-cut job from a slow one — a killed
-process leaves no marker — so the threshold has to clear the **slowest single
-post** (a full comment ensemble plus summary on a long thread), not the average
-one. Below it a resume is refused, which is unambiguous.
+Liveness has **two** sources, and it needs both.
+
+`jobs.updated_at` is written by the **assembler and by nobody else**, once per
+post landing. So it is a heartbeat only for a job with many posts landing
+steadily; for the minutes a single post spends in Stage 1 and Stage 2 it does not
+move at all, and a one-post job's row is untouched from creation until it
+finishes. Judged on that alone, a perfectly healthy job on a local LLM reads as
+stalled after five minutes — and resume then re-enqueues a post that is still
+being worked on, which is how two runs of one post end up racing.
+
+The stage-event buffer is the per-post signal the row cannot be: every frame
+carries wall-clock `ts` (§4), so the newest frame says when the pipeline last did
+something for this job. Resume takes the **more recent** of the two. Absence of
+frames is treated as *no evidence* — the buffer has a 1 h TTL — never as proof
+the job is dead.
+
+A killed process still leaves no marker, so the threshold must clear the
+**slowest single post** (a full comment ensemble plus summary on a long thread).
+Below it a resume is refused, which is unambiguous.
 
 **There is no per-post partial resume.** A post that was mid-flight is redone
 from Stage 1.
@@ -152,7 +191,67 @@ forever.
 
 The dashboard renders this as the **Analysis Jobs** tab (progress, stop/resume/
 delete) and the **Trace** tab (the per-post stage rail) —
-[DASHBOARD_UI.md](DASHBOARD_UI.md).
+[DASHBOARD_UI.md](DASHBOARD_UI.md). The Trace tab's client holds that stream
+**outside React** (`utils/traceSession.js`), because tabs are rendered
+conditionally and leaving the tab would otherwise abandon a post mid-pipeline.
+
+## 4.1 A job's report covers that job
+
+The Jobs tab's per-row **Download Report** sends
+`GET /v1/reports/export_latest?job_id={id}`, and the API resolves the job's own
+`selector` — its `post_ids` when it has them, otherwise its campaign.
+
+Until 29 Aug 2026 it sent only `job.campaign_id`. **A job created from explicit
+`post_ids` has no campaign**, so the request fell through to `campaign_id=all`
+and a one-post job downloaded a report over the whole corpus, named
+`analysis_report_all.pdf`. The scope is now part of the request, part of the
+filename, and printed on the PDF — [REPORTS.md](REPORTS.md) §1.1.
+
+This is worth remembering as a *class* of bug rather than one incident: the
+job selector is the only record of what a job was asked to do, and any feature
+that answers "about this job" has to read it rather than infer it from a column
+that happens to be populated for some jobs.
+
+## 4.2 Progress has two sources, and the durable one is the status
+
+`job:{id}:total` and `job:{id}:completed` are **two separate Redis keys with a
+24 h TTL, and they expire independently**. That is the fact everything here turns
+on. A finished job can be left holding either one alone, and on 29 Aug 2026 two
+live jobs showed both halves at once:
+
+| Job | Counters present | Rendered |
+| --- | --- | --- |
+| a 1-post `analysis_run` | `:total` only | **0%** |
+| a 50-post `posts_upload` | `:completed` only | **—** |
+
+Both had finished. Two different wrong answers, from the same missing data.
+
+Three separate defects produced that, and each needed its own fix:
+
+1. **The API fabricated the zero.** `list_analysis_jobs` coerced a missing
+   `:completed` to `0` while reporting a missing `:total` as `null`. It now
+   reports **both** as `null` — "the counter is gone" and "the counter says zero"
+   are different facts, and a caller cannot distinguish them if the API will not.
+2. **The tab rendered a number it did not have.** `total > 0 ? completed/total :
+   (isFinished ? 100 : 0)` coerces `null` to `0` first, which is what erased the
+   difference in the first place.
+3. **Neither consulted the durable record.** The counters are ephemeral; the job
+   *status* is a Postgres column that does not expire — and `done` **means** every
+   post landed, because the assembler writes it only once
+   `completed + failed >= total`.
+
+So the rule is now: a real ratio when both counters are present; otherwise a
+terminal `done` status is read as **100%**, marked with a `*` and a tooltip
+saying it is derived from the status rather than counted. `failed` and
+`cancelled` are *not* complete and never get the full bar — a stopped job's
+progress is genuinely lost, and it says **—**. A running job with no counters yet
+says **—**. A counter that exists and reads zero is a measurement and still
+renders 0%, and real counters win over the status even when they contradict it:
+a measurement beats an inference, and the contradiction is worth seeing.
+
+`post_count`, derived from the job's selector rather than from Redis, is the
+durable answer to "how many posts was this job for" and is what the Posts column
+falls back to.
 
 ## 5. Statuses
 
@@ -175,6 +274,13 @@ delete) and the **Trace** tab (the per-post stage rail) —
 | `options` persisted and reused on resume | ✅ Measured |
 | Backend re-resolved against tenant policy on resume | ✅ Measured |
 | Stage events replay correctly for a late subscriber | ✅ Measured |
+| A job's report is scoped to that job's posts | ✅ Measured — [`tests/test_report_scope.py`](../tests/test_report_scope.py) |
+| Resume attributes a result to the job that produced it, not to a timestamp | ✅ Measured — `tests/test_job_lifecycle.py` |
+| A completion recorded outside the assembler still writes the counters | ✅ Measured |
+| Liveness reads the pipeline's frames, not only the jobs row | ✅ Measured |
+| A missing counter is reported as null, never as 0 | ✅ Measured — `tests/test_job_lifecycle.py` |
+| A finished job reads 100% from its status when the counters cannot answer | ✅ Measured — `dashboard/src/pages/AnalysisJobs.test.jsx` |
+| Cancelled and failed jobs never render as complete | ✅ Measured |
 | Behaviour under a genuine mid-batch power cut | 🟡 Reasoned + tested, **not staged on real hardware** |
 
 Cross-references: [PIPELINE.md](PIPELINE.md) · [INGESTION.md](INGESTION.md) ·

@@ -239,9 +239,11 @@ Q&A, grounded reports, and targeted deep-dives (never per post) — see §11.
    > power leaves the row reading `running`, the Redis counters gone and the
    > in-flight messages lost — nothing in the system marks that job as dead. So
    > `POST /v1/analysis/{id}/resume` recomputes the remainder from the selector
-   > plus the `analysis_results` rows written at or after the job's `created_at`,
-   > re-enqueues only those posts under the same job id, and rebuilds the counters
-   > with `completed` seeded at what is already done. The seeding is what lets the
+   > plus the `analysis_results` rows written at or after the job's `created_at`
+   > **and stamped with that job's id** (`processing.job_id` — the table is
+   > upserted per post, so a timestamp alone cannot tell this job's result from a
+   > concurrent re-run's), re-enqueues only those posts under the same job id, and
+   > rebuilds the counters with `completed` seeded at what is already done. The seeding is what lets the
    > assembler finish the job on its last post instead of its first. `jobs.options`
    > is persisted for the same reason: a job resumed without the options it was
    > started with would finish half-summarised. See
@@ -618,6 +620,7 @@ since only a stored sample of comments is shipped.
     "nlp_engine": "llm",
     "stub_mode": false,
     "degraded_components": [],
+    "job_id": "1be7e085-388f-4e1f-bd81-0d20678e382b",
     "schema_version": "1.3"
   },
   "created_at": "2026-05-04T18:19:14",

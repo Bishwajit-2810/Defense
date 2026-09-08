@@ -1,0 +1,20 @@
+graph TD
+    Up["Upstream monitoring<br/>platform"]
+    Op["Operator /<br/>analyst"]
+    P(("0 · Selective Intelligence"))
+    Down["Downstream<br/>consumer app"]
+    Backend["LLM backend<br/><small>self-hosted vLLM or Ollama<br/>Groq Cloud</small>"]
+
+    Up -- "post-with-details payload" --> P
+    P -. "no write-back" .-> Up
+    Op -- "requests and questions" --> P
+    P -- "results and briefings" --> Op
+    P -- "canonical result JSON" --> Down
+    P -- "prompts" --> Backend
+    Backend -- "completions" --> P
+
+    class Up,Op,Down,Backend entry
+    class P svc
+
+    classDef entry fill:#eaecff,stroke:#4a3aa7,stroke-width:1.4px,color:#373660
+    classDef svc fill:#ddf0ff,stroke:#2a78d6,stroke-width:1.4px,color:#203d61

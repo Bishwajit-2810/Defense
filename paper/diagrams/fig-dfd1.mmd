@@ -1,0 +1,44 @@
+graph TD
+    Up["Upstream platform"]
+    Op["Operator / analyst"]
+    Down["Downstream consumer"]
+    Backend["LLM backend"]
+
+    P1(("1.0 · Ingest"))
+    P2(("2.0 · Cheap NLP"))
+    P3(("3.0 · Route"))
+    P4(("4.0 · LLM analysis"))
+    P5(("5.0 · Assemble"))
+    P6(("6.0 · Insight"))
+
+    D1[("D1 posts and<br/>raw payloads")]
+    D2[("D2 analysis_results<br/>+ embedding")]
+    D3[("D3 response cache<br/>usage counters")]
+    D4[("D4 model registry<br/>configuration")]
+    D5[("D5 analytics events<br/>comment sentiments")]
+
+    Up -- "[1] post-with-details" --> P1
+    Op -- "[2] analysis request" --> P1
+    P1 -- "[3] raw payload" --> D1
+    P1 -- "[4] normalised<br/>envelope" --> P2
+    D4 -- "[5] model config" --> P2
+    P2 -- "[6] stage-1 result" --> P3
+    P3 -- "[7] task flags ·<br/>selected comments" --> P4
+    P4 <-- "[8] prompt /<br/>completion" --> Backend
+    P4 <-- "[9] cache ·<br/>counters" --> D3
+    P4 -- "[10] stage-2 result" --> P5
+    P5 -- "[11] canonical JSON" --> D1
+    P5 -- "[12] results +<br/>embedding" --> D2
+    P5 -- "[13] events + comment<br/>labels" --> D5
+    P5 -- "[14] canonical<br/>result JSON" --> Down
+    D2 -- "[15] results +<br/>vectors" --> P6
+    D5 -- "[16] comment<br/>sentiments" --> P6
+    P6 -- "[17] grounded briefing" --> Op
+
+    class Up,Op,Down,Backend entry
+    class P1,P2,P3,P4,P5,P6 svc
+    class D1,D2,D3,D4,D5 store
+
+    classDef entry fill:#eaecff,stroke:#4a3aa7,stroke-width:1.4px,color:#373660
+    classDef svc fill:#ddf0ff,stroke:#2a78d6,stroke-width:1.4px,color:#203d61
+    classDef store fill:#d8f7e6,stroke:#008d5a,stroke-width:1.4px,color:#0a4730

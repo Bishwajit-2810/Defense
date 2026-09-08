@@ -153,6 +153,11 @@ This is the JSON the whole system exists to produce:
     "nlp_engine":  "llm",                           // stub | models | llm
     "stub_mode":   false,                           // MODEL_STUB_MODE — true means the embedding is a hash, not a vector
     "degraded_components": [],                      // real-mode components that fell back (§9.10)
+    // WHICH RUN produced this row. analysis_results is upserted ON CONFLICT
+    // (post_id), so a re-analysis overwrites the row and only `updated_at`
+    // moves — this is the only field that attributes the result to a job.
+    // null = replayed / hand-XADDed post; key ABSENT = written before stamping.
+    "job_id": "1be7e085-…",
     "schema_version": "1.3"
   },
   "created_at": "2026-06-12T10:00:00Z",
@@ -218,7 +223,25 @@ curl -N "$API/v1/analysis/<job_id>/stream?api_key=demo"
 # data: {"job_id":"…","post_id":"…","completed":24,"failed":0,"total":50,"overall_sentiment":"negative"}
 # event: done
 # data: {"completed":50,"failed":0,"total":50,…}
+
+# The jobs list, which the dashboard's Jobs tab reads
+curl -s -H "$KEY" "$API/v1/analysis?limit=25" | python -m json.tool
+# → {"jobs":[{"id":"…","type":"analysis_run","status":"done","post_count":1,
+#             "campaign_id":null,"total":1,"completed":1,…}],"total":1}
 ```
+
+**`total` and `completed` can each be `null`, and `null` is not `0`.** They are
+two separate Redis keys with a 24 h TTL that **expire independently**, so a
+finished job is routinely left holding one without the other. Coercing the
+missing one to zero — which this endpoint did for `completed` until 29 Aug 2026 —
+turns "no counter" into "none of them landed", and a finished job reports 0 %.
+
+A client should read `status` as the durable answer and the counters as
+best-effort detail: `done` *means* every post landed (the assembler writes it
+only once `completed + failed >= total`), while `cancelled` and `failed` are not
+complete and must never be rendered as such. `post_count` comes from the job's
+selector rather than from Redis, so it survives the TTL and answers "how many
+posts was this job for".
 
 ### 2b-bis. Stop a job, or delete its record
 
@@ -284,10 +307,21 @@ progress bar picks up at 30/300 rather than restarting.
 still reads `running`, and its Redis counters went with the power. So the answer
 is derived from **Postgres alone** — the job's selector gives the full post set,
 and a post counts as done when its `analysis_results` row was written at or after
-the job's `created_at`. That table is `UNIQUE (post_id)` with no job column, so
-the timestamp is the only discriminator available; it also means a post some
-*other* job re-analysed in the meantime counts as done, which is the right answer
-— a fresh result exists either way.
+the job's `created_at` **and carries this job's id** in `processing.job_id`.
+
+The second half of that was missing until 29 Aug 2026, and this document argued
+the omission was correct: `analysis_results` is `UNIQUE (post_id)`, so "a post
+another job re-analysed in the meantime counts as done — a fresh result exists
+either way". It does not follow. The table is upserted `ON CONFLICT (post_id)`, so
+a timestamp test asks *"has anything touched this post since the job started"*,
+which a **concurrent** re-run answers yes to while the job's own post is still in
+the pipeline. That is what happened: a second run of the same post landed seven
+seconds before the job's post reached the router, and resume marked the job
+`done` with its post still inside Stage 2. A result written by another job is now
+positive evidence that *this* job's post has **not** landed. Rows written before
+stamping have no `job_id` key at all; they still count, and the response's
+`reason` says they were matched by timestamp only rather than presenting the
+guess as a fact.
 
 **What resume rebuilds.** `job:{id}:total` and `job:{id}:completed` are re-seeded
 (to 300 and 30), and `job:{id}:failed` is reset because those posts are being
@@ -297,12 +331,22 @@ the *last* remaining post lands: with no `total` at all it falls back to
 total. Any stop flag is cleared first — the workers drop anything carrying it, so
 clearing after enqueueing would make the whole resume a no-op.
 
-**When it is refused.** A job that has written progress within the last 5 minutes
+**When it is refused.** A job that has reported progress within the last 5 minutes
 (`_STALE_JOB_SECONDS`) is busy, not interrupted, and re-enqueueing under it would
 duplicate work and corrupt its counters — so it 409s and tells you to stop it
-first. `jobs.updated_at` is the heartbeat: the assembler touches it as every post
-lands. The dashboard shows the same threshold as a **stalled** badge, so a
-power-cut job stops reading as one that is still working.
+first.
+
+Liveness has **two** sources and needs both. `jobs.updated_at` is written by the
+**assembler and by nobody else**, once per post landing — so it is a heartbeat
+only for a job with posts landing steadily. For the minutes a single post spends
+in Stage 1 and Stage 2 it does not move at all, and a one-post job's row is
+untouched from creation until it finishes: judged on that alone, a healthy job
+reads as stalled and resume will happily start a second run of a post that is
+still being worked on. The job's **stage frames** carry wall-clock `ts`, so the
+newest one says when the pipeline last did something for this job; resume takes
+the more recent of the two. No frames means *no evidence* (the buffer has a 1 h
+TTL), never "dead". The dashboard's **stalled** badge still reads the row alone,
+so it can flag a job the API will refuse to resume — the safe direction.
 
 **What it does not do.** There is no per-post partial resume: a post that was
 mid-flight is redone from Stage 1. The original request's `options` are reused
@@ -532,6 +576,7 @@ curl -s -H "$KEY" "$API/v1/search?q=fuel%20price%20anger&semantic=true&limit=10"
 curl -s -X POST $API/v1/reports -H "$KEY" -H "Content-Type: application/json" \
   -d '{"type":"trend","options":{"grounded":true}}' | python -m json.tool
 # → {"report_id":"…","status":"done","summary":"<LLM-B narrative>","summary_source":"llm",
+#    "scope_label":"all campaigns",
 #    "clusters":[{"label":"fuel prices","size":12,"top_sentiment":"negative"},…],
 #    "metrics":{"total_posts":50,"sentiment_breakdown":{…},"languages":{…}}}
 # "summary_source":"aggregate" means the LLM was unreachable and the SQL summary was kept.
@@ -546,7 +591,25 @@ curl -s -H "$KEY" "$API/v1/reports/<report_id>/export?format=pdf" -o report.pdf
 curl -s -H "$KEY" \
   "$API/v1/reports/export_latest?campaign_id=all&type=mass_reaction&format=pdf" \
   -o latest.pdf     # format=html for the HTML version
+
+# Scope it to ONE JOB's posts — what the Jobs tab's per-row download sends
+curl -s -H "$KEY" "$API/v1/reports/export_latest?job_id=<job_id>&format=pdf" -o job.pdf
+# The API reads that job's selector. An unknown job_id is a 404, NOT a corpus report.
+
+# Or name the posts yourself
+curl -s -X POST $API/v1/reports -H "$KEY" -H "Content-Type: application/json" \
+  -d '{"post_ids":["cmor32gy…"],"options":{"grounded":true}}'
 ```
+
+**Scope, and why it is a field rather than an assumption.** `campaign_id` used to
+be the only scope a report understood. Every job started by
+`POST /v1/analysis/run` with explicit `post_ids` has no campaign, so the Jobs
+tab's download fell through to `campaign_id=all` — a **one-post job returned a
+report over the whole corpus**, and nothing in the PDF said otherwise. Since
+29 Aug 2026 `POST /v1/reports` takes `post_ids`, `export_latest` takes `job_id`,
+every SQL aggregate carries the same filter, the 5-minute report cache is keyed
+on the scope (not just the campaign), and the response and the rendered header
+carry `scope_label`. Details in [REPORTS.md](REPORTS.md) §1.1.
 
 **`clusters` is the SQL topic aggregate; `embedding_clusters` is the LLM one.**
 A grounded report also runs the embedding-cluster path (k-means over the corpus
@@ -785,7 +848,7 @@ remainder — all real routes, most of them what the dashboard calls:
 | `POST` | `/v1/chat/conversations/{conversation_id}/messages` | Append turns to a conversation. |
 | `GET` | `/v1/reports/{report_id}` | Fetch a generated report by id. |
 | `GET` | `/v1/reports/{report_id}/export` | Export that report as a downloadable PDF or HTML file. |
-| `GET` | `/v1/reports/export_latest/export` | Generate a **fresh** grounded mass-reaction report and stream it straight back — no id round-trip. |
+| `GET` | `/v1/reports/export_latest/export` | Generate a **fresh** grounded mass-reaction report and stream it straight back — no id round-trip. Takes `campaign_id`, **`job_id`** (scope to one analysis job's posts) and `format`. |
 | `GET` | `/v1/logs/services` | Which services are present in the log buffer (populates the Logs tab's filter). Every entry read `service: "-"` until 21 Aug 2026: the Redis sink is a stdlib handler reading `record.service`, while `setup_logging` binds the name through structlog's contextvars, which never touch the stdlib record. |
 | `GET` | `/v1/logs/stream` | Tail server-side logs over SSE. Needs an SSE ticket, like every other stream — see §3. **Replays `backfill` lines (default 60) before tailing**, subscribing to `logs:live` *before* reading `logs:recent` so no line can fall between the two — which means the line straddling the join arrives twice by construction. A client must dedupe (ts + level + message) and must open exactly one stream per view; two open streams double every line *and* the backfill, which is precisely how the Logs tab came to look like the backend was doing everything twice. |
 | `GET` | `/v1/analysis/overview` | Corpus-level rollup the **Overview** tab reads — post/comment totals, sentiment mix, and `corpus_coverage` (the aggregate 3.75% figure, alongside the per-post number the rest of the API shows). |

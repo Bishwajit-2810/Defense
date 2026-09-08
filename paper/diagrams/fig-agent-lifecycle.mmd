@@ -1,0 +1,11 @@
+stateDiagram-v2
+    direction LR
+    [*] --> queued
+    queued --> running: runner picked it up
+    running --> completed: passed the guards
+    running --> failed: error · budget · guard
+    queued --> cancelled: operator cancelled
+    running --> cancelled: operator cancelled
+    completed --> [*]
+    failed --> [*]
+    cancelled --> [*]
